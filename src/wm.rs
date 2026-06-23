@@ -128,7 +128,7 @@ fn ease_out_back(t: f32) -> f32 {
     (t * t).mul_add(inner, 1.0)
 }
 
-fn rect_contains(r: FrameRect, x: i32, y: i32) -> bool {
+const fn rect_contains(r: FrameRect, x: i32, y: i32) -> bool {
     x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }
 
@@ -166,6 +166,7 @@ const PALETTE: [u32; 8] = [
     0xffaa_dd66,
 ];
 
+#[allow(clippy::too_many_lines)]
 pub fn run() -> R<()> {
     let (conn, screen_num) = x11rb::connect(None)?;
     let screen = conn.setup().roots[screen_num].clone();
