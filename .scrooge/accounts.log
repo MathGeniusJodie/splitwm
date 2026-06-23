@@ -9473,3 +9473,135 @@ Rewrite the project overview to match the current state of the code. Do NOT modi
 **splitwm** is a standalone X11 tiling window manager in Rust that replicates the terminal-multiplexer-style split layout of a Lua-based AwesomeWM config, where persistent n-ary split trees hold tabbed leaf stacks on a horizontally-scrollable canvas.
 
 The architecture separates pure layout math (`tree.rs`, `state.rs`) from X11 event handling (`wm.rs`) and software rendering (`render.rs`) — each leaf gets its own frame window with a custom slanted tab bar and rounded focus border composited via tiny-skia and blitted with `PutImage`, avoiding compositing manager dependencies. An arena-keyed tree (`NodeId` → `HashMap`) avoids Rust's borrow-checker friction for parent-child mutations, and the split tree is kept n-ary (not binary) so that collapsing a leaf reflows its ratio proportionally to siblings rather than forcing a binary rebalance. `theme.rs` is the single source of truth for all palette and metric constants; `state.rs` owns every mutation (split, close, resize, tab cycle, scroll, canvas width) so the event loop in `wm.rs` never touches the tree directly. Frame windows are positioned/hidden by `arrange()` which dynamically computes canvas width from leaf count and minimum split width, recomputes geometry on every mutation, maps off-screen frames out, and reparents active clients into the correct frame via a tracked `parent_leaf` field — a deliberate simplicity trade-off over per-client state tracking for reparent/visibility. Focus-direction navigation uses pure `usize` modular arithmetic throughout, avoiding signed-integer casts.
+=== 2026-06-23 15:05:11 cratchit @preset/cratchit prompt=2424 completion=111 cost=$0.000089 ===
+>>> prompt
+PROJECT ROOT: /home/jodie/Downloads/splitwm
+TASK: the changes made in this session
+
+PROJECT OVERVIEW:
+**splitwm** is a standalone X11 tiling window manager in Rust that replicates the terminal-multiplexer-style split layout of a Lua-based AwesomeWM config, where persistent n-ary split trees hold tabbed leaf stacks on a horizontally-scrollable canvas.
+
+The architecture separates pure layout math (`tree.rs`, `state.rs`) from X11 event handling (`wm.rs`) and software rendering (`render.rs`) — each leaf gets its own frame window with a custom slanted tab bar and rounded focus border composited via tiny-skia and blitted with `PutImage`, avoiding compositing manager dependencies. An arena-keyed tree (`NodeId` → `HashMap`) avoids Rust's borrow-checker friction for parent-child mutations, and the split tree is kept n-ary (not binary) so that collapsing a leaf reflows its ratio proportionally to siblings rather than forcing a binary rebalance. `theme.rs` is the single source of truth for all palette and metric constants; `state.rs` owns every mutation (split, close, resize, tab cycle, scroll, canvas width) so the event loop in `wm.rs` never touches the tree directly. Frame windows are positioned/hidden by `arrange()` which dynamically computes canvas width from leaf count and minimum split width, recomputes geometry on every mutation, maps off-screen frames out, and reparents active clients into the correct frame via a tracked `parent_leaf` field — a deliberate simplicity trade-off over per-client state tracking for reparent/visibility. Focus-direction navigation uses pure `usize` modular arithmetic throughout, avoiding signed-integer casts.
+CODE MAP (files mentioned in the task shown in full):
+src/main.rs
+src/render.rs
+src/state.rs
+src/theme.rs
+src/tree.rs
+src/wm.rs
+
+SCROOGE'S INSTRUCTIONS:
+The task above is complete. The PROJECT OVERVIEW in your briefing may now be stale given what changed:
+?? .scrooge/check_attempts
+
+Rewrite the project overview to match the current state of the code. Do NOT modify any files. Your final message must be ONLY the overview text — first line: what the project is in one sentence, then one short prose paragraph on architecture and non-obvious invariants, at most 15 lines. Output nothing else.
+
+
+<<< output
+
+=== 2026-06-23 15:05:16 cratchit @preset/cratchit prompt=15594 completion=85 cost=$0.001882 ===
+>>> prompt
+PROJECT ROOT: /home/jodie/Downloads/splitwm
+TASK: the changes made in this session
+
+PROJECT OVERVIEW:
+**splitwm** is a standalone X11 tiling window manager in Rust that replicates the terminal-multiplexer-style split layout of a Lua-based AwesomeWM config, where persistent n-ary split trees hold tabbed leaf stacks on a horizontally-scrollable canvas.
+
+The architecture separates pure layout math (`tree.rs`, `state.rs`) from X11 event handling (`wm.rs`) and software rendering (`render.rs`) — each leaf gets its own frame window with a custom slanted tab bar and rounded focus border composited via tiny-skia and blitted with `PutImage`, avoiding compositing manager dependencies. An arena-keyed tree (`NodeId` → `HashMap`) avoids Rust's borrow-checker friction for parent-child mutations, and the split tree is kept n-ary (not binary) so that collapsing a leaf reflows its ratio proportionally to siblings rather than forcing a binary rebalance. `theme.rs` is the single source of truth for all palette and metric constants; `state.rs` owns every mutation (split, close, resize, tab cycle, scroll, canvas width) so the event loop in `wm.rs` never touches the tree directly. Frame windows are positioned/hidden by `arrange()` which dynamically computes canvas width from leaf count and minimum split width, recomputes geometry on every mutation, maps off-screen frames out, and reparents active clients into the correct frame via a tracked `parent_leaf` field — a deliberate simplicity trade-off over per-client state tracking for reparent/visibility. Focus-direction navigation uses pure `usize` modular arithmetic throughout, avoiding signed-integer casts.
+CODE MAP (files mentioned in the task shown in full):
+src/main.rs
+src/render.rs
+src/state.rs
+src/theme.rs
+src/tree.rs
+src/wm.rs
+
+SCROOGE'S INSTRUCTIONS:
+The task above is complete. The PROJECT OVERVIEW in your briefing may now be stale given what changed:
+?? .scrooge/check_attempts
+
+Rewrite the project overview to match the current state of the code. Do NOT modify any files. Your final message must be ONLY the overview text — first line: what the project is in one sentence, then one short prose paragraph on architecture and non-obvious invariants, at most 15 lines. Output nothing else.
+
+
+<<< output
+
+=== 2026-06-23 15:05:20 cratchit @preset/cratchit prompt=45236 completion=84 cost=$0.004223 ===
+>>> prompt
+PROJECT ROOT: /home/jodie/Downloads/splitwm
+TASK: the changes made in this session
+
+PROJECT OVERVIEW:
+**splitwm** is a standalone X11 tiling window manager in Rust that replicates the terminal-multiplexer-style split layout of a Lua-based AwesomeWM config, where persistent n-ary split trees hold tabbed leaf stacks on a horizontally-scrollable canvas.
+
+The architecture separates pure layout math (`tree.rs`, `state.rs`) from X11 event handling (`wm.rs`) and software rendering (`render.rs`) — each leaf gets its own frame window with a custom slanted tab bar and rounded focus border composited via tiny-skia and blitted with `PutImage`, avoiding compositing manager dependencies. An arena-keyed tree (`NodeId` → `HashMap`) avoids Rust's borrow-checker friction for parent-child mutations, and the split tree is kept n-ary (not binary) so that collapsing a leaf reflows its ratio proportionally to siblings rather than forcing a binary rebalance. `theme.rs` is the single source of truth for all palette and metric constants; `state.rs` owns every mutation (split, close, resize, tab cycle, scroll, canvas width) so the event loop in `wm.rs` never touches the tree directly. Frame windows are positioned/hidden by `arrange()` which dynamically computes canvas width from leaf count and minimum split width, recomputes geometry on every mutation, maps off-screen frames out, and reparents active clients into the correct frame via a tracked `parent_leaf` field — a deliberate simplicity trade-off over per-client state tracking for reparent/visibility. Focus-direction navigation uses pure `usize` modular arithmetic throughout, avoiding signed-integer casts.
+CODE MAP (files mentioned in the task shown in full):
+src/main.rs
+src/render.rs
+src/state.rs
+src/theme.rs
+src/tree.rs
+src/wm.rs
+
+SCROOGE'S INSTRUCTIONS:
+The task above is complete. The PROJECT OVERVIEW in your briefing may now be stale given what changed:
+?? .scrooge/check_attempts
+
+Rewrite the project overview to match the current state of the code. Do NOT modify any files. Your final message must be ONLY the overview text — first line: what the project is in one sentence, then one short prose paragraph on architecture and non-obvious invariants, at most 15 lines. Output nothing else.
+
+
+<<< output
+
+=== 2026-06-23 15:05:28 cratchit @preset/cratchit prompt=45596 completion=294 cost=$0.000267 ===
+>>> prompt
+PROJECT ROOT: /home/jodie/Downloads/splitwm
+TASK: the changes made in this session
+
+PROJECT OVERVIEW:
+**splitwm** is a standalone X11 tiling window manager in Rust that replicates the terminal-multiplexer-style split layout of a Lua-based AwesomeWM config, where persistent n-ary split trees hold tabbed leaf stacks on a horizontally-scrollable canvas.
+
+The architecture separates pure layout math (`tree.rs`, `state.rs`) from X11 event handling (`wm.rs`) and software rendering (`render.rs`) — each leaf gets its own frame window with a custom slanted tab bar and rounded focus border composited via tiny-skia and blitted with `PutImage`, avoiding compositing manager dependencies. An arena-keyed tree (`NodeId` → `HashMap`) avoids Rust's borrow-checker friction for parent-child mutations, and the split tree is kept n-ary (not binary) so that collapsing a leaf reflows its ratio proportionally to siblings rather than forcing a binary rebalance. `theme.rs` is the single source of truth for all palette and metric constants; `state.rs` owns every mutation (split, close, resize, tab cycle, scroll, canvas width) so the event loop in `wm.rs` never touches the tree directly. Frame windows are positioned/hidden by `arrange()` which dynamically computes canvas width from leaf count and minimum split width, recomputes geometry on every mutation, maps off-screen frames out, and reparents active clients into the correct frame via a tracked `parent_leaf` field — a deliberate simplicity trade-off over per-client state tracking for reparent/visibility. Focus-direction navigation uses pure `usize` modular arithmetic throughout, avoiding signed-integer casts.
+CODE MAP (files mentioned in the task shown in full):
+src/main.rs
+src/render.rs
+src/state.rs
+src/theme.rs
+src/tree.rs
+src/wm.rs
+
+SCROOGE'S INSTRUCTIONS:
+The task above is complete. The PROJECT OVERVIEW in your briefing may now be stale given what changed:
+?? .scrooge/check_attempts
+
+Rewrite the project overview to match the current state of the code. Do NOT modify any files. Your final message must be ONLY the overview text — first line: what the project is in one sentence, then one short prose paragraph on architecture and non-obvious invariants, at most 15 lines. Output nothing else.
+
+
+<<< output
+
+=== 2026-06-23 15:05:38 cratchit @preset/cratchit prompt=45901 completion=462 cost=$0.000304 ===
+>>> prompt
+PROJECT ROOT: /home/jodie/Downloads/splitwm
+TASK: the changes made in this session
+
+PROJECT OVERVIEW:
+**splitwm** is a standalone X11 tiling window manager in Rust that replicates the terminal-multiplexer-style split layout of a Lua-based AwesomeWM config, where persistent n-ary split trees hold tabbed leaf stacks on a horizontally-scrollable canvas.
+
+The architecture separates pure layout math (`tree.rs`, `state.rs`) from X11 event handling (`wm.rs`) and software rendering (`render.rs`) — each leaf gets its own frame window with a custom slanted tab bar and rounded focus border composited via tiny-skia and blitted with `PutImage`, avoiding compositing manager dependencies. An arena-keyed tree (`NodeId` → `HashMap`) avoids Rust's borrow-checker friction for parent-child mutations, and the split tree is kept n-ary (not binary) so that collapsing a leaf reflows its ratio proportionally to siblings rather than forcing a binary rebalance. `theme.rs` is the single source of truth for all palette and metric constants; `state.rs` owns every mutation (split, close, resize, tab cycle, scroll, canvas width) so the event loop in `wm.rs` never touches the tree directly. Frame windows are positioned/hidden by `arrange()` which dynamically computes canvas width from leaf count and minimum split width, recomputes geometry on every mutation, maps off-screen frames out, and reparents active clients into the correct frame via a tracked `parent_leaf` field — a deliberate simplicity trade-off over per-client state tracking for reparent/visibility. Focus-direction navigation uses pure `usize` modular arithmetic throughout, avoiding signed-integer casts.
+CODE MAP (files mentioned in the task shown in full):
+src/main.rs
+src/render.rs
+src/state.rs
+src/theme.rs
+src/tree.rs
+src/wm.rs
+
+SCROOGE'S INSTRUCTIONS:
+The task above is complete. The PROJECT OVERVIEW in your briefing may now be stale given what changed:
+?? .scrooge/check_attempts
+
+Rewrite the project overview to match the current state of the code. Do NOT modify any files. Your final message must be ONLY the overview text — first line: what the project is in one sentence, then one short prose paragraph on architecture and non-obvious invariants, at most 15 lines. Output nothing else.
+
+
+<<< output
+**splitwm** is a standalone X11 tiling window manager in Rust that replicates the terminal-multiplexer-style split layout of a Lua-based AwesomeWM config, featuring animated transitions, gap drag-resize handles, insert-column buttons, auto font-shrinking (smush), app icons, content-sampled accent colours, and optional PNG wallpaper underlay.
+
+The architecture separates pure layout math (`tree.rs`, `state.rs`) from X11 event handling (`wm.rs`) and software rendering (`render.rs`). Each leaf gets its own frame window with a custom slanted tab bar and rounded focus border composited via tiny-skia and blitted with chunked `PutImage`, avoiding compositing-manager dependencies. An arena-keyed tree (`NodeId` → `HashMap`) avoids Rust's borrow-checker friction for parent-child mutations, and the split tree is kept n-ary (not binary) so that collapsing a leaf reflows its ratio proportionally to siblings rather than forcing a binary rebalance. `theme.rs` is the single source of truth for all palette and metric constants; `state.rs` owns every mutation (split, close, resize, tab cycle, scroll, canvas width, insert-at-root, boundary resize) so the event loop in `wm.rs` never touches the tree directly. Layout-changing actions trigger an ease-out-back animation that interpolates frame rects over ~17 frames, with freshly created leaves starting from a collapsed sliver. Frame windows are positioned/hidden by `arrange()` which dynamically computes canvas width from leaf count and minimum split width, recomputes geometry on every mutation, maps off-screen frames out, and reparents active clients into the correct frame via a tracked `parent_leaf` field. Gap boundaries expose draggable handles and "+" insert buttons whose positions are updated each arrange pass, while a `smush` system synthesizes Ctrl+0/Ctrl+- keystrokes via XTEST to auto-shrink terminal fonts in narrow splits. Focus-direction navigation uses `usize` modular arithmetic on `collect_leaves()` ordering, and scroll state is kept on a horizontally-scrollable canvas wider than the viewport when needed.

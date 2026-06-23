@@ -26,7 +26,7 @@ use x11rb::CURRENT_TIME;
 use crate::render::{Icon, LeafView, Renderer, TabInfo};
 use crate::state::State;
 use crate::theme;
-use crate::tree::{client_geo, Boundary, Dir, NodeId, Rect, Win};
+use crate::tree::{Boundary, Dir, NodeId, Rect, Win};
 
 type R<T> = Result<T, Box<dyn Error>>;
 
@@ -66,8 +66,6 @@ enum Action {
 }
 
 struct Client {
-    frame: Window,
-    parent_leaf: NodeId, // leaf whose frame currently parents this client
     label: char,
     color: u32,
     icon: Option<Rc<Icon>>,
@@ -77,10 +75,9 @@ struct Wm {
     conn: RustConnection,
     root: Window,
     depth: u8,
-    visual: u32,
     state: State,
     clients: HashMap<Win, Client>,
-    frames: HashMap<NodeId, Window>, // leaf id -> frame window
+    underlay: Window, // single full-screen window holding all chrome
     renderer: Renderer,
     gc: Gcontext,                     // shared graphics context for all `PutImage` blits
     keymap: HashMap<u32, u8>,         // keysym -> keycode
@@ -89,11 +86,9 @@ struct Wm {
     max_req_bytes: usize,
     atom_net_wm_icon: u32,
     animate: bool,                               // play a transition on next arrange
-    prev_frame_rect: HashMap<NodeId, FrameRect>, // last applied frame screen rects
-    handles: Vec<Window>,                        // pooled gap drag-handle windows
-    plus_btns: Vec<Window>,                      // pooled "+" insert-column windows
-    handle_bound: HashMap<Window, Boundary>,     // resize-handle window -> its boundary
-    plus_insert: HashMap<Window, usize>,         // "+" window -> root insertion index
+    prev_frame_rect: HashMap<NodeId, FrameRect>, // last applied leaf chrome screen rects
+    handle_regions: Vec<(FrameRect, Boundary)>,  // gap resize hit-rects (screen coords)
+    plus_regions: Vec<(FrameRect, usize)>,       // "+" hit-rects -> root insertion index
     drag: Option<Drag>,                          // active gap resize
     smush_applied: HashMap<Win, (u8, i32)>,      // client -> (mode, width bucket)
 }
@@ -116,10 +111,10 @@ struct FrameRect {
     h: i32,
 }
 
-/// A frame placed during an arrange, retained so the animator can move it.
+/// A leaf placed during an arrange, retained so the animator can move it.
+#[derive(Clone, Copy)]
 struct Placement {
     leaf: NodeId,
-    frame: Window,
     target: FrameRect,
     active_client: Option<Win>,
     focused: bool,
@@ -131,6 +126,10 @@ fn ease_out_back(t: f32) -> f32 {
     let t = t - 1.0;
     let inner = (c + 1.0).mul_add(t, c);
     (t * t).mul_add(inner, 1.0)
+}
+
+fn rect_contains(r: FrameRect, x: i32, y: i32) -> bool {
+    x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }
 
 fn lerp_rect(a: FrameRect, b: FrameRect, p: f32) -> FrameRect {
@@ -199,25 +198,65 @@ pub fn run() -> R<()> {
         .map(|r| r.atom)
         .unwrap_or(0);
 
+    // Single full-screen underlay window: wallpaper + all leaf chrome + drag
+    // handles + "+" buttons are composited onto it, below every client.
+    let geo = conn.get_geometry(root)?.reply()?;
+    let underlay = conn.generate_id()?;
+    conn.create_window(
+        screen.root_depth,
+        underlay,
+        root,
+        0,
+        0,
+        geo.width,
+        geo.height,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        screen.root_visual,
+        &CreateWindowAux::new()
+            .background_pixel(screen.black_pixel)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE
+                    | EventMask::BUTTON1_MOTION,
+            ),
+    )?;
+    conn.map_window(underlay)?;
+    // Keep the underlay pinned at the bottom of the stack.
+    conn.configure_window(
+        underlay,
+        &ConfigureWindowAux::new().stack_mode(StackMode::BELOW),
+    )?;
+    // Deliver button1 (and the drag's motion/release) even over the underlay.
+    conn.grab_button(
+        true,
+        underlay,
+        EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::BUTTON1_MOTION,
+        GrabMode::ASYNC,
+        GrabMode::ASYNC,
+        x11rb::NONE,
+        x11rb::NONE,
+        ButtonIndex::M1,
+        ModMask::ANY,
+    )?;
+
     let mut wm = Wm {
         depth: screen.root_depth,
-        visual: screen.root_visual,
         gc,
         keymap: HashMap::new(),
         bindings: Vec::new(),
         renderer: Renderer::new(),
         state: State::new(),
         clients: HashMap::new(),
-        frames: HashMap::new(),
+        underlay,
         running: true,
         max_req_bytes,
         atom_net_wm_icon,
         animate: false,
         prev_frame_rect: HashMap::new(),
-        handles: Vec::new(),
-        plus_btns: Vec::new(),
-        handle_bound: HashMap::new(),
-        plus_insert: HashMap::new(),
+        handle_regions: Vec::new(),
+        plus_regions: Vec::new(),
         drag: None,
         smush_applied: HashMap::new(),
         conn,
@@ -226,7 +265,7 @@ pub fn run() -> R<()> {
 
     wm.build_keymap()?;
     wm.grab_keys()?;
-    wm.set_wallpaper()?;
+    wm.set_wallpaper();
     // Mod4 + wheel scrolls the canvas horizontally.
     for btn in [ButtonIndex::M4, ButtonIndex::M5] {
         wm.conn.grab_button(
@@ -258,30 +297,13 @@ pub fn run() -> R<()> {
 }
 
 impl Wm {
-    /// Paint a scaled PNG wallpaper (env `SPLITWM_WALLPAPER`) as the root
-    /// background so the gaps between leaves show it. No-op if unset/unreadable.
-    fn set_wallpaper(&mut self) -> R<()> {
-        let Ok(path) = std::env::var("SPLITWM_WALLPAPER") else {
-            return Ok(());
-        };
-        let wa = self.wa();
-        if !self.renderer.set_wallpaper(&path, wa.w, wa.h) {
-            return Ok(());
+    /// Load the wallpaper (env `SPLITWM_WALLPAPER`) into the renderer; it is
+    /// composited onto the underlay each arrange. No-op if unset/unreadable.
+    fn set_wallpaper(&mut self) {
+        if let Ok(path) = std::env::var("SPLITWM_WALLPAPER") {
+            let wa = self.wa();
+            self.renderer.set_wallpaper(&path, wa.w, wa.h);
         }
-        let Some(buf) = self.renderer.wallpaper_bgrx() else {
-            return Ok(());
-        };
-        let (w, h) = (wa.w as u16, wa.h as u16);
-        let pm = self.conn.generate_id()?;
-        self.conn.create_pixmap(self.depth, pm, self.root, w, h)?;
-        self.put_image(pm, w, h, &buf)?;
-        self.conn.change_window_attributes(
-            self.root,
-            &ChangeWindowAttributesAux::new().background_pixmap(pm),
-        )?;
-        self.conn.clear_area(false, self.root, 0, 0, 0, 0)?;
-        self.conn.free_pixmap(pm)?;
-        Ok(())
     }
 
     fn wa(&self) -> Rect {
@@ -408,14 +430,8 @@ impl Wm {
         let (label, color) = self.client_identity(win);
         let icon = self.fetch_icon(win);
 
-        // Create the frame for the focused leaf if needed; pin client there.
+        // Pin the client into the focused leaf's tab stack.
         self.state.pin_client(win);
-        let leaf = self
-            .state
-            .leaf_of_client(win)
-            .unwrap_or_else(|| self.state.focused_leaf_valid());
-
-        let frame = self.ensure_frame(leaf)?;
 
         self.conn.change_window_attributes(
             win,
@@ -434,19 +450,11 @@ impl Wm {
             ButtonIndex::M1,
             ModMask::ANY,
         )?;
-        self.conn.reparent_window(win, frame, 0, 0)?;
-        self.conn.map_window(win)?;
+        // No border; the chrome (border + tab bar) is drawn on the underlay.
+        self.conn
+            .configure_window(win, &ConfigureWindowAux::new().border_width(0))?;
 
-        self.clients.insert(
-            win,
-            Client {
-                frame,
-                parent_leaf: leaf,
-                label,
-                color,
-                icon,
-            },
-        );
+        self.clients.insert(win, Client { label, color, icon });
         self.state.activate_client(win);
         self.arrange()?;
         self.focus(Some(win))?;
@@ -683,9 +691,15 @@ impl Wm {
 
     fn on_button(&mut self, e: ButtonPressEvent) -> R<()> {
         let wa = self.wa();
-        // Drag handle: begin a gap resize.
-        if e.detail == 1 {
-            if let Some(b) = self.handle_bound.get(&e.event).copied() {
+        // Clicks on the underlay (gaps): hit-test drag handles and "+" buttons.
+        if e.detail == 1 && e.event == self.underlay {
+            let (mx, my) = (i32::from(e.event_x), i32::from(e.event_y));
+            if let Some(b) = self
+                .handle_regions
+                .iter()
+                .find(|(r, _)| rect_contains(*r, mx, my))
+                .map(|(_, b)| *b)
+            {
                 self.drag = Some(Drag {
                     parent: b.parent,
                     idx: b.idx,
@@ -695,10 +709,13 @@ impl Wm {
                 });
                 return Ok(());
             }
-            // "+" button: insert a column.
-            if let Some(&at) = self.plus_insert.get(&e.event) {
-                let idx = if at == usize::MAX { usize::MAX } else { at };
-                self.state.insert_at_root(idx);
+            if let Some(at) = self
+                .plus_regions
+                .iter()
+                .find(|(r, _)| rect_contains(*r, mx, my))
+                .map(|(_, at)| *at)
+            {
+                self.state.insert_at_root(at);
                 self.animate = true;
                 self.state.ensure_in_view(wa);
                 self.state.scroll_x = self.state.scroll_target;
@@ -707,6 +724,7 @@ impl Wm {
                 self.focus(f)?;
                 return Ok(());
             }
+            return Ok(());
         }
         if e.detail == 4 || e.detail == 5 {
             let dir = if e.detail == 4 { -1 } else { 1 };
@@ -752,23 +770,10 @@ impl Wm {
         Ok(())
     }
 
-    fn on_expose(&self, e: ExposeEvent) -> R<()> {
-        if e.count != 0 {
-            return Ok(());
-        }
-        // A "+" button exposed: repaint its glyph.
-        if self.plus_insert.contains_key(&e.window) {
-            self.paint_plus(e.window)?;
-            return Ok(());
-        }
-        // Repaint whichever frame got exposed.
-        let leaf = self
-            .frames
-            .iter()
-            .find(|(_, &w)| w == e.window)
-            .map(|(&l, _)| l);
-        if let Some(leaf) = leaf {
-            self.paint_frame(leaf)?;
+    fn on_expose(&mut self, e: ExposeEvent) -> R<()> {
+        // Recompose the underlay once the exposure run completes.
+        if e.count == 0 && e.window == self.underlay {
+            self.arrange()?;
         }
         Ok(())
     }
@@ -856,44 +861,8 @@ impl Wm {
         Ok(())
     }
 
-    // --- frames & arrange ---
+    // --- arrange: compose the underlay + place clients ---
 
-    /// Reparent a client window into `parent` and record which leaf now owns
-    /// it. `leaf` is `NodeId::MAX` when parking a client back on root.
-    fn reparent_client(&mut self, w: Win, parent: Window, leaf: NodeId) -> R<()> {
-        self.conn.reparent_window(w, parent, 0, 0)?;
-        if let Some(c) = self.clients.get_mut(&w) {
-            c.parent_leaf = leaf;
-        }
-        Ok(())
-    }
-
-    fn ensure_frame(&mut self, leaf: NodeId) -> R<Window> {
-        if let Some(&f) = self.frames.get(&leaf) {
-            return Ok(f);
-        }
-        let f = self.conn.generate_id()?;
-        let aux = CreateWindowAux::new()
-            .background_pixel(theme::WALLPAPER & 0x00ff_ffff)
-            .event_mask(EventMask::EXPOSURE | EventMask::SUBSTRUCTURE_NOTIFY);
-        self.conn.create_window(
-            self.depth,
-            f,
-            self.root,
-            0,
-            0,
-            100,
-            100,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            self.visual,
-            &aux,
-        )?;
-        self.frames.insert(leaf, f);
-        Ok(f)
-    }
-
-    #[allow(clippy::too_many_lines)]
     fn arrange(&mut self) -> R<()> {
         // Refresh the focused client's sampled accent from its content.
         if let Some(f) = self.state.focused_client() {
@@ -901,8 +870,6 @@ impl Wm {
         }
         let wa = self.wa();
         let gap = theme::GAP;
-        let tb_h = theme::tb_h(gap);
-        let bw = theme::FOCUS_BORDER_WIDTH;
 
         // Grow the canvas if the tree is wider than the viewport: root-level
         // horizontal branches accumulate width as they gain children. We give
@@ -916,239 +883,197 @@ impl Wm {
         let scroll_x = self.state.scroll_x;
         let focused = self.state.focused_leaf_valid();
 
-        // Remove frames for leaves that no longer exist.
-        let live: std::collections::HashSet<NodeId> = leaves.iter().copied().collect();
-        let dead: Vec<NodeId> = self
-            .frames
-            .keys()
-            .copied()
-            .filter(|l| !live.contains(l))
-            .collect();
-        for leaf in dead {
-            if let Some(f) = self.frames.remove(&leaf) {
-                // Reparent any surviving clients back to root before destroy.
-                let kids: Vec<Win> = self
-                    .clients
-                    .iter()
-                    .filter(|(_, c)| c.frame == f)
-                    .map(|(&w, _)| w)
-                    .collect();
-                for w in kids {
-                    self.reparent_client(w, self.root, NodeId::MAX)?;
-                }
-                self.conn.destroy_window(f)?;
-            }
-        }
-
-        // On-screen frames positioned this pass, for the optional animation.
+        // Screen-space chrome rect for every on-screen leaf.
         let mut placed: Vec<Placement> = Vec::new();
-
         for &leaf in &leaves {
-            let geo = match geos.get(&leaf) {
-                Some(g) => *g,
-                None => continue,
+            let Some(geo) = geos.get(&leaf).copied() else {
+                continue;
             };
-            let frame = self.ensure_frame(leaf)?;
-
-            // Frame screen rect: visual top is gap above geo.y.
             let target = FrameRect {
                 x: geo.x - scroll_x,
                 y: geo.y - gap,
                 w: geo.w.max(1),
                 h: (geo.h + gap).max(1),
             };
-
-            let off_screen = target.x + target.w <= wa.x || target.x >= wa.x + wa.w;
-
-            // Always reparent this leaf's clients into its frame (so they
-            // travel/hide with it), then map/unmap based on visibility.
-            let (active_client, tabs): (Option<Win>, Vec<Win>) = {
-                let l = self.state.tree.leaf(leaf).unwrap();
-                (l.tabs.get(l.active).copied(), l.tabs.clone())
-            };
-            let cg = client_geo(geo, bw, gap, tb_h, scroll_x);
-            for w in &tabs {
-                let need_reparent = self.clients.get(w).is_some_and(|c| c.parent_leaf != leaf);
-                if need_reparent {
-                    self.reparent_client(*w, frame, leaf)?;
-                }
-                if Some(*w) == active_client && !off_screen {
-                    self.conn.configure_window(
-                        *w,
-                        &ConfigureWindowAux::new()
-                            .x(bw)
-                            .y(tb_h)
-                            .width(u32::try_from(cg.w).unwrap_or(0))
-                            .height(u32::try_from(cg.h).unwrap_or(0))
-                            .border_width(0),
-                    )?;
-                    self.conn.map_window(*w)?;
-                } else {
-                    self.conn.unmap_window(*w)?;
-                }
-            }
-
-            if off_screen {
-                self.conn.unmap_window(frame)?;
+            if target.x + target.w <= wa.x || target.x >= wa.x + wa.w {
                 self.prev_frame_rect.remove(&leaf);
                 continue;
             }
-            self.place_frame(frame, target)?;
-            self.conn.map_window(frame)?;
-            self.paint_frame_geo(
-                leaf,
-                frame,
-                target.x,
-                target.y,
-                target.w,
-                target.h,
-                focused == leaf,
-            )?;
+            let active_client = self
+                .state
+                .tree
+                .leaf(leaf)
+                .and_then(|l| l.tabs.get(l.active).copied());
             placed.push(Placement {
                 leaf,
-                frame,
                 target,
                 active_client,
                 focused: focused == leaf,
             });
         }
 
+        // Drag-handle / "+" hit-regions for the current layout.
+        self.compute_widgets(wa);
+
         if std::mem::take(&mut self.animate) {
             self.run_layout_animation(&placed)?;
         }
+        self.compose(&placed, true)?;
+        self.place_clients(&placed)?;
+
         // Cache final rects as the start point for the next transition.
         self.prev_frame_rect = placed.iter().map(|p| (p.leaf, p.target)).collect();
-        self.update_handles(wa)?;
         self.conn.flush()?;
         Ok(())
     }
 
-    // --- gap drag handles & "+" insert buttons ---
+    /// Composite the wallpaper, every placed leaf's chrome, and (optionally)
+    /// the drag handles / "+" buttons onto the single underlay window.
+    fn compose(&self, placed: &[Placement], widgets: bool) -> R<()> {
+        let wa = self.wa();
+        let (w, h) = (wa.w.max(1) as u32, wa.h.max(1) as u32);
+        let mut pm = self.renderer.screen_base(w, h);
+        {
+            let mut m = pm.as_mut();
+            for p in placed {
+                let view = self.leaf_view(p.leaf, p.target.w, p.target.h, p.focused);
+                self.renderer
+                    .draw_leaf(&mut m, p.target.x as f32, p.target.y as f32, &view);
+            }
+            if widgets {
+                for (r, _) in &self.handle_regions {
+                    crate::render::draw_handle(
+                        &mut m, r.x as f32, r.y as f32, r.w as f32, r.h as f32, false,
+                    );
+                }
+                for (r, _) in &self.plus_regions {
+                    let cx = (r.x + r.w / 2) as f32;
+                    let cy = (r.y + r.h / 2) as f32;
+                    crate::render::draw_plus(&mut m, cx, cy, r.w as f32);
+                }
+            }
+        }
+        let buf = crate::render::pixmap_to_bgrx(&pm);
+        self.put_image(self.underlay, w as u16, h as u16, &buf)?;
+        Ok(())
+    }
+
+    /// Build the render view for a leaf at a given (possibly animated) size.
+    fn leaf_view(&self, leaf: NodeId, w: i32, h: i32, focused: bool) -> LeafView {
+        let accent = self
+            .state
+            .tree
+            .leaf(leaf)
+            .and_then(|l| l.tabs.get(l.active))
+            .and_then(|c| self.clients.get(c))
+            .map_or(theme::COLOR_ACCENT, |c| c.color);
+        let tabs: Vec<TabInfo> = self
+            .state
+            .tree
+            .leaf(leaf)
+            .map(|l| {
+                l.tabs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, win)| {
+                        let c = self.clients.get(win);
+                        TabInfo {
+                            label: c.map_or('?', |c| c.label),
+                            color: c.map_or(theme::COLOR_FG, |c| c.color),
+                            active: i == l.active,
+                            icon: c.and_then(|c| c.icon.clone()),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        LeafView {
+            w,
+            h,
+            tb_h: theme::tb_h(theme::GAP),
+            bw: theme::FOCUS_BORDER_WIDTH,
+            focused,
+            accent,
+            tabs,
+        }
+    }
+
+    /// Position each leaf's active client below its tab bar; unmap the rest.
+    fn place_clients(&self, placed: &[Placement]) -> R<()> {
+        let gap = theme::GAP;
+        let tb_h = theme::tb_h(gap);
+        let bw = theme::FOCUS_BORDER_WIDTH;
+        let mut visible: std::collections::HashSet<Win> = std::collections::HashSet::new();
+        for p in placed {
+            if let Some(c) = p.active_client {
+                let r = p.target;
+                let cw = (r.w - 2 * bw).max(1);
+                let ch = (r.h - tb_h - bw).max(1);
+                self.conn.configure_window(
+                    c,
+                    &ConfigureWindowAux::new()
+                        .x(r.x + bw)
+                        .y(r.y + tb_h)
+                        .width(u32::try_from(cw).unwrap_or(1))
+                        .height(u32::try_from(ch).unwrap_or(1))
+                        .border_width(0)
+                        .stack_mode(StackMode::ABOVE),
+                )?;
+                self.conn.map_window(c)?;
+                visible.insert(c);
+            }
+        }
+        for &w in self.clients.keys() {
+            if !visible.contains(&w) {
+                self.conn.unmap_window(w)?;
+            }
+        }
+        Ok(())
+    }
+
+    // --- gap drag handles & "+" insert buttons (composited on the underlay) ---
 
     const PLUS_SZ: i32 = 22;
 
-    fn ensure_handle(&mut self, i: usize) -> R<Window> {
-        if let Some(&w) = self.handles.get(i) {
-            return Ok(w);
-        }
-        let w = self.conn.generate_id()?;
-        let aux = CreateWindowAux::new()
-            .background_pixel(theme::COLOR_HANDLE & 0x00ff_ffff | 0x0040_4048)
-            .event_mask(
-                EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::BUTTON1_MOTION,
-            );
-        self.conn.create_window(
-            self.depth,
-            w,
-            self.root,
-            0,
-            0,
-            8,
-            8,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            self.visual,
-            &aux,
-        )?;
-        // Passive grab so the press (and the ensuing motion/release of the
-        // drag) is delivered to us via the implicit active grab.
-        self.conn.grab_button(
-            true,
-            w,
-            EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::BUTTON1_MOTION,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-            x11rb::NONE,
-            x11rb::NONE,
-            ButtonIndex::M1,
-            ModMask::ANY,
-        )?;
-        self.handles.push(w);
-        Ok(w)
-    }
-
-    fn ensure_plus(&mut self, i: usize) -> R<Window> {
-        if let Some(&w) = self.plus_btns.get(i) {
-            return Ok(w);
-        }
-        let w = self.conn.generate_id()?;
-        let aux = CreateWindowAux::new()
-            .background_pixel(0x0020_2024)
-            .event_mask(EventMask::BUTTON_PRESS | EventMask::EXPOSURE);
-        let sz = u16::try_from(Self::PLUS_SZ).unwrap_or(22);
-        self.conn.create_window(
-            self.depth,
-            w,
-            self.root,
-            0,
-            0,
-            sz,
-            sz,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            self.visual,
-            &aux,
-        )?;
-        self.conn.grab_button(
-            true,
-            w,
-            EventMask::BUTTON_PRESS,
-            GrabMode::ASYNC,
-            GrabMode::ASYNC,
-            x11rb::NONE,
-            x11rb::NONE,
-            ButtonIndex::M1,
-            ModMask::ANY,
-        )?;
-        self.plus_btns.push(w);
-        Ok(w)
-    }
-
-    /// Place gap drag handles and "+" insert buttons for the current layout.
-    fn update_handles(&mut self, wa: Rect) -> R<()> {
-        // Don't reshuffle while a drag is live.
-        if self.drag.is_some() {
-            return Ok(());
-        }
+    /// Recompute the screen-space hit-regions for gap drag handles and "+"
+    /// insert buttons. They are drawn by `compose`, not separate windows.
+    fn compute_widgets(&mut self, wa: Rect) {
+        self.handle_regions.clear();
+        self.plus_regions.clear();
         let gap = theme::GAP;
         let hw = (gap - 10).max(4);
         let scroll_x = self.state.scroll_x;
         let canvas_w = self.state.canvas_w.unwrap_or(wa.w);
-        let bounds = self.state.boundaries(wa);
-        self.handle_bound.clear();
-        self.plus_insert.clear();
-
-        let (mut hi, mut pi) = (0usize, 0usize);
-        for b in &bounds {
+        for b in self.state.boundaries(wa) {
             let vis_x = b.x - scroll_x;
             if vis_x + hw / 2 <= wa.x || vis_x - hw / 2 >= wa.x + wa.w {
                 continue;
             }
-            let h = self.ensure_handle(hi)?;
-            self.handle_bound.insert(h, *b);
-            self.show_window(h, vis_x - hw / 2, b.y, hw, b.h.max(1))?;
-            hi += 1;
-            // "+" inserts a column only at root-level gaps.
+            self.handle_regions.push((
+                FrameRect {
+                    x: vis_x - hw / 2,
+                    y: b.y,
+                    w: hw,
+                    h: b.h.max(1),
+                },
+                b,
+            ));
             if b.root {
-                let p = self.ensure_plus(pi)?;
-                self.plus_insert.insert(p, b.idx + 1);
                 let py = b.y + (b.h - Self::PLUS_SZ) / 2;
-                self.show_window(
-                    p,
-                    vis_x - Self::PLUS_SZ / 2,
-                    py,
-                    Self::PLUS_SZ,
-                    Self::PLUS_SZ,
-                )?;
-                self.paint_plus(p)?;
-                pi += 1;
+                self.plus_regions.push((
+                    FrameRect {
+                        x: vis_x - Self::PLUS_SZ / 2,
+                        y: py,
+                        w: Self::PLUS_SZ,
+                        h: Self::PLUS_SZ,
+                    },
+                    b.idx + 1,
+                ));
             }
         }
-
         // Edge "+" buttons (insert at the far left / far right of the canvas).
-        let span_y = wa.y + gap;
         let span_h = (wa.h - 2 * gap).max(Self::PLUS_SZ);
-        let edge_cy = span_y + (span_h - Self::PLUS_SZ) / 2;
+        let edge_cy = wa.y + gap + (span_h - Self::PLUS_SZ) / 2;
         for (canvas_x, at) in [
             (wa.x + gap / 2, 0usize),
             (wa.x + canvas_w - gap / 2, usize::MAX),
@@ -1157,95 +1082,29 @@ impl Wm {
             if vis_x < wa.x || vis_x > wa.x + wa.w {
                 continue;
             }
-            let p = self.ensure_plus(pi)?;
-            self.plus_insert.insert(p, at);
-            self.show_window(
-                p,
-                vis_x - Self::PLUS_SZ / 2,
-                edge_cy,
-                Self::PLUS_SZ,
-                Self::PLUS_SZ,
-            )?;
-            self.paint_plus(p)?;
-            pi += 1;
+            self.plus_regions.push((
+                FrameRect {
+                    x: vis_x - Self::PLUS_SZ / 2,
+                    y: edge_cy,
+                    w: Self::PLUS_SZ,
+                    h: Self::PLUS_SZ,
+                },
+                at,
+            ));
         }
-
-        for i in hi..self.handles.len() {
-            self.conn.unmap_window(self.handles[i])?;
-        }
-        for i in pi..self.plus_btns.len() {
-            self.conn.unmap_window(self.plus_btns[i])?;
-        }
-        Ok(())
     }
 
-    fn show_window(&self, w: Window, x: i32, y: i32, width: i32, height: i32) -> R<()> {
-        self.conn.configure_window(
-            w,
-            &ConfigureWindowAux::new()
-                .x(x)
-                .y(y)
-                .width(u32::try_from(width).unwrap_or(1))
-                .height(u32::try_from(height).unwrap_or(1))
-                .stack_mode(StackMode::ABOVE),
-        )?;
-        self.conn.map_window(w)?;
-        Ok(())
-    }
-
-    fn paint_plus(&self, w: Window) -> R<()> {
-        let sz = Self::PLUS_SZ;
-        let mut pm = tiny_skia::Pixmap::new(sz as u32, sz as u32).unwrap();
-        pm.fill(tiny_skia::Color::from_rgba8(0x20, 0x20, 0x24, 0xff));
-        let c = sz as f32 / 2.0;
-        let arm = sz as f32 * 0.28;
-        let mut pb = tiny_skia::PathBuilder::new();
-        pb.move_to(c - arm, c);
-        pb.line_to(c + arm, c);
-        pb.move_to(c, c - arm);
-        pb.line_to(c, c + arm);
-        if let Some(path) = pb.finish() {
-            let mut paint = tiny_skia::Paint::default();
-            paint.set_color(tiny_skia::Color::from_rgba8(0xff, 0xff, 0xff, 0xff));
-            paint.anti_alias = true;
-            let stroke = tiny_skia::Stroke {
-                width: 2.5,
-                ..Default::default()
-            };
-            pm.stroke_path(
-                &path,
-                &paint,
-                &stroke,
-                tiny_skia::Transform::identity(),
-                None,
-            );
-        }
-        let buf = crate::render::pixmap_to_bgrx(&pm);
-        self.put_image(w, sz as u16, sz as u16, &buf)?;
-        Ok(())
-    }
-
-    /// Position a frame window at a screen rect.
-    fn place_frame(&self, frame: Window, r: FrameRect) -> R<()> {
-        self.conn.configure_window(
-            frame,
-            &ConfigureWindowAux::new()
-                .x(r.x)
-                .y(r.y)
-                .width(u32::try_from(r.w).unwrap_or(1))
-                .height(u32::try_from(r.h).unwrap_or(1)),
-        )?;
-        Ok(())
-    }
-
-    /// Animate the just-placed frames from their previous rect (or a collapsed
-    /// sliver, for freshly-created leaves) to their target, using an
-    /// ease-out-back curve — matching splitwm's split/reflow feel.
+    /// Animate the placed leaves from their previous rect (or a collapsed
+    /// sliver, for freshly-created leaves) to their target with an
+    /// ease-out-back curve, re-compositing the underlay each frame.
+    ///
+    /// Driven by wall-clock time, not a fixed frame count: each frame does a
+    /// full-screen software recomposite + blit (not cheap), so we step by how
+    /// much real time has elapsed and always finish in `DURATION`, ending
+    /// exactly on the target. A slow renderer simply shows fewer frames.
     fn run_layout_animation(&self, placed: &[Placement]) -> R<()> {
-        const FRAMES: i32 = 17; // ~0.28s at 60fps
-        let bw = theme::FOCUS_BORDER_WIDTH;
-        let tb_h = theme::tb_h(theme::GAP);
-        // Pair each placement with its start rect.
+        use std::time::{Duration, Instant};
+        const DURATION: Duration = Duration::from_millis(280);
         let starts: Vec<FrameRect> = placed
             .iter()
             .map(|p| {
@@ -1260,107 +1119,27 @@ impl Wm {
                     })
             })
             .collect();
-        for step in 1..=FRAMES {
-            let t = step as f32 / FRAMES as f32;
+        let start = Instant::now();
+        loop {
+            let t = (start.elapsed().as_secs_f32() / DURATION.as_secs_f32()).min(1.0);
             let e = ease_out_back(t);
-            for (p, start) in placed.iter().zip(&starts) {
-                let r = lerp_rect(*start, p.target, e);
-                self.place_frame(p.frame, r)?;
-                if let Some(c) = p.active_client {
-                    let cw = (r.w - 2 * bw).max(1);
-                    let ch = (r.h - tb_h - bw).max(1);
-                    self.conn.configure_window(
-                        c,
-                        &ConfigureWindowAux::new()
-                            .x(bw)
-                            .y(tb_h)
-                            .width(u32::try_from(cw).unwrap_or(1))
-                            .height(u32::try_from(ch).unwrap_or(1)),
-                    )?;
-                }
-                self.paint_frame_geo(p.leaf, p.frame, r.x, r.y, r.w.max(1), r.h.max(1), p.focused)?;
-            }
-            self.conn.flush()?;
-            std::thread::sleep(std::time::Duration::from_millis(16));
-        }
-        Ok(())
-    }
-
-    fn paint_frame(&self, leaf: NodeId) -> R<()> {
-        let Some(&frame) = self.frames.get(&leaf) else {
-            return Ok(());
-        };
-        let g = self.conn.get_geometry(frame)?.reply()?;
-        let focused = self.state.focused_leaf_valid() == leaf;
-        self.paint_frame_geo(
-            leaf,
-            frame,
-            i32::from(g.x),
-            i32::from(g.y),
-            i32::from(g.width),
-            i32::from(g.height),
-            focused,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn paint_frame_geo(
-        &self,
-        leaf: NodeId,
-        frame: Window,
-        fx: i32,
-        fy: i32,
-        fw: i32,
-        fh: i32,
-        focused: bool,
-    ) -> R<()> {
-        let gap = theme::GAP;
-        let tb_h = theme::tb_h(gap);
-        let bw = theme::FOCUS_BORDER_WIDTH;
-
-        let accent = {
-            let l = self.state.tree.leaf(leaf);
-            l.and_then(|l| l.tabs.get(l.active))
-                .and_then(|w| self.clients.get(w))
-                .map_or(theme::COLOR_ACCENT, |c| c.color)
-        };
-        let tabs: Vec<TabInfo> = {
-            let Some(l) = self.state.tree.leaf(leaf) else {
-                return Ok(());
-            };
-            l.tabs
+            let interp: Vec<Placement> = placed
                 .iter()
-                .enumerate()
-                .map(|(i, w)| {
-                    let c = self.clients.get(w);
-                    TabInfo {
-                        label: c.map_or('?', |c| c.label),
-                        color: c.map_or(theme::COLOR_FG, |c| c.color),
-                        active: i == l.active,
-                        icon: c.and_then(|c| c.icon.clone()),
-                    }
+                .zip(&starts)
+                .map(|(p, s)| Placement {
+                    leaf: p.leaf,
+                    target: lerp_rect(*s, p.target, e),
+                    active_client: p.active_client,
+                    focused: p.focused,
                 })
-                .collect()
-        };
-
-        let view = LeafView {
-            x: fx,
-            y: fy,
-            w: fw,
-            h: fh,
-            tb_h,
-            bw,
-            focused,
-            accent,
-            tabs,
-        };
-        let buf = self.renderer.render(&view);
-        self.put_image(
-            frame,
-            u16::try_from(fw).unwrap_or(u16::MAX),
-            u16::try_from(fh).unwrap_or(u16::MAX),
-            &buf,
-        )?;
+                .collect();
+            self.compose(&interp, false)?;
+            self.place_clients(&interp)?;
+            self.conn.flush()?;
+            if t >= 1.0 {
+                break;
+            }
+        }
         Ok(())
     }
 

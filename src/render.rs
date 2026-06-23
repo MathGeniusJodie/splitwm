@@ -43,8 +43,6 @@ pub struct TabInfo {
 }
 
 pub struct LeafView {
-    pub x: i32, // frame screen position (for wallpaper alignment)
-    pub y: i32,
     pub w: i32,
     pub h: i32, // frame height (content height + gap)
     pub tb_h: i32,
@@ -83,32 +81,31 @@ impl Renderer {
         self.wallpaper.is_some()
     }
 
-    /// The scaled wallpaper as `PutImage`-ready BGRX bytes (for the root).
-    pub fn wallpaper_bgrx(&self) -> Option<Vec<u8>> {
-        self.wallpaper.as_ref().map(to_bgrx)
-    }
-
-    /// Render the leaf frame. Returns BGRX bytes (4 bytes/pixel).
-    pub fn render(&self, v: &LeafView) -> Vec<u8> {
-        let w = v.w.max(1) as u32;
-        let h = v.h.max(1) as u32;
-        let mut pm = Pixmap::new(w, h).unwrap();
-
-        // Background: copy this frame's slice of the wallpaper so it blends
-        // seamlessly into the surrounding gaps; solid colour if there is none.
+    /// A fresh screen-sized pixmap initialised with the wallpaper (or the
+    /// solid background colour). All leaf chrome is composited onto this.
+    pub fn screen_base(&self, w: u32, h: u32) -> Pixmap {
+        let mut pm = Pixmap::new(w.max(1), h.max(1)).unwrap();
         if let Some(wp) = &self.wallpaper {
             pm.as_mut().draw_pixmap(
                 0,
                 0,
                 wp.as_ref(),
                 &PixmapPaint::default(),
-                Transform::from_translate(-v.x as f32, -v.y as f32),
+                Transform::identity(),
                 None,
             );
         } else {
             pm.fill(argb(theme::WALLPAPER));
         }
+        pm
+    }
 
+    /// Draw one leaf's chrome (content panel, focus border, tab bar) into the
+    /// shared screen pixmap at screen offset (ox, oy). The background (gaps and
+    /// the strip behind the tab bar) is whatever was already composited, so
+    /// the wallpaper shows through — no opaque per-leaf box.
+    pub fn draw_leaf(&self, pm: &mut PixmapMut, ox: f32, oy: f32, v: &LeafView) {
+        let tf = Transform::from_translate(ox, oy);
         let tb_h = v.tb_h as f32;
         let bw = v.bw as f32;
         let content_top = tb_h;
@@ -127,7 +124,7 @@ impl Renderer {
             ..Default::default()
         };
         bg.set_color(argb(0xff00_0000));
-        pm.fill_path(&panel, &bg, FillRule::Winding, Transform::identity(), None);
+        pm.fill_path(&panel, &bg, FillRule::Winding, tf, None);
 
         // Focus border around content.
         let border_col = if v.focused {
@@ -149,15 +146,13 @@ impl Renderer {
             (content_h - bw / 2.0).max(1.0),
             theme::BORDER_RADIUS + bw / 2.0,
         );
-        pm.stroke_path(&border, &stroke_paint, &stroke, Transform::identity(), None);
+        pm.stroke_path(&border, &stroke_paint, &stroke, tf, None);
 
-        // Tabs.
-        self.draw_tabs(&mut pm.as_mut(), v, tb_h);
-
-        to_bgrx(&pm)
+        self.draw_tabs(pm, ox, oy, v, tb_h);
     }
 
-    fn draw_tabs(&self, pm: &mut PixmapMut, v: &LeafView, tb_h: f32) {
+    fn draw_tabs(&self, pm: &mut PixmapMut, ox: f32, oy: f32, v: &LeafView, tb_h: f32) {
+        let tf = Transform::from_translate(ox, oy);
         let icon = tb_h - 4.0;
         let slot = TAB_PAD_H + icon + TAB_PAD_H + TAB_GAP;
         let mut x = (v.bw as f32) + 4.0;
@@ -174,7 +169,7 @@ impl Renderer {
                 0xff14_1414
             };
             p.set_color(argb(fill));
-            pm.fill_path(&path, &p, FillRule::Winding, Transform::identity(), None);
+            pm.fill_path(&path, &p, FillRule::Winding, tf, None);
             if tab.active {
                 let mut sp = Paint::<'_> {
                     anti_alias: true,
@@ -188,13 +183,13 @@ impl Renderer {
                         width: 2.0,
                         ..Default::default()
                     },
-                    Transform::identity(),
+                    tf,
                     None,
                 );
             }
-            // Centered app icon, or a letter glyph as fallback.
-            let cx = x + tw / 2.0;
-            let cy = tb_h / 2.0;
+            // Centered app icon, or a letter glyph as fallback (absolute coords).
+            let cx = ox + x + tw / 2.0;
+            let cy = oy + tb_h / 2.0;
             if let Some(img) = &tab.icon {
                 let isz = (icon * 0.92).round();
                 draw_icon(pm, img, cx - isz / 2.0, cy - isz / 2.0, isz);
@@ -281,6 +276,52 @@ fn draw_icon(pm: &mut PixmapMut, img: &Icon, dx: f32, dy: f32, size: f32) {
             }
             data[idx + 3] = 255;
         }
+    }
+}
+
+/// Draw a rounded "pill" gap drag-handle into the screen pixmap.
+pub fn draw_handle(pm: &mut PixmapMut, x: f32, y: f32, w: f32, h: f32, hot: bool) {
+    let path = rounded_rect(x, y, w.max(1.0), h.max(1.0), w / 2.0);
+    let mut p = Paint::<'_> {
+        anti_alias: true,
+        ..Default::default()
+    };
+    p.set_color(argb(if hot {
+        theme::COLOR_FG
+    } else {
+        theme::COLOR_HANDLE
+    }));
+    pm.fill_path(&path, &p, FillRule::Winding, Transform::identity(), None);
+}
+
+/// Draw a translucent rounded "+" insert button centred at (cx, cy).
+pub fn draw_plus(pm: &mut PixmapMut, cx: f32, cy: f32, sz: f32) {
+    let half = sz / 2.0;
+    let bgp = rounded_rect(cx - half, cy - half, sz, sz, sz * 0.28);
+    let mut bg = Paint::<'_> {
+        anti_alias: true,
+        ..Default::default()
+    };
+    bg.set_color(argb(theme::COLOR_BTN_BG));
+    pm.fill_path(&bgp, &bg, FillRule::Winding, Transform::identity(), None);
+
+    let arm = sz * 0.28;
+    let mut pb = PathBuilder::new();
+    pb.move_to(cx - arm, cy);
+    pb.line_to(cx + arm, cy);
+    pb.move_to(cx, cy - arm);
+    pb.line_to(cx, cy + arm);
+    if let Some(path) = pb.finish() {
+        let mut p = Paint::<'_> {
+            anti_alias: true,
+            ..Default::default()
+        };
+        p.set_color(argb(theme::COLOR_FG));
+        let stroke = Stroke {
+            width: 2.5,
+            ..Default::default()
+        };
+        pm.stroke_path(&path, &p, &stroke, Transform::identity(), None);
     }
 }
 

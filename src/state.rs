@@ -36,10 +36,6 @@ impl State {
 
     // --- tab helpers ---
 
-    pub fn leaf_of_client(&self, c: Win) -> Option<NodeId> {
-        self.tree.find_leaf_for_client(c)
-    }
-
     /// Pin a client into the focused leaf just after the active tab.
     pub fn pin_client(&mut self, c: Win) {
         let lid = self.focused_leaf_valid();

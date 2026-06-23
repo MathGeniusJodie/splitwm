@@ -399,14 +399,3 @@ impl Tree {
         }
     }
 }
-
-/// Client content rect inside a leaf (below the tab bar, inside the border),
-/// translated by horizontal scroll. Mirrors `theme.client_geo` in Lua.
-pub fn client_geo(geo: Rect, bw: i32, gap: i32, tb_h: i32, scroll_x: i32) -> Rect {
-    Rect {
-        x: geo.x + bw - scroll_x,
-        y: geo.y - gap + tb_h,
-        w: (geo.w - bw * 2).max(1),
-        h: (geo.h + gap - bw - tb_h).max(1),
-    }
-}
