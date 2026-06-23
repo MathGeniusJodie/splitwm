@@ -73,7 +73,7 @@ struct Wm {
     clients: HashMap<Win, Client>,
     frames: HashMap<NodeId, Window>, // leaf id -> frame window
     renderer: Renderer,
-    gc: Gcontext, // shared graphics context for all `PutImage` blits
+    gc: Gcontext,                     // shared graphics context for all `PutImage` blits
     keymap: HashMap<u32, u8>,         // keysym -> keycode
     bindings: Vec<(u16, u8, Action)>, // (modmask, keycode, action)
     running: bool,

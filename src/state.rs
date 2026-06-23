@@ -105,8 +105,8 @@ impl State {
             return None;
         }
         let cur = leaves.iter().position(|&l| l == from)?;
-        let step = if next { 1 } else { -1 };
-        let i = (cur as i64 + step).rem_euclid(leaves.len() as i64) as usize;
+        let n = leaves.len();
+        let i = if next { (cur + 1) % n } else { (cur + n - 1) % n };
         Some(leaves[i])
     }
 
