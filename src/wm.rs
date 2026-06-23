@@ -81,6 +81,42 @@ struct Wm {
     running: bool,
     max_req_bytes: usize,
     atom_net_wm_icon: u32,
+    animate: bool,                              // play a transition on next arrange
+    prev_frame_rect: HashMap<NodeId, FrameRect>, // last applied frame screen rects
+}
+
+#[derive(Clone, Copy)]
+struct FrameRect {
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+/// A frame placed during an arrange, retained so the animator can move it.
+struct Placement {
+    leaf: NodeId,
+    frame: Window,
+    target: FrameRect,
+    active_client: Option<Win>,
+    focused: bool,
+}
+
+/// ease-out-back (slight overshoot then settle), matching animation.lua.
+fn ease_out_back(t: f32) -> f32 {
+    let c = 1.1;
+    let t = t - 1.0;
+    t * t * ((c + 1.0) * t + c) + 1.0
+}
+
+fn lerp_rect(a: FrameRect, b: FrameRect, p: f32) -> FrameRect {
+    let l = |s: i32, e: i32| s + ((e - s) as f32 * p) as i32;
+    FrameRect {
+        x: l(a.x, b.x),
+        y: l(a.y, b.y),
+        w: l(a.w, b.w).max(1),
+        h: l(a.h, b.h).max(1),
+    }
 }
 
 const MOD4: u16 = 0x40; // ModMask::M4
@@ -152,6 +188,8 @@ pub fn run() -> R<()> {
         running: true,
         max_req_bytes,
         atom_net_wm_icon,
+        animate: false,
+        prev_frame_rect: HashMap::new(),
         conn,
         root,
     };
@@ -524,6 +562,22 @@ impl Wm {
             return Ok(());
         };
         let wa = self.wa();
+        // Layout-changing actions get an animated transition.
+        self.animate = matches!(
+            action,
+            Action::SplitH
+                | Action::SplitV
+                | Action::Close
+                | Action::Grow
+                | Action::Shrink
+                | Action::MoveTabNext
+                | Action::MoveTabPrev
+        );
+        // On split the existing content moves to a fresh leaf id; carry its
+        // current frame rect over so it slides from its old spot, not a sliver.
+        let pre_split = matches!(action, Action::SplitH | Action::SplitV)
+            .then(|| self.prev_frame_rect.get(&self.state.focused_leaf_valid()).copied())
+            .flatten();
         match action {
             Action::SpawnTerminal => self.spawn_terminal(),
             Action::SplitH => self.state.split_focused(Dir::H),
@@ -564,6 +618,9 @@ impl Wm {
                 self.running = false;
                 return Ok(());
             }
+        }
+        if let Some(rect) = pre_split {
+            self.prev_frame_rect.insert(self.state.focused_leaf_valid(), rect);
         }
         self.state.ensure_in_view(wa);
         self.state.scroll_x = self.state.scroll_target;
@@ -723,6 +780,9 @@ impl Wm {
             }
         }
 
+        // On-screen frames positioned this pass, for the optional animation.
+        let mut placed: Vec<Placement> = Vec::new();
+
         for &leaf in &leaves {
             let geo = match geos.get(&leaf) {
                 Some(g) => *g,
@@ -731,12 +791,14 @@ impl Wm {
             let frame = self.ensure_frame(leaf)?;
 
             // Frame screen rect: visual top is gap above geo.y.
-            let fx = geo.x - scroll_x;
-            let fy = geo.y - gap;
-            let fw = geo.w.max(1);
-            let fh = (geo.h + gap).max(1);
+            let target = FrameRect {
+                x: geo.x - scroll_x,
+                y: geo.y - gap,
+                w: geo.w.max(1),
+                h: (geo.h + gap).max(1),
+            };
 
-            let off_screen = fx + fw <= wa.x || fx >= wa.x + wa.w;
+            let off_screen = target.x + target.w <= wa.x || target.x >= wa.x + wa.w;
 
             // Always reparent this leaf's clients into its frame (so they
             // travel/hide with it), then map/unmap based on visibility.
@@ -768,20 +830,85 @@ impl Wm {
 
             if off_screen {
                 self.conn.unmap_window(frame)?;
+                self.prev_frame_rect.remove(&leaf);
                 continue;
             }
-            self.conn.configure_window(
-                frame,
-                &ConfigureWindowAux::new()
-                    .x(fx)
-                    .y(fy)
-                    .width(u32::try_from(fw).unwrap_or(0))
-                    .height(u32::try_from(fh).unwrap_or(0)),
-            )?;
+            self.place_frame(frame, target)?;
             self.conn.map_window(frame)?;
-            self.paint_frame_geo(leaf, frame, fw, fh, focused == leaf)?;
+            self.paint_frame_geo(leaf, frame, target.w, target.h, focused == leaf)?;
+            placed.push(Placement {
+                leaf,
+                frame,
+                target,
+                active_client,
+                focused: focused == leaf,
+            });
         }
+
+        if std::mem::take(&mut self.animate) {
+            self.run_layout_animation(&placed)?;
+        }
+        // Cache final rects as the start point for the next transition.
+        self.prev_frame_rect = placed.iter().map(|p| (p.leaf, p.target)).collect();
         self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Position a frame window at a screen rect.
+    fn place_frame(&self, frame: Window, r: FrameRect) -> R<()> {
+        self.conn.configure_window(
+            frame,
+            &ConfigureWindowAux::new()
+                .x(r.x)
+                .y(r.y)
+                .width(u32::try_from(r.w).unwrap_or(1))
+                .height(u32::try_from(r.h).unwrap_or(1)),
+        )?;
+        Ok(())
+    }
+
+    /// Animate the just-placed frames from their previous rect (or a collapsed
+    /// sliver, for freshly-created leaves) to their target, using an
+    /// ease-out-back curve — matching splitwm's split/reflow feel.
+    fn run_layout_animation(&mut self, placed: &[Placement]) -> R<()> {
+        const FRAMES: i32 = 17; // ~0.28s at 60fps
+        let bw = theme::FOCUS_BORDER_WIDTH;
+        let tb_h = theme::tb_h(theme::GAP);
+        // Pair each placement with its start rect.
+        let starts: Vec<FrameRect> = placed
+            .iter()
+            .map(|p| {
+                self.prev_frame_rect.get(&p.leaf).copied().unwrap_or(FrameRect {
+                    x: p.target.x,
+                    y: p.target.y,
+                    w: 1,
+                    h: p.target.h,
+                })
+            })
+            .collect();
+        for step in 1..=FRAMES {
+            let t = step as f32 / FRAMES as f32;
+            let e = ease_out_back(t);
+            for (p, start) in placed.iter().zip(&starts) {
+                let r = lerp_rect(*start, p.target, e);
+                self.place_frame(p.frame, r)?;
+                if let Some(c) = p.active_client {
+                    let cw = (r.w - 2 * bw).max(1);
+                    let ch = (r.h - tb_h - bw).max(1);
+                    self.conn.configure_window(
+                        c,
+                        &ConfigureWindowAux::new()
+                            .x(bw)
+                            .y(tb_h)
+                            .width(u32::try_from(cw).unwrap_or(1))
+                            .height(u32::try_from(ch).unwrap_or(1)),
+                    )?;
+                }
+                self.paint_frame_geo(p.leaf, p.frame, r.w.max(1), r.h.max(1), p.focused)?;
+            }
+            self.conn.flush()?;
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
         Ok(())
     }
 
