@@ -21,7 +21,8 @@ is a standalone WM with no Lua/awesome dependency.
 - **[tiny-skia](https://crates.io/crates/tiny-skia)** — pure-Rust 2D rasteriser
   for the tab bars / borders (rendered to a buffer, blitted via `PutImage`).
 - **[fontdue](https://crates.io/crates/fontdue)** — glyph rasterising for tab
-  labels (a system monospace TTF is loaded at runtime).
+  labels (a system monospace TTF is loaded at runtime, as a fallback when a
+  client has no `_NET_WM_ICON`).
 
 ## Architecture
 
@@ -35,7 +36,12 @@ is a standalone WM with no Lua/awesome dependency.
 
 Each leaf gets a **frame window** (child of root) covering its area; the active
 client is reparented into the frame and positioned below the tab bar. Scrolling
-moves the frames; off-screen frames are unmapped.
+moves the frames; off-screen frames are unmapped. Frames paint their own slice
+of the wallpaper as the background, so they blend into the surrounding gaps.
+
+Gap **drag handles** and **"+" insert buttons** are pooled child-of-root
+windows positioned in the gaps each arrange; layout-changing actions play an
+**ease-out-back** animation by interpolating frame geometry over ~0.28 s.
 
 ## Keybindings (Mod4 = Super)
 
@@ -54,6 +60,11 @@ moves the frames; off-screen frames are unmapped.
 | `Mod4+Shift+c`       | kill focused window |
 | `Mod4+Shift+q`       | quit splitwm |
 | `Mod4 + scroll wheel`| scroll the canvas horizontally |
+| drag a gap handle    | resize the two adjacent columns |
+| click a gap / edge `+`| insert an empty column there |
+
+Set `SPLITWM_WALLPAPER=/path/to.png` to render a scaled wallpaper behind the
+gaps.
 
 ## Build & test
 
@@ -70,16 +81,28 @@ Xephyr :1 -ac -screen 1280x800 &
 DISPLAY=:1 ./target/release/splitwm
 ```
 
-## Status — v1 (core)
+## Status
 
 Implemented: tree splits (H/V, n-ary, flattening), tabbed leaves, custom slanted
-tab bars with per-client accent colours, rounded focus border, scrollable
-canvas, focus engine, resize, tab cycling/moving, split close with tab merge,
-keybindings, click-to-focus, Mod4+wheel scroll.
+tab bars, rounded focus border, scrollable canvas, focus engine, resize, tab
+cycling/moving, split close with tab merge, keybindings, click-to-focus,
+Mod4+wheel scroll.
 
-Deferred to later passes (present in the Lua original): split/scroll
-**animations**, **drag-and-drop** of tabs/splits, per-client **colour sampling**
-from window pixels, **wallpaper underlay** + drag handles, **status bar** /
-clock, the **"smush"** narrow-split font shrink, app-launcher icons in empty
-splits, the gap **"+"** column-insert buttons, and multi-tag/multi-monitor
-support (v1 runs a single tag on the primary screen).
+Parity features ported from the Lua original:
+
+- **App icons** in tabs from `_NET_WM_ICON` (letter-glyph fallback).
+- **Window-content colour sampling** — the focused client's top strip is
+  sampled to tint its active tab and focus border.
+- **Wallpaper underlay** (`SPLITWM_WALLPAPER`), with frames painting their own
+  wallpaper slice so gaps blend seamlessly.
+- **Split / close / resize animations** (ease-out-back).
+- Gap **drag-to-resize handles** and **"+" column-insert** buttons (gaps + edges).
+- **Smush** — auto font-shrink (Ctrl+0 / Ctrl+-) into narrow focused splits via
+  XTEST.
+
+Not ported: the **status bar** / clock (intentionally excluded), and
+multi-tag/multi-monitor support (runs a single tag on the primary screen).
+
+> Note: pointer-driven drag/insert is exercised by unit tests on the underlying
+> layout ops; it can't be synthesised in the headless Xephyr used for the
+> screenshot drive (`XWarpPointer` is ignored there).
