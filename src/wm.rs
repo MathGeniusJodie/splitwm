@@ -453,10 +453,10 @@ impl Wm {
     /// "active tab blends into the app" behaviour). Best-effort: errors and
     /// near-black/uniform reads leave the palette colour in place.
     fn resample_color(&mut self, win: Win) {
-        let Ok(geo) = self.conn.get_geometry(win).and_then(|c| Ok(c.reply())) else {
+        let Ok(cookie) = self.conn.get_geometry(win) else {
             return;
         };
-        let Ok(geo) = geo else { return };
+        let Ok(geo) = cookie.reply() else { return };
         let w = geo.width;
         if w == 0 || geo.height == 0 {
             return;
