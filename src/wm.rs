@@ -5,7 +5,12 @@ use std::collections::HashMap;
 use std::error::Error;
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::*;
+use x11rb::protocol::xproto::{
+    Allow, AtomEnum, ButtonIndex, ButtonPressEvent, ChangeWindowAttributesAux,
+    ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, CreateGCAux, CreateWindowAux,
+    EventMask, ExposeEvent, GrabMode, ImageFormat, InputFocus, KeyPressEvent, MapRequestEvent,
+    ModMask, StackMode, Window, WindowClass,
+};
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::CURRENT_TIME;
@@ -68,7 +73,7 @@ struct Wm {
     clients: HashMap<Win, Client>,
     frames: HashMap<NodeId, Window>, // leaf id -> frame window
     renderer: Renderer,
-    keymap: HashMap<u32, u8>, // keysym -> keycode
+    keymap: HashMap<u32, u8>,         // keysym -> keycode
     bindings: Vec<(u16, u8, Action)>, // (modmask, keycode, action)
     running: bool,
     max_req_bytes: usize,
@@ -81,26 +86,31 @@ fn workarea(conn: &RustConnection, root: Window) -> R<Rect> {
     Ok(Rect {
         x: 0,
         y: 0,
-        w: geo.width as i32,
-        h: geo.height as i32,
+        w: i32::from(geo.width),
+        h: i32::from(geo.height),
     })
 }
 
 // Hue-rotated palette so distinct clients get distinct accent colours.
 const PALETTE: [u32; 8] = [
-    0xff66aaff, 0xffff6688, 0xff66dd99, 0xffffcc66, 0xffcc88ff, 0xff66dddd,
-    0xffff9966, 0xffaadd66,
+    0xff66_aaff,
+    0xffff_6688,
+    0xff66_dd99,
+    0xffff_cc66,
+    0xffcc_88ff,
+    0xff66_dddd,
+    0xffff_9966,
+    0xffaa_dd66,
 ];
 
 pub fn run() -> R<()> {
-    let (conn, _screen_num) = x11rb::connect(None)?;
-    let screen = conn.setup().roots[_screen_num].clone();
+    let (conn, screen_num) = x11rb::connect(None)?;
+    let screen = conn.setup().roots[screen_num].clone();
     let root = screen.root;
 
     // Become the window manager.
-    let mask = EventMask::SUBSTRUCTURE_REDIRECT
-        | EventMask::SUBSTRUCTURE_NOTIFY
-        | EventMask::BUTTON_PRESS;
+    let mask =
+        EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY | EventMask::BUTTON_PRESS;
     let change = ChangeWindowAttributesAux::new().event_mask(mask);
     conn.change_window_attributes(root, &change)?
         .check()
@@ -163,7 +173,12 @@ pub fn run() -> R<()> {
 
 impl Wm {
     fn wa(&self) -> Rect {
-        workarea(&self.conn, self.root).unwrap_or(Rect { x: 0, y: 0, w: 1280, h: 800 })
+        workarea(&self.conn, self.root).unwrap_or(Rect {
+            x: 0,
+            y: 0,
+            w: 1280,
+            h: 800,
+        })
     }
 
     // --- keyboard ---
@@ -209,21 +224,19 @@ impl Wm {
             (MOD4 | shift, ks::C, Action::KillClient),
         ];
         // Also grab with Lock (CapsLock) and Mod2 (NumLock) variants.
-        let extra = [0u16, u16::from(ModMask::LOCK), u16::from(ModMask::M2),
-            u16::from(ModMask::LOCK) | u16::from(ModMask::M2)];
+        let extra = [
+            0u16,
+            u16::from(ModMask::LOCK),
+            u16::from(ModMask::M2),
+            u16::from(ModMask::LOCK) | u16::from(ModMask::M2),
+        ];
         for &(modmask, sym, action) in defs {
             if let Some(&kc) = self.keymap.get(&sym) {
                 self.bindings.push((modmask, kc, action));
                 for e in extra {
                     let m = ModMask::from(modmask | e);
-                    self.conn.grab_key(
-                        true,
-                        self.root,
-                        m,
-                        kc,
-                        GrabMode::ASYNC,
-                        GrabMode::ASYNC,
-                    )?;
+                    self.conn
+                        .grab_key(true, self.root, m, kc, GrabMode::ASYNC, GrabMode::ASYNC)?;
                 }
             }
         }
@@ -232,8 +245,7 @@ impl Wm {
 
     fn lookup_action(&self, modmask: u16, keycode: u8) -> Option<Action> {
         // Strip Lock/Mod2 before matching.
-        let clean = modmask
-            & !(u16::from(ModMask::LOCK) | u16::from(ModMask::M2));
+        let clean = modmask & !(u16::from(ModMask::LOCK) | u16::from(ModMask::M2));
         self.bindings
             .iter()
             .find(|(m, kc, _)| *m == clean && *kc == keycode)
@@ -242,12 +254,13 @@ impl Wm {
 
     // --- event dispatch ---
 
+    #[allow(clippy::needless_pass_by_value)]
     fn handle_event(&mut self, ev: Event) -> R<()> {
         match ev {
             Event::MapRequest(e) => self.on_map_request(e)?,
-            Event::UnmapNotify(e) => self.on_unmap(e.window)?,
+            Event::UnmapNotify(e) => self.on_unmap(e.window),
             Event::DestroyNotify(e) => self.on_destroy(e.window)?,
-            Event::ConfigureRequest(e) => self.on_configure_request(e)?,
+            Event::ConfigureRequest(e) => self.on_configure_request(&e)?,
             Event::KeyPress(e) => self.on_key(e)?,
             Event::ButtonPress(e) => self.on_button(e)?,
             Event::Expose(e) => self.on_expose(e)?,
@@ -256,13 +269,13 @@ impl Wm {
         Ok(())
     }
 
-    fn on_configure_request(&mut self, e: ConfigureRequestEvent) -> R<()> {
+    fn on_configure_request(&self, e: &ConfigureRequestEvent) -> R<()> {
         // Honour requests for windows we don't (yet) manage; managed clients
         // are positioned by arrange().
         if self.clients.contains_key(&e.window) {
             return Ok(());
         }
-        let aux = ConfigureWindowAux::from_configure_request(&e);
+        let aux = ConfigureWindowAux::from_configure_request(e);
         self.conn.configure_window(e.window, &aux)?;
         Ok(())
     }
@@ -282,7 +295,10 @@ impl Wm {
 
         // Create the frame for the focused leaf if needed; pin client there.
         self.state.pin_client(win);
-        let leaf = self.state.leaf_of_client(win).unwrap_or(self.state.focused_leaf_valid());
+        let leaf = self
+            .state
+            .leaf_of_client(win)
+            .unwrap_or_else(|| self.state.focused_leaf_valid());
 
         let frame = self.ensure_frame(leaf)?;
 
@@ -331,24 +347,27 @@ impl Wm {
             .unwrap_or_default();
         // WM_CLASS is "instance\0class\0"; take the class (second string).
         let parts: Vec<&[u8]> = class.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
-        let name = parts.get(1).or(parts.get(0)).copied().unwrap_or(b"?");
+        let name = parts
+            .get(1)
+            .or_else(|| parts.first())
+            .copied()
+            .unwrap_or(b"?");
         let label = name
             .first()
-            .map(|&b| (b as char).to_ascii_uppercase())
-            .unwrap_or('?');
+            .map_or('?', |&b| (b as char).to_ascii_uppercase());
         let mut hash: u32 = 5381;
         for &b in name {
-            hash = hash.wrapping_mul(33).wrapping_add(b as u32);
+            hash = hash.wrapping_mul(33).wrapping_add(u32::from(b));
         }
         let color = PALETTE[(hash as usize) % PALETTE.len()];
         (label, color)
     }
 
-    fn on_unmap(&mut self, _win: Win) -> R<()> {
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
+    const fn on_unmap(&self, _win: Win) {
         // We unmap inactive tabs and reparent clients ourselves, both of which
         // generate UnmapNotify. Distinguishing those from a real client
         // withdraw is fiddly, so we unmanage on DestroyNotify only.
-        Ok(())
     }
 
     fn on_destroy(&mut self, win: Win) -> R<()> {
@@ -369,9 +388,8 @@ impl Wm {
     }
 
     fn on_key(&mut self, e: KeyPressEvent) -> R<()> {
-        let action = match self.lookup_action(e.state.into(), e.detail) {
-            Some(a) => a,
-            None => return Ok(()),
+        let Some(action) = self.lookup_action(e.state.into(), e.detail) else {
+            return Ok(());
         };
         let wa = self.wa();
         match action {
@@ -440,23 +458,29 @@ impl Wm {
                 self.focus(Some(e.event))?;
             }
             // Replay so the click reaches the app.
-            self.conn.allow_events(Allow::REPLAY_POINTER, CURRENT_TIME)?;
+            self.conn
+                .allow_events(Allow::REPLAY_POINTER, CURRENT_TIME)?;
         }
         Ok(())
     }
 
-    fn on_expose(&mut self, e: ExposeEvent) -> R<()> {
+    fn on_expose(&self, e: ExposeEvent) -> R<()> {
         if e.count != 0 {
             return Ok(());
         }
         // Repaint whichever frame got exposed.
-        let leaf = self.frames.iter().find(|(_, &w)| w == e.window).map(|(&l, _)| l);
+        let leaf = self
+            .frames
+            .iter()
+            .find(|(_, &w)| w == e.window)
+            .map(|(&l, _)| l);
         if let Some(leaf) = leaf {
             self.paint_frame(leaf)?;
         }
         Ok(())
     }
 
+    #[allow(clippy::unused_self)]
     fn spawn_terminal(&self) {
         let term = std::env::var("TERMINAL").unwrap_or_else(|_| "xterm".into());
         // Detach so children don't become zombies / die with us.
@@ -468,22 +492,17 @@ impl Wm {
 
     // --- focus ---
 
-    fn focus(&mut self, win: Option<Win>) -> R<()> {
+    fn focus(&self, win: Option<Win>) -> R<()> {
         match win {
             Some(w) if self.clients.contains_key(&w) => {
                 self.conn
                     .set_input_focus(InputFocus::POINTER_ROOT, w, CURRENT_TIME)?;
-                self.conn.configure_window(
-                    w,
-                    &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-                )?;
+                self.conn
+                    .configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
             }
             _ => {
-                self.conn.set_input_focus(
-                    InputFocus::POINTER_ROOT,
-                    self.root,
-                    CURRENT_TIME,
-                )?;
+                self.conn
+                    .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
             }
         }
         Ok(())
@@ -497,7 +516,7 @@ impl Wm {
         }
         let f = self.conn.generate_id()?;
         let aux = CreateWindowAux::new()
-            .background_pixel(theme::WALLPAPER & 0x00ffffff)
+            .background_pixel(theme::WALLPAPER & 0x00ff_ffff)
             .event_mask(EventMask::EXPOSURE | EventMask::SUBSTRUCTURE_NOTIFY);
         self.conn.create_window(
             self.depth,
@@ -527,7 +546,7 @@ impl Wm {
         // each leaf a comfortable minimum so splits don't get crushed.
         let leaves = self.state.tree.collect_leaves();
         let min_leaf_w = (theme::min_split_w() + 2 * gap).max(wa.w / 3);
-        let needed = leaves.len() as i32 * min_leaf_w;
+        let needed = i32::try_from(leaves.len()).unwrap_or(i32::MAX) * min_leaf_w;
         self.state.canvas_w = Some(needed.max(wa.w));
 
         let geos = self.state.compute(wa);
@@ -536,7 +555,12 @@ impl Wm {
 
         // Remove frames for leaves that no longer exist.
         let live: std::collections::HashSet<NodeId> = leaves.iter().copied().collect();
-        let dead: Vec<NodeId> = self.frames.keys().copied().filter(|l| !live.contains(l)).collect();
+        let dead: Vec<NodeId> = self
+            .frames
+            .keys()
+            .copied()
+            .filter(|l| !live.contains(l))
+            .collect();
         for leaf in dead {
             if let Some(f) = self.frames.remove(&leaf) {
                 // Reparent any surviving clients back to root before destroy.
@@ -579,10 +603,7 @@ impl Wm {
             };
             let cg = client_geo(geo, bw, gap, tb_h, scroll_x);
             for w in &tabs {
-                let need_reparent = self
-                    .clients
-                    .get(w)
-                    .map_or(false, |c| c.parent_leaf != leaf);
+                let need_reparent = self.clients.get(w).is_some_and(|c| c.parent_leaf != leaf);
                 if need_reparent {
                     self.conn.reparent_window(*w, frame, 0, 0)?;
                     if let Some(c) = self.clients.get_mut(w) {
@@ -595,8 +616,8 @@ impl Wm {
                         &ConfigureWindowAux::new()
                             .x(bw)
                             .y(tb_h)
-                            .width(cg.w as u32)
-                            .height(cg.h as u32)
+                            .width(u32::try_from(cg.w).unwrap_or(0))
+                            .height(u32::try_from(cg.h).unwrap_or(0))
                             .border_width(0),
                     )?;
                     self.conn.map_window(*w)?;
@@ -614,8 +635,8 @@ impl Wm {
                 &ConfigureWindowAux::new()
                     .x(fx)
                     .y(fy)
-                    .width(fw as u32)
-                    .height(fh as u32),
+                    .width(u32::try_from(fw).unwrap_or(0))
+                    .height(u32::try_from(fh).unwrap_or(0)),
             )?;
             self.conn.map_window(frame)?;
             self.paint_frame_geo(leaf, frame, fw, fh, focused == leaf)?;
@@ -624,25 +645,36 @@ impl Wm {
         Ok(())
     }
 
-    fn paint_frame(&mut self, leaf: NodeId) -> R<()> {
-        let frame = match self.frames.get(&leaf) {
-            Some(&f) => f,
-            None => return Ok(()),
+    fn paint_frame(&self, leaf: NodeId) -> R<()> {
+        let Some(&frame) = self.frames.get(&leaf) else {
+            return Ok(());
         };
         let g = self.conn.get_geometry(frame)?.reply()?;
         let focused = self.state.focused_leaf_valid() == leaf;
-        self.paint_frame_geo(leaf, frame, g.width as i32, g.height as i32, focused)
+        self.paint_frame_geo(
+            leaf,
+            frame,
+            i32::from(g.width),
+            i32::from(g.height),
+            focused,
+        )
     }
 
-    fn paint_frame_geo(&mut self, leaf: NodeId, frame: Window, fw: i32, fh: i32, focused: bool) -> R<()> {
+    fn paint_frame_geo(
+        &self,
+        leaf: NodeId,
+        frame: Window,
+        fw: i32,
+        fh: i32,
+        focused: bool,
+    ) -> R<()> {
         let gap = theme::GAP;
         let tb_h = theme::tb_h(gap);
         let bw = theme::FOCUS_BORDER_WIDTH;
 
         let tabs: Vec<TabInfo> = {
-            let l = match self.state.tree.leaf(leaf) {
-                Some(l) => l,
-                None => return Ok(()),
+            let Some(l) = self.state.tree.leaf(leaf) else {
+                return Ok(());
             };
             l.tabs
                 .iter()
@@ -667,7 +699,12 @@ impl Wm {
             tabs,
         };
         let buf = self.renderer.render(&view);
-        self.put_image(frame, fw as u16, fh as u16, &buf)?;
+        self.put_image(
+            frame,
+            u16::try_from(fw).unwrap_or(u16::MAX),
+            u16::try_from(fh).unwrap_or(u16::MAX),
+            &buf,
+        )?;
         Ok(())
     }
 
@@ -690,7 +727,7 @@ impl Wm {
                 w,
                 rows,
                 0,
-                y as i16,
+                i16::try_from(y).unwrap_or(i16::MAX),
                 0,
                 self.depth,
                 &data[start..end],

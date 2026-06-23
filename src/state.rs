@@ -17,7 +17,7 @@ impl State {
     pub fn new() -> Self {
         let tree = Tree::new();
         let root = tree.root;
-        State {
+        Self {
             tree,
             focused_leaf: root,
             scroll_x: 0,
@@ -91,8 +91,9 @@ impl State {
         if l.tabs.is_empty() {
             return None;
         }
-        let n = l.tabs.len() as i32;
-        l.active = (((l.active as i32 + offset) % n + n) % n) as usize;
+        let n = i32::try_from(l.tabs.len()).unwrap_or(i32::MAX);
+        let pos = ((i32::try_from(l.active).unwrap_or(0) + offset) % n + n) % n;
+        l.active = usize::try_from(pos).unwrap_or(0);
         l.tabs.get(l.active).copied()
     }
 
@@ -105,7 +106,11 @@ impl State {
         }
         let cur = leaves.iter().position(|&l| l == from)?;
         let i = if next {
-            if cur + 1 < leaves.len() { cur + 1 } else { 0 }
+            if cur + 1 < leaves.len() {
+                cur + 1
+            } else {
+                0
+            }
         } else if cur > 0 {
             cur - 1
         } else {
@@ -144,9 +149,13 @@ impl State {
 
     fn split_node(&mut self, leaf: NodeId, dir: Dir, child_a: NodeId, child_b: NodeId) {
         if let Some((parent, idx)) = self.tree.find_parent(leaf) {
-            let same_dir = matches!(self.tree.get(parent), Some(Node::Branch { dir: d, .. }) if *d == dir);
+            let same_dir =
+                matches!(self.tree.get(parent), Some(Node::Branch { dir: d, .. }) if *d == dir);
             if same_dir {
-                if let Some(Node::Branch { children, ratios, .. }) = self.tree.get_mut(parent) {
+                if let Some(Node::Branch {
+                    children, ratios, ..
+                }) = self.tree.get_mut(parent)
+                {
                     let old_r = ratios[idx];
                     ratios[idx] = old_r * theme::SPLIT_RATIO;
                     ratios.insert(idx + 1, old_r * (1.0 - theme::SPLIT_RATIO));
@@ -155,18 +164,22 @@ impl State {
                 }
                 return;
             }
-            let branch = self.tree.make_branch(dir, theme::SPLIT_RATIO, child_a, child_b);
+            let branch = self
+                .tree
+                .make_branch(dir, theme::SPLIT_RATIO, child_a, child_b);
             if let Some(Node::Branch { children, .. }) = self.tree.get_mut(parent) {
                 children[idx] = branch;
             }
         } else {
             // leaf is root
-            let branch = self.tree.make_branch(dir, theme::SPLIT_RATIO, child_a, child_b);
+            let branch = self
+                .tree
+                .make_branch(dir, theme::SPLIT_RATIO, child_a, child_b);
             self.tree.root = branch;
         }
     }
 
-    /// Split the focused leaf; existing tabs stay in child_a (now focused).
+    /// Split the focused leaf; existing tabs stay in `child_a` (now focused).
     pub fn split_focused(&mut self, dir: Dir) {
         let leaf = self.focused_leaf_valid();
         // Move tabs into a fresh leaf node (child_a), leave child_b empty.
@@ -192,13 +205,16 @@ impl State {
     /// Close the focused leaf, merging its tabs into the adjacent sibling.
     pub fn close_focused(&mut self) -> bool {
         let leaf = self.focused_leaf_valid();
-        let (parent, idx) = match self.tree.find_parent(leaf) {
-            Some(p) => p,
-            None => return false, // root leaf: nothing to close
+        let Some((parent, idx)) = self.tree.find_parent(leaf) else {
+            return false; // root leaf: nothing to close
         };
 
         // Merge this leaf's tabs into the adjacent sibling's first leaf.
-        let tabs: Vec<Win> = self.tree.leaf(leaf).map(|l| l.tabs.clone()).unwrap_or_default();
+        let tabs: Vec<Win> = self
+            .tree
+            .leaf(leaf)
+            .map(|l| l.tabs.clone())
+            .unwrap_or_default();
         let dest_child = {
             let (children,) = match self.tree.get(parent) {
                 Some(Node::Branch { children, .. }) => (children.clone(),),
@@ -223,7 +239,10 @@ impl State {
 
         if nchildren > 2 {
             // n-ary: remove this child, redistribute its ratio.
-            if let Some(Node::Branch { children, ratios, .. }) = self.tree.get_mut(parent) {
+            if let Some(Node::Branch {
+                children, ratios, ..
+            }) = self.tree.get_mut(parent)
+            {
                 let removed = ratios[idx];
                 children.remove(idx);
                 ratios.remove(idx);
@@ -242,17 +261,16 @@ impl State {
             let keep = children
                 .iter()
                 .find(|&&c| self.tree.contains(c, focused_id));
-            self.focused_leaf = match keep {
-                Some(&_) => focused_id,
-                None => {
-                    let fb = idx.min(children.len() - 1);
-                    self.tree.first_leaf(children[fb])
-                }
+            self.focused_leaf = if let Some(&_) = keep {
+                focused_id
+            } else {
+                let fb = idx.min(children.len() - 1);
+                self.tree.first_leaf(children[fb])
             };
         } else {
             // binary: collapse parent, sibling takes its place.
             let sibling = match self.tree.get(parent) {
-                Some(Node::Branch { children, .. }) => children[if idx == 0 { 1 } else { 0 }],
+                Some(Node::Branch { children, .. }) => children[usize::from(idx == 0)],
                 _ => return false,
             };
             self.tree.remove_node(leaf);
@@ -277,11 +295,13 @@ impl State {
 
     pub fn resize_focused(&mut self, delta: f64) -> bool {
         let leaf = self.focused_leaf_valid();
-        let (parent, idx) = match self.tree.find_parent(leaf) {
-            Some(p) => p,
-            None => return false,
+        let Some((parent, idx)) = self.tree.find_parent(leaf) else {
+            return false;
         };
-        if let Some(Node::Branch { children, ratios, .. }) = self.tree.get_mut(parent) {
+        if let Some(Node::Branch {
+            children, ratios, ..
+        }) = self.tree.get_mut(parent)
+        {
             let n = children.len();
             let other = if idx + 1 < n { idx + 1 } else { idx - 1 };
             let min_r = 0.01;

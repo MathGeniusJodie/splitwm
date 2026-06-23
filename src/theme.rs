@@ -20,7 +20,7 @@ pub const BTN_SIZE: i32 = 26;
 pub const BTN_SPACING: i32 = 5;
 pub const N_SPLIT_BTNS: i32 = 5;
 
-pub fn min_split_w() -> i32 {
+pub const fn min_split_w() -> i32 {
     N_SPLIT_BTNS * BTN_SIZE + (N_SPLIT_BTNS - 1) * BTN_SPACING
 }
 
@@ -31,14 +31,14 @@ pub fn tb_h(gap: i32) -> i32 {
 }
 
 // --- colors (ARGB u32, matching rc.lua) ---
-pub const COLOR_BG: u32 = 0xff000000; // splitwm_color_bg #000000ff
-pub const COLOR_FG: u32 = 0xffffffff;
-pub const COLOR_ACCENT: u32 = 0xffff6666;
-pub const COLOR_BTN_BG: u32 = 0x80000000; // #00000080
-pub const COLOR_FG_DISABLED: u32 = 0x55ffffff;
-pub const COLOR_HANDLE: u32 = 0x55ffffff;
-pub const COLOR_FG_HOVER: u32 = 0x20ffffff;
-pub const COLOR_CLOSE: u32 = 0xffff6666;
+pub const COLOR_BG: u32 = 0xff00_0000; // splitwm_color_bg #000000ff
+pub const COLOR_FG: u32 = 0xffff_ffff;
+pub const COLOR_ACCENT: u32 = 0xffff_6666;
+pub const COLOR_BTN_BG: u32 = 0x8000_0000; // #00000080
+pub const COLOR_FG_DISABLED: u32 = 0x55ff_ffff;
+pub const COLOR_HANDLE: u32 = 0x55ff_ffff;
+pub const COLOR_FG_HOVER: u32 = 0x20ff_ffff;
+pub const COLOR_CLOSE: u32 = 0xffff_6666;
 
 /// Wallpaper / root background.
 pub const WALLPAPER: u32 = COLOR_BG;

@@ -51,14 +51,14 @@ impl Tree {
     pub fn new() -> Self {
         let mut nodes = HashMap::new();
         nodes.insert(1, Node::Leaf(Leaf::default()));
-        Tree {
+        Self {
             nodes,
             next_id: 2,
             root: 1,
         }
     }
 
-    fn gen_id(&mut self) -> NodeId {
+    const fn gen_id(&mut self) -> NodeId {
         let id = self.next_id;
         self.next_id += 1;
         id
@@ -143,7 +143,7 @@ impl Tree {
     pub fn find_leaf_for_client(&self, c: Win) -> Option<NodeId> {
         self.collect_leaves()
             .into_iter()
-            .find(|&l| self.leaf(l).map_or(false, |lf| lf.tabs.contains(&c)))
+            .find(|&l| self.leaf(l).is_some_and(|lf| lf.tabs.contains(&c)))
     }
 
     pub fn contains(&self, subtree: NodeId, target: NodeId) -> bool {
@@ -197,7 +197,7 @@ fn child_sizes(children: &[(bool, f64)], usable: i32, min_sz: i32) -> Vec<i32> {
         if is_min {
             sizes[i] = min_sz;
         } else if Some(i) != last_normal {
-            let sz = ((usable_normal as f64 * r / ratio_sum).floor() as i32).max(1);
+            let sz = ((f64::from(usable_normal) * r / ratio_sum).floor() as i32).max(1);
             sizes[i] = sz;
             allocated += sz;
         }
@@ -210,7 +210,15 @@ fn child_sizes(children: &[(bool, f64)], usable: i32, min_sz: i32) -> Vec<i32> {
 
 impl Tree {
     /// Compute the screen rect of every leaf. `geos` is keyed by leaf id.
-    pub fn compute(&self, x: i32, y: i32, w: i32, h: i32, gap: i32, tb_h: i32) -> HashMap<NodeId, Rect> {
+    pub fn compute(
+        &self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        gap: i32,
+        tb_h: i32,
+    ) -> HashMap<NodeId, Rect> {
         let mut geos = HashMap::new();
         self.compute_inner(
             self.root,
@@ -225,6 +233,7 @@ impl Tree {
         geos
     }
 
+    #[allow(clippy::many_single_char_names, clippy::too_many_arguments)] // recursive geometry walk
     fn compute_inner(
         &self,
         node: NodeId,
@@ -246,14 +255,12 @@ impl Tree {
                 ratios,
             }) => {
                 let inner = gap;
-                let n = children.len() as i32;
+                let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
                 let meta: Vec<(bool, f64)> = children
                     .iter()
                     .enumerate()
                     .map(|(i, &c)| {
-                        let is_min = self
-                            .leaf(c)
-                            .map_or(false, |l| l.minimized);
+                        let is_min = self.leaf(c).is_some_and(|l| l.minimized);
                         (is_min, ratios[i])
                     })
                     .collect();
@@ -284,7 +291,7 @@ impl Tree {
 }
 
 /// Client content rect inside a leaf (below the tab bar, inside the border),
-/// translated by horizontal scroll. Mirrors theme.client_geo in Lua.
+/// translated by horizontal scroll. Mirrors `theme.client_geo` in Lua.
 pub fn client_geo(geo: Rect, bw: i32, gap: i32, tb_h: i32, scroll_x: i32) -> Rect {
     Rect {
         x: geo.x + bw - scroll_x,

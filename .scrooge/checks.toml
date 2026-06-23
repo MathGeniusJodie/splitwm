@@ -1,0 +1,9 @@
+# Per-language check commands run by `scrooge check` after each task.
+# Edit freely (agents may too). Remove a key to skip that stage.
+
+[rust]
+format = "cargo fmt"
+quick = "cargo check --quiet"
+test = "cargo test --quiet"
+lint_fix = "cargo clippy --fix --allow-dirty --allow-staged --quiet -- -D warnings -W clippy::pedantic -W clippy::nursery -A clippy::module_name_repetitions -A clippy::must_use_candidate -A clippy::missing_errors_doc -A clippy::missing_panics_doc -A clippy::too_many_arguments -A clippy::unused_async -A clippy::cast_possible_truncation 2>/dev/null"
+lint = "cargo clippy --quiet -- -D warnings -W clippy::pedantic -W clippy::nursery -A clippy::module_name_repetitions -A clippy::must_use_candidate -A clippy::missing_errors_doc -A clippy::missing_panics_doc -A clippy::too_many_arguments -A clippy::unused_async -A clippy::cast_possible_truncation"

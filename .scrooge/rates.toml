@@ -1,0 +1,5 @@
+# Scrooge-model token prices (USD per million tokens) used to compute
+# `shillings_saved` in ledger.json. Edit freely (agents may too).
+
+scrooge_usd_per_mtok_in = 3.0
+scrooge_usd_per_mtok_out = 15.0
