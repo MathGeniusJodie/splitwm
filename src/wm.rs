@@ -3,6 +3,7 @@
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::rc::Rc;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
@@ -15,7 +16,7 @@ use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::CURRENT_TIME;
 
-use crate::render::{LeafView, Renderer, TabInfo};
+use crate::render::{Icon, LeafView, Renderer, TabInfo};
 use crate::state::State;
 use crate::theme;
 use crate::tree::{client_geo, Dir, NodeId, Rect, Win};
@@ -62,6 +63,7 @@ struct Client {
     parent_leaf: NodeId, // leaf whose frame currently parents this client
     label: char,
     color: u32,
+    icon: Option<Rc<Icon>>,
 }
 
 struct Wm {
@@ -78,6 +80,7 @@ struct Wm {
     bindings: Vec<(u16, u8, Action)>, // (modmask, keycode, action)
     running: bool,
     max_req_bytes: usize,
+    atom_net_wm_icon: u32,
 }
 
 const MOD4: u16 = 0x40; // ModMask::M4
@@ -130,6 +133,12 @@ pub fn run() -> R<()> {
     let gc = conn.generate_id()?;
     conn.create_gc(gc, root, &CreateGCAux::new())?;
 
+    let atom_net_wm_icon = conn
+        .intern_atom(false, b"_NET_WM_ICON")?
+        .reply()
+        .map(|r| r.atom)
+        .unwrap_or(0);
+
     let mut wm = Wm {
         depth: screen.root_depth,
         visual: screen.root_visual,
@@ -142,12 +151,14 @@ pub fn run() -> R<()> {
         frames: HashMap::new(),
         running: true,
         max_req_bytes,
+        atom_net_wm_icon,
         conn,
         root,
     };
 
     wm.build_keymap()?;
     wm.grab_keys()?;
+    wm.set_wallpaper()?;
     // Mod4 + wheel scrolls the canvas horizontally.
     for btn in [ButtonIndex::M4, ButtonIndex::M5] {
         wm.conn.grab_button(
@@ -179,6 +190,29 @@ pub fn run() -> R<()> {
 }
 
 impl Wm {
+    /// Paint a scaled PNG wallpaper (env `SPLITWM_WALLPAPER`) as the root
+    /// background so the gaps between leaves show it. No-op if unset/unreadable.
+    fn set_wallpaper(&mut self) -> R<()> {
+        let Ok(path) = std::env::var("SPLITWM_WALLPAPER") else {
+            return Ok(());
+        };
+        let wa = self.wa();
+        let Some(buf) = crate::render::load_wallpaper(&path, wa.w, wa.h) else {
+            return Ok(());
+        };
+        let (w, h) = (wa.w as u16, wa.h as u16);
+        let pm = self.conn.generate_id()?;
+        self.conn.create_pixmap(self.depth, pm, self.root, w, h)?;
+        self.put_image(pm, w, h, &buf)?;
+        self.conn.change_window_attributes(
+            self.root,
+            &ChangeWindowAttributesAux::new().background_pixmap(pm),
+        )?;
+        self.conn.clear_area(false, self.root, 0, 0, 0, 0)?;
+        self.conn.free_pixmap(pm)?;
+        Ok(())
+    }
+
     fn wa(&self) -> Rect {
         workarea(&self.conn, self.root).unwrap_or(Rect {
             x: 0,
@@ -297,8 +331,9 @@ impl Wm {
     }
 
     fn manage(&mut self, win: Win) -> R<()> {
-        // Class -> label + colour.
+        // Class -> label + colour; app icon from _NET_WM_ICON.
         let (label, color) = self.client_identity(win);
+        let icon = self.fetch_icon(win);
 
         // Create the frame for the focused leaf if needed; pin client there.
         self.state.pin_client(win);
@@ -336,6 +371,7 @@ impl Wm {
                 parent_leaf: leaf,
                 label,
                 color,
+                icon,
             },
         );
         self.state.activate_client(win);
@@ -368,6 +404,95 @@ impl Wm {
         }
         let color = PALETTE[(hash as usize) % PALETTE.len()];
         (label, color)
+    }
+
+    /// Read `_NET_WM_ICON` and pick the icon whose size is closest to (but
+    /// preferably >=) the tab height. The property is a list of
+    /// `width, height, w*h ARGB pixels` blocks packed as 32-bit CARDINALs.
+    fn fetch_icon(&self, win: Win) -> Option<Rc<Icon>> {
+        if self.atom_net_wm_icon == 0 {
+            return None;
+        }
+        let reply = self
+            .conn
+            .get_property(false, win, self.atom_net_wm_icon, AtomEnum::CARDINAL, 0, u32::MAX)
+            .ok()?
+            .reply()
+            .ok()?;
+        let vals: Vec<u32> = reply.value32()?.collect();
+        let want = theme::tb_h(theme::GAP) as u32;
+        let mut i = 0;
+        let mut best: Option<(u32, u32, usize)> = None; // (w, h, pixel_start)
+        while i + 2 <= vals.len() {
+            let (w, h) = (vals[i], vals[i + 1]);
+            let start = i + 2;
+            let count = (w as usize).checked_mul(h as usize)?;
+            if w == 0 || h == 0 || start + count > vals.len() {
+                break;
+            }
+            let better = match best {
+                None => true,
+                Some((bw, _, _)) => {
+                    // Prefer the smallest size that still covers `want`,
+                    // otherwise the largest available.
+                    (w >= want && (bw < want || w < bw)) || (bw < want && w > bw)
+                }
+            };
+            if better {
+                best = Some((w, h, start));
+            }
+            i = start + count;
+        }
+        let (w, h, start) = best?;
+        let argb = vals[start..start + (w * h) as usize].to_vec();
+        Some(Rc::new(Icon { w, h, argb }))
+    }
+
+    /// Sample the focused client's top-center content and, if it reads as a
+    /// real colour, adopt it as the client's accent (matches the original's
+    /// "active tab blends into the app" behaviour). Best-effort: errors and
+    /// near-black/uniform reads leave the palette colour in place.
+    fn resample_color(&mut self, win: Win) {
+        let Ok(geo) = self.conn.get_geometry(win).and_then(|c| Ok(c.reply())) else {
+            return;
+        };
+        let Ok(geo) = geo else { return };
+        let w = geo.width;
+        if w == 0 || geo.height == 0 {
+            return;
+        }
+        let strip_h = 4u16.min(geo.height);
+        let Ok(img) = self
+            .conn
+            .get_image(ImageFormat::Z_PIXMAP, win, 0, 0, w, strip_h, !0)
+        else {
+            return;
+        };
+        let Ok(img) = img.reply() else { return };
+        let data = &img.data;
+        if data.len() < 4 {
+            return;
+        }
+        let (mut sr, mut sg, mut sb, mut n) = (0u64, 0u64, 0u64, 0u64);
+        for px in data.chunks_exact(4) {
+            // Z_PIXMAP on a depth-24 TrueColor visual: B, G, R, X.
+            sb += u64::from(px[0]);
+            sg += u64::from(px[1]);
+            sr += u64::from(px[2]);
+            n += 1;
+        }
+        if n == 0 {
+            return;
+        }
+        let (r, g, b) = ((sr / n) as u32, (sg / n) as u32, (sb / n) as u32);
+        // Reject near-black (unrendered/obscured content).
+        if r + g + b < 24 {
+            return;
+        }
+        let color = 0xff00_0000 | (r << 16) | (g << 8) | b;
+        if let Some(c) = self.clients.get_mut(&win) {
+            c.color = color;
+        }
     }
 
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
@@ -553,6 +678,10 @@ impl Wm {
     }
 
     fn arrange(&mut self) -> R<()> {
+        // Refresh the focused client's sampled accent from its content.
+        if let Some(f) = self.state.focused_client() {
+            self.resample_color(f);
+        }
         let wa = self.wa();
         let gap = theme::GAP;
         let tb_h = theme::tb_h(gap);
@@ -683,6 +812,12 @@ impl Wm {
         let tb_h = theme::tb_h(gap);
         let bw = theme::FOCUS_BORDER_WIDTH;
 
+        let accent = {
+            let l = self.state.tree.leaf(leaf);
+            l.and_then(|l| l.tabs.get(l.active))
+                .and_then(|w| self.clients.get(w))
+                .map_or(theme::COLOR_ACCENT, |c| c.color)
+        };
         let tabs: Vec<TabInfo> = {
             let Some(l) = self.state.tree.leaf(leaf) else {
                 return Ok(());
@@ -696,6 +831,7 @@ impl Wm {
                         label: c.map_or('?', |c| c.label),
                         color: c.map_or(theme::COLOR_FG, |c| c.color),
                         active: i == l.active,
+                        icon: c.and_then(|c| c.icon.clone()),
                     }
                 })
                 .collect()
@@ -707,6 +843,7 @@ impl Wm {
             tb_h,
             bw,
             focused,
+            accent,
             tabs,
         };
         let buf = self.renderer.render(&view);

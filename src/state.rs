@@ -106,7 +106,11 @@ impl State {
         }
         let cur = leaves.iter().position(|&l| l == from)?;
         let n = leaves.len();
-        let i = if next { (cur + 1) % n } else { (cur + n - 1) % n };
+        let i = if next {
+            (cur + 1) % n
+        } else {
+            (cur + n - 1) % n
+        };
         Some(leaves[i])
     }
 

@@ -19,7 +19,7 @@ done
 DISPLAY=:1 xdotool getdisplaygeometry >/dev/null 2>&1 || { echo "Xephyr DOWN"; cat /tmp/xephyr.log; exit 1; }
 echo "Xephyr up"
 
-DISPLAY=:1 TERMINAL=xterm "$DIR/target/debug/splitwm" >/tmp/splitwm.log 2>&1 &
+DISPLAY=:1 TERMINAL=xterm SPLITWM_WALLPAPER=/tmp/wall.png "$DIR/target/debug/splitwm" >/tmp/splitwm.log 2>&1 &
 WM_PID=$!
 sleep 0.7
 kill -0 $WM_PID 2>/dev/null || { echo "WM DOWN"; cat /tmp/splitwm.log; exit 1; }
@@ -28,6 +28,8 @@ echo "WM up"
 shot() { DISPLAY=:1 import -window root "$SHOTS/$1.png" 2>/dev/null && echo "shot $1"; }
 key() { DISPLAY=:1 xdotool key --clearmodifiers "$1"; sleep 0.4; }
 term() { DISPLAY=:1 xterm -e "sleep 3000" & sleep 1.2; }
+# A solid-colour terminal so window-content sampling has something to read.
+cterm() { DISPLAY=:1 xterm -bg "$1" -e "sleep 3000" & sleep 1.2; }
 
 # 1: two terminals stacked as tabs in one split
 term; term
@@ -36,8 +38,9 @@ shot 01_two_tabs
 # 2: split horizontally (Mod4+v) -> new empty split to the right
 key "super+v"
 shot 02_split_h
-# put a terminal in the new split
-term
+# put a coloured terminal in the new split -> content-sampled accent
+cterm "DarkGreen"
+sleep 0.6
 shot 03_term_in_split2
 
 # 3: split vertically (Mod4+h)

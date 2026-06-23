@@ -11,6 +11,8 @@
     clippy::many_single_char_names
 )]
 
+use std::rc::Rc;
+
 use fontdue::Font;
 use tiny_skia::{
     Color, FillRule, Paint, PathBuilder, Pixmap, PixmapMut, Rect as SkRect, Stroke, Transform,
@@ -22,10 +24,18 @@ pub struct Renderer {
     font: Font,
 }
 
+/// A decoded application icon (non-premultiplied ARGB pixels, row-major).
+pub struct Icon {
+    pub w: u32,
+    pub h: u32,
+    pub argb: Vec<u32>,
+}
+
 pub struct TabInfo {
     pub label: char,
     pub color: u32, // ARGB accent for this client
     pub active: bool,
+    pub icon: Option<Rc<Icon>>,
 }
 
 pub struct LeafView {
@@ -34,6 +44,8 @@ pub struct LeafView {
     pub tb_h: i32,
     pub bw: i32,
     pub focused: bool,
+    /// Accent colour of the active client (focus-border tint when focused).
+    pub accent: u32,
     pub tabs: Vec<TabInfo>,
 }
 
@@ -87,7 +99,7 @@ impl Renderer {
 
         // Focus border around content.
         let border_col = if v.focused {
-            theme::COLOR_ACCENT
+            v.accent | 0xff00_0000
         } else {
             theme::COLOR_HANDLE
         };
@@ -148,16 +160,15 @@ impl Renderer {
                     None,
                 );
             }
-            // Centered label glyph.
+            // Centered app icon, or a letter glyph as fallback.
             let cx = x + tw / 2.0;
-            self.draw_glyph(
-                pm,
-                tab.label,
-                cx,
-                tb_h / 2.0 + 2.0,
-                icon * 0.7,
-                theme::COLOR_FG,
-            );
+            let cy = tb_h / 2.0;
+            if let Some(img) = &tab.icon {
+                let isz = (icon * 0.92).round();
+                draw_icon(pm, img, cx - isz / 2.0, cy - isz / 2.0, isz);
+            } else {
+                self.draw_glyph(pm, tab.label, cx, cy + 2.0, icon * 0.7, theme::COLOR_FG);
+            }
             x += slot;
         }
     }
@@ -196,6 +207,47 @@ impl Renderer {
                 }
                 data[idx + 3] = 255;
             }
+        }
+    }
+}
+
+/// Blit `img` scaled to a `size`x`size` box at (dx, dy), alpha-blending each
+/// source pixel over the (premultiplied RGBA) pixmap.
+fn draw_icon(pm: &mut PixmapMut, img: &Icon, dx: f32, dy: f32, size: f32) {
+    if img.w == 0 || img.h == 0 || size < 1.0 {
+        return;
+    }
+    let pw = pm.width() as i32;
+    let ph = pm.height() as i32;
+    let data = pm.data_mut();
+    let isz = size as i32;
+    let ox = dx.round() as i32;
+    let oy = dy.round() as i32;
+    for ty in 0..isz {
+        let sy = (ty as u32 * img.h / isz as u32).min(img.h - 1);
+        let py = oy + ty;
+        if py < 0 || py >= ph {
+            continue;
+        }
+        for tx in 0..isz {
+            let sx = (tx as u32 * img.w / isz as u32).min(img.w - 1);
+            let px = ox + tx;
+            if px < 0 || px >= pw {
+                continue;
+            }
+            let s = img.argb[(sy * img.w + sx) as usize];
+            let a = (s >> 24) & 0xff;
+            if a == 0 {
+                continue;
+            }
+            let (sr, sg, sb) = ((s >> 16) & 0xff, (s >> 8) & 0xff, s & 0xff);
+            let idx = ((py * pw + px) * 4) as usize;
+            // Source is straight ARGB; pixmap is premultiplied RGBA.
+            for (k, sc) in [sr, sg, sb].iter().enumerate() {
+                let dst = u32::from(data[idx + k]);
+                data[idx + k] = ((sc * a + dst * (255 - a)) / 255) as u8;
+            }
+            data[idx + 3] = 255;
         }
     }
 }
@@ -260,6 +312,29 @@ fn to_bgrx(pm: &Pixmap) -> Vec<u8> {
         out[i + 3] = 0;
     }
     out
+}
+
+/// Load a PNG wallpaper and scale it to cover a `w`x`h` area, returning BGRX
+/// bytes (4 bytes/pixel) ready for `PutImage`. `None` if it can't be read.
+pub fn load_wallpaper(path: &str, w: i32, h: i32) -> Option<Vec<u8>> {
+    use tiny_skia::{PixmapPaint, Transform};
+    let src = Pixmap::load_png(path).ok()?;
+    let (dw, dh) = (w.max(1) as u32, h.max(1) as u32);
+    let mut dst = Pixmap::new(dw, dh)?;
+    dst.fill(argb(theme::COLOR_BG));
+    let scale = (dw as f32 / src.width() as f32).max(dh as f32 / src.height() as f32);
+    let ox = (dw as f32 - src.width() as f32 * scale) / 2.0;
+    let oy = (dh as f32 - src.height() as f32 * scale) / 2.0;
+    let tf = Transform::from_scale(scale, scale).post_translate(ox, oy);
+    dst.as_mut().draw_pixmap(
+        0,
+        0,
+        src.as_ref(),
+        &PixmapPaint::default(),
+        tf,
+        None,
+    );
+    Some(to_bgrx(&dst))
 }
 
 fn load_system_font() -> Font {
