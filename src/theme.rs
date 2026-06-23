@@ -11,6 +11,10 @@ pub const EMPTY_RADIUS: f32 = 14.0;
 pub const TITLEBAR_HEIGHT: i32 = 34;
 pub const TAB_EXTRA_H: i32 = 2;
 
+// Split widths below which the focused client gets font-shrink shortcuts.
+pub const SMUSH_THRESHOLD: i32 = 900;
+pub const TINY_SMUSH_THRESHOLD: i32 = 650;
+
 pub const SPLIT_RATIO: f64 = 0.618;
 pub const RESIZE_STEP: f64 = 0.05;
 pub const SCROLL_STEP: i32 = 100;

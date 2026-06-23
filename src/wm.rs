@@ -88,6 +88,7 @@ struct Wm {
     handle_bound: HashMap<Window, Boundary>,    // resize-handle window -> its boundary
     plus_insert: HashMap<Window, usize>,        // "+" window -> root insertion index
     drag: Option<Drag>,                         // active gap resize
+    smush_applied: HashMap<Win, (u8, i32)>,     // client -> (mode, width bucket)
 }
 
 /// An in-progress gap resize started by dragging a handle.
@@ -210,6 +211,7 @@ pub fn run() -> R<()> {
         handle_bound: HashMap::new(),
         plus_insert: HashMap::new(),
         drag: None,
+        smush_applied: HashMap::new(),
         conn,
         root,
     };
@@ -440,6 +442,7 @@ impl Wm {
         self.state.activate_client(win);
         self.arrange()?;
         self.focus(Some(win))?;
+        self.smush_focused()?;
         Ok(())
     }
 
@@ -574,6 +577,7 @@ impl Wm {
         if self.clients.remove(&win).is_none() {
             return Ok(());
         }
+        self.smush_applied.remove(&win);
         self.state.unpin_client(win);
         // Keep focus inside the leaf the window lived in.
         self.arrange()?;
@@ -652,6 +656,7 @@ impl Wm {
         self.arrange()?;
         let f = self.state.focused_client();
         self.focus(f)?;
+        self.smush_focused()?;
         Ok(())
     }
 
@@ -721,6 +726,7 @@ impl Wm {
     fn on_button_release(&mut self) -> R<()> {
         if self.drag.take().is_some() {
             self.arrange()?;
+            self.smush_focused()?;
         }
         Ok(())
     }
@@ -754,6 +760,61 @@ impl Wm {
             .arg("-c")
             .arg(format!("{term} &"))
             .spawn();
+    }
+
+    // --- smush (auto font shrink in narrow splits) ---
+
+    /// If the focused split is narrow, synthesize Ctrl+0 then Ctrl+- (once or
+    /// twice) into the focused client to shrink its font, matching splitwm's
+    /// smush. Only the focused, settled client is touched; results are cached
+    /// per client + width bucket so small resizes don't re-trigger.
+    fn smush_focused(&mut self) -> R<()> {
+        let Some(c) = self.state.focused_client() else {
+            return Ok(());
+        };
+        let wa = self.wa();
+        let geos = self.state.compute(wa);
+        let Some(g) = geos.get(&self.state.focused_leaf_valid()) else {
+            return Ok(());
+        };
+        let width = g.w;
+        let (mode, bucket) = if width >= theme::SMUSH_THRESHOLD {
+            (0u8, 0)
+        } else if width < theme::TINY_SMUSH_THRESHOLD {
+            (2u8, width / 25)
+        } else {
+            (1u8, width / 25)
+        };
+        match self.smush_applied.get(&c) {
+            Some(&(0, _)) if mode == 0 => return Ok(()), // already at default zoom
+            Some(&(m, b)) if m == mode && b == bucket => return Ok(()),
+            _ => {}
+        }
+        self.smush_applied.insert(c, (mode, bucket));
+
+        let ctrl = self.keymap.get(&0xffe3).copied(); // Control_L
+        let zero = self.keymap.get(&0x30).copied(); // '0'
+        let minus = self.keymap.get(&0x2d).copied(); // '-'
+        let (Some(ctrl), Some(zero), Some(minus)) = (ctrl, zero, minus) else {
+            return Ok(());
+        };
+        self.send_combo(ctrl, zero)?; // reset zoom
+        for _ in 0..mode {
+            self.send_combo(ctrl, minus)?; // shrink
+        }
+        Ok(())
+    }
+
+    /// Synthesize a Ctrl+<key> chord to the focused window via XTEST.
+    fn send_combo(&self, ctrl: u8, key: u8) -> R<()> {
+        use x11rb::protocol::xtest::ConnectionExt as _;
+        const PRESS: u8 = 2;
+        const RELEASE: u8 = 3;
+        for (ty, kc) in [(PRESS, ctrl), (PRESS, key), (RELEASE, key), (RELEASE, ctrl)] {
+            self.conn
+                .xtest_fake_input(ty, kc, CURRENT_TIME, self.root, 0, 0, 0)?;
+        }
+        Ok(())
     }
 
     // --- focus ---
