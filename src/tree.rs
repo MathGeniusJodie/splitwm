@@ -314,9 +314,26 @@ pub struct Boundary {
 
 impl Tree {
     /// Vertical gaps between adjacent columns in every H-branch.
-    pub fn h_boundaries(&self, x: i32, y: i32, w: i32, h: i32, gap: i32, tb_h: i32) -> Vec<Boundary> {
+    pub fn h_boundaries(
+        &self,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        gap: i32,
+        tb_h: i32,
+    ) -> Vec<Boundary> {
         let mut out = Vec::new();
-        self.boundaries_inner(self.root, x + gap, y + gap, w - 2 * gap, h - 2 * gap, gap, tb_h, &mut out);
+        self.boundaries_inner(
+            self.root,
+            x + gap,
+            y + gap,
+            w - 2 * gap,
+            h - 2 * gap,
+            gap,
+            tb_h,
+            &mut out,
+        );
         out
     }
 
@@ -332,7 +349,12 @@ impl Tree {
         tb_h: i32,
         out: &mut Vec<Boundary>,
     ) {
-        let Some(Node::Branch { dir, children, ratios }) = self.nodes.get(&node) else {
+        let Some(Node::Branch {
+            dir,
+            children,
+            ratios,
+        }) = self.nodes.get(&node)
+        else {
             return;
         };
         let inner = gap;

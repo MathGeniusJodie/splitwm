@@ -362,7 +362,10 @@ impl State {
         let root = self.tree.root;
         let is_h = matches!(self.tree.get(root), Some(Node::Branch { dir: Dir::H, .. }));
         if is_h {
-            if let Some(Node::Branch { children, ratios, .. }) = self.tree.get_mut(root) {
+            if let Some(Node::Branch {
+                children, ratios, ..
+            }) = self.tree.get_mut(root)
+            {
                 let avg = ratios.iter().sum::<f64>() / ratios.len() as f64;
                 let i = at.min(children.len());
                 children.insert(i, new);
@@ -421,7 +424,12 @@ fn remove_from_leaf(l: &mut Leaf, c: Win) {
 mod tests {
     use super::*;
 
-    const WA: Rect = Rect { x: 0, y: 0, w: 1280, h: 800 };
+    const WA: Rect = Rect {
+        x: 0,
+        y: 0,
+        w: 1280,
+        h: 800,
+    };
 
     #[test]
     fn insert_at_root_grows_columns() {

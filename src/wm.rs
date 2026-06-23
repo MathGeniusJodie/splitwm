@@ -1,6 +1,13 @@
 //! X11 window-manager core: become WM, manage clients in per-leaf frame
 //! windows, run keybindings, drive the splitwm layout + renderer.
 
+#![allow(
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
+
 use std::collections::HashMap;
 use std::error::Error;
 use std::rc::Rc;
@@ -81,14 +88,14 @@ struct Wm {
     running: bool,
     max_req_bytes: usize,
     atom_net_wm_icon: u32,
-    animate: bool,                              // play a transition on next arrange
+    animate: bool,                               // play a transition on next arrange
     prev_frame_rect: HashMap<NodeId, FrameRect>, // last applied frame screen rects
-    handles: Vec<Window>,                       // pooled gap drag-handle windows
-    plus_btns: Vec<Window>,                     // pooled "+" insert-column windows
-    handle_bound: HashMap<Window, Boundary>,    // resize-handle window -> its boundary
-    plus_insert: HashMap<Window, usize>,        // "+" window -> root insertion index
-    drag: Option<Drag>,                         // active gap resize
-    smush_applied: HashMap<Win, (u8, i32)>,     // client -> (mode, width bucket)
+    handles: Vec<Window>,                        // pooled gap drag-handle windows
+    plus_btns: Vec<Window>,                      // pooled "+" insert-column windows
+    handle_bound: HashMap<Window, Boundary>,     // resize-handle window -> its boundary
+    plus_insert: HashMap<Window, usize>,         // "+" window -> root insertion index
+    drag: Option<Drag>,                          // active gap resize
+    smush_applied: HashMap<Win, (u8, i32)>,      // client -> (mode, width bucket)
 }
 
 /// An in-progress gap resize started by dragging a handle.
@@ -96,7 +103,7 @@ struct Wm {
 struct Drag {
     parent: NodeId,
     idx: usize,
-    left_x: i32,  // canvas-space left edge of the left child
+    left_x: i32,   // canvas-space left edge of the left child
     combined: i32, // left_w + right_w in px (held constant)
     gap: i32,
 }
@@ -481,7 +488,14 @@ impl Wm {
         }
         let reply = self
             .conn
-            .get_property(false, win, self.atom_net_wm_icon, AtomEnum::CARDINAL, 0, u32::MAX)
+            .get_property(
+                false,
+                win,
+                self.atom_net_wm_icon,
+                AtomEnum::CARDINAL,
+                0,
+                u32::MAX,
+            )
             .ok()?
             .reply()
             .ok()?;
@@ -605,7 +619,11 @@ impl Wm {
         // On split the existing content moves to a fresh leaf id; carry its
         // current frame rect over so it slides from its old spot, not a sliver.
         let pre_split = matches!(action, Action::SplitH | Action::SplitV)
-            .then(|| self.prev_frame_rect.get(&self.state.focused_leaf_valid()).copied())
+            .then(|| {
+                self.prev_frame_rect
+                    .get(&self.state.focused_leaf_valid())
+                    .copied()
+            })
             .flatten();
         match action {
             Action::SpawnTerminal => self.spawn_terminal(),
@@ -649,7 +667,8 @@ impl Wm {
             }
         }
         if let Some(rect) = pre_split {
-            self.prev_frame_rect.insert(self.state.focused_leaf_valid(), rect);
+            self.prev_frame_rect
+                .insert(self.state.focused_leaf_valid(), rect);
         }
         self.state.ensure_in_view(wa);
         self.state.scroll_x = self.state.scroll_target;
@@ -973,7 +992,15 @@ impl Wm {
             }
             self.place_frame(frame, target)?;
             self.conn.map_window(frame)?;
-            self.paint_frame_geo(leaf, frame, target.x, target.y, target.w, target.h, focused == leaf)?;
+            self.paint_frame_geo(
+                leaf,
+                frame,
+                target.x,
+                target.y,
+                target.w,
+                target.h,
+                focused == leaf,
+            )?;
             placed.push(Placement {
                 leaf,
                 frame,
@@ -1008,7 +1035,17 @@ impl Wm {
                 EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::BUTTON1_MOTION,
             );
         self.conn.create_window(
-            self.depth, w, self.root, 0, 0, 8, 8, 0, WindowClass::INPUT_OUTPUT, self.visual, &aux,
+            self.depth,
+            w,
+            self.root,
+            0,
+            0,
+            8,
+            8,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            self.visual,
+            &aux,
         )?;
         // Passive grab so the press (and the ensuing motion/release of the
         // drag) is delivered to us via the implicit active grab.
@@ -1037,7 +1074,17 @@ impl Wm {
             .event_mask(EventMask::BUTTON_PRESS | EventMask::EXPOSURE);
         let sz = u16::try_from(Self::PLUS_SZ).unwrap_or(22);
         self.conn.create_window(
-            self.depth, w, self.root, 0, 0, sz, sz, 0, WindowClass::INPUT_OUTPUT, self.visual, &aux,
+            self.depth,
+            w,
+            self.root,
+            0,
+            0,
+            sz,
+            sz,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            self.visual,
+            &aux,
         )?;
         self.conn.grab_button(
             true,
@@ -1083,7 +1130,13 @@ impl Wm {
                 let p = self.ensure_plus(pi)?;
                 self.plus_insert.insert(p, b.idx + 1);
                 let py = b.y + (b.h - Self::PLUS_SZ) / 2;
-                self.show_window(p, vis_x - Self::PLUS_SZ / 2, py, Self::PLUS_SZ, Self::PLUS_SZ)?;
+                self.show_window(
+                    p,
+                    vis_x - Self::PLUS_SZ / 2,
+                    py,
+                    Self::PLUS_SZ,
+                    Self::PLUS_SZ,
+                )?;
                 self.paint_plus(p)?;
                 pi += 1;
             }
@@ -1103,7 +1156,13 @@ impl Wm {
             }
             let p = self.ensure_plus(pi)?;
             self.plus_insert.insert(p, at);
-            self.show_window(p, vis_x - Self::PLUS_SZ / 2, edge_cy, Self::PLUS_SZ, Self::PLUS_SZ)?;
+            self.show_window(
+                p,
+                vis_x - Self::PLUS_SZ / 2,
+                edge_cy,
+                Self::PLUS_SZ,
+                Self::PLUS_SZ,
+            )?;
             self.paint_plus(p)?;
             pi += 1;
         }
@@ -1150,7 +1209,13 @@ impl Wm {
                 width: 2.5,
                 ..Default::default()
             };
-            pm.stroke_path(&path, &paint, &stroke, tiny_skia::Transform::identity(), None);
+            pm.stroke_path(
+                &path,
+                &paint,
+                &stroke,
+                tiny_skia::Transform::identity(),
+                None,
+            );
         }
         let buf = crate::render::pixmap_to_bgrx(&pm);
         self.put_image(w, sz as u16, sz as u16, &buf)?;
@@ -1173,7 +1238,7 @@ impl Wm {
     /// Animate the just-placed frames from their previous rect (or a collapsed
     /// sliver, for freshly-created leaves) to their target, using an
     /// ease-out-back curve — matching splitwm's split/reflow feel.
-    fn run_layout_animation(&mut self, placed: &[Placement]) -> R<()> {
+    fn run_layout_animation(&self, placed: &[Placement]) -> R<()> {
         const FRAMES: i32 = 17; // ~0.28s at 60fps
         let bw = theme::FOCUS_BORDER_WIDTH;
         let tb_h = theme::tb_h(theme::GAP);
@@ -1181,12 +1246,15 @@ impl Wm {
         let starts: Vec<FrameRect> = placed
             .iter()
             .map(|p| {
-                self.prev_frame_rect.get(&p.leaf).copied().unwrap_or(FrameRect {
-                    x: p.target.x,
-                    y: p.target.y,
-                    w: 1,
-                    h: p.target.h,
-                })
+                self.prev_frame_rect
+                    .get(&p.leaf)
+                    .copied()
+                    .unwrap_or(FrameRect {
+                        x: p.target.x,
+                        y: p.target.y,
+                        w: 1,
+                        h: p.target.h,
+                    })
             })
             .collect();
         for step in 1..=FRAMES {
