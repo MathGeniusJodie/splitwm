@@ -40,6 +40,8 @@ mod ks {
     pub const BRACKETRIGHT: u32 = 0x5d;
     pub const MINUS: u32 = 0x2d;
     pub const EQUAL: u32 = 0x3d;
+    pub const ZERO: u32 = 0x30;
+    pub const CONTROL_L: u32 = 0xffe3;
     pub const V: u32 = 0x76;
     pub const H: u32 = 0x68;
     pub const Q: u32 = 0x71;
@@ -804,13 +806,16 @@ impl Wm {
         let Some(g) = geos.get(&self.state.focused_leaf_valid()) else {
             return Ok(());
         };
+        // Bucket widths so sub-bucket resizes don't re-trigger the shortcuts.
+        const SMUSH_BUCKET: i32 = 25;
         let width = g.w;
+        let bucket = width / SMUSH_BUCKET;
         let (mode, bucket) = if width >= theme::SMUSH_THRESHOLD {
             (0u8, 0)
         } else if width < theme::TINY_SMUSH_THRESHOLD {
-            (2u8, width / 25)
+            (2u8, bucket)
         } else {
-            (1u8, width / 25)
+            (1u8, bucket)
         };
         match self.smush_applied.get(&c) {
             Some(&(0, _)) if mode == 0 => return Ok(()), // already at default zoom
@@ -819,9 +824,9 @@ impl Wm {
         }
         self.smush_applied.insert(c, (mode, bucket));
 
-        let ctrl = self.keymap.get(&0xffe3).copied(); // Control_L
-        let zero = self.keymap.get(&0x30).copied(); // '0'
-        let minus = self.keymap.get(&0x2d).copied(); // '-'
+        let ctrl = self.keymap.get(&ks::CONTROL_L).copied();
+        let zero = self.keymap.get(&ks::ZERO).copied();
+        let minus = self.keymap.get(&ks::MINUS).copied();
         let (Some(ctrl), Some(zero), Some(minus)) = (ctrl, zero, minus) else {
             return Ok(());
         };
@@ -897,7 +902,6 @@ impl Wm {
                 h: (geo.h + gap).max(1),
             };
             if target.x + target.w <= wa.x || target.x >= wa.x + wa.w {
-                self.prev_frame_rect.remove(&leaf);
                 continue;
             }
             let active_client = self
@@ -917,9 +921,9 @@ impl Wm {
         self.compute_widgets(wa);
 
         if std::mem::take(&mut self.animate) {
-            self.run_layout_animation(&placed)?;
+            self.run_layout_animation(wa, &placed)?;
         }
-        self.compose(&placed, true)?;
+        self.compose(wa, &placed, true)?;
         self.place_clients(&placed)?;
 
         // Cache final rects as the start point for the next transition.
@@ -930,8 +934,7 @@ impl Wm {
 
     /// Composite the wallpaper, every placed leaf's chrome, and (optionally)
     /// the drag handles / "+" buttons onto the single underlay window.
-    fn compose(&self, placed: &[Placement], widgets: bool) -> R<()> {
-        let wa = self.wa();
+    fn compose(&self, wa: Rect, placed: &[Placement], widgets: bool) -> R<()> {
         let (w, h) = (wa.w.max(1) as u32, wa.h.max(1) as u32);
         let mut pm = self.renderer.screen_base(w, h);
         {
@@ -961,17 +964,12 @@ impl Wm {
 
     /// Build the render view for a leaf at a given (possibly animated) size.
     fn leaf_view(&self, leaf: NodeId, w: i32, h: i32, focused: bool) -> LeafView {
-        let accent = self
-            .state
-            .tree
-            .leaf(leaf)
+        let l = self.state.tree.leaf(leaf);
+        let accent = l
             .and_then(|l| l.tabs.get(l.active))
             .and_then(|c| self.clients.get(c))
             .map_or(theme::COLOR_ACCENT, |c| c.color);
-        let tabs: Vec<TabInfo> = self
-            .state
-            .tree
-            .leaf(leaf)
+        let tabs: Vec<TabInfo> = l
             .map(|l| {
                 l.tabs
                     .iter()
@@ -1035,6 +1033,18 @@ impl Wm {
     // --- gap drag handles & "+" insert buttons (composited on the underlay) ---
 
     const PLUS_SZ: i32 = 22;
+    /// Total px trimmed off the gap to get the drag-handle pill width.
+    const HANDLE_INSET: i32 = 10;
+
+    /// A `PLUS_SZ`-square hit/draw rect centred horizontally on `vis_x`.
+    const fn plus_rect(vis_x: i32, y: i32) -> FrameRect {
+        FrameRect {
+            x: vis_x - Self::PLUS_SZ / 2,
+            y,
+            w: Self::PLUS_SZ,
+            h: Self::PLUS_SZ,
+        }
+    }
 
     /// Recompute the screen-space hit-regions for gap drag handles and "+"
     /// insert buttons. They are drawn by `compose`, not separate windows.
@@ -1042,7 +1052,7 @@ impl Wm {
         self.handle_regions.clear();
         self.plus_regions.clear();
         let gap = theme::GAP;
-        let hw = (gap - 10).max(4);
+        let hw = (gap - Self::HANDLE_INSET).max(4);
         let scroll_x = self.state.scroll_x;
         let canvas_w = self.state.canvas_w.unwrap_or(wa.w);
         for b in self.state.boundaries(wa) {
@@ -1061,15 +1071,7 @@ impl Wm {
             ));
             if b.root {
                 let py = b.y + (b.h - Self::PLUS_SZ) / 2;
-                self.plus_regions.push((
-                    FrameRect {
-                        x: vis_x - Self::PLUS_SZ / 2,
-                        y: py,
-                        w: Self::PLUS_SZ,
-                        h: Self::PLUS_SZ,
-                    },
-                    b.idx + 1,
-                ));
+                self.plus_regions.push((Self::plus_rect(vis_x, py), b.idx + 1));
             }
         }
         // Edge "+" buttons (insert at the far left / far right of the canvas).
@@ -1083,15 +1085,7 @@ impl Wm {
             if vis_x < wa.x || vis_x > wa.x + wa.w {
                 continue;
             }
-            self.plus_regions.push((
-                FrameRect {
-                    x: vis_x - Self::PLUS_SZ / 2,
-                    y: edge_cy,
-                    w: Self::PLUS_SZ,
-                    h: Self::PLUS_SZ,
-                },
-                at,
-            ));
+            self.plus_regions.push((Self::plus_rect(vis_x, edge_cy), at));
         }
     }
 
@@ -1103,7 +1097,7 @@ impl Wm {
     /// full-screen software recomposite + blit (not cheap), so we step by how
     /// much real time has elapsed and always finish in `DURATION`, ending
     /// exactly on the target. A slow renderer simply shows fewer frames.
-    fn run_layout_animation(&self, placed: &[Placement]) -> R<()> {
+    fn run_layout_animation(&self, wa: Rect, placed: &[Placement]) -> R<()> {
         use std::time::{Duration, Instant};
         const DURATION: Duration = Duration::from_millis(280);
         let starts: Vec<FrameRect> = placed
@@ -1134,7 +1128,7 @@ impl Wm {
                     focused: p.focused,
                 })
                 .collect();
-            self.compose(&interp, false)?;
+            self.compose(wa, &interp, false)?;
             self.place_clients(&interp)?;
             self.conn.flush()?;
             if t >= 1.0 {
