@@ -127,9 +127,10 @@ struct Placement {
 
 /// ease-out-back (slight overshoot then settle), matching animation.lua.
 fn ease_out_back(t: f32) -> f32 {
-    let c = 1.1;
+    let c = 1.1_f32;
     let t = t - 1.0;
-    t * t * ((c + 1.0) * t + c) + 1.0
+    let inner = (c + 1.0).mul_add(t, c);
+    (t * t).mul_add(inner, 1.0)
 }
 
 fn lerp_rect(a: FrameRect, b: FrameRect, p: f32) -> FrameRect {
@@ -891,6 +892,7 @@ impl Wm {
         Ok(f)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn arrange(&mut self) -> R<()> {
         // Refresh the focused client's sampled accent from its content.
         if let Some(f) = self.state.focused_client() {

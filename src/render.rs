@@ -358,8 +358,8 @@ fn load_wallpaper_pixmap(path: &str, w: i32, h: i32) -> Option<Pixmap> {
     let mut dst = Pixmap::new(dw, dh)?;
     dst.fill(argb(theme::COLOR_BG));
     let scale = (dw as f32 / src.width() as f32).max(dh as f32 / src.height() as f32);
-    let ox = (dw as f32 - src.width() as f32 * scale) / 2.0;
-    let oy = (dh as f32 - src.height() as f32 * scale) / 2.0;
+    let ox = (src.width() as f32).mul_add(-scale, dw as f32) / 2.0;
+    let oy = (src.height() as f32).mul_add(-scale, dh as f32) / 2.0;
     let tf = Transform::from_scale(scale, scale).post_translate(ox, oy);
     dst.as_mut()
         .draw_pixmap(0, 0, src.as_ref(), &PixmapPaint::default(), tf, None);

@@ -357,6 +357,7 @@ impl State {
 
     /// Insert a new empty leaf column at root-children index `at`, making the
     /// root an H-branch if it isn't one. The new leaf becomes focused.
+    #[allow(clippy::cast_precision_loss)]
     pub fn insert_at_root(&mut self, at: usize) -> NodeId {
         let new = self.tree.make_leaf();
         let root = self.tree.root;
