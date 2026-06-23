@@ -297,6 +297,87 @@ impl Tree {
     }
 }
 
+/// A vertical gap between two horizontally-adjacent children of an H-branch:
+/// the place a drag handle / "+" button sits. Coordinates are canvas-space.
+#[derive(Clone, Copy)]
+pub struct Boundary {
+    pub parent: NodeId,
+    pub idx: usize, // left child index within parent.children
+    pub x: i32,     // gap centre x
+    pub left_x: i32,
+    pub left_w: i32,
+    pub right_w: i32,
+    pub y: i32,
+    pub h: i32,
+    pub root: bool, // whether `parent` is the tree root (insert eligible)
+}
+
+impl Tree {
+    /// Vertical gaps between adjacent columns in every H-branch.
+    pub fn h_boundaries(&self, x: i32, y: i32, w: i32, h: i32, gap: i32, tb_h: i32) -> Vec<Boundary> {
+        let mut out = Vec::new();
+        self.boundaries_inner(self.root, x + gap, y + gap, w - 2 * gap, h - 2 * gap, gap, tb_h, &mut out);
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn boundaries_inner(
+        &self,
+        node: NodeId,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        gap: i32,
+        tb_h: i32,
+        out: &mut Vec<Boundary>,
+    ) {
+        let Some(Node::Branch { dir, children, ratios }) = self.nodes.get(&node) else {
+            return;
+        };
+        let inner = gap;
+        let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
+        let meta: Vec<(bool, f64)> = children
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (self.leaf(c).is_some_and(|l| l.minimized), ratios[i]))
+            .collect();
+        if *dir == Dir::H {
+            let usable = (w - inner * (n - 1)).max(0);
+            let sizes = child_sizes(&meta, usable, gap);
+            let mut cx = x;
+            for (i, &c) in children.iter().enumerate() {
+                let cw = sizes[i];
+                if i + 1 < children.len() {
+                    out.push(Boundary {
+                        parent: node,
+                        idx: i,
+                        x: cx + cw + inner / 2,
+                        left_x: cx,
+                        left_w: cw,
+                        right_w: sizes[i + 1],
+                        y,
+                        h,
+                        root: node == self.root,
+                    });
+                }
+                self.boundaries_inner(c, cx, y, cw, h, gap, tb_h, out);
+                cx += cw + inner;
+            }
+        } else {
+            let usable = (h - inner * (n - 1)).max(0);
+            let min_sz = (tb_h - inner).max(0);
+            let sizes = child_sizes(&meta, usable, min_sz);
+            let mut cy = y;
+            for (i, &c) in children.iter().enumerate() {
+                let ch = sizes[i];
+                self.boundaries_inner(c, x, cy, w, ch, gap, tb_h, out);
+                cy += ch + inner;
+            }
+        }
+    }
+}
+
 /// Client content rect inside a leaf (below the tab bar, inside the border),
 /// translated by horizontal scroll. Mirrors `theme.client_geo` in Lua.
 pub fn client_geo(geo: Rect, bw: i32, gap: i32, tb_h: i32, scroll_x: i32) -> Rect {

@@ -2,7 +2,7 @@
 //! Combines splitwm core.lua + ops.lua + scroll bookkeeping for one tag.
 
 use crate::theme;
-use crate::tree::{Dir, Leaf, Node, NodeId, Rect, Tree, Win};
+use crate::tree::{Boundary, Dir, Leaf, Node, NodeId, Rect, Tree, Win};
 
 pub struct State {
     pub tree: Tree,
@@ -334,6 +334,57 @@ impl State {
             .compute(wa.x, wa.y, canvas_w, wa.h, gap, theme::tb_h(gap))
     }
 
+    /// Vertical gaps between columns, for drag handles / insert buttons.
+    pub fn boundaries(&self, wa: Rect) -> Vec<Boundary> {
+        let gap = theme::GAP;
+        let canvas_w = self.canvas_w.unwrap_or(wa.w);
+        self.tree
+            .h_boundaries(wa.x, wa.y, canvas_w, wa.h, gap, theme::tb_h(gap))
+    }
+
+    /// Set the split ratio at a boundary so the left child occupies fraction
+    /// `frac` of the two neighbours' combined width (their sum is preserved).
+    pub fn resize_boundary(&mut self, parent: NodeId, idx: usize, frac: f64) {
+        if let Some(Node::Branch { ratios, .. }) = self.tree.get_mut(parent) {
+            if idx + 1 < ratios.len() {
+                let combined = ratios[idx] + ratios[idx + 1];
+                let f = frac.clamp(0.05, 0.95);
+                ratios[idx] = combined * f;
+                ratios[idx + 1] = combined * (1.0 - f);
+            }
+        }
+    }
+
+    /// Insert a new empty leaf column at root-children index `at`, making the
+    /// root an H-branch if it isn't one. The new leaf becomes focused.
+    pub fn insert_at_root(&mut self, at: usize) -> NodeId {
+        let new = self.tree.make_leaf();
+        let root = self.tree.root;
+        let is_h = matches!(self.tree.get(root), Some(Node::Branch { dir: Dir::H, .. }));
+        if is_h {
+            if let Some(Node::Branch { children, ratios, .. }) = self.tree.get_mut(root) {
+                let avg = ratios.iter().sum::<f64>() / ratios.len() as f64;
+                let i = at.min(children.len());
+                children.insert(i, new);
+                ratios.insert(i, avg);
+                let s: f64 = ratios.iter().sum();
+                for r in ratios.iter_mut() {
+                    *r /= s;
+                }
+            }
+        } else {
+            let branch = self.tree.make_branch(Dir::H, theme::SPLIT_RATIO, root, new);
+            if at == 0 {
+                if let Some(Node::Branch { children, .. }) = self.tree.get_mut(branch) {
+                    children.swap(0, 1);
+                }
+            }
+            self.tree.root = branch;
+        }
+        self.focused_leaf = new;
+        new
+    }
+
     /// Scroll so the focused split sits inside the viewport (one gap margin).
     pub fn ensure_in_view(&mut self, wa: Rect) {
         let geos = self.compute(wa);
@@ -363,5 +414,72 @@ fn remove_from_leaf(l: &mut Leaf, c: Win) {
         } else if i < l.active || l.active >= l.tabs.len() {
             l.active = l.active.saturating_sub(1).min(l.tabs.len() - 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WA: Rect = Rect { x: 0, y: 0, w: 1280, h: 800 };
+
+    #[test]
+    fn insert_at_root_grows_columns() {
+        let mut s = State::new();
+        s.split_focused(Dir::H); // root H-branch, 2 columns
+        assert_eq!(s.tree.collect_leaves().len(), 2);
+        s.insert_at_root(1); // insert between
+        assert_eq!(s.tree.collect_leaves().len(), 3);
+        // The inserted leaf is focused and empty.
+        assert!(s.focused_client().is_none());
+        // Ratios renormalise to sum 1.
+        if let Some(Node::Branch { ratios, .. }) = s.tree.get(s.tree.root) {
+            let sum: f64 = ratios.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-9, "ratios sum {sum}");
+        } else {
+            panic!("root not a branch");
+        }
+    }
+
+    #[test]
+    fn insert_at_root_wraps_single_leaf() {
+        let mut s = State::new();
+        s.insert_at_root(0); // root is a lone leaf -> wrap into H-branch
+        assert_eq!(s.tree.collect_leaves().len(), 2);
+        assert!(matches!(
+            s.tree.get(s.tree.root),
+            Some(Node::Branch { dir: Dir::H, .. })
+        ));
+    }
+
+    #[test]
+    fn resize_boundary_preserves_neighbour_sum() {
+        let mut s = State::new();
+        s.split_focused(Dir::H);
+        let root = s.tree.root;
+        let before = match s.tree.get(root) {
+            Some(Node::Branch { ratios, .. }) => ratios[0] + ratios[1],
+            _ => panic!(),
+        };
+        s.resize_boundary(root, 0, 0.25);
+        match s.tree.get(root) {
+            Some(Node::Branch { ratios, .. }) => {
+                assert!((ratios[0] + ratios[1] - before).abs() < 1e-9);
+                assert!((ratios[0] / (ratios[0] + ratios[1]) - 0.25).abs() < 1e-9);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn boundaries_match_column_count() {
+        let mut s = State::new();
+        s.split_focused(Dir::H);
+        s.canvas_w = Some(WA.w);
+        // One gap between two columns.
+        assert_eq!(s.boundaries(WA).len(), 1);
+        s.insert_at_root(1);
+        s.canvas_w = Some(WA.w);
+        assert_eq!(s.boundaries(WA).len(), 2);
     }
 }

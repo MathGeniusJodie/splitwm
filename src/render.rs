@@ -15,13 +15,16 @@ use std::rc::Rc;
 
 use fontdue::Font;
 use tiny_skia::{
-    Color, FillRule, Paint, PathBuilder, Pixmap, PixmapMut, Rect as SkRect, Stroke, Transform,
+    Color, FillRule, Paint, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Rect as SkRect, Stroke,
+    Transform,
 };
 
 use crate::theme;
 
 pub struct Renderer {
     font: Font,
+    /// Screen-sized scaled wallpaper; frame backgrounds copy their slice of it.
+    wallpaper: Option<Pixmap>,
 }
 
 /// A decoded application icon (non-premultiplied ARGB pixels, row-major).
@@ -39,6 +42,8 @@ pub struct TabInfo {
 }
 
 pub struct LeafView {
+    pub x: i32, // frame screen position (for wallpaper alignment)
+    pub y: i32,
     pub w: i32,
     pub h: i32, // frame height (content height + gap)
     pub tb_h: i32,
@@ -65,7 +70,21 @@ const TAB_CORNER: f32 = 9.0;
 impl Renderer {
     pub fn new() -> Self {
         let font = load_system_font();
-        Self { font }
+        Self {
+            font,
+            wallpaper: None,
+        }
+    }
+
+    /// Load+scale a PNG wallpaper to cover `w`x`h`. Returns whether it loaded.
+    pub fn set_wallpaper(&mut self, path: &str, w: i32, h: i32) -> bool {
+        self.wallpaper = load_wallpaper_pixmap(path, w, h);
+        self.wallpaper.is_some()
+    }
+
+    /// The scaled wallpaper as `PutImage`-ready BGRX bytes (for the root).
+    pub fn wallpaper_bgrx(&self) -> Option<Vec<u8>> {
+        self.wallpaper.as_ref().map(to_bgrx)
     }
 
     /// Render the leaf frame. Returns BGRX bytes (4 bytes/pixel).
@@ -74,8 +93,20 @@ impl Renderer {
         let h = v.h.max(1) as u32;
         let mut pm = Pixmap::new(w, h).unwrap();
 
-        // Whole frame opaque background (wallpaper colour) so gaps blend in.
-        pm.fill(argb(theme::WALLPAPER));
+        // Background: copy this frame's slice of the wallpaper so it blends
+        // seamlessly into the surrounding gaps; solid colour if there is none.
+        if let Some(wp) = &self.wallpaper {
+            pm.as_mut().draw_pixmap(
+                0,
+                0,
+                wp.as_ref(),
+                &PixmapPaint::default(),
+                Transform::from_translate(-v.x as f32, -v.y as f32),
+                None,
+            );
+        } else {
+            pm.fill(argb(theme::WALLPAPER));
+        }
 
         let tb_h = v.tb_h as f32;
         let bw = v.bw as f32;
@@ -301,6 +332,11 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> tiny_skia::Path {
     pb.finish().unwrap()
 }
 
+/// Public wrapper: convert a tiny-skia pixmap to `PutImage`-ready BGRX bytes.
+pub fn pixmap_to_bgrx(pm: &Pixmap) -> Vec<u8> {
+    to_bgrx(pm)
+}
+
 fn to_bgrx(pm: &Pixmap) -> Vec<u8> {
     let src = pm.data();
     let mut out = vec![0u8; src.len()];
@@ -314,10 +350,9 @@ fn to_bgrx(pm: &Pixmap) -> Vec<u8> {
     out
 }
 
-/// Load a PNG wallpaper and scale it to cover a `w`x`h` area, returning BGRX
-/// bytes (4 bytes/pixel) ready for `PutImage`. `None` if it can't be read.
-pub fn load_wallpaper(path: &str, w: i32, h: i32) -> Option<Vec<u8>> {
-    use tiny_skia::{PixmapPaint, Transform};
+/// Load a PNG wallpaper and scale it to cover a `w`x`h` area. `None` if it
+/// can't be read.
+fn load_wallpaper_pixmap(path: &str, w: i32, h: i32) -> Option<Pixmap> {
     let src = Pixmap::load_png(path).ok()?;
     let (dw, dh) = (w.max(1) as u32, h.max(1) as u32);
     let mut dst = Pixmap::new(dw, dh)?;
@@ -326,15 +361,9 @@ pub fn load_wallpaper(path: &str, w: i32, h: i32) -> Option<Vec<u8>> {
     let ox = (dw as f32 - src.width() as f32 * scale) / 2.0;
     let oy = (dh as f32 - src.height() as f32 * scale) / 2.0;
     let tf = Transform::from_scale(scale, scale).post_translate(ox, oy);
-    dst.as_mut().draw_pixmap(
-        0,
-        0,
-        src.as_ref(),
-        &PixmapPaint::default(),
-        tf,
-        None,
-    );
-    Some(to_bgrx(&dst))
+    dst.as_mut()
+        .draw_pixmap(0, 0, src.as_ref(), &PixmapPaint::default(), tf, None);
+    Some(dst)
 }
 
 fn load_system_font() -> Font {

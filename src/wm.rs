@@ -19,7 +19,7 @@ use x11rb::CURRENT_TIME;
 use crate::render::{Icon, LeafView, Renderer, TabInfo};
 use crate::state::State;
 use crate::theme;
-use crate::tree::{client_geo, Dir, NodeId, Rect, Win};
+use crate::tree::{client_geo, Boundary, Dir, NodeId, Rect, Win};
 
 type R<T> = Result<T, Box<dyn Error>>;
 
@@ -83,6 +83,21 @@ struct Wm {
     atom_net_wm_icon: u32,
     animate: bool,                              // play a transition on next arrange
     prev_frame_rect: HashMap<NodeId, FrameRect>, // last applied frame screen rects
+    handles: Vec<Window>,                       // pooled gap drag-handle windows
+    plus_btns: Vec<Window>,                     // pooled "+" insert-column windows
+    handle_bound: HashMap<Window, Boundary>,    // resize-handle window -> its boundary
+    plus_insert: HashMap<Window, usize>,        // "+" window -> root insertion index
+    drag: Option<Drag>,                         // active gap resize
+}
+
+/// An in-progress gap resize started by dragging a handle.
+#[derive(Clone, Copy)]
+struct Drag {
+    parent: NodeId,
+    idx: usize,
+    left_x: i32,  // canvas-space left edge of the left child
+    combined: i32, // left_w + right_w in px (held constant)
+    gap: i32,
 }
 
 #[derive(Clone, Copy)]
@@ -190,6 +205,11 @@ pub fn run() -> R<()> {
         atom_net_wm_icon,
         animate: false,
         prev_frame_rect: HashMap::new(),
+        handles: Vec::new(),
+        plus_btns: Vec::new(),
+        handle_bound: HashMap::new(),
+        plus_insert: HashMap::new(),
+        drag: None,
         conn,
         root,
     };
@@ -235,7 +255,10 @@ impl Wm {
             return Ok(());
         };
         let wa = self.wa();
-        let Some(buf) = crate::render::load_wallpaper(&path, wa.w, wa.h) else {
+        if !self.renderer.set_wallpaper(&path, wa.w, wa.h) {
+            return Ok(());
+        }
+        let Some(buf) = self.renderer.wallpaper_bgrx() else {
             return Ok(());
         };
         let (w, h) = (wa.w as u16, wa.h as u16);
@@ -342,6 +365,8 @@ impl Wm {
             Event::ConfigureRequest(e) => self.on_configure_request(&e)?,
             Event::KeyPress(e) => self.on_key(e)?,
             Event::ButtonPress(e) => self.on_button(e)?,
+            Event::ButtonRelease(_) => self.on_button_release()?,
+            Event::MotionNotify(e) => self.on_motion(&e)?,
             Event::Expose(e) => self.on_expose(e)?,
             _ => {}
         }
@@ -632,6 +657,31 @@ impl Wm {
 
     fn on_button(&mut self, e: ButtonPressEvent) -> R<()> {
         let wa = self.wa();
+        // Drag handle: begin a gap resize.
+        if e.detail == 1 {
+            if let Some(b) = self.handle_bound.get(&e.event).copied() {
+                self.drag = Some(Drag {
+                    parent: b.parent,
+                    idx: b.idx,
+                    left_x: b.left_x,
+                    combined: b.left_w + b.right_w,
+                    gap: theme::GAP,
+                });
+                return Ok(());
+            }
+            // "+" button: insert a column.
+            if let Some(&at) = self.plus_insert.get(&e.event) {
+                let idx = if at == usize::MAX { usize::MAX } else { at };
+                self.state.insert_at_root(idx);
+                self.animate = true;
+                self.state.ensure_in_view(wa);
+                self.state.scroll_x = self.state.scroll_target;
+                self.arrange()?;
+                let f = self.state.focused_client();
+                self.focus(f)?;
+                return Ok(());
+            }
+        }
         if e.detail == 4 || e.detail == 5 {
             let dir = if e.detail == 4 { -1 } else { 1 };
             self.state.scroll_delta(wa, dir * theme::SCROLL_STEP);
@@ -653,8 +703,35 @@ impl Wm {
         Ok(())
     }
 
+    fn on_motion(&mut self, e: &x11rb::protocol::xproto::MotionNotifyEvent) -> R<()> {
+        let Some(d) = self.drag else {
+            return Ok(());
+        };
+        if d.combined <= 0 {
+            return Ok(());
+        }
+        let canvas_mx = i32::from(e.root_x) + self.state.scroll_x;
+        let new_left_w = canvas_mx - d.left_x - d.gap / 2;
+        let frac = f64::from(new_left_w) / f64::from(d.combined);
+        self.state.resize_boundary(d.parent, d.idx, frac);
+        self.arrange()?;
+        Ok(())
+    }
+
+    fn on_button_release(&mut self) -> R<()> {
+        if self.drag.take().is_some() {
+            self.arrange()?;
+        }
+        Ok(())
+    }
+
     fn on_expose(&self, e: ExposeEvent) -> R<()> {
         if e.count != 0 {
+            return Ok(());
+        }
+        // A "+" button exposed: repaint its glyph.
+        if self.plus_insert.contains_key(&e.window) {
+            self.paint_plus(e.window)?;
             return Ok(());
         }
         // Repaint whichever frame got exposed.
@@ -835,7 +912,7 @@ impl Wm {
             }
             self.place_frame(frame, target)?;
             self.conn.map_window(frame)?;
-            self.paint_frame_geo(leaf, frame, target.w, target.h, focused == leaf)?;
+            self.paint_frame_geo(leaf, frame, target.x, target.y, target.w, target.h, focused == leaf)?;
             placed.push(Placement {
                 leaf,
                 frame,
@@ -850,7 +927,172 @@ impl Wm {
         }
         // Cache final rects as the start point for the next transition.
         self.prev_frame_rect = placed.iter().map(|p| (p.leaf, p.target)).collect();
+        self.update_handles(wa)?;
         self.conn.flush()?;
+        Ok(())
+    }
+
+    // --- gap drag handles & "+" insert buttons ---
+
+    const PLUS_SZ: i32 = 22;
+
+    fn ensure_handle(&mut self, i: usize) -> R<Window> {
+        if let Some(&w) = self.handles.get(i) {
+            return Ok(w);
+        }
+        let w = self.conn.generate_id()?;
+        let aux = CreateWindowAux::new()
+            .background_pixel(theme::COLOR_HANDLE & 0x00ff_ffff | 0x0040_4048)
+            .event_mask(
+                EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::BUTTON1_MOTION,
+            );
+        self.conn.create_window(
+            self.depth, w, self.root, 0, 0, 8, 8, 0, WindowClass::INPUT_OUTPUT, self.visual, &aux,
+        )?;
+        // Passive grab so the press (and the ensuing motion/release of the
+        // drag) is delivered to us via the implicit active grab.
+        self.conn.grab_button(
+            true,
+            w,
+            EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::BUTTON1_MOTION,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            x11rb::NONE,
+            x11rb::NONE,
+            ButtonIndex::M1,
+            ModMask::ANY,
+        )?;
+        self.handles.push(w);
+        Ok(w)
+    }
+
+    fn ensure_plus(&mut self, i: usize) -> R<Window> {
+        if let Some(&w) = self.plus_btns.get(i) {
+            return Ok(w);
+        }
+        let w = self.conn.generate_id()?;
+        let aux = CreateWindowAux::new()
+            .background_pixel(0x0020_2024)
+            .event_mask(EventMask::BUTTON_PRESS | EventMask::EXPOSURE);
+        let sz = u16::try_from(Self::PLUS_SZ).unwrap_or(22);
+        self.conn.create_window(
+            self.depth, w, self.root, 0, 0, sz, sz, 0, WindowClass::INPUT_OUTPUT, self.visual, &aux,
+        )?;
+        self.conn.grab_button(
+            true,
+            w,
+            EventMask::BUTTON_PRESS,
+            GrabMode::ASYNC,
+            GrabMode::ASYNC,
+            x11rb::NONE,
+            x11rb::NONE,
+            ButtonIndex::M1,
+            ModMask::ANY,
+        )?;
+        self.plus_btns.push(w);
+        Ok(w)
+    }
+
+    /// Place gap drag handles and "+" insert buttons for the current layout.
+    fn update_handles(&mut self, wa: Rect) -> R<()> {
+        // Don't reshuffle while a drag is live.
+        if self.drag.is_some() {
+            return Ok(());
+        }
+        let gap = theme::GAP;
+        let hw = (gap - 10).max(4);
+        let scroll_x = self.state.scroll_x;
+        let canvas_w = self.state.canvas_w.unwrap_or(wa.w);
+        let bounds = self.state.boundaries(wa);
+        self.handle_bound.clear();
+        self.plus_insert.clear();
+
+        let (mut hi, mut pi) = (0usize, 0usize);
+        for b in &bounds {
+            let vis_x = b.x - scroll_x;
+            if vis_x + hw / 2 <= wa.x || vis_x - hw / 2 >= wa.x + wa.w {
+                continue;
+            }
+            let h = self.ensure_handle(hi)?;
+            self.handle_bound.insert(h, *b);
+            self.show_window(h, vis_x - hw / 2, b.y, hw, b.h.max(1))?;
+            hi += 1;
+            // "+" inserts a column only at root-level gaps.
+            if b.root {
+                let p = self.ensure_plus(pi)?;
+                self.plus_insert.insert(p, b.idx + 1);
+                let py = b.y + (b.h - Self::PLUS_SZ) / 2;
+                self.show_window(p, vis_x - Self::PLUS_SZ / 2, py, Self::PLUS_SZ, Self::PLUS_SZ)?;
+                self.paint_plus(p)?;
+                pi += 1;
+            }
+        }
+
+        // Edge "+" buttons (insert at the far left / far right of the canvas).
+        let span_y = wa.y + gap;
+        let span_h = (wa.h - 2 * gap).max(Self::PLUS_SZ);
+        let edge_cy = span_y + (span_h - Self::PLUS_SZ) / 2;
+        for (canvas_x, at) in [
+            (wa.x + gap / 2, 0usize),
+            (wa.x + canvas_w - gap / 2, usize::MAX),
+        ] {
+            let vis_x = canvas_x - scroll_x;
+            if vis_x < wa.x || vis_x > wa.x + wa.w {
+                continue;
+            }
+            let p = self.ensure_plus(pi)?;
+            self.plus_insert.insert(p, at);
+            self.show_window(p, vis_x - Self::PLUS_SZ / 2, edge_cy, Self::PLUS_SZ, Self::PLUS_SZ)?;
+            self.paint_plus(p)?;
+            pi += 1;
+        }
+
+        for i in hi..self.handles.len() {
+            self.conn.unmap_window(self.handles[i])?;
+        }
+        for i in pi..self.plus_btns.len() {
+            self.conn.unmap_window(self.plus_btns[i])?;
+        }
+        Ok(())
+    }
+
+    fn show_window(&self, w: Window, x: i32, y: i32, width: i32, height: i32) -> R<()> {
+        self.conn.configure_window(
+            w,
+            &ConfigureWindowAux::new()
+                .x(x)
+                .y(y)
+                .width(u32::try_from(width).unwrap_or(1))
+                .height(u32::try_from(height).unwrap_or(1))
+                .stack_mode(StackMode::ABOVE),
+        )?;
+        self.conn.map_window(w)?;
+        Ok(())
+    }
+
+    fn paint_plus(&self, w: Window) -> R<()> {
+        let sz = Self::PLUS_SZ;
+        let mut pm = tiny_skia::Pixmap::new(sz as u32, sz as u32).unwrap();
+        pm.fill(tiny_skia::Color::from_rgba8(0x20, 0x20, 0x24, 0xff));
+        let c = sz as f32 / 2.0;
+        let arm = sz as f32 * 0.28;
+        let mut pb = tiny_skia::PathBuilder::new();
+        pb.move_to(c - arm, c);
+        pb.line_to(c + arm, c);
+        pb.move_to(c, c - arm);
+        pb.line_to(c, c + arm);
+        if let Some(path) = pb.finish() {
+            let mut paint = tiny_skia::Paint::default();
+            paint.set_color(tiny_skia::Color::from_rgba8(0xff, 0xff, 0xff, 0xff));
+            paint.anti_alias = true;
+            let stroke = tiny_skia::Stroke {
+                width: 2.5,
+                ..Default::default()
+            };
+            pm.stroke_path(&path, &paint, &stroke, tiny_skia::Transform::identity(), None);
+        }
+        let buf = crate::render::pixmap_to_bgrx(&pm);
+        self.put_image(w, sz as u16, sz as u16, &buf)?;
         Ok(())
     }
 
@@ -904,7 +1146,7 @@ impl Wm {
                             .height(u32::try_from(ch).unwrap_or(1)),
                     )?;
                 }
-                self.paint_frame_geo(p.leaf, p.frame, r.w.max(1), r.h.max(1), p.focused)?;
+                self.paint_frame_geo(p.leaf, p.frame, r.x, r.y, r.w.max(1), r.h.max(1), p.focused)?;
             }
             self.conn.flush()?;
             std::thread::sleep(std::time::Duration::from_millis(16));
@@ -921,16 +1163,21 @@ impl Wm {
         self.paint_frame_geo(
             leaf,
             frame,
+            i32::from(g.x),
+            i32::from(g.y),
             i32::from(g.width),
             i32::from(g.height),
             focused,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn paint_frame_geo(
         &self,
         leaf: NodeId,
         frame: Window,
+        fx: i32,
+        fy: i32,
         fw: i32,
         fh: i32,
         focused: bool,
@@ -965,6 +1212,8 @@ impl Wm {
         };
 
         let view = LeafView {
+            x: fx,
+            y: fy,
             w: fw,
             h: fh,
             tb_h,
