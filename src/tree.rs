@@ -141,9 +141,16 @@ impl Tree {
     }
 
     pub fn find_leaf_for_client(&self, c: Win) -> Option<NodeId> {
-        self.collect_leaves()
-            .into_iter()
-            .find(|&l| self.leaf(l).is_some_and(|lf| lf.tabs.contains(&c)))
+        self.find_leaf_for_client_from(self.root, c)
+    }
+
+    fn find_leaf_for_client_from(&self, node: NodeId, c: Win) -> Option<NodeId> {
+        match self.nodes.get(&node)? {
+            Node::Leaf(l) => l.tabs.contains(&c).then_some(node),
+            Node::Branch { children, .. } => children
+                .iter()
+                .find_map(|&child| self.find_leaf_for_client_from(child, c)),
+        }
     }
 
     pub fn contains(&self, subtree: NodeId, target: NodeId) -> bool {

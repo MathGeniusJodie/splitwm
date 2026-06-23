@@ -8,8 +8,8 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     Allow, AtomEnum, ButtonIndex, ButtonPressEvent, ChangeWindowAttributesAux,
     ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, CreateGCAux, CreateWindowAux,
-    EventMask, ExposeEvent, GrabMode, ImageFormat, InputFocus, KeyPressEvent, MapRequestEvent,
-    ModMask, StackMode, Window, WindowClass,
+    EventMask, ExposeEvent, Gcontext, GrabMode, ImageFormat, InputFocus, KeyPressEvent,
+    MapRequestEvent, ModMask, StackMode, Window, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
@@ -73,6 +73,7 @@ struct Wm {
     clients: HashMap<Win, Client>,
     frames: HashMap<NodeId, Window>, // leaf id -> frame window
     renderer: Renderer,
+    gc: Gcontext, // shared graphics context for all `PutImage` blits
     keymap: HashMap<u32, u8>,         // keysym -> keycode
     bindings: Vec<(u16, u8, Action)>, // (modmask, keycode, action)
     running: bool,
@@ -124,9 +125,15 @@ pub fn run() -> R<()> {
     // Conservative cap for chunking PutImage (X core caps near 256 KiB).
     let max_req_bytes = 200_000usize;
 
+    // One graphics context, reused for every frame blit (all frames share the
+    // root's depth/visual, so a single GC created on root works for all).
+    let gc = conn.generate_id()?;
+    conn.create_gc(gc, root, &CreateGCAux::new())?;
+
     let mut wm = Wm {
         depth: screen.root_depth,
         visual: screen.root_visual,
+        gc,
         keymap: HashMap::new(),
         bindings: Vec::new(),
         renderer: Renderer::new(),
@@ -510,6 +517,16 @@ impl Wm {
 
     // --- frames & arrange ---
 
+    /// Reparent a client window into `parent` and record which leaf now owns
+    /// it. `leaf` is `NodeId::MAX` when parking a client back on root.
+    fn reparent_client(&mut self, w: Win, parent: Window, leaf: NodeId) -> R<()> {
+        self.conn.reparent_window(w, parent, 0, 0)?;
+        if let Some(c) = self.clients.get_mut(&w) {
+            c.parent_leaf = leaf;
+        }
+        Ok(())
+    }
+
     fn ensure_frame(&mut self, leaf: NodeId) -> R<Window> {
         if let Some(&f) = self.frames.get(&leaf) {
             return Ok(f);
@@ -571,10 +588,7 @@ impl Wm {
                     .map(|(&w, _)| w)
                     .collect();
                 for w in kids {
-                    self.conn.reparent_window(w, self.root, 0, 0)?;
-                    if let Some(c) = self.clients.get_mut(&w) {
-                        c.parent_leaf = NodeId::MAX;
-                    }
+                    self.reparent_client(w, self.root, NodeId::MAX)?;
                 }
                 self.conn.destroy_window(f)?;
             }
@@ -605,10 +619,7 @@ impl Wm {
             for w in &tabs {
                 let need_reparent = self.clients.get(w).is_some_and(|c| c.parent_leaf != leaf);
                 if need_reparent {
-                    self.conn.reparent_window(*w, frame, 0, 0)?;
-                    if let Some(c) = self.clients.get_mut(w) {
-                        c.parent_leaf = leaf;
-                    }
+                    self.reparent_client(*w, frame, leaf)?;
                 }
                 if Some(*w) == active_client && !off_screen {
                     self.conn.configure_window(
@@ -709,8 +720,7 @@ impl Wm {
     }
 
     fn put_image(&self, drawable: Window, w: u16, h: u16, data: &[u8]) -> R<()> {
-        let gc = self.conn.generate_id()?;
-        self.conn.create_gc(gc, drawable, &CreateGCAux::new())?;
+        let gc = self.gc;
         let stride = w as usize * 4;
         // Chunk by rows to stay under the maximum request length.
         let overhead = 64;
@@ -734,7 +744,6 @@ impl Wm {
             )?;
             y += rows;
         }
-        self.conn.free_gc(gc)?;
         Ok(())
     }
 }

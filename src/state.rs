@@ -92,7 +92,7 @@ impl State {
             return None;
         }
         let n = i32::try_from(l.tabs.len()).unwrap_or(i32::MAX);
-        let pos = ((i32::try_from(l.active).unwrap_or(0) + offset) % n + n) % n;
+        let pos = (i32::try_from(l.active).unwrap_or(0) + offset).rem_euclid(n);
         l.active = usize::try_from(pos).unwrap_or(0);
         l.tabs.get(l.active).copied()
     }
@@ -105,17 +105,8 @@ impl State {
             return None;
         }
         let cur = leaves.iter().position(|&l| l == from)?;
-        let i = if next {
-            if cur + 1 < leaves.len() {
-                cur + 1
-            } else {
-                0
-            }
-        } else if cur > 0 {
-            cur - 1
-        } else {
-            leaves.len() - 1
-        };
+        let step = if next { 1 } else { -1 };
+        let i = (cur as i64 + step).rem_euclid(leaves.len() as i64) as usize;
         Some(leaves[i])
     }
 
