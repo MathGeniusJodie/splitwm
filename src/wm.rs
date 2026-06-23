@@ -798,6 +798,8 @@ impl Wm {
     /// smush. Only the focused, settled client is touched; results are cached
     /// per client + width bucket so small resizes don't re-trigger.
     fn smush_focused(&mut self) -> R<()> {
+        // Bucket widths so sub-bucket resizes don't re-trigger the shortcuts.
+        const SMUSH_BUCKET: i32 = 25;
         let Some(c) = self.state.focused_client() else {
             return Ok(());
         };
@@ -806,8 +808,6 @@ impl Wm {
         let Some(g) = geos.get(&self.state.focused_leaf_valid()) else {
             return Ok(());
         };
-        // Bucket widths so sub-bucket resizes don't re-trigger the shortcuts.
-        const SMUSH_BUCKET: i32 = 25;
         let width = g.w;
         let bucket = width / SMUSH_BUCKET;
         let (mode, bucket) = if width >= theme::SMUSH_THRESHOLD {
@@ -1071,7 +1071,8 @@ impl Wm {
             ));
             if b.root {
                 let py = b.y + (b.h - Self::PLUS_SZ) / 2;
-                self.plus_regions.push((Self::plus_rect(vis_x, py), b.idx + 1));
+                self.plus_regions
+                    .push((Self::plus_rect(vis_x, py), b.idx + 1));
             }
         }
         // Edge "+" buttons (insert at the far left / far right of the canvas).
@@ -1085,7 +1086,8 @@ impl Wm {
             if vis_x < wa.x || vis_x > wa.x + wa.w {
                 continue;
             }
-            self.plus_regions.push((Self::plus_rect(vis_x, edge_cy), at));
+            self.plus_regions
+                .push((Self::plus_rect(vis_x, edge_cy), at));
         }
     }
 
