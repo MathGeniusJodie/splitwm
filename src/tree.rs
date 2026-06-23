@@ -337,7 +337,7 @@ impl Tree {
         out
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
     fn boundaries_inner(
         &self,
         node: NodeId,

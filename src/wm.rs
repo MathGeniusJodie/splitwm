@@ -533,6 +533,7 @@ impl Wm {
     /// real colour, adopt it as the client's accent (matches the original's
     /// "active tab blends into the app" behaviour). Best-effort: errors and
     /// near-black/uniform reads leave the palette colour in place.
+    #[allow(clippy::many_single_char_names)]
     fn resample_color(&mut self, win: Win) {
         let Ok(cookie) = self.conn.get_geometry(win) else {
             return;

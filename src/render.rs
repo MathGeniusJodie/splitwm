@@ -8,7 +8,8 @@
     clippy::cast_precision_loss,
     clippy::cast_possible_wrap,
     clippy::unnecessary_cast,
-    clippy::many_single_char_names
+    clippy::many_single_char_names,
+    clippy::tuple_array_conversions
 )]
 
 use std::rc::Rc;
