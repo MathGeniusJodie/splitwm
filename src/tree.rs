@@ -24,12 +24,13 @@ pub struct Rect {
     pub h: i32,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Leaf {
-    pub tabs: Vec<Win>,
-    /// 0-based index into `tabs`; meaningless when `tabs` is empty.
-    pub active: usize,
+    /// The single window shown in this split, if any.
+    pub client: Option<Win>,
     pub minimized: bool,
+    /// Persistent accent colour for this split (kept across splits/closes).
+    pub color: u32,
 }
 
 pub enum Node {
@@ -50,7 +51,13 @@ pub struct Tree {
 impl Tree {
     pub fn new() -> Self {
         let mut nodes = HashMap::new();
-        nodes.insert(1, Node::Leaf(Leaf::default()));
+        nodes.insert(
+            1,
+            Node::Leaf(Leaf {
+                color: crate::theme::leaf_color(1),
+                ..Leaf::default()
+            }),
+        );
         Self {
             nodes,
             next_id: 2,
@@ -66,7 +73,13 @@ impl Tree {
 
     pub fn make_leaf(&mut self) -> NodeId {
         let id = self.gen_id();
-        self.nodes.insert(id, Node::Leaf(Leaf::default()));
+        self.nodes.insert(
+            id,
+            Node::Leaf(Leaf {
+                color: crate::theme::leaf_color(id),
+                ..Leaf::default()
+            }),
+        );
         id
     }
 
@@ -146,7 +159,7 @@ impl Tree {
 
     fn find_leaf_for_client_from(&self, node: NodeId, c: Win) -> Option<NodeId> {
         match self.nodes.get(&node)? {
-            Node::Leaf(l) => l.tabs.contains(&c).then_some(node),
+            Node::Leaf(l) => (l.client == Some(c)).then_some(node),
             Node::Branch { children, .. } => children
                 .iter()
                 .find_map(|&child| self.find_leaf_for_client_from(child, c)),

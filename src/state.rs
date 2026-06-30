@@ -11,6 +11,8 @@ pub struct State {
     pub scroll_target: i32,
     /// Canvas width; None falls back to the workarea width.
     pub canvas_w: Option<i32>,
+    /// Windows not currently shown in any split, in the bottom taskbar.
+    pub taskbar: Vec<Win>,
 }
 
 impl State {
@@ -23,6 +25,7 @@ impl State {
             scroll_x: 0,
             scroll_target: 0,
             canvas_w: None,
+            taskbar: Vec::new(),
         }
     }
 
@@ -34,63 +37,86 @@ impl State {
         }
     }
 
-    // --- tab helpers ---
+    // --- window placement helpers ---
 
-    /// Pin a client into the focused leaf just after the active tab.
-    pub fn pin_client(&mut self, c: Win) {
-        let lid = self.focused_leaf_valid();
-        if self.tree.find_leaf_for_client(c).is_some() {
-            return;
-        }
-        if let Some(l) = self.tree.leaf_mut(lid) {
-            let pos = if l.tabs.is_empty() {
-                0
-            } else {
-                (l.active + 1).min(l.tabs.len())
-            };
-            l.tabs.insert(pos, c);
-            l.active = pos;
+    /// Drop a client into the bottom taskbar (deduplicated).
+    fn push_taskbar(&mut self, c: Win) {
+        if !self.taskbar.contains(&c) {
+            self.taskbar.push(c);
         }
     }
 
-    pub fn unpin_client(&mut self, c: Win) {
-        for lid in self.tree.collect_leaves() {
-            if let Some(l) = self.tree.leaf_mut(lid) {
-                remove_from_leaf(l, c);
-            }
-        }
-    }
-
-    /// Set the active tab / focused leaf to whatever holds `c`.
-    pub fn activate_client(&mut self, c: Win) -> bool {
+    /// Detach `c` from wherever it lives (a split or the taskbar).
+    fn detach(&mut self, c: Win) {
         if let Some(lid) = self.tree.find_leaf_for_client(c) {
             if let Some(l) = self.tree.leaf_mut(lid) {
-                if let Some(i) = l.tabs.iter().position(|&t| t == c) {
-                    l.active = i;
-                    self.focused_leaf = lid;
-                    return true;
-                }
+                l.client = None;
             }
+        }
+        self.taskbar.retain(|&w| w != c);
+    }
+
+    /// Place a new client into the focused leaf, bumping any current occupant
+    /// down to the taskbar.
+    pub fn pin_client(&mut self, c: Win) {
+        if self.tree.find_leaf_for_client(c).is_some() || self.taskbar.contains(&c) {
+            return;
+        }
+        self.assign_to_leaf(c, self.focused_leaf_valid());
+    }
+
+    /// Put `c` into leaf `dst`, displacing the existing occupant to the taskbar.
+    /// `c` is first detached from its previous home.
+    pub fn assign_to_leaf(&mut self, c: Win, dst: NodeId) {
+        if !self.tree.is_leaf(dst) {
+            return;
+        }
+        self.detach(c);
+        let displaced = self.tree.leaf(dst).and_then(|l| l.client);
+        if let Some(prev) = displaced {
+            if prev != c {
+                self.push_taskbar(prev);
+            }
+        }
+        if let Some(l) = self.tree.leaf_mut(dst) {
+            l.client = Some(c);
+        }
+        self.focused_leaf = dst;
+    }
+
+    /// Remove a client entirely (window gone): clear it from its split/taskbar.
+    pub fn unpin_client(&mut self, c: Win) {
+        self.detach(c);
+    }
+
+    /// Focus whatever split currently shows `c`.
+    pub fn activate_client(&mut self, c: Win) -> bool {
+        if let Some(lid) = self.tree.find_leaf_for_client(c) {
+            self.focused_leaf = lid;
+            return true;
         }
         false
     }
 
-    /// Currently active client of the focused leaf.
+    /// Currently shown client of the focused leaf.
     pub fn focused_client(&self) -> Option<Win> {
-        let l = self.tree.leaf(self.focused_leaf_valid())?;
-        l.tabs.get(l.active).copied()
+        self.tree.leaf(self.focused_leaf_valid())?.client
     }
 
-    pub fn cycle_tab(&mut self, offset: i32) -> Option<Win> {
-        let lid = self.focused_leaf_valid();
-        let l = self.tree.leaf_mut(lid)?;
-        if l.tabs.is_empty() {
+    /// Swap the focused split's window with the next/prev taskbar entry,
+    /// cycling which off-screen window is shown.
+    pub fn cycle_taskbar(&mut self, offset: i32) -> Option<Win> {
+        if self.taskbar.is_empty() {
             return None;
         }
-        let n = i32::try_from(l.tabs.len()).unwrap_or(i32::MAX);
-        let pos = (i32::try_from(l.active).unwrap_or(0) + offset).rem_euclid(n);
-        l.active = usize::try_from(pos).unwrap_or(0);
-        l.tabs.get(l.active).copied()
+        let lid = self.focused_leaf_valid();
+        let next = if offset >= 0 {
+            self.taskbar.remove(0)
+        } else {
+            self.taskbar.pop()?
+        };
+        self.assign_to_leaf(next, lid);
+        Some(next)
     }
 
     // --- focus / move between splits ---
@@ -119,21 +145,39 @@ impl State {
         }
     }
 
-    /// Move the focused tab to the adjacent split. Returns the moved client.
+    /// Move the focused window to the adjacent split (displacing its occupant
+    /// to the taskbar). Returns the moved client.
     pub fn move_tab_to_direction(&mut self, next: bool) -> Option<Win> {
         let src = self.focused_leaf_valid();
         let dst = self.adjacent_leaf(src, next)?;
-        let c = {
-            let l = self.tree.leaf(src)?;
-            *l.tabs.get(l.active)?
-        };
-        self.unpin_client(c);
-        if let Some(d) = self.tree.leaf_mut(dst) {
-            d.tabs.push(c);
-            d.active = d.tabs.len() - 1;
-        }
-        self.focused_leaf = dst;
+        let c = self.tree.leaf(src)?.client?;
+        self.assign_to_leaf(c, dst);
         Some(c)
+    }
+
+    /// Toggle a leaf's minimized flag (the layout collapses it to min size).
+    pub fn toggle_minimize(&mut self, leaf: NodeId) {
+        if let Some(l) = self.tree.leaf_mut(leaf) {
+            l.minimized = !l.minimized;
+        }
+    }
+
+    /// Swap the contents of two leaves (the "swap split" button). Each leaf
+    /// keeps its own persistent colour; only the window/minimized state moves.
+    pub fn swap_leaves(&mut self, a: NodeId, b: NodeId) {
+        if a == b {
+            return;
+        }
+        let read = |id| self.tree.leaf(id).map(|l| (l.client, l.minimized));
+        let (Some(da), Some(db)) = (read(a), read(b)) else {
+            return;
+        };
+        if let Some(l) = self.tree.leaf_mut(a) {
+            (l.client, l.minimized) = db;
+        }
+        if let Some(l) = self.tree.leaf_mut(b) {
+            (l.client, l.minimized) = da;
+        }
     }
 
     // --- splitting ---
@@ -170,55 +214,59 @@ impl State {
         }
     }
 
-    /// Split the focused leaf; existing tabs stay in `child_a` (now focused).
+    /// Split the focused leaf; the existing window stays in `child_a` (now
+    /// focused) and `child_b` starts empty.
     pub fn split_focused(&mut self, dir: Dir) {
         let leaf = self.focused_leaf_valid();
-        // Move tabs into a fresh leaf node (child_a), leave child_b empty.
-        let (tabs, active, minimized) = {
+        // child_a keeps the original split's window *and* its accent colour, so
+        // colour stays with the content; child_b gets a fresh colour.
+        let (client, minimized, color) = {
             let l = self.tree.leaf(leaf).unwrap();
-            (l.tabs.clone(), l.active, l.minimized)
+            (l.client, l.minimized, l.color)
         };
         let child_a = self.tree.insert_node(Node::Leaf(Leaf {
-            tabs,
-            active,
+            client,
             minimized,
+            color,
         }));
         let child_b = self.tree.make_leaf();
-        // The original `leaf` node id is reused as a branch via split_node:
-        // we replace references to it. Easiest: turn `leaf` into child_a's
-        // role by giving child_a the tabs and inserting a branch in place.
+        // Insert a branch in place of `leaf`, with child_a carrying the window.
         self.split_node(leaf, dir, child_a, child_b);
         // The old leaf node is now detached; drop it.
         self.tree.remove_node(leaf);
         self.focused_leaf = child_a;
     }
 
-    /// Close the focused leaf, merging its tabs into the adjacent sibling.
+    /// Close the focused leaf. Its window moves into the adjacent sibling if
+    /// that split is empty, otherwise down to the taskbar.
     pub fn close_focused(&mut self) -> bool {
         let leaf = self.focused_leaf_valid();
         let Some((parent, idx)) = self.tree.find_parent(leaf) else {
             return false; // root leaf: nothing to close
         };
 
-        // Merge this leaf's tabs into the adjacent sibling's first leaf.
-        let tabs: Vec<Win> = self
-            .tree
-            .leaf(leaf)
-            .map(|l| l.tabs.clone())
-            .unwrap_or_default();
+        // Relocate this leaf's window: into the adjacent sibling's first leaf
+        // if it is empty, otherwise onto the taskbar.
+        let client = self.tree.leaf(leaf).and_then(|l| l.client);
         let dest_child = {
-            let (children,) = match self.tree.get(parent) {
-                Some(Node::Branch { children, .. }) => (children.clone(),),
+            let children = match self.tree.get(parent) {
+                Some(Node::Branch { children, .. }) => children.clone(),
                 _ => return false,
             };
             let dest_idx = if idx > 0 { idx - 1 } else { 1 };
             self.tree.first_leaf(children[dest_idx])
         };
-        if let Some(d) = self.tree.leaf_mut(dest_child) {
-            let was_empty = d.tabs.is_empty();
-            d.tabs.extend(tabs);
-            if was_empty && !d.tabs.is_empty() {
-                d.active = 0;
+        if let Some(c) = client {
+            let dest_free = self
+                .tree
+                .leaf(dest_child)
+                .is_some_and(|l| l.client.is_none());
+            if dest_free {
+                if let Some(d) = self.tree.leaf_mut(dest_child) {
+                    d.client = Some(c);
+                }
+            } else {
+                self.push_taskbar(c);
             }
         }
 
@@ -402,17 +450,6 @@ impl State {
         }
         if target != sx {
             self.scroll_to(wa, target);
-        }
-    }
-}
-
-fn remove_from_leaf(l: &mut Leaf, c: Win) {
-    if let Some(i) = l.tabs.iter().position(|&t| t == c) {
-        l.tabs.remove(i);
-        if l.tabs.is_empty() {
-            l.active = 0;
-        } else if i < l.active || l.active >= l.tabs.len() {
-            l.active = l.active.saturating_sub(1).min(l.tabs.len() - 1);
         }
     }
 }

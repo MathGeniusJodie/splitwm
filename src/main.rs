@@ -1,3 +1,4 @@
+mod menu;
 mod render;
 mod state;
 mod theme;

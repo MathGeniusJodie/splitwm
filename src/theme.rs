@@ -15,6 +15,11 @@ pub const TAB_EXTRA_H: i32 = 2;
 pub const SMUSH_THRESHOLD: i32 = 900;
 pub const TINY_SMUSH_THRESHOLD: i32 = 650;
 
+// Bottom taskbar holding windows not shown in any split.
+pub const TASKBAR_H: i32 = 56;
+pub const TASKBAR_ICON: i32 = 36;
+pub const TASKBAR_GAP: i32 = 10;
+
 pub const SPLIT_RATIO: f64 = 0.618;
 pub const RESIZE_STEP: f64 = 0.05;
 pub const SCROLL_STEP: i32 = 100;
@@ -32,6 +37,23 @@ pub const fn min_split_w() -> i32 {
 /// disappears into it.
 pub fn tb_h(gap: i32) -> i32 {
     TITLEBAR_HEIGHT.max(gap) + TAB_EXTRA_H
+}
+
+// Hue-rotated palette giving each split its own persistent accent colour.
+pub const LEAF_PALETTE: [u32; 8] = [
+    0xff66_aaff,
+    0xffff_6688,
+    0xff66_dd99,
+    0xffff_cc66,
+    0xffcc_88ff,
+    0xff66_dddd,
+    0xffff_9966,
+    0xffaa_dd66,
+];
+
+/// A stable accent colour for a leaf, picked from `LEAF_PALETTE` by id.
+pub const fn leaf_color(id: u32) -> u32 {
+    LEAF_PALETTE[(id as usize) % LEAF_PALETTE.len()]
 }
 
 // --- colors (ARGB u32, matching rc.lua) ---

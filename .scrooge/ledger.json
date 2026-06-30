@@ -1,8 +1,8 @@
 {
   "cratchit": {
-    "completion_tokens": 49244,
-    "cost_usd": 0.0749022828,
-    "prompt_tokens": 5580746,
-    "shillings_saved": 17.4059957172
+    "completion_tokens": 127840,
+    "cost_usd": 0.27784792490000026,
+    "prompt_tokens": 10832104,
+    "shillings_saved": 34.1360640751
   }
 }

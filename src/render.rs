@@ -37,8 +37,7 @@ pub struct Icon {
 
 pub struct TabInfo {
     pub label: char,
-    pub color: u32, // ARGB accent for this client
-    pub active: bool,
+    pub color: u32, // ARGB accent for this split
     pub icon: Option<Rc<Icon>>,
 }
 
@@ -48,9 +47,10 @@ pub struct LeafView {
     pub tb_h: i32,
     pub bw: i32,
     pub focused: bool,
-    /// Accent colour of the active client (focus-border tint when focused).
+    /// Accent colour of the split (focus-border tint when focused).
     pub accent: u32,
-    pub tabs: Vec<TabInfo>,
+    /// The split's single window, if any.
+    pub tab: Option<TabInfo>,
 }
 
 fn argb(c: u32) -> Color {
@@ -65,6 +65,14 @@ const TAB_PAD_H: f32 = 22.0;
 const TAB_SLANT: f32 = 0.364; // tan(20deg)
 const TAB_GAP: f32 = 6.0;
 const TAB_CORNER: f32 = 9.0;
+
+/// X (leaf-local) and width of the title tab's clickable slot.
+pub fn tab_slot(bw: i32, tb_h: i32, i: i32) -> (f32, f32) {
+    let icon = tb_h as f32 - 4.0;
+    let slot = TAB_PAD_H + icon + TAB_PAD_H + TAB_GAP;
+    let tw = TAB_PAD_H.mul_add(2.0, icon);
+    ((i as f32).mul_add(slot, bw as f32 + 4.0), tw)
+}
 
 impl Renderer {
     pub fn new() -> Self {
@@ -84,7 +92,16 @@ impl Renderer {
     /// A fresh screen-sized pixmap initialised with the wallpaper (or the
     /// solid background colour). All leaf chrome is composited onto this.
     pub fn screen_base(&self, w: u32, h: u32) -> Pixmap {
-        let mut pm = Pixmap::new(w.max(1), h.max(1)).unwrap();
+        let (w, h) = (w.max(1), h.max(1));
+        // The wallpaper is pre-scaled to the screen size, so a clone (raw
+        // memcpy) reproduces the base far cheaper than re-running the alpha
+        // blend through draw_pixmap on every single frame.
+        if let Some(wp) = &self.wallpaper {
+            if wp.width() == w && wp.height() == h {
+                return wp.clone();
+            }
+        }
+        let mut pm = Pixmap::new(w, h).unwrap();
         if let Some(wp) = &self.wallpaper {
             pm.as_mut().draw_pixmap(
                 0,
@@ -152,51 +169,42 @@ impl Renderer {
     }
 
     fn draw_tabs(&self, pm: &mut PixmapMut, ox: f32, oy: f32, v: &LeafView, tb_h: f32) {
+        let Some(tab) = &v.tab else {
+            return;
+        };
         let tf = Transform::from_translate(ox, oy);
         let icon = tb_h - 4.0;
-        let slot = TAB_PAD_H + icon + TAB_PAD_H + TAB_GAP;
-        let mut x = (v.bw as f32) + 4.0;
-        for tab in &v.tabs {
-            let tw = TAB_PAD_H.mul_add(2.0, icon);
-            let path = tab_path(x, 0.0, tw, tb_h);
-            let mut p = Paint::<'_> {
-                anti_alias: true,
+        let (x, tw) = tab_slot(v.bw, tb_h as i32, 0);
+        let path = tab_path(x, 0.0, tw, tb_h);
+        let mut p = Paint::<'_> {
+            anti_alias: true,
+            ..Default::default()
+        };
+        p.set_color(argb(blend(tab.color, 0xff20_2020)));
+        pm.fill_path(&path, &p, FillRule::Winding, tf, None);
+        let mut sp = Paint::<'_> {
+            anti_alias: true,
+            ..Default::default()
+        };
+        sp.set_color(argb(tab.color | 0xff00_0000));
+        pm.stroke_path(
+            &path,
+            &sp,
+            &Stroke {
+                width: 2.0,
                 ..Default::default()
-            };
-            let fill = if tab.active {
-                blend(tab.color, 0xff20_2020)
-            } else {
-                0xff14_1414
-            };
-            p.set_color(argb(fill));
-            pm.fill_path(&path, &p, FillRule::Winding, tf, None);
-            if tab.active {
-                let mut sp = Paint::<'_> {
-                    anti_alias: true,
-                    ..Default::default()
-                };
-                sp.set_color(argb(tab.color | 0xff00_0000));
-                pm.stroke_path(
-                    &path,
-                    &sp,
-                    &Stroke {
-                        width: 2.0,
-                        ..Default::default()
-                    },
-                    tf,
-                    None,
-                );
-            }
-            // Centered app icon, or a letter glyph as fallback (absolute coords).
-            let cx = ox + x + tw / 2.0;
-            let cy = oy + tb_h / 2.0;
-            if let Some(img) = &tab.icon {
-                let isz = (icon * 0.92).round();
-                draw_icon(pm, img, cx - isz / 2.0, cy - isz / 2.0, isz);
-            } else {
-                self.draw_glyph(pm, tab.label, cx, cy + 2.0, icon * 0.7, theme::COLOR_FG);
-            }
-            x += slot;
+            },
+            tf,
+            None,
+        );
+        // Centered app icon, or a letter glyph as fallback (absolute coords).
+        let cx = ox + x + tw / 2.0;
+        let cy = oy + tb_h / 2.0;
+        if let Some(img) = &tab.icon {
+            let isz = (icon * 0.92).round();
+            draw_icon(pm, img, cx - isz / 2.0, cy - isz / 2.0, isz);
+        } else {
+            self.draw_glyph(pm, tab.label, cx, cy + 2.0, icon * 0.7, theme::COLOR_FG);
         }
     }
 
@@ -236,6 +244,63 @@ impl Renderer {
             }
         }
     }
+
+    /// Draw one taskbar entry: a rounded background tile with the app icon
+    /// (or letter-glyph fallback) centred in it.
+    pub fn draw_taskbar_item(
+        &self,
+        pm: &mut PixmapMut,
+        r: TaskItem,
+        icon: Option<&Icon>,
+        label: char,
+        color: u32,
+        highlight: bool,
+    ) {
+        let bgp = rounded_rect(r.x, r.y, r.w.max(1.0), r.h.max(1.0), 8.0);
+        let mut bg = Paint::<'_> {
+            anti_alias: true,
+            ..Default::default()
+        };
+        bg.set_color(argb(theme::COLOR_BTN_BG));
+        pm.fill_path(&bgp, &bg, FillRule::Winding, Transform::identity(), None);
+
+        let cx = r.x + r.w / 2.0;
+        let cy = r.y + r.h / 2.0;
+        let isz = r.h.min(r.w) - 6.0;
+        if let Some(img) = icon {
+            draw_icon(pm, img, cx - isz / 2.0, cy - isz / 2.0, isz);
+        } else {
+            self.draw_glyph(pm, label, cx, cy + 2.0, isz * 0.7, color);
+        }
+
+        // Windows currently shown in a split get an accent box around them.
+        if highlight {
+            let mut sp = Paint::<'_> {
+                anti_alias: true,
+                ..Default::default()
+            };
+            sp.set_color(argb(color | 0xff00_0000));
+            pm.stroke_path(
+                &bgp,
+                &sp,
+                &Stroke {
+                    width: 2.0,
+                    ..Default::default()
+                },
+                Transform::identity(),
+                None,
+            );
+        }
+    }
+}
+
+/// A taskbar tile rectangle (screen coords) for the renderer.
+#[derive(Clone, Copy)]
+pub struct TaskItem {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
 }
 
 /// Blit `img` scaled to a `size`x`size` box at (dx, dy), alpha-blending each
@@ -325,6 +390,165 @@ pub fn draw_plus(pm: &mut PixmapMut, cx: f32, cy: f32, sz: f32) {
     }
 }
 
+/// The split-control buttons drawn at the right of each leaf's tab bar.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BtnIcon {
+    MinimizeV,
+    MinimizeH,
+    ExpandV,
+    ExpandH,
+    Swap,
+    VSplit,
+    HSplit,
+    Close,
+}
+
+/// Draw one round split-control button centred at (cx, cy): a circular
+/// background plus its 2px stroked glyph, ported from splitwm `icons.lua`.
+pub fn draw_button(
+    pm: &mut PixmapMut,
+    cx: f32,
+    cy: f32,
+    size: f32,
+    icon: BtnIcon,
+    disabled: bool,
+    picked: bool,
+) {
+    let mut bg = Paint::<'_> {
+        anti_alias: true,
+        ..Default::default()
+    };
+    bg.set_color(argb(if picked {
+        theme::COLOR_FG
+    } else {
+        theme::COLOR_BTN_BG
+    }));
+    let mut cb = PathBuilder::new();
+    cb.push_circle(cx, cy, size / 2.0);
+    pm.fill_path(
+        &cb.finish().unwrap(),
+        &bg,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
+
+    let col = if disabled {
+        theme::COLOR_FG_DISABLED
+    } else if picked {
+        theme::COLOR_BG
+    } else {
+        theme::COLOR_FG
+    };
+    if let Some(path) = build_glyph_path(cx, cy, size, icon) {
+        let mut p = Paint::<'_> {
+            anti_alias: true,
+            ..Default::default()
+        };
+        p.set_color(argb(col));
+        let stroke = Stroke {
+            width: 2.0,
+            line_cap: tiny_skia::LineCap::Round,
+            line_join: tiny_skia::LineJoin::Round,
+            ..Default::default()
+        };
+        pm.stroke_path(&path, &p, &stroke, Transform::identity(), None);
+    }
+}
+
+/// Build the glyph path for a button icon, or None if empty.
+fn build_glyph_path(cx: f32, cy: f32, size: f32, icon: BtnIcon) -> Option<tiny_skia::Path> {
+    // Glyph geometry uses a local (w, h) box; (ox, oy) is its top-left corner.
+    let (w, h) = (size, size);
+    let (ox, oy) = (cx - w / 2.0, cy - h / 2.0);
+    let mut pb = PathBuilder::new();
+    let mut seg = |pts: &[(f32, f32)]| {
+        for (i, &(px, py)) in pts.iter().enumerate() {
+            if i == 0 {
+                pb.move_to(ox + px, oy + py);
+            } else {
+                pb.line_to(ox + px, oy + py);
+            }
+        }
+    };
+    let (cxl, cyl) = (w / 2.0, h / 2.0);
+    match icon {
+        BtnIcon::Close => {
+            let s = 4.0;
+            seg(&[(cxl - s, cyl - s), (cxl + s, cyl + s)]);
+            seg(&[(cxl + s, cyl - s), (cxl - s, cyl + s)]);
+        }
+        BtnIcon::VSplit | BtnIcon::HSplit => {
+            let (bw, bh) = (10.0, 10.0);
+            let (bx, by) = (cxl - bw / 2.0, cyl - bh / 2.0);
+            seg(&[
+                (bx, by),
+                (bx + bw, by),
+                (bx + bw, by + bh),
+                (bx, by + bh),
+                (bx, by),
+            ]);
+            if icon == BtnIcon::VSplit {
+                seg(&[(cxl, by + 1.0), (cxl, by + bh - 1.0)]);
+            } else {
+                seg(&[(bx + 1.0, cyl), (bx + bw - 1.0, cyl)]);
+            }
+        }
+        BtnIcon::MinimizeH => {
+            let (g, a) = (3.0, 4.0);
+            seg(&[
+                (cxl - g - a, cyl - a),
+                (cxl - g, cyl),
+                (cxl - g - a, cyl + a),
+            ]);
+            seg(&[
+                (cxl + g + a, cyl - a),
+                (cxl + g, cyl),
+                (cxl + g + a, cyl + a),
+            ]);
+        }
+        BtnIcon::ExpandH => {
+            let (g, a) = (3.0, 4.0);
+            seg(&[(cxl - g, cyl - a), (cxl - g - a, cyl), (cxl - g, cyl + a)]);
+            seg(&[(cxl + g, cyl - a), (cxl + g + a, cyl), (cxl + g, cyl + a)]);
+        }
+        BtnIcon::MinimizeV => {
+            let (g, a) = (3.0, 4.0);
+            seg(&[
+                (cxl - a, cyl - g - a),
+                (cxl, cyl - g),
+                (cxl + a, cyl - g - a),
+            ]);
+            seg(&[
+                (cxl - a, cyl + g + a),
+                (cxl, cyl + g),
+                (cxl + a, cyl + g + a),
+            ]);
+        }
+        BtnIcon::ExpandV => {
+            let (g, a) = (3.0, 4.0);
+            seg(&[(cxl - a, cyl - g), (cxl, cyl - g - a), (cxl + a, cyl - g)]);
+            seg(&[(cxl - a, cyl + g), (cxl, cyl + g + a), (cxl + a, cyl + g)]);
+        }
+        BtnIcon::Swap => {
+            let (s, ay) = (4.0, 3.0);
+            seg(&[(cxl - s, cyl - ay), (cxl + s, cyl - ay)]);
+            seg(&[
+                (cxl + s - 3.0, cyl - ay - 2.0),
+                (cxl + s, cyl - ay),
+                (cxl + s - 3.0, cyl - ay + 2.0),
+            ]);
+            seg(&[(cxl + s, cyl + ay), (cxl - s, cyl + ay)]);
+            seg(&[
+                (cxl - s + 3.0, cyl + ay - 2.0),
+                (cxl - s, cyl + ay),
+                (cxl - s + 3.0, cyl + ay + 2.0),
+            ]);
+        }
+    }
+    pb.finish()
+}
+
 const fn blend(top: u32, bottom: u32) -> u32 {
     let a = ((top >> 24) & 0xff) as u32;
     let r = ((((top >> 16) & 0xff) * a + ((bottom >> 16) & 0xff) * (255 - a)) / 255) & 0xff;
@@ -374,14 +598,179 @@ fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> tiny_skia::Path {
     pb.finish().unwrap()
 }
 
-/// Public wrapper: convert a tiny-skia pixmap to `PutImage`-ready BGRX bytes.
-pub fn pixmap_to_bgrx(pm: &Pixmap) -> Vec<u8> {
-    to_bgrx(pm)
+// --- application launcher menu ---
+
+pub const MENU_ROW_H: i32 = 26;
+pub const MENU_BORDER: i32 = 8;
+const MENU_PAD_X: f32 = 12.0;
+const MENU_FONT_PX: f32 = 14.0;
+const MENU_ARROW_W: f32 = 16.0;
+
+impl Renderer {
+    /// Advance width of a left-aligned string at pixel size `px`.
+    fn text_width(&self, s: &str, px: f32) -> f32 {
+        s.chars()
+            .map(|c| self.font.metrics(c, px).advance_width)
+            .sum()
+    }
+
+    /// Inner content width (excludes the black border) for a menu column.
+    pub fn menu_content_w(&self, labels: &[String], any_arrow: bool) -> i32 {
+        let mut w = 0.0f32;
+        for l in labels {
+            w = w.max(self.text_width(l, MENU_FONT_PX));
+        }
+        let arrow = if any_arrow { MENU_ARROW_W } else { 0.0 };
+        (MENU_PAD_X.mul_add(2.0, w) + arrow).ceil() as i32
+    }
+
+    /// Render a menu column to its own pixmap. `content_w` is the inner width
+    /// (shared across a menu + submenu so columns line up); `seps` marks
+    /// divider rows, `hi` is the hovered row.
+    pub fn draw_menu(
+        &self,
+        labels: &[String],
+        arrows: &[bool],
+        seps: &[bool],
+        content_w: i32,
+        hi: Option<usize>,
+    ) -> Pixmap {
+        let rows = labels.len() as i32;
+        let w = (content_w + 2 * MENU_BORDER).max(1) as u32;
+        let h = (rows * MENU_ROW_H + 2 * MENU_BORDER).max(1) as u32;
+        let mut pm = Pixmap::new(w, h).unwrap();
+        pm.fill(argb(0xff00_0000));
+        let b = MENU_BORDER as f32;
+        let cw = content_w as f32;
+        let mut m = pm.as_mut();
+        for (i, label) in labels.iter().enumerate() {
+            let ry = (i as i32 as f32).mul_add(MENU_ROW_H as f32, b);
+            if seps.get(i).copied().unwrap_or(false) {
+                // Faint divider line centred in the row.
+                let mut p = Paint::<'_> {
+                    anti_alias: false,
+                    ..Default::default()
+                };
+                p.set_color(argb(0x33ff_ffff));
+                if let Some(rect) =
+                    SkRect::from_xywh(b + 4.0, ry + MENU_ROW_H as f32 / 2.0, cw - 8.0, 1.0)
+                {
+                    let mut pb = PathBuilder::new();
+                    pb.push_rect(rect);
+                    m.fill_path(
+                        &pb.finish().unwrap(),
+                        &p,
+                        FillRule::Winding,
+                        Transform::identity(),
+                        None,
+                    );
+                }
+                continue;
+            }
+            if Some(i) == hi {
+                let hp = rounded_rect(b + 2.0, ry + 1.0, cw - 4.0, MENU_ROW_H as f32 - 2.0, 4.0);
+                let mut p = Paint::<'_> {
+                    anti_alias: true,
+                    ..Default::default()
+                };
+                p.set_color(argb(theme::COLOR_FG_HOVER));
+                m.fill_path(&hp, &p, FillRule::Winding, Transform::identity(), None);
+            }
+            let baseline = MENU_FONT_PX.mul_add(0.35, ry + MENU_ROW_H as f32 / 2.0);
+            self.draw_text(
+                &mut m,
+                label,
+                b + MENU_PAD_X,
+                baseline,
+                MENU_FONT_PX,
+                theme::COLOR_FG,
+            );
+            if arrows.get(i).copied().unwrap_or(false) {
+                // Small right-pointing triangle (▸) drawn as a path.
+                let ax = b + cw - MENU_ARROW_W + 4.0;
+                let ay = ry + MENU_ROW_H as f32 / 2.0;
+                let mut pb = PathBuilder::new();
+                pb.move_to(ax, ay - 4.0);
+                pb.line_to(ax + 6.0, ay);
+                pb.line_to(ax, ay + 4.0);
+                pb.close();
+                let mut p = Paint::<'_> {
+                    anti_alias: true,
+                    ..Default::default()
+                };
+                p.set_color(argb(theme::COLOR_FG));
+                m.fill_path(
+                    &pb.finish().unwrap(),
+                    &p,
+                    FillRule::Winding,
+                    Transform::identity(),
+                    None,
+                );
+            }
+        }
+        pm
+    }
+
+    /// Draw a left-aligned UTF-8 string with its baseline at `y`.
+    fn draw_text(&self, pm: &mut PixmapMut, text: &str, x: f32, y: f32, px: f32, color: u32) {
+        let mut pen = x;
+        for ch in text.chars() {
+            let (metrics, bitmap) = self.font.rasterize(ch, px);
+            if metrics.width > 0 && metrics.height > 0 {
+                let gx = (pen + metrics.xmin as f32).round() as i32;
+                let gy = (y - (metrics.ymin + metrics.height as i32) as f32).round() as i32;
+                Self::blit_coverage(pm, &bitmap, metrics.width, metrics.height, gx, gy, color);
+            }
+            pen += metrics.advance_width;
+        }
+    }
+
+    /// Alpha-blend an 8-bit coverage bitmap in `color` onto the pixmap.
+    #[allow(clippy::too_many_arguments)]
+    fn blit_coverage(
+        pm: &mut PixmapMut,
+        bitmap: &[u8],
+        bw: usize,
+        bh: usize,
+        ox: i32,
+        oy: i32,
+        color: u32,
+    ) {
+        let pw = pm.width() as i32;
+        let ph = pm.height() as i32;
+        let data = pm.data_mut();
+        let [cr, cg, cb] = [
+            ((color >> 16) & 0xff) as u32,
+            ((color >> 8) & 0xff) as u32,
+            (color & 0xff) as u32,
+        ];
+        for gy in 0..bh {
+            for gx in 0..bw {
+                let a = u32::from(bitmap[gy * bw + gx]);
+                if a == 0 {
+                    continue;
+                }
+                let (px_, py_) = (ox + gx as i32, oy + gy as i32);
+                if px_ < 0 || py_ < 0 || px_ >= pw || py_ >= ph {
+                    continue;
+                }
+                let idx = ((py_ * pw + px_) * 4) as usize;
+                for (k, cc) in [cr, cg, cb].iter().enumerate() {
+                    let dst = u32::from(data[idx + k]);
+                    data[idx + k] = ((cc * a + dst * (255 - a)) / 255) as u8;
+                }
+                data[idx + 3] = 255;
+            }
+        }
+    }
 }
 
-fn to_bgrx(pm: &Pixmap) -> Vec<u8> {
+/// Public wrapper: convert a tiny-skia pixmap to `PutImage`-ready BGRX bytes.
+/// Convert a tiny-skia pixmap to X11 BGRX bytes, reusing `out`'s allocation
+/// (resized as needed) so the full-screen buffer isn't reallocated each frame.
+pub fn pixmap_to_bgrx(pm: &Pixmap, out: &mut Vec<u8>) {
     let src = pm.data();
-    let mut out = vec![0u8; src.len()];
+    out.resize(src.len(), 0);
     for i in (0..src.len()).step_by(4) {
         // tiny-skia: R,G,B,A (premultiplied; opaque here) -> B,G,R,X
         out[i] = src[i + 2];
@@ -389,7 +778,6 @@ fn to_bgrx(pm: &Pixmap) -> Vec<u8> {
         out[i + 2] = src[i];
         out[i + 3] = 0;
     }
-    out
 }
 
 /// Load a PNG wallpaper and scale it to cover a `w`x`h` area. `None` if it
