@@ -58,6 +58,14 @@ pub enum Action {
 pub struct Client {
     pub label: char,
     pub icon: Option<Rc<Icon>>,
+    /// WM_CLASS class string, used to group windows of the same app for
+    /// icon color-rotation.
+    pub class: Rc<str>,
+    /// Persistent icon hue-rotation slot (see `theme::icon_hue_rotation`),
+    /// assigned once when the window is managed and kept for its lifetime.
+    /// Only applied while another window of the same `class` is also open —
+    /// separate from split accent colours (`Leaf::color`).
+    pub icon_slot: Option<usize>,
 }
 
 pub struct Wm {
@@ -69,6 +77,11 @@ pub struct Wm {
     /// Stable insertion order of managed windows, for the bottom bar.
     pub bar_order: Vec<Win>,
     pub underlay: Window,
+    /// Never-mapped window owning the ICCCM `WM_S<n>` manager selection for
+    /// the whole process lifetime; a `SelectionClear` naming it means
+    /// another WM has taken over (e.g. via its own `--replace`), so we quit
+    /// gracefully and let it grab `SUBSTRUCTURE_REDIRECT`.
+    pub sel_owner: Window,
     pub renderer: Renderer,
     pub gc: Gcontext,
     pub keymap: HashMap<u32, u8>,

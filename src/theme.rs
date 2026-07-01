@@ -85,7 +85,7 @@ pub const fn lighter_index(index: Index) -> Index {
 }
 
 // --- metrics (rc.lua overrides applied) ---
-pub const GAP: i32 = 40; // beautiful.splitwm_gap
+pub const GAP: i32 = 20; // beautiful.splitwm_gap
 
 // Bitmap window-border 9-slice insets, at winborder.png's native resolution
 // (drawn 1:1, one image pixel per screen pixel).
@@ -143,6 +143,22 @@ pub const FALLBACK_ACCENT_INDEX: Index = palette_color::CRIMSON;
 /// A stable accent palette index for a leaf, picked from `LEAF_PALETTE` by id.
 pub const fn leaf_color_index(id: u32) -> Index {
     LEAF_PALETTE[(id as usize) % LEAF_PALETTE.len()]
+}
+
+// --- icon color-rotation (same-app window disambiguation) ---
+//
+// Separate from `LEAF_PALETTE`/split accents above: this hue-rotates a
+// window's own app-icon bitmap (in OKLCH space, via `oklch::rotate_hue_argb`)
+// rather than palette-swapping na16-indexed chrome, so it isn't limited to
+// the fixed 16-colour set. `ICON_HUE_STEPS` evenly spaced slots around the
+// hue circle — kept small (60° apart) so each rotation is unmistakable at a
+// glance rather than a subtle shift.
+pub const ICON_HUE_STEPS: usize = 6;
+
+/// The `slot`th persistent icon hue-rotation (degrees), assigned once per
+/// window (see `Wm::assign_icon_slot`) and kept for the window's lifetime.
+pub const fn icon_hue_rotation(slot: usize) -> f32 {
+    (slot % ICON_HUE_STEPS) as f32 * (360.0 / ICON_HUE_STEPS as f32)
 }
 
 // --- colors (ARGB u32, matching rc.lua) ---

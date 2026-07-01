@@ -1,4 +1,5 @@
 mod menu;
+mod oklch;
 mod render;
 mod state;
 mod theme;
@@ -10,7 +11,8 @@ mod wm;
 pub type Index = pixel_graphics::Index;
 
 fn main() {
-    if let Err(e) = wm::run() {
+    let replace = std::env::args().skip(1).any(|a| a == "--replace");
+    if let Err(e) = wm::run(replace) {
         eprintln!("splitwm: fatal: {e:?}");
         std::process::exit(1);
     }

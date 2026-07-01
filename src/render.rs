@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use fontdue::Font;
 use pixel_graphics::{
-    Framebuffer, Paint as PgPaint, Palette as PgPalette, Sprite, Swap, TRANSPARENT,
+    Framebuffer, Paint as PgPaint, Palette as PgPalette, Rgb as PgRgb, Sprite, Swap, TRANSPARENT,
 };
 use tiny_skia::{
     Color, FillRule, IntSize, Paint, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Rect as SkRect,
@@ -92,6 +92,9 @@ pub struct Icon {
 pub struct TabInfo {
     pub label: char,
     pub icon: Option<Rc<Icon>>,
+    /// Icon hue-rotation (degrees) for same-app disambiguation (see
+    /// `Wm::icon_hue`); `None` unless a sibling window is also open.
+    pub icon_hue: Option<f32>,
 }
 
 pub struct LeafView {
@@ -596,7 +599,7 @@ impl Renderer {
         let cx = ox + bw + isz / 2.0 + 4.0;
         let cy = oy + tb_h / 2.0;
         if let Some(img) = &tab.icon {
-            draw_icon(pm, img, cx - isz / 2.0, cy - isz / 2.0, isz);
+            self.draw_icon(pm, img, cx - isz / 2.0, cy - isz / 2.0, isz, tab.icon_hue);
         } else {
             self.draw_glyph(pm, tab.label, cx, cy + 2.0, isz * 0.7, theme::COLOR_FG);
         }
@@ -641,6 +644,7 @@ impl Renderer {
 
     /// Draw one taskbar entry: a rounded background tile with the app icon
     /// (or letter-glyph fallback) centred in it.
+    #[allow(clippy::too_many_arguments)]
     pub fn draw_taskbar_item(
         &self,
         pm: &mut PixmapMut,
@@ -649,6 +653,7 @@ impl Renderer {
         label: char,
         color: u32,
         highlight: bool,
+        icon_hue: Option<f32>,
     ) {
         let bgp = rounded_rect(r.x, r.y, r.w.max(1.0), r.h.max(1.0), 8.0);
         let mut bg = Paint::<'_> {
@@ -662,7 +667,7 @@ impl Renderer {
         let cy = r.y + r.h / 2.0;
         let isz = r.h.min(r.w) - 6.0;
         if let Some(img) = icon {
-            draw_icon(pm, img, cx - isz / 2.0, cy - isz / 2.0, isz);
+            self.draw_icon(pm, img, cx - isz / 2.0, cy - isz / 2.0, isz, icon_hue);
         } else {
             self.draw_glyph(pm, label, cx, cy + 2.0, isz * 0.7, color);
         }
@@ -686,6 +691,113 @@ impl Renderer {
             );
         }
     }
+
+    /// Snap every non-transparent pixel in `icon` to the nearest na16
+    /// palette colour (alpha is kept as-is), so app icons render as flat
+    /// pixel art matching the rest of the UI's 16-colour chrome. Called
+    /// once when an icon is fetched (`Wm::fetch_icon`), not per frame.
+    pub fn quantize_icon(&self, icon: &Icon) -> Icon {
+        let argb = icon.argb.iter().map(|&px| self.quantize_argb(px)).collect();
+        Icon {
+            w: icon.w,
+            h: icon.h,
+            argb,
+        }
+    }
+
+    fn quantize_argb(&self, px: u32) -> u32 {
+        let a = px >> 24;
+        if a == 0 {
+            return px;
+        }
+        let rgb = PgRgb {
+            r: ((px >> 16) & 0xff) as u8,
+            g: ((px >> 8) & 0xff) as u8,
+            b: (px & 0xff) as u8,
+        };
+        let snapped = self.palette.color(self.palette.nearest_index(rgb));
+        (a << 24)
+            | (u32::from(snapped.r) << 16)
+            | (u32::from(snapped.g) << 8)
+            | u32::from(snapped.b)
+    }
+
+    /// Rotate `argb`'s hue by `deg` in OKLCH space, then re-snap the result
+    /// onto the na16 palette so a rotated icon stays as flatly pixel-art as
+    /// the un-rotated (already-quantized) source.
+    fn rotate_and_requantize(&self, argb: u32, deg: f32) -> u32 {
+        self.quantize_argb(crate::oklch::rotate_hue_argb(argb, deg))
+    }
+
+    /// Blit `img` scaled to a `size`x`size` box at (dx, dy), alpha-blending
+    /// each source pixel over the (premultiplied RGBA) pixmap. When
+    /// `hue_deg` is `Some`, each source pixel's hue is rotated that many
+    /// degrees in OKLCH space and re-quantized before blending — the
+    /// same-app icon disambiguation effect (see `Wm::icon_hue`), applied to
+    /// the bitmap itself rather than an overlay.
+    fn draw_icon(
+        &self,
+        pm: &mut PixmapMut,
+        img: &Icon,
+        dx: f32,
+        dy: f32,
+        size: f32,
+        hue_deg: Option<f32>,
+    ) {
+        self.draw_icon_alpha(pm, img, dx, dy, size, 255, hue_deg);
+    }
+
+    /// As `draw_icon`, but each source pixel's alpha is additionally scaled
+    /// by `alpha` (0-255) — used to dim disabled buttons.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_icon_alpha(
+        &self,
+        pm: &mut PixmapMut,
+        img: &Icon,
+        dx: f32,
+        dy: f32,
+        size: f32,
+        alpha: u32,
+        hue_deg: Option<f32>,
+    ) {
+        if img.w == 0 || img.h == 0 || size < 1.0 {
+            return;
+        }
+        let pw = pm.width() as i32;
+        let ph = pm.height() as i32;
+        let data = pm.data_mut();
+        let isz = size as i32;
+        let ox = dx.round() as i32;
+        let oy = dy.round() as i32;
+        for ty in 0..isz {
+            let sy = (ty as u32 * img.h / isz as u32).min(img.h - 1);
+            let py = oy + ty;
+            if py < 0 || py >= ph {
+                continue;
+            }
+            for tx in 0..isz {
+                let sx = (tx as u32 * img.w / isz as u32).min(img.w - 1);
+                let px = ox + tx;
+                if px < 0 || px >= pw {
+                    continue;
+                }
+                let s = img.argb[(sy * img.w + sx) as usize];
+                let s = hue_deg.map_or(s, |deg| self.rotate_and_requantize(s, deg));
+                let a = ((s >> 24) & 0xff) * alpha / 255;
+                if a == 0 {
+                    continue;
+                }
+                let (sr, sg, sb) = ((s >> 16) & 0xff, (s >> 8) & 0xff, s & 0xff);
+                let idx = ((py * pw + px) * 4) as usize;
+                // Source is straight ARGB; pixmap is premultiplied RGBA.
+                for (k, sc) in [sr, sg, sb].iter().enumerate() {
+                    let dst = u32::from(data[idx + k]);
+                    data[idx + k] = ((sc * a + dst * (255 - a)) / 255) as u8;
+                }
+                data[idx + 3] = 255;
+            }
+        }
+    }
 }
 
 /// A taskbar tile rectangle (screen coords) for the renderer.
@@ -695,53 +807,6 @@ pub struct TaskItem {
     pub y: f32,
     pub w: f32,
     pub h: f32,
-}
-
-/// Blit `img` scaled to a `size`x`size` box at (dx, dy), alpha-blending each
-/// source pixel over the (premultiplied RGBA) pixmap.
-fn draw_icon(pm: &mut PixmapMut, img: &Icon, dx: f32, dy: f32, size: f32) {
-    draw_icon_alpha(pm, img, dx, dy, size, 255);
-}
-
-/// As `draw_icon`, but each source pixel's alpha is additionally scaled by
-/// `alpha` (0-255) — used to dim disabled buttons.
-fn draw_icon_alpha(pm: &mut PixmapMut, img: &Icon, dx: f32, dy: f32, size: f32, alpha: u32) {
-    if img.w == 0 || img.h == 0 || size < 1.0 {
-        return;
-    }
-    let pw = pm.width() as i32;
-    let ph = pm.height() as i32;
-    let data = pm.data_mut();
-    let isz = size as i32;
-    let ox = dx.round() as i32;
-    let oy = dy.round() as i32;
-    for ty in 0..isz {
-        let sy = (ty as u32 * img.h / isz as u32).min(img.h - 1);
-        let py = oy + ty;
-        if py < 0 || py >= ph {
-            continue;
-        }
-        for tx in 0..isz {
-            let sx = (tx as u32 * img.w / isz as u32).min(img.w - 1);
-            let px = ox + tx;
-            if px < 0 || px >= pw {
-                continue;
-            }
-            let s = img.argb[(sy * img.w + sx) as usize];
-            let a = ((s >> 24) & 0xff) * alpha / 255;
-            if a == 0 {
-                continue;
-            }
-            let (sr, sg, sb) = ((s >> 16) & 0xff, (s >> 8) & 0xff, s & 0xff);
-            let idx = ((py * pw + px) * 4) as usize;
-            // Source is straight ARGB; pixmap is premultiplied RGBA.
-            for (k, sc) in [sr, sg, sb].iter().enumerate() {
-                let dst = u32::from(data[idx + k]);
-                data[idx + k] = ((sc * a + dst * (255 - a)) / 255) as u8;
-            }
-            data[idx + 3] = 255;
-        }
-    }
 }
 
 /// Draw a translucent rounded "+" insert button centred at (cx, cy).
@@ -828,7 +893,7 @@ impl Renderer {
         } else {
             &variant.normal[accent]
         };
-        draw_icon(pm, img, cx - size / 2.0, cy - size / 2.0, size);
+        self.draw_icon(pm, img, cx - size / 2.0, cy - size / 2.0, size, None);
     }
 }
 

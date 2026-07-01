@@ -19,9 +19,9 @@ use std::rc::Rc;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     Allow, AtomEnum, ButtonIndex, ButtonPressEvent, ButtonReleaseEvent, ChangeWindowAttributesAux,
-    ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, CreateGCAux, CreateWindowAux,
-    EventMask, ExposeEvent, GrabMode, ImageFormat, InputFocus, KeyPressEvent, MapRequestEvent,
-    ModMask, StackMode, Window, WindowClass,
+    ClientMessageEvent, ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, CreateGCAux,
+    CreateWindowAux, EventMask, ExposeEvent, GrabMode, ImageFormat, InputFocus, KeyPressEvent,
+    MapRequestEvent, MapState, ModMask, PropMode, StackMode, Window, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::CURRENT_TIME;
@@ -33,11 +33,120 @@ use crate::tree::{Dir, Node, NodeId, Rect, Win};
 
 pub use types::*;
 
+/// Claim the ICCCM manager selection (`WM_S<n>`) for this screen before
+/// grabbing `SUBSTRUCTURE_REDIRECT`, which only one client may hold at a
+/// time. Plain startup (no existing owner) just registers ours. With
+/// `--replace` and an existing owner, this waits for the outgoing WM to
+/// notice it lost the selection and destroy its manager window — which is
+/// also when it releases the redirect — before returning, so the
+/// `SUBSTRUCTURE_REDIRECT` grab in `run` can succeed right after.
+fn claim_manager_selection(
+    conn: &x11rb::rust_connection::RustConnection,
+    screen_num: usize,
+    root: Window,
+    screen: &x11rb::protocol::xproto::Screen,
+    replace: bool,
+) -> R<Window> {
+    let wm_sn_atom = conn
+        .intern_atom(false, format!("WM_S{screen_num}").as_bytes())?
+        .reply()?
+        .atom;
+    let manager_atom = conn.intern_atom(false, b"MANAGER")?.reply()?.atom;
+
+    // A tiny, never-mapped window that exists only to own the selection for
+    // the rest of the process's life (kept alive, never destroyed).
+    let sel_owner = conn.generate_id()?;
+    conn.create_window(
+        screen.root_depth,
+        sel_owner,
+        root,
+        -1,
+        -1,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        screen.root_visual,
+        &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+    )?;
+
+    // ICCCM wants a real timestamp, not CurrentTime, for SetSelectionOwner:
+    // change a property on our own window and read the server's timestamp
+    // back off the resulting PropertyNotify.
+    conn.change_property(
+        PropMode::REPLACE,
+        sel_owner,
+        AtomEnum::WM_CLASS,
+        AtomEnum::STRING,
+        8,
+        7,
+        b"splitwm",
+    )?;
+    conn.flush()?;
+    let timestamp = loop {
+        if let Event::PropertyNotify(e) = conn.wait_for_event()? {
+            if e.window == sel_owner {
+                break e.time;
+            }
+        }
+    };
+
+    let previous_owner = conn.get_selection_owner(wm_sn_atom)?.reply()?.owner;
+    if previous_owner != x11rb::NONE {
+        if !replace {
+            return Err(
+                "another window manager is already running (pass --replace to take over)".into(),
+            );
+        }
+        // Watch for the outgoing WM's manager window going away, which is
+        // how we know it actually relinquished control.
+        conn.change_window_attributes(
+            previous_owner,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+        )?;
+    }
+
+    conn.set_selection_owner(sel_owner, wm_sn_atom, timestamp)?;
+    if conn.get_selection_owner(wm_sn_atom)?.reply()?.owner != sel_owner {
+        return Err("failed to acquire the WM_Sn manager selection".into());
+    }
+
+    if previous_owner != x11rb::NONE {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            match conn.poll_for_event()? {
+                Some(Event::DestroyNotify(e)) if e.window == previous_owner => break,
+                _ if std::time::Instant::now() >= deadline => {
+                    // Best-effort: the SUBSTRUCTURE_REDIRECT grab right
+                    // after this call is the real gate, so proceed even if
+                    // the old WM never confirmed.
+                    break;
+                }
+                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+    }
+
+    // Announce the handover to anyone watching root for MANAGER messages
+    // (panels/pagers use this to notice a WM switch).
+    let manager_msg = ClientMessageEvent::new(
+        32,
+        root,
+        manager_atom,
+        [timestamp, wm_sn_atom, sel_owner, 0, 0],
+    );
+    conn.send_event(false, root, EventMask::STRUCTURE_NOTIFY, manager_msg)?;
+    conn.flush()?;
+    Ok(sel_owner)
+}
+
 #[allow(clippy::too_many_lines)]
-pub fn run() -> R<()> {
+pub fn run(replace: bool) -> R<()> {
     let (conn, screen_num) = x11rb::connect(None)?;
     let screen = conn.setup().roots[screen_num].clone();
     let root = screen.root;
+
+    let sel_owner = claim_manager_selection(&conn, screen_num, root, &screen, replace)?;
 
     // Become the window manager.
     let mask =
@@ -186,6 +295,7 @@ pub fn run() -> R<()> {
         clients: HashMap::new(),
         bar_order: Vec::new(),
         underlay,
+        sel_owner,
         running: true,
         max_req_bytes,
         atom_net_wm_icon,
@@ -226,6 +336,10 @@ pub fn run() -> R<()> {
             ModMask::M4,
         )?;
     }
+
+    // Take over from a previous WM (if any) without dropping whatever it had
+    // on screen: adopt already-mapped windows before the first arrange.
+    wm.manage_existing_windows()?;
 
     wm.conn.flush()?;
     wm.arrange()?;
@@ -389,6 +503,9 @@ impl Wm {
             Event::ButtonRelease(e) => self.on_button_release(e)?,
             Event::MotionNotify(e) => self.on_motion(e)?,
             Event::Expose(e) => self.on_expose(*e)?,
+            // Another WM took over the manager selection (e.g. its own
+            // `--replace`); quit gracefully so it can grab the redirect.
+            Event::SelectionClear(e) if e.owner == self.sel_owner => self.running = false,
             _ => {}
         }
         Ok(())
@@ -405,6 +522,34 @@ impl Wm {
         Ok(())
     }
 
+    /// Adopt windows already mapped on the root when splitwm starts, so
+    /// taking over from a previous window manager doesn't lose whatever was
+    /// on screen. A well-behaved WM adds every client it reparents to its
+    /// SaveSet, so once it exits (releasing `SUBSTRUCTURE_REDIRECT`, which
+    /// is what let us become the WM in the first place) the X server
+    /// auto-reparents surviving client windows back onto root, still
+    /// mapped — exactly what a normal `MapRequest` handles, just batched
+    /// here once at startup instead of arriving one at a time.
+    fn manage_existing_windows(&mut self) -> R<()> {
+        let children = self.conn.query_tree(self.root)?.reply()?.children;
+        for win in children {
+            if win == self.underlay || win == self.menu.main_win || win == self.menu.sub_win {
+                continue;
+            }
+            let Ok(attrs) = self.conn.get_window_attributes(win)?.reply() else {
+                continue;
+            };
+            if attrs.override_redirect
+                || attrs.map_state != MapState::VIEWABLE
+                || attrs.class != WindowClass::INPUT_OUTPUT
+            {
+                continue;
+            }
+            self.manage(win)?;
+        }
+        Ok(())
+    }
+
     fn on_map_request(&mut self, e: MapRequestEvent) -> R<()> {
         if self.clients.contains_key(&e.window) {
             self.conn.map_window(e.window)?;
@@ -416,8 +561,10 @@ impl Wm {
 
     fn manage(&mut self, win: Win) -> R<()> {
         // Class -> label; app icon from _NET_WM_ICON.
-        let label = self.client_identity(win);
+        let class = self.client_identity(win);
+        let label = class.chars().next().map_or('?', |c| c.to_ascii_uppercase());
         let icon = self.fetch_icon(win);
+        let icon_slot = self.assign_icon_slot(&class);
 
         // Place the client into the focused split (displacing any occupant).
         self.state.pin_client(win);
@@ -443,7 +590,15 @@ impl Wm {
         self.conn
             .configure_window(win, &ConfigureWindowAux::new().border_width(0))?;
 
-        self.clients.insert(win, Client { label, icon });
+        self.clients.insert(
+            win,
+            Client {
+                label,
+                icon,
+                class,
+                icon_slot,
+            },
+        );
         if !self.bar_order.contains(&win) {
             self.bar_order.push(win);
         }
@@ -453,7 +608,10 @@ impl Wm {
         Ok(())
     }
 
-    fn client_identity(&self, win: Win) -> char {
+    /// WM_CLASS's class string (second of the "instance\0class\0" pair),
+    /// used both as the taskbar label's source letter and to group windows
+    /// of the same app for icon color-rotation (`assign_icon_slot`).
+    fn client_identity(&self, win: Win) -> Rc<str> {
         let class = self
             .conn
             .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
@@ -461,15 +619,43 @@ impl Wm {
             .and_then(|c| c.reply().ok())
             .map(|r| r.value)
             .unwrap_or_default();
-        // WM_CLASS is "instance\0class\0"; take the class (second string).
         let parts: Vec<&[u8]> = class.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
         let name = parts
             .get(1)
             .or_else(|| parts.first())
             .copied()
             .unwrap_or(b"?");
-        name.first()
-            .map_or('?', |&b| (b as char).to_ascii_uppercase())
+        Rc::from(String::from_utf8_lossy(name).as_ref())
+    }
+
+    /// First hue-rotation slot (see `theme::icon_hue_rotation`) not already
+    /// held by another open window of `class`, so windows of one app stay
+    /// distinguishable while a free slot remains. Freeing is implicit: once
+    /// a window is unmanaged it drops out of `self.clients`, so its slot no
+    /// longer counts as used.
+    fn assign_icon_slot(&self, class: &str) -> Option<usize> {
+        let used: std::collections::HashSet<usize> = self
+            .clients
+            .values()
+            .filter(|c| c.class.as_ref() == class)
+            .filter_map(|c| c.icon_slot)
+            .collect();
+        (0..theme::ICON_HUE_STEPS).find(|s| !used.contains(s))
+    }
+
+    /// The icon hue-rotation (degrees) for `win`'s app-icon bitmap: `None`
+    /// unless another managed window shares its app class, even though the
+    /// slot itself was already assigned and is persistent for the window's
+    /// whole lifetime.
+    pub(crate) fn icon_hue(&self, win: Win) -> Option<f32> {
+        let client = self.clients.get(&win)?;
+        let slot = client.icon_slot?;
+        let siblings = self
+            .clients
+            .values()
+            .filter(|c| c.class == client.class)
+            .count();
+        (siblings >= 2).then(|| theme::icon_hue_rotation(slot))
     }
 
     /// Read `_NET_WM_ICON` and pick the icon whose size is closest to (but
@@ -518,7 +704,11 @@ impl Wm {
         }
         let (w, h, start) = best?;
         let argb = vals[start..start + (w * h) as usize].to_vec();
-        Some(Rc::new(Icon { w, h, argb }))
+        let icon = Icon { w, h, argb };
+        // Quantize to the na16 chrome palette so app icons render as flat
+        // pixel art matching the rest of the UI, and so the (rotate + snap)
+        // hue-rotation for same-app disambiguation stays crisp.
+        Some(Rc::new(self.renderer.quantize_icon(&icon)))
     }
 
     #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
@@ -758,21 +948,10 @@ impl Wm {
                 }
                 return Ok(());
             }
-            if let Some(b) = self
-                .handle_regions
-                .iter()
-                .find(|(r, _)| rect_contains(*r, mx, my))
-                .map(|(_, b)| *b)
-            {
-                self.drag = Some(Drag {
-                    parent: b.parent,
-                    idx: b.idx,
-                    left_x: b.left_x,
-                    combined: b.left_w + b.right_w,
-                    gap: theme::GAP,
-                });
-                return Ok(());
-            }
+            // The boundary "+" button sits centred inside its drag handle's
+            // hit region (the handle spans the full boundary height so it's
+            // easy to grab; "+" is a small target in its middle) — check the
+            // narrower "+" rect first so it isn't shadowed by the handle.
             if let Some(at) = self
                 .plus_regions
                 .iter()
@@ -786,6 +965,21 @@ impl Wm {
                 self.arrange()?;
                 let f = self.state.focused_client();
                 self.focus(f)?;
+                return Ok(());
+            }
+            if let Some(b) = self
+                .handle_regions
+                .iter()
+                .find(|(r, _)| rect_contains(*r, mx, my))
+                .map(|(_, b)| *b)
+            {
+                self.drag = Some(Drag {
+                    parent: b.parent,
+                    idx: b.idx,
+                    left_x: b.left_x,
+                    combined: b.left_w + b.right_w,
+                    gap: theme::GAP,
+                });
                 return Ok(());
             }
             // Clicking an empty split's body (no client window catches it):
@@ -1046,6 +1240,7 @@ impl Wm {
                     client.map_or('?', |c| c.label),
                     t.accent,
                     t.on_screen,
+                    self.icon_hue(t.win),
                 );
             }
             // Launcher "+" at the right end of the bar.
@@ -1085,6 +1280,7 @@ impl Wm {
         let tab = client.map(|c| TabInfo {
             label: c.label,
             icon: c.icon.clone(),
+            icon_hue: win.and_then(|w| self.icon_hue(w)),
         });
         LeafView {
             w,
