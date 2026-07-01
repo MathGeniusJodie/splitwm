@@ -13,7 +13,8 @@ use std::rc::Rc;
 use x11rb::protocol::xproto::{Atom, ConnectionExt, Gcontext, Window};
 use x11rb::rust_connection::RustConnection;
 
-use crate::render::{Icon, Renderer};
+use crate::icon::Icon;
+use crate::render::Renderer;
 use crate::state::State;
 use crate::tree::{Boundary, Dir, NodeId, Rect, Win};
 

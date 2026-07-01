@@ -24,6 +24,18 @@ pub struct Rect {
     pub h: i32,
 }
 
+impl Rect {
+    /// This rect inset by `m` on every side.
+    pub const fn shrunk(self, m: i32) -> Self {
+        Self {
+            x: self.x + m,
+            y: self.y + m,
+            w: self.w - 2 * m,
+            h: self.h - 2 * m,
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct Leaf {
     /// The single window shown in this split, if any.
@@ -292,17 +304,9 @@ fn child_sizes(children: &[(bool, f64)], usable: i32, min_sz: i32) -> Vec<i32> {
 
 impl Tree {
     /// Compute the screen rect of every leaf. `geos` is keyed by leaf id.
-    pub fn compute(&self, x: i32, y: i32, w: i32, h: i32, gap: i32) -> HashMap<NodeId, Rect> {
+    pub fn compute(&self, area: Rect, gap: i32) -> HashMap<NodeId, Rect> {
         let mut geos = HashMap::new();
-        self.compute_inner(
-            self.root,
-            x + gap,
-            y + gap,
-            w - 2 * gap,
-            h - 2 * gap,
-            gap,
-            &mut geos,
-        );
+        self.compute_inner(self.root, area.shrunk(gap), gap, &mut geos);
         geos
     }
 
@@ -331,27 +335,16 @@ impl Tree {
         }
     }
 
-    #[allow(clippy::many_single_char_names, clippy::too_many_arguments)] // recursive geometry walk
-    fn compute_inner(
-        &self,
-        node: NodeId,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        gap: i32,
-        geos: &mut HashMap<NodeId, Rect>,
-    ) {
+    fn compute_inner(&self, node: NodeId, at: Rect, gap: i32, geos: &mut HashMap<NodeId, Rect>) {
         match self.nodes.get(&node) {
             Some(Node::Leaf(_)) => {
-                geos.insert(node, Rect { x, y, w, h });
+                geos.insert(node, at);
             }
             Some(Node::Branch {
                 dir,
                 children,
                 ratios,
             }) => {
-                let inner = gap;
                 let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
                 let meta = self.child_meta(children, ratios);
                 // A minimized child collapses to `gap` in the split dimension
@@ -361,22 +354,22 @@ impl Tree {
                 // needing a size of its own.
                 let minimized_size = gap;
                 if *dir == Dir::H {
-                    let usable = (w - inner * (n - 1)).max(0);
+                    let usable = (at.w - gap * (n - 1)).max(0);
                     let sizes = child_sizes(&meta, usable, minimized_size);
-                    let mut cx = x;
+                    let mut cx = at.x;
                     for (i, &c) in children.iter().enumerate() {
                         let cw = sizes[i];
-                        self.compute_inner(c, cx, y, cw, h, gap, geos);
-                        cx += cw + inner;
+                        self.compute_inner(c, Rect { x: cx, w: cw, ..at }, gap, geos);
+                        cx += cw + gap;
                     }
                 } else {
-                    let usable = (h - inner * (n - 1)).max(0);
+                    let usable = (at.h - gap * (n - 1)).max(0);
                     let sizes = child_sizes(&meta, usable, minimized_size);
-                    let mut cy = y;
+                    let mut cy = at.y;
                     for (i, &c) in children.iter().enumerate() {
                         let ch = sizes[i];
-                        self.compute_inner(c, x, cy, w, ch, gap, geos);
-                        cy += ch + inner;
+                        self.compute_inner(c, Rect { y: cy, h: ch, ..at }, gap, geos);
+                        cy += ch + gap;
                     }
                 }
             }
@@ -402,31 +395,13 @@ pub struct Boundary {
 
 impl Tree {
     /// Vertical gaps between adjacent columns in every H-branch.
-    pub fn h_boundaries(&self, x: i32, y: i32, w: i32, h: i32, gap: i32) -> Vec<Boundary> {
+    pub fn h_boundaries(&self, area: Rect, gap: i32) -> Vec<Boundary> {
         let mut out = Vec::new();
-        self.boundaries_inner(
-            self.root,
-            x + gap,
-            y + gap,
-            w - 2 * gap,
-            h - 2 * gap,
-            gap,
-            &mut out,
-        );
+        self.boundaries_inner(self.root, area.shrunk(gap), gap, &mut out);
         out
     }
 
-    #[allow(clippy::too_many_arguments, clippy::many_single_char_names)]
-    fn boundaries_inner(
-        &self,
-        node: NodeId,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        gap: i32,
-        out: &mut Vec<Boundary>,
-    ) {
+    fn boundaries_inner(&self, node: NodeId, at: Rect, gap: i32, out: &mut Vec<Boundary>) {
         let Some(Node::Branch {
             dir,
             children,
@@ -435,39 +410,38 @@ impl Tree {
         else {
             return;
         };
-        let inner = gap;
         let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
         let meta = self.child_meta(children, ratios);
         if *dir == Dir::H {
-            let usable = (w - inner * (n - 1)).max(0);
+            let usable = (at.w - gap * (n - 1)).max(0);
             let sizes = child_sizes(&meta, usable, gap);
-            let mut cx = x;
+            let mut cx = at.x;
             for (i, &c) in children.iter().enumerate() {
                 let cw = sizes[i];
                 if i + 1 < children.len() {
                     out.push(Boundary {
                         parent: node,
                         idx: i,
-                        x: cx + cw + inner / 2,
+                        x: cx + cw + gap / 2,
                         left_x: cx,
                         left_w: cw,
                         right_w: sizes[i + 1],
-                        y,
-                        h,
+                        y: at.y,
+                        h: at.h,
                         root: node == self.root,
                     });
                 }
-                self.boundaries_inner(c, cx, y, cw, h, gap, out);
-                cx += cw + inner;
+                self.boundaries_inner(c, Rect { x: cx, w: cw, ..at }, gap, out);
+                cx += cw + gap;
             }
         } else {
-            let usable = (h - inner * (n - 1)).max(0);
+            let usable = (at.h - gap * (n - 1)).max(0);
             let sizes = child_sizes(&meta, usable, gap);
-            let mut cy = y;
+            let mut cy = at.y;
             for (i, &c) in children.iter().enumerate() {
                 let ch = sizes[i];
-                self.boundaries_inner(c, x, cy, w, ch, gap, out);
-                cy += ch + inner;
+                self.boundaries_inner(c, Rect { y: cy, h: ch, ..at }, gap, out);
+                cy += ch + gap;
             }
         }
     }

@@ -378,14 +378,14 @@ impl State {
     pub fn compute(&self, wa: Rect) -> std::collections::HashMap<NodeId, Rect> {
         let gap = theme::GAP;
         let canvas_w = self.canvas_w.unwrap_or(wa.w);
-        self.tree.compute(wa.x, wa.y, canvas_w, wa.h, gap)
+        self.tree.compute(Rect { w: canvas_w, ..wa }, gap)
     }
 
     /// Vertical gaps between columns, for drag handles / insert buttons.
     pub fn boundaries(&self, wa: Rect) -> Vec<Boundary> {
         let gap = theme::GAP;
         let canvas_w = self.canvas_w.unwrap_or(wa.w);
-        self.tree.h_boundaries(wa.x, wa.y, canvas_w, wa.h, gap)
+        self.tree.h_boundaries(Rect { w: canvas_w, ..wa }, gap)
     }
 
     /// Canvas-space x-span `(start_x, width)` of the leftmost/rightmost

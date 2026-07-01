@@ -19,6 +19,7 @@ use pixel_graphics::{
     Rect as PgRect, Rgb as PgRgb, Rgba, Sprite, Swap,
 };
 
+use crate::icon::Icon;
 use crate::theme::{self, palette_color};
 use crate::Index;
 
@@ -78,13 +79,6 @@ impl ButtonArt {
                 .expect("embedded disabled button PNG"),
         }
     }
-}
-
-/// A decoded application icon (non-premultiplied ARGB pixels, row-major).
-pub struct Icon {
-    pub w: u32,
-    pub h: u32,
-    pub argb: Vec<u32>,
 }
 
 pub struct TabInfo {
@@ -590,57 +584,10 @@ impl Renderer {
         }
     }
 
-    /// Snap every non-transparent pixel in `icon` to the nearest na16
-    /// palette colour (alpha is kept as-is), so app icons render as flat
-    /// pixel art matching the rest of the UI's 16-colour chrome. Called
-    /// once when an icon is fetched (`Wm::fetch_icon`), not per frame.
-    pub fn quantize_icon(&self, icon: &Icon) -> Icon {
-        let argb = icon.argb.iter().map(|&px| self.quantize_argb(px)).collect();
-        Icon {
-            w: icon.w,
-            h: icon.h,
-            argb,
-        }
-    }
-
-    fn quantize_argb(&self, px: u32) -> u32 {
-        let a = px >> 24;
-        if a == 0 {
-            return px;
-        }
-        let rgb = PgRgb {
-            r: ((px >> 16) & 0xff) as u8,
-            g: ((px >> 8) & 0xff) as u8,
-            b: (px & 0xff) as u8,
-        };
-        let snapped = self.palette.color(self.palette.nearest_index(rgb));
-        (a << 24)
-            | (u32::from(snapped.r) << 16)
-            | (u32::from(snapped.g) << 8)
-            | u32::from(snapped.b)
-    }
-
-    /// Rotate `argb`'s hue by `deg` in OKLCH space, then re-snap the result
-    /// onto the na16 palette so a rotated icon stays as flatly pixel-art as
-    /// the un-rotated (already-quantized) source.
-    fn rotate_and_requantize(&self, argb: u32, deg: f32) -> u32 {
-        self.quantize_argb(crate::oklch::rotate_hue_argb(argb, deg))
-    }
-
-    /// Hue-rotate a whole icon by `deg` degrees (OKLCH) and re-quantize —
-    /// the same-app disambiguation variant (see `Wm::refresh_icon_rotations`).
-    /// Computed once per window and cached; the per-pixel OKLCH math is far
-    /// too heavy to run inside the per-frame blit.
-    pub fn rotate_icon(&self, icon: &Icon, deg: f32) -> Icon {
-        Icon {
-            w: icon.w,
-            h: icon.h,
-            argb: icon
-                .argb
-                .iter()
-                .map(|&px| self.rotate_and_requantize(px, deg))
-                .collect(),
-        }
+    /// The na16 palette all art/indices resolve through, for callers running
+    /// the `icon` colour pipeline.
+    pub fn palette(&self) -> &PgPalette {
+        &self.palette
     }
 
     /// Blit `img` nearest-scaled to a `size`x`size` box at (dx, dy). Icons
@@ -816,8 +763,8 @@ impl Renderer {
 
 // --- application launcher menu ---
 
-pub const MENU_ROW_H: i32 = 26;
-pub const MENU_BORDER: i32 = 8;
+use crate::menu::{frame_size, MENU_BORDER, MENU_ROW_H};
+
 const MENU_PAD_X: i32 = 12;
 const MENU_ARROW_W: i32 = 16;
 
@@ -853,8 +800,8 @@ impl Renderer {
         hi: Option<usize>,
     ) -> Framebuffer {
         let rows = labels.len() as i32;
-        let w = (content_w + 2 * MENU_BORDER).max(1) as usize;
-        let h = (rows * MENU_ROW_H + 2 * MENU_BORDER).max(1) as usize;
+        let (fw, fh) = frame_size(rows, content_w);
+        let (w, h) = (fw.max(1) as usize, fh.max(1) as usize);
         let mut fb = Framebuffer::new(w, h, palette_color::BLACK);
         let b = MENU_BORDER;
         let cw = content_w;

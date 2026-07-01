@@ -1,6 +1,4 @@
 //! Resolved colors and layout metrics, ported from splitwm/theme.lua + rc.lua.
-//! Some palette entries are reserved for features still being ported.
-#![allow(dead_code)]
 
 use crate::Index;
 
@@ -171,13 +169,3 @@ pub const ICON_HUE_STEPS: usize = 6;
 pub const fn icon_hue_rotation(slot: usize) -> f32 {
     (slot % ICON_HUE_STEPS) as f32 * (360.0 / ICON_HUE_STEPS as f32)
 }
-
-// --- colors (ARGB u32, matching rc.lua) ---
-pub const COLOR_BG: u32 = 0xff00_0000; // splitwm_color_bg #000000ff
-pub const COLOR_FG: u32 = 0xffff_ffff;
-pub const COLOR_ACCENT: u32 = 0xffff_6666;
-pub const COLOR_BTN_BG: u32 = 0x8000_0000; // #00000080
-pub const COLOR_FG_HOVER: u32 = 0x20ff_ffff;
-
-/// Wallpaper / root background.
-pub const WALLPAPER: u32 = COLOR_BG;

@@ -4,6 +4,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt, StackMode, Window};
 
 use super::types::{FrameRect, Wm, R};
+use crate::menu::{frame_size, Item, MENU_BORDER, MENU_ROW_H};
 use crate::tree::NodeId;
 
 impl Wm {
@@ -13,8 +14,7 @@ impl Wm {
         let labels = self.menu.tree.main.labels.clone();
         let cw = self.renderer.menu_content_w(&labels, true);
         let rows = i32::try_from(labels.len()).unwrap_or(0);
-        let w = cw + 2 * crate::render::MENU_BORDER;
-        let h = rows * crate::render::MENU_ROW_H + 2 * crate::render::MENU_BORDER;
+        let (w, h) = frame_size(rows, cw);
         let wa = self.wa();
         let x = (ax - w).clamp(wa.x, (wa.x + wa.w - w).max(wa.x));
         let y = (ay - h).clamp(wa.y, (wa.y + wa.h - h).max(wa.y));
@@ -73,7 +73,7 @@ impl Wm {
         let seps: Vec<bool> = m
             .items
             .iter()
-            .map(|it| matches!(it, crate::menu::Item::Separator))
+            .map(|it| matches!(it, Item::Separator))
             .collect();
         let fb = self.renderer.draw_menu(
             &m.labels,
@@ -98,7 +98,7 @@ impl Wm {
         let Some(cat) = self.menu.open_cat else {
             return Ok(());
         };
-        let crate::menu::Item::Submenu(idx) = self.menu.tree.main.items[cat] else {
+        let Item::Submenu(idx) = self.menu.tree.main.items[cat] else {
             return Ok(());
         };
         let sub = &self.menu.tree.subs[idx];
@@ -124,27 +124,23 @@ impl Wm {
 
     /// Open the submenu for main row `cat` to the right of that row.
     pub(crate) fn open_submenu(&mut self, cat: usize) -> R<()> {
-        let crate::menu::Item::Submenu(idx) = self.menu.tree.main.items[cat] else {
+        let Item::Submenu(idx) = self.menu.tree.main.items[cat] else {
             return Ok(());
         };
         let labels = self.menu.tree.subs[idx].labels.clone();
         let cw = self.renderer.menu_content_w(&labels, false);
         let rows = i32::try_from(labels.len()).unwrap_or(0);
-        let w = cw + 2 * crate::render::MENU_BORDER;
-        let h = rows * crate::render::MENU_ROW_H + 2 * crate::render::MENU_BORDER;
+        let (w, h) = frame_size(rows, cw);
         let wa = self.wa();
-        let row_y = self.menu.main.y
-            + crate::render::MENU_BORDER
-            + i32::try_from(cat).unwrap_or(0) * crate::render::MENU_ROW_H;
-        let y = (row_y - crate::render::MENU_BORDER)
-            .min(wa.y + wa.h - h)
-            .max(wa.y);
+        let row_y =
+            self.menu.main.y + MENU_BORDER + i32::try_from(cat).unwrap_or(0) * MENU_ROW_H;
+        let y = (row_y - MENU_BORDER).min(wa.y + wa.h - h).max(wa.y);
         // Prefer the right side; flip left if it would overflow.
-        let right_x = self.menu.main.x + self.menu.main.w - crate::render::MENU_BORDER;
+        let right_x = self.menu.main.x + self.menu.main.w - MENU_BORDER;
         let x = if right_x + w <= wa.x + wa.w {
             right_x
         } else {
-            self.menu.main.x - w + crate::render::MENU_BORDER
+            self.menu.main.x - w + MENU_BORDER
         };
         self.menu.sub_cw = cw;
         self.menu.sub_hi = None;
@@ -167,11 +163,11 @@ impl Wm {
 
     /// Row index under window-local y, or None for the border padding.
     pub(crate) fn menu_row_at(ly: i32, n: usize) -> Option<usize> {
-        let inner = ly - crate::render::MENU_BORDER;
+        let inner = ly - MENU_BORDER;
         if inner < 0 {
             return None;
         }
-        let row = (inner / crate::render::MENU_ROW_H) as usize;
+        let row = (inner / MENU_ROW_H) as usize;
         (row < n).then_some(row)
     }
 
@@ -179,14 +175,14 @@ impl Wm {
         if win == self.menu.main_win {
             let n = self.menu.tree.main.labels.len();
             let row = Self::menu_row_at(ly, n)
-                .filter(|&r| !matches!(self.menu.tree.main.items[r], crate::menu::Item::Separator));
+                .filter(|&r| !matches!(self.menu.tree.main.items[r], Item::Separator));
             if row != self.menu.main_hi {
                 self.menu.main_hi = row;
                 self.paint_menu_main()?;
             }
             // Hovering a category opens its submenu; hovering anything else closes it.
             match row.map(|r| &self.menu.tree.main.items[r]) {
-                Some(crate::menu::Item::Submenu(_)) => {
+                Some(Item::Submenu(_)) => {
                     if self.menu.open_cat != row {
                         self.open_submenu(row.unwrap())?;
                     }
@@ -200,7 +196,7 @@ impl Wm {
             }
         } else if win == self.menu.sub_win {
             if let Some(cat) = self.menu.open_cat {
-                if let crate::menu::Item::Submenu(idx) = self.menu.tree.main.items[cat] {
+                if let Item::Submenu(idx) = self.menu.tree.main.items[cat] {
                     let n = self.menu.tree.subs[idx].labels.len();
                     let row = Self::menu_row_at(ly, n);
                     if row != self.menu.sub_hi {
@@ -219,24 +215,24 @@ impl Wm {
             let n = self.menu.tree.main.labels.len();
             match Self::menu_row_at(ly, n) {
                 Some(r) => match &self.menu.tree.main.items[r] {
-                    crate::menu::Item::Launch(c) => Some(c.clone()),
+                    Item::Launch(c) => Some(c.clone()),
                     // Clicking a category just (re)opens its submenu.
-                    crate::menu::Item::Submenu(_) => {
+                    Item::Submenu(_) => {
                         self.open_submenu(r)?;
                         return Ok(());
                     }
-                    crate::menu::Item::Separator => return Ok(()),
+                    Item::Separator => return Ok(()),
                 },
                 None => return Ok(()),
             }
         } else if win == self.menu.sub_win {
             match self.menu.open_cat {
                 Some(cat) => match self.menu.tree.main.items[cat] {
-                    crate::menu::Item::Submenu(idx) => {
+                    Item::Submenu(idx) => {
                         let n = self.menu.tree.subs[idx].labels.len();
                         match Self::menu_row_at(ly, n) {
                             Some(r) => match &self.menu.tree.subs[idx].items[r] {
-                                crate::menu::Item::Launch(c) => Some(c.clone()),
+                                Item::Launch(c) => Some(c.clone()),
                                 _ => return Ok(()),
                             },
                             None => return Ok(()),

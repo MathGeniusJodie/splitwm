@@ -14,7 +14,7 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::CURRENT_TIME;
 
 use super::types::{Client, Wm, R};
-use crate::render::Icon;
+use crate::icon::{self, Icon};
 use crate::theme;
 use crate::tree::Win;
 
@@ -336,10 +336,11 @@ impl Wm {
             if slot == 0 {
                 continue;
             }
-            let rotated = Rc::new(
-                self.renderer
-                    .rotate_icon(&icon, theme::icon_hue_rotation(slot)),
-            );
+            let rotated = Rc::new(icon::rotate(
+                self.renderer.palette(),
+                &icon,
+                theme::icon_hue_rotation(slot),
+            ));
             if let Some(c) = self.clients.get_mut(&win) {
                 c.icon_rotated = Some(rotated);
             }
@@ -411,7 +412,7 @@ impl Wm {
         // Quantize to the na16 chrome palette so app icons render as flat
         // pixel art matching the rest of the UI, and so the (rotate + snap)
         // hue-rotation for same-app disambiguation stays crisp.
-        Some(Rc::new(self.renderer.quantize_icon(&icon)))
+        Some(Rc::new(icon::quantize(self.renderer.palette(), &icon)))
     }
 
     // --- focus & spawning ---

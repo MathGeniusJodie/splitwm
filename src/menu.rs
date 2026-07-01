@@ -31,6 +31,35 @@ pub struct Menu {
     pub arrows: Vec<bool>,
 }
 
+impl Menu {
+    fn new() -> Self {
+        Self {
+            labels: Vec::new(),
+            items: Vec::new(),
+            arrows: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, label: String, item: Item, arrow: bool) {
+        self.labels.push(label);
+        self.items.push(item);
+        self.arrows.push(arrow);
+    }
+}
+
+// Menu-frame geometry, shared by the renderer (drawing) and `wm` (window
+// placement and row hit-testing).
+pub const MENU_ROW_H: i32 = 26;
+pub const MENU_BORDER: i32 = 8;
+
+/// Outer (window) size of a menu frame holding `rows` rows of `content_w`.
+pub const fn frame_size(rows: i32, content_w: i32) -> (i32, i32) {
+    (
+        content_w + 2 * MENU_BORDER,
+        rows * MENU_ROW_H + 2 * MENU_BORDER,
+    )
+}
+
 /// The whole menu tree: row 0.. of `main` may reference `subs` by index.
 pub struct MenuTree {
     pub main: Menu,
@@ -197,41 +226,25 @@ const QUICK: &[Quick] = &[
 pub fn build() -> MenuTree {
     let by_cat = scan();
 
-    let mut main = Menu {
-        labels: Vec::new(),
-        items: Vec::new(),
-        arrows: Vec::new(),
-    };
-    let push = |m: &mut Menu, label: String, item: Item, arrow: bool| {
-        m.labels.push(label);
-        m.items.push(item);
-        m.arrows.push(arrow);
-    };
-
+    let mut main = Menu::new();
     let mut subs = Vec::new();
     for (cat, apps) in by_cat {
         if apps.is_empty() {
             continue;
         }
-        let mut sub = Menu {
-            labels: Vec::new(),
-            items: Vec::new(),
-            arrows: Vec::new(),
-        };
+        let mut sub = Menu::new();
         for a in apps {
-            sub.labels.push(a.name);
-            sub.items.push(Item::Launch(a.exec));
-            sub.arrows.push(false);
+            sub.push(a.name, Item::Launch(a.exec), false);
         }
         let idx = subs.len();
         subs.push(sub);
-        push(&mut main, cat, Item::Submenu(idx), true);
+        main.push(cat, Item::Submenu(idx), true);
     }
 
-    push(&mut main, String::new(), Item::Separator, false);
+    main.push(String::new(), Item::Separator, false);
     for q in QUICK {
         let cmd = std::env::var(q.env).unwrap_or_else(|_| q.default.to_string());
-        push(&mut main, q.label.to_string(), Item::Launch(cmd), false);
+        main.push(q.label.to_string(), Item::Launch(cmd), false);
     }
 
     MenuTree { main, subs }

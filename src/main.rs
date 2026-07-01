@@ -1,3 +1,4 @@
+mod icon;
 mod menu;
 mod oklch;
 mod render;
