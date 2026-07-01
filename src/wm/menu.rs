@@ -68,32 +68,33 @@ impl Wm {
         Ok(())
     }
 
-    pub(crate) fn paint_menu_main(&self) -> R<()> {
+    pub(crate) fn paint_menu_main(&mut self) -> R<()> {
         let m = &self.menu.tree.main;
         let seps: Vec<bool> = m
             .items
             .iter()
             .map(|it| matches!(it, crate::menu::Item::Separator))
             .collect();
-        let pm = self.renderer.draw_menu(
+        let fb = self.renderer.draw_menu(
             &m.labels,
             &m.arrows,
             &seps,
             self.menu.main_cw,
             self.menu.main_hi,
         );
-        let mut buf = self.bgrx.borrow_mut();
-        crate::render::pixmap_to_bgrx(&pm, &mut buf);
+        let mut buf = std::mem::take(&mut self.bgrx);
+        self.renderer.present(&fb, &mut buf);
+        self.bgrx = buf;
         self.put_image(
             self.menu.main_win,
-            pm.width() as u16,
-            pm.height() as u16,
-            &buf,
+            fb.width as u16,
+            fb.height as u16,
+            &self.bgrx,
         )?;
         Ok(())
     }
 
-    pub(crate) fn paint_menu_sub(&self) -> R<()> {
+    pub(crate) fn paint_menu_sub(&mut self) -> R<()> {
         let Some(cat) = self.menu.open_cat else {
             return Ok(());
         };
@@ -102,20 +103,21 @@ impl Wm {
         };
         let sub = &self.menu.tree.subs[idx];
         let seps = vec![false; sub.labels.len()];
-        let pm = self.renderer.draw_menu(
+        let fb = self.renderer.draw_menu(
             &sub.labels,
             &sub.arrows,
             &seps,
             self.menu.sub_cw,
             self.menu.sub_hi,
         );
-        let mut buf = self.bgrx.borrow_mut();
-        crate::render::pixmap_to_bgrx(&pm, &mut buf);
+        let mut buf = std::mem::take(&mut self.bgrx);
+        self.renderer.present(&fb, &mut buf);
+        self.bgrx = buf;
         self.put_image(
             self.menu.sub_win,
-            pm.width() as u16,
-            pm.height() as u16,
-            &buf,
+            fb.width as u16,
+            fb.height as u16,
+            &self.bgrx,
         )?;
         Ok(())
     }

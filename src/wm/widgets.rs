@@ -11,6 +11,7 @@ impl Wm {
         self.tab_regions.clear();
         self.btn_regions.clear();
         self.taskbar_regions.clear();
+        self.edge_handle_regions.clear();
 
         self.compute_leaf_widgets(placed);
         self.compute_boundary_widgets(wa);
@@ -29,6 +30,7 @@ impl Wm {
         let right = wa.x + wa.w - gap;
         let mut x = wa.x + gap;
         let mut tiles = Vec::with_capacity(self.bar_order.len());
+        let cbs = theme::TASKBAR_CLOSE;
         for &win in &self.bar_order {
             if x + isz > right {
                 break;
@@ -41,8 +43,16 @@ impl Wm {
                     w: isz,
                     h: isz,
                 },
+                // Close badge in the tile's bottom-right corner; hit-tested
+                // before the tile so clicking it closes instead of focusing.
+                close: FrameRect {
+                    x: x + isz - cbs,
+                    y: y + isz - cbs,
+                    w: cbs,
+                    h: cbs,
+                },
                 win,
-                accent: leaf.map_or(theme::COLOR_FG, |l| self.leaf_color(l)),
+                accent: leaf.map_or(theme::palette_color::CREAM, |l| self.leaf_color_index(l)),
                 on_screen: leaf.is_some(),
             });
             x += isz + gap;
@@ -59,7 +69,7 @@ impl Wm {
 
     /// Per-leaf titlebar hit-rects, trailing "+" new-tab buttons, and split-control buttons.
     pub(crate) fn compute_leaf_widgets(&mut self, placed: &[Placement]) {
-        let tb_h = theme::tb_h(theme::GAP);
+        let tb_h = theme::tb_h();
         let bw = theme::BORDER_LEFT;
         for p in placed {
             let leaf = self.state.tree.leaf(p.leaf);
@@ -157,6 +167,42 @@ impl Wm {
             }
         }
         self.compute_edge_plus_buttons(wa, scroll_x, canvas_w, gap);
+        self.compute_edge_handle_widgets(wa);
+    }
+
+    /// Drag handles at the outer left/right canvas margins, letting the
+    /// leftmost/rightmost column grow or shrink into its own margin — the
+    /// edge-of-canvas analogue of the internal boundary handles above.
+    /// Only present once there are at least two root-level columns (see
+    /// `State::edge_span`); nothing to grab otherwise.
+    pub(crate) fn compute_edge_handle_widgets(&mut self, wa: Rect) {
+        let gap = theme::GAP;
+        let scroll_x = self.state.scroll_x;
+        let span_h = (wa.h - 2 * gap).max(1);
+        for left in [true, false] {
+            let Some((start_x, w)) = self.state.edge_span(wa, left) else {
+                continue;
+            };
+            // The whole gap-wide margin strip *outside* the column is the
+            // hit region — not a narrow pill centred on the column's edge:
+            // half of such a pill sits under the client window (which
+            // swallows clicks), leaving only a few workable pixels next to
+            // the split.
+            let col_edge = (if left { start_x } else { start_x + w }) - scroll_x;
+            let x = if left { col_edge - gap } else { col_edge };
+            if x + gap <= wa.x || x >= wa.x + wa.w {
+                continue;
+            }
+            self.edge_handle_regions.push((
+                FrameRect {
+                    x,
+                    y: wa.y + gap,
+                    w: gap,
+                    h: span_h,
+                },
+                left,
+            ));
+        }
     }
 
     /// Edge "+" buttons at the far left / far right of the canvas.

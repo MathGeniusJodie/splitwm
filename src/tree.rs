@@ -183,18 +183,6 @@ impl Tree {
         }
     }
 
-    pub fn contains(&self, subtree: NodeId, target: NodeId) -> bool {
-        if subtree == target {
-            return true;
-        }
-        match self.nodes.get(&subtree) {
-            Some(Node::Branch { children, .. }) => {
-                children.iter().any(|&c| self.contains(c, target))
-            }
-            _ => false,
-        }
-    }
-
     /// (parent id, index of `target` within parent.children), or None for root.
     pub fn find_parent(&self, target: NodeId) -> Option<(NodeId, usize)> {
         for (&id, node) in &self.nodes {
@@ -205,6 +193,50 @@ impl Tree {
             }
         }
         None
+    }
+
+    /// (parent, index-within-parent) for every child in one arena walk, for
+    /// callers that need many parent lookups per frame — `find_parent` scans
+    /// the whole arena per call, which is O(n²) when done once per leaf.
+    pub fn parent_map(&self) -> HashMap<NodeId, (NodeId, usize)> {
+        let mut out = HashMap::new();
+        for (&id, node) in &self.nodes {
+            if let Node::Branch { children, .. } = node {
+                for (i, &c) in children.iter().enumerate() {
+                    out.insert(c, (id, i));
+                }
+            }
+        }
+        out
+    }
+
+    /// The layout's width in *column units*: how many minimum-width columns
+    /// it needs side by side. A leaf is one column; an H-branch needs the sum
+    /// of its children; a V-branch is only as wide as its widest child —
+    /// stacking leaves vertically must not demand extra canvas width.
+    pub fn h_units(&self) -> i32 {
+        self.h_units_from(self.root)
+    }
+
+    fn h_units_from(&self, node: NodeId) -> i32 {
+        match self.nodes.get(&node) {
+            Some(Node::Branch {
+                dir: Dir::H,
+                children,
+                ..
+            }) => children.iter().map(|&c| self.h_units_from(c)).sum(),
+            Some(Node::Branch {
+                dir: Dir::V,
+                children,
+                ..
+            }) => children
+                .iter()
+                .map(|&c| self.h_units_from(c))
+                .max()
+                .unwrap_or(1),
+            Some(Node::Leaf(_)) => 1,
+            None => 0,
+        }
     }
 }
 
@@ -272,6 +304,31 @@ impl Tree {
             &mut geos,
         );
         geos
+    }
+
+    /// Pixel widths of the root's immediate horizontally-arranged columns,
+    /// without recursing into subtrees — so it still works when a column
+    /// is itself a further-split branch, whose own leaves wouldn't appear
+    /// in `compute`'s per-leaf geometry. A single leaf, or a root that's
+    /// itself a *vertical* branch (children stacked, each spanning the
+    /// full width), count as one column occupying the whole row —
+    /// `usable_w` is the already gap-trimmed width available to it (see
+    /// `compute`'s `w - 2 * gap`).
+    pub fn root_h_sizes(&self, usable_w: i32, gap: i32) -> Option<Vec<i32>> {
+        match self.get(self.root)? {
+            Node::Leaf(_) => Some(vec![usable_w.max(0)]),
+            Node::Branch { dir: Dir::V, .. } => Some(vec![usable_w.max(0)]),
+            Node::Branch {
+                dir: Dir::H,
+                children,
+                ratios,
+            } => {
+                let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
+                let meta = self.child_meta(children, ratios);
+                let usable = (usable_w - gap * (n - 1)).max(0);
+                Some(child_sizes(&meta, usable, gap))
+            }
+        }
     }
 
     #[allow(clippy::many_single_char_names, clippy::too_many_arguments)] // recursive geometry walk

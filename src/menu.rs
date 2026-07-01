@@ -62,13 +62,16 @@ fn first_main_category(cats: &str) -> String {
     "Other".to_string()
 }
 
-/// Strip desktop-entry field codes (`%f`, `%U`, …) from an Exec line.
+/// Strip desktop-entry field codes (`%f`, `%U`, …) from an Exec line;
+/// `%%` is the spec's escape for a literal `%`.
 fn clean_exec(exec: &str) -> String {
     let mut out = String::with_capacity(exec.len());
     let mut chars = exec.chars();
     while let Some(c) = chars.next() {
         if c == '%' {
-            chars.next(); // drop the field-code letter
+            if chars.next() == Some('%') {
+                out.push('%');
+            }
         } else {
             out.push(c);
         }

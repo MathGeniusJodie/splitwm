@@ -98,6 +98,15 @@ pub const BORDER_BOTTOM: i32 = 7;
 pub const TASKBAR_H: i32 = 56;
 pub const TASKBAR_ICON: i32 = 36;
 pub const TASKBAR_GAP: i32 = 10;
+/// Side of the square close ("x") badge in a taskbar tile's bottom-right corner.
+pub const TASKBAR_CLOSE: i32 = 13;
+
+/// Default `WM_NAME` of the window parked entirely off-screen past the right
+/// edge (see `Wm::manage_dock`), outside the split tree, immune to canvas
+/// scrolling, and reserving no layout space. cozyui sets this exact title
+/// and never sets `WM_CLASS`, so title is the only identity it exposes.
+/// Overridable at runtime with the `SPLITWM_DOCK_TITLE` environment variable.
+pub const DOCK_TITLE: &str = "cozyui";
 
 pub const SPLIT_RATIO: f64 = 0.618;
 pub const RESIZE_STEP: f64 = 0.05;
@@ -107,7 +116,9 @@ pub const SCROLL_STEP: i32 = 100;
 // hsplit/vsplit PNGs, drawn at 1:1 scale (no stretching).
 pub const BTN_SIZE: i32 = 19;
 pub const BTN_SPACING: i32 = 4;
-pub const N_SPLIT_BTNS: i32 = 5;
+/// How many split-control buttons a titlebar holds (close/split/minimize);
+/// must match `BtnKind`'s variants — `min_split_w` derives from it.
+pub const N_SPLIT_BTNS: i32 = 3;
 /// Vertical nudge (down = positive) applied to titlebar buttons, to fine-tune
 /// their alignment within the bitmap titlebar.
 pub const BTN_Y_OFFSET: i32 = 3;
@@ -117,7 +128,7 @@ pub const fn min_split_w() -> i32 {
 }
 
 /// Titlebar height: the top inset of the bitmap window border.
-pub const fn tb_h(_gap: i32) -> i32 {
+pub const fn tb_h() -> i32 {
     BORDER_TOP
 }
 

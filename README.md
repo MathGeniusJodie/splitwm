@@ -1,75 +1,101 @@
 # splitwm (Rust)
 
-A from-scratch X11 window manager in Rust, cloning the behaviour and look of
+A from-scratch X11 window manager in Rust, a standalone port of
 [MathGeniusJodie/awesome](https://github.com/MathGeniusJodie/awesome)'s
-**splitwm** — a terminal-multiplexer-style tiling layout where:
+**splitwm** layout (originally Lua on AwesomeWM) — a
+terminal-multiplexer-style tiling layout where:
 
 - Splits are persistent containers arranged in an n-ary tree (split
   horizontally or vertically).
-- Each split is a **leaf** holding a *tab stack* of windows; the active tab is
-  shown, the rest are hidden but kept.
+- Each split shows **one window**; everything else lives in a **bottom
+  taskbar** and can be cycled into a split (`Mod4+[` / `]`) or clicked in.
 - The whole layout lives on a **horizontally-scrollable canvas** that can be
-  wider than the screen.
-- Each leaf draws a custom **slanted tab bar** and a rounded focus border.
-
-The original is ~5500 lines of Lua running on top of AwesomeWM's engine; this
-is a standalone WM with no Lua/awesome dependency.
+  wider than the screen (trackpad two-finger swipe, or Mod4+swipe over a
+  window).
+- All chrome — bitmap window borders, titlebars, buttons, drag handles,
+  taskbar — is **palette-swapped pixel art** (the na16 palette), composited
+  in software onto a single full-screen underlay window below every client.
 
 ## Stack
 
-- **[x11rb](https://crates.io/crates/x11rb)** — pure-Rust X11/XCB binding.
-- **[tiny-skia](https://crates.io/crates/tiny-skia)** — pure-Rust 2D rasteriser
-  for the tab bars / borders (rendered to a buffer, blitted via `PutImage`).
-- **[fontdue](https://crates.io/crates/fontdue)** — glyph rasterising for tab
-  labels (a system monospace TTF is loaded at runtime, as a fallback when a
-  client has no `_NET_WM_ICON`).
+- **[x11rb](https://crates.io/crates/x11rb)** — pure-Rust X11/XCB binding
+  (`xinput` feature for smooth trackpad scrolling).
+- **[tiny-skia](https://crates.io/crates/tiny-skia)** — pure-Rust 2D
+  rasteriser for the underlay compositing (blitted via `PutImage`).
+- **[fontdue](https://crates.io/crates/fontdue)** — glyph rasterising for
+  labels (a system TTF/OTF is loaded at runtime; labels degrade to nothing
+  if none is found).
+- **pixel-graphics** (vendored) — palette-indexed sprite drawing and the
+  palette-swap machinery behind the per-split accent colours.
 
 ## Architecture
 
 | file | role |
 |------|------|
-| `src/theme.rs`  | colours + layout metrics (ported from `theme.lua` / `rc.lua`) |
-| `src/tree.rs`   | pure split-tree math + geometry (ported from `tree.lua`) |
-| `src/state.rs`  | per-tag layout state + all tree/tab mutations (`core.lua`+`ops.lua`) |
-| `src/render.rs` | tiny-skia drawing of leaf decorations → BGRX buffer |
-| `src/wm.rs`     | X11 event loop: become WM, per-leaf frame windows, reparenting, keybindings |
+| `src/theme.rs`      | palette indices, colours, layout metrics |
+| `src/tree.rs`       | pure split-tree math + geometry |
+| `src/state.rs`      | per-tag layout state + all tree/taskbar mutations |
+| `src/render.rs`     | software rendering: 9-slice borders, buttons, icons, menu |
+| `src/oklch.rs`      | OKLCH hue rotation for same-app icon disambiguation |
+| `src/menu.rs`       | freedesktop `.desktop` scan → launcher menu tree |
+| `src/wm/mod.rs`     | become WM, EWMH announcement, event loop |
+| `src/wm/events.rs`  | event dispatch: keys, buttons, drags, scroll coalescing |
+| `src/wm/clients.rs` | client lifecycle, icons, focus, WM_DELETE/WM_STATE |
+| `src/wm/arrange.rs` | layout → placements, underlay compositing, animation |
+| `src/wm/widgets.rs` | hit-region computation (handles, "+", tabs, taskbar) |
+| `src/wm/menu.rs`    | launcher menu windows (paint, hover, click) |
 
-Each leaf gets a **frame window** (child of root) covering its area; the active
-client is reparented into the frame and positioned below the tab bar. Scrolling
-moves the frames; off-screen frames are unmapped. Frames paint their own slice
-of the wallpaper as the background, so they blend into the surrounding gaps.
+There is **no reparenting**: clients stay children of the root, positioned
+below their split's titlebar, and all decoration is drawn on the underlay.
+Windows hidden from the layout are unmapped (with ICCCM `WM_STATE` kept in
+sync, and self-inflicted unmaps distinguished from client withdrawal); on
+quit or WM handover everything is remapped so nothing is stranded.
 
-Gap **drag handles** and **"+" insert buttons** are pooled child-of-root
-windows positioned in the gaps each arrange; layout-changing actions play an
-**ease-out-back** animation by interpolating frame geometry over ~0.28 s.
+ICCCM/EWMH surface: `WM_S<n>` manager selection (`--replace` supported both
+ways), `WM_STATE`, `WM_DELETE_WINDOW` for polite closing,
+`_NET_SUPPORTING_WM_CHECK`, `_NET_CLIENT_LIST`, `_NET_ACTIVE_WINDOW`,
+`_NET_WM_ICON`. Single monitor, single tag; RandR screen resizes and
+keyboard-mapping changes are handled.
 
 ## Keybindings (Mod4 = Super)
 
 | key | action |
 |-----|--------|
 | `Mod4+Return`        | open terminal (`$TERMINAL`, default `xterm`) |
-| `Mod4+v`             | split horizontally |
-| `Mod4+h`             | split vertically |
-| `Mod4+q`             | close current split |
+| `Mod4+v`             | split into columns |
+| `Mod4+h`             | split into rows |
+| `Mod4+q`             | close current split (window goes to sibling/taskbar) |
 | `Mod4+Tab` / `Right` | focus next split |
 | `Mod4+Shift+Tab` / `Left` | focus previous split |
-| `Mod4+]` / `[`       | next / previous tab in split |
-| `Mod4+Shift+]` / `[` | move tab to next / previous split |
+| `Mod4+]` / `[`       | cycle taskbar window into the focused split (fwd/back) |
+| `Mod4+Shift+]` / `[` | move window to next / previous split |
 | `Mod4+l` / `=`       | grow split |
 | `Mod4+Shift+l` / `Mod4+-` | shrink split |
-| `Mod4+Shift+c`       | kill focused window |
-| `Mod4+Shift+q`       | quit splitwm |
-| `Mod4 + scroll wheel`| scroll the canvas horizontally |
+| `Mod4+Shift+c`       | close focused window (`WM_DELETE_WINDOW`, falls back to kill) |
+| `Mod4+Shift+q`       | quit splitwm (remaps all hidden windows first) |
+| trackpad h-swipe     | scroll the canvas (over gaps; hold Mod4 over a window) |
 | drag a gap handle    | resize the two adjacent columns |
-| click a gap / edge `+`| insert an empty column there |
+| drag a canvas edge   | resize the outer column into its margin |
+| click a gap/edge `+` | insert an empty column there |
+| taskbar tile         | focus that window / bring it into the focused split |
+| taskbar tile corner `x` | close that window politely |
+| taskbar `+`          | app launcher menu (from `.desktop` files) |
+| titlebar buttons     | minimize / split (right-click: other direction) / close split |
 
-Set `SPLITWM_WALLPAPER=/path/to.png` to render a scaled wallpaper behind the
-gaps.
+## Environment
+
+- `SPLITWM_WALLPAPER=/path/to.png` — scaled wallpaper behind the gaps.
+- `SPLITWM_DOCK_TITLE` (default `cozyui`) — a window with this `WM_NAME` is
+  docked off-screen past the canvas's right end, revealed by scrolling all
+  the way right.
+- `SPLITWM_DEBUG_SCROLL=1` — log scroll-device discovery and batch timings.
+- `TERMINAL`, `BROWSER`, `FILEMANAGER` — quick-launch entries in the menu.
 
 ## Build & test
 
 ```sh
 cargo build --release
+cargo test          # layout-state unit tests
 
 # Launch in a nested X server (Xephyr) and drive an automated UI test that
 # splits, tabs, scrolls, resizes and closes, dropping screenshots in
@@ -83,26 +109,15 @@ DISPLAY=:1 ./target/release/splitwm
 
 ## Status
 
-Implemented: tree splits (H/V, n-ary, flattening), tabbed leaves, custom slanted
-tab bars, rounded focus border, scrollable canvas, focus engine, resize, tab
-cycling/moving, split close with tab merge, keybindings, click-to-focus,
-Mod4+wheel scroll.
+Implemented: n-ary tree splits with flattening, scrollable canvas with
+edge/gap resize and column insertion, bottom taskbar with cycle/close,
+per-split persistent accent colours (palette-swapped bitmap chrome), app
+icons from `_NET_WM_ICON` quantized to the chrome palette (hue-rotated per
+window when one app has several), `.desktop` launcher menu, docked sidebar,
+layout animations (ease-out-back, ~60 fps paced), smooth trackpad canvas
+panning, `--replace` in both directions.
 
-Parity features ported from the Lua original:
-
-- **App icons** in tabs from `_NET_WM_ICON` (letter-glyph fallback).
-- **Window-content colour sampling** — the focused client's top strip is
-  sampled to tint its active tab and focus border.
-- **Wallpaper underlay** (`SPLITWM_WALLPAPER`), with frames painting their own
-  wallpaper slice so gaps blend seamlessly.
-- **Split / close / resize animations** (ease-out-back).
-- Gap **drag-to-resize handles** and **"+" column-insert** buttons (gaps + edges).
-- **Smush** — auto font-shrink (Ctrl+0 / Ctrl+-) into narrow focused splits via
-  XTEST.
-
-Not ported: the **status bar** / clock (intentionally excluded), and
-multi-tag/multi-monitor support (runs a single tag on the primary screen).
-
-> Note: pointer-driven drag/insert is exercised by unit tests on the underlying
-> layout ops; it can't be synthesised in the headless Xephyr used for the
-> screenshot drive (`XWarpPointer` is ignored there).
+Intentionally not implemented: multi-monitor, multiple tags, a status
+bar/clock, and the Lua original's slanted tab bars, per-leaf tab stacks,
+window-content colour sampling, and XTEST "smush" — this port shows one
+window per split and keeps the rest in the taskbar.

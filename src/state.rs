@@ -11,6 +11,16 @@ pub struct State {
     pub scroll_target: i32,
     /// Canvas width; None falls back to the workarea width.
     pub canvas_w: Option<i32>,
+    /// Extra scrollable width past `canvas_w` reserved for the docked
+    /// sidebar (see `Wm::manage_dock`), so scrolling all the way right
+    /// reveals it even though it sits outside the split tree and doesn't
+    /// affect `compute`'s leaf geometry. Zero when nothing is docked.
+    pub dock_extra: i32,
+    /// Cumulative manual adjustment to `canvas_w` from dragging an
+    /// edge-of-canvas resize handle (see `resize_edge`), layered on top of
+    /// `Wm::arrange`'s own leaf-count-driven heuristic every frame so a
+    /// manual resize isn't immediately overwritten by it.
+    pub canvas_w_extra: i32,
     /// Windows not currently shown in any split, in the bottom taskbar.
     pub taskbar: Vec<Win>,
 }
@@ -25,6 +35,8 @@ impl State {
             scroll_x: 0,
             scroll_target: 0,
             canvas_w: None,
+            dock_extra: 0,
+            canvas_w_extra: 0,
             taskbar: Vec::new(),
         }
     }
@@ -110,12 +122,25 @@ impl State {
             return None;
         }
         let lid = self.focused_leaf_valid();
-        let next = if offset >= 0 {
+        let forward = offset >= 0;
+        let displaced = self.tree.leaf(lid).and_then(|l| l.client);
+        let next = if forward {
             self.taskbar.remove(0)
         } else {
             self.taskbar.pop()?
         };
         self.assign_to_leaf(next, lid);
+        // `assign_to_leaf` pushes the displaced occupant to the *back* —
+        // exactly where backward cycling pops from, which would make prev
+        // flip-flop between two windows instead of walking the list in
+        // reverse. Move it to the front so forward and backward are true
+        // inverse rotations of the same queue.
+        if !forward {
+            if let Some(d) = displaced {
+                self.taskbar.retain(|&w| w != d);
+                self.taskbar.insert(0, d);
+            }
+        }
         Some(next)
     }
 
@@ -252,12 +277,14 @@ impl State {
             }
         }
 
-        let focused_id = self.focused_leaf;
         let nchildren = match self.tree.get(parent) {
             Some(Node::Branch { children, .. }) => children.len(),
             _ => return false,
         };
 
+        // Focus always moves to the nearest surviving neighbour: the closed
+        // leaf *was* the focused one (node ids are never reused, so it can't
+        // still be found anywhere in the tree after removal).
         if nchildren > 2 {
             // n-ary: remove this child, redistribute its ratio.
             if let Some(Node::Branch {
@@ -279,15 +306,8 @@ impl State {
                 Some(Node::Branch { children, .. }) => children.clone(),
                 _ => unreachable!(),
             };
-            let keep = children
-                .iter()
-                .find(|&&c| self.tree.contains(c, focused_id));
-            self.focused_leaf = if let Some(&_) = keep {
-                focused_id
-            } else {
-                let fb = idx.min(children.len() - 1);
-                self.tree.first_leaf(children[fb])
-            };
+            let fb = idx.min(children.len() - 1);
+            self.focused_leaf = self.tree.first_leaf(children[fb]);
         } else {
             // binary: collapse parent, sibling takes its place.
             let sibling = match self.tree.get(parent) {
@@ -303,11 +323,7 @@ impl State {
                 }
             }
             self.tree.remove_node(parent);
-            self.focused_leaf = if self.tree.contains(sibling, focused_id) {
-                focused_id
-            } else {
-                self.tree.first_leaf(sibling)
-            };
+            self.focused_leaf = self.tree.first_leaf(sibling);
         }
         true
     }
@@ -324,6 +340,12 @@ impl State {
         }) = self.tree.get_mut(parent)
         {
             let n = children.len();
+            if n < 2 {
+                // No sibling to trade width with (also guards the `idx - 1`
+                // underflow below if a degenerate single-child branch ever
+                // exists).
+                return false;
+            }
             let other = if idx + 1 < n { idx + 1 } else { idx - 1 };
             let min_r = 0.01;
             let cur = ratios[idx];
@@ -340,7 +362,7 @@ impl State {
     // --- scroll ---
 
     pub fn max_scroll(&self, wa: Rect) -> i32 {
-        (self.canvas_w.unwrap_or(wa.w) - wa.w).max(0)
+        (self.canvas_w.unwrap_or(wa.w) + self.dock_extra - wa.w).max(0)
     }
 
     pub fn scroll_to(&mut self, wa: Rect, target: i32) {
@@ -364,6 +386,80 @@ impl State {
         let gap = theme::GAP;
         let canvas_w = self.canvas_w.unwrap_or(wa.w);
         self.tree.h_boundaries(wa.x, wa.y, canvas_w, wa.h, gap)
+    }
+
+    /// Canvas-space x-span `(start_x, width)` of the leftmost/rightmost
+    /// root-level column — used to seed and drive an edge-of-canvas resize
+    /// drag (see `resize_edge`). A single leaf, or a root that's itself a
+    /// vertical branch, count as one column spanning the whole row, so
+    /// `left`/`right` both describe the same span in that case (see
+    /// `Tree::root_h_sizes`). `None` only if the tree is somehow empty.
+    pub fn edge_span(&self, wa: Rect, left: bool) -> Option<(i32, i32)> {
+        let gap = theme::GAP;
+        let canvas_w = self.canvas_w.unwrap_or(wa.w);
+        let sizes = self.tree.root_h_sizes(canvas_w - 2 * gap, gap)?;
+        let start_x = wa.x + gap;
+        if left {
+            Some((start_x, sizes[0]))
+        } else {
+            let n = sizes.len();
+            let before: i32 = sizes[..n - 1].iter().sum();
+            let gaps_before = gap * i32::try_from(n - 1).unwrap_or(0);
+            Some((start_x + before + gaps_before, sizes[n - 1]))
+        }
+    }
+
+    /// Resize the leftmost or rightmost root-level column to `target_w`
+    /// pixels: the column absorbs the whole delta, every sibling keeps its
+    /// exact current pixel width, and `canvas_w` grows/shrinks by that same
+    /// delta (via `canvas_w_extra`, layered on top of `Wm::arrange`'s
+    /// heuristic each frame) — the canvas itself tracks the resize, the
+    /// same way it grows when a new column is inserted. `theme::GAP` (the
+    /// margin) never changes. A single leaf (or a vertical-branch root) has
+    /// no sibling ratios to redistribute — it's the whole row already, so
+    /// only `canvas_w_extra` moves.
+    ///
+    /// For the left edge specifically, the column's *start* is what's
+    /// meant to track the mouse (growing toward the screen edge), but
+    /// `Tree::compute` always lays children out left-to-right from a fixed
+    /// origin — so growing column 0 there necessarily shifts every later
+    /// column's canvas-space x right by `delta`. The caller (`Wm::on_motion`)
+    /// nudges `scroll_x`/`scroll_target` by the same `delta` so those
+    /// columns stay put on screen and only the dragged edge visibly moves.
+    pub fn resize_edge(&mut self, wa: Rect, left: bool, target_w: i32) -> i32 {
+        let root = self.tree.root;
+        let gap = theme::GAP;
+        let canvas_w = self.canvas_w.unwrap_or(wa.w);
+        let Some(mut widths) = self.tree.root_h_sizes(canvas_w - 2 * gap, gap) else {
+            return 0;
+        };
+        let idx = if left { 0 } else { widths.len() - 1 };
+        let old_w = widths[idx];
+        let min_w = theme::min_split_w();
+        let new_w = target_w.max(min_w);
+        let delta = new_w - old_w;
+        if delta == 0 {
+            return 0;
+        }
+        if widths.len() > 1 {
+            widths[idx] = new_w;
+            let total: i32 = widths.iter().sum();
+            if total <= 0 {
+                return 0;
+            }
+            if let Some(Node::Branch {
+                dir: Dir::H,
+                ratios,
+                ..
+            }) = self.tree.get_mut(root)
+            {
+                for (r, &w) in ratios.iter_mut().zip(widths.iter()) {
+                    *r = f64::from(w) / f64::from(total);
+                }
+            }
+        }
+        self.canvas_w_extra += delta;
+        delta
     }
 
     /// Set the split ratio at a boundary so the left child occupies fraction
@@ -546,5 +642,213 @@ mod tests {
             .collect();
         let unique: std::collections::HashSet<_> = colors.iter().collect();
         assert_eq!(unique.len(), colors.len());
+    }
+
+    /// `dock_extra` must open up exactly enough extra scroll room to slide
+    /// the docked sidebar fully into view, mirroring `Wm::place_dock`'s
+    /// `x = wa.x + canvas_w - scroll_x` formula, even when there's only one
+    /// column and the canvas alone has no scroll room of its own.
+    #[test]
+    fn dock_extra_reveals_sidebar_at_max_scroll() {
+        let mut s = State::new();
+        s.canvas_w = Some(WA.w); // single leaf: canvas == viewport, no scroll room on its own
+        let docked_w = 300;
+        s.dock_extra = docked_w;
+
+        assert_eq!(s.max_scroll(WA), docked_w);
+
+        let canvas_w = s.canvas_w.unwrap();
+        let dock_x_at = |scroll_x: i32| WA.x + canvas_w - scroll_x;
+
+        // Fully off-screen to the right before scrolling.
+        assert!(dock_x_at(0) >= WA.x + WA.w);
+
+        // Scrolling to the clamped max brings it flush to the right edge.
+        s.scroll_to(WA, i32::MAX);
+        assert_eq!(s.scroll_target, docked_w);
+        assert_eq!(dock_x_at(s.scroll_target), WA.x + WA.w - docked_w);
+    }
+
+    /// A single leaf has no sibling to trade width with, but it should
+    /// still be resizable — both edges describe the same full-width span,
+    /// and shrinking it should work exactly like a two-column edge resize
+    /// minus the ratio bookkeeping (see `resize_edge_shrinks_lone_leaf`).
+    #[test]
+    fn edge_span_is_full_width_for_single_leaf() {
+        let s = State::new();
+        let canvas_w = s.canvas_w.unwrap_or(WA.w);
+        let want = (WA.x + crate::theme::GAP, canvas_w - 2 * crate::theme::GAP);
+        assert_eq!(s.edge_span(WA, true), Some(want));
+        assert_eq!(s.edge_span(WA, false), Some(want));
+    }
+
+    /// Shrinking the lone leaf from the right edge should narrow it by
+    /// exactly the requested delta and shrink `canvas_w` by the same
+    /// amount, with no ratios to touch (there's no `Node::Branch` at all).
+    #[test]
+    fn resize_edge_shrinks_lone_leaf() {
+        let mut s = State::new();
+        s.canvas_w = Some(WA.w);
+        let (_, w_before) = s.edge_span(WA, false).unwrap();
+
+        let shrink_by = 50;
+        let applied = s.resize_edge(WA, false, w_before - shrink_by);
+        assert_eq!(applied, -shrink_by);
+        assert_eq!(s.canvas_w_extra, -shrink_by);
+
+        s.canvas_w = Some(WA.w + s.canvas_w_extra);
+        let (_, w_after) = s.edge_span(WA, false).unwrap();
+        assert_eq!(w_after, w_before - shrink_by);
+    }
+
+    /// Growing the left column via `resize_edge` should widen it by exactly
+    /// the requested delta, leave the other column's pixel width untouched,
+    /// grow `canvas_w` by that same delta (so the scrollable canvas tracks
+    /// the resize, the way it does for every other canvas-widening
+    /// operation), and report the applied delta so the caller can
+    /// compensate scroll.
+    #[test]
+    fn resize_edge_grows_left_column_and_canvas() {
+        let mut s = State::new();
+        s.split_focused(Dir::H);
+        s.canvas_w = Some(WA.w);
+        let canvas_w_before = s.canvas_w.unwrap();
+
+        let before = s.compute(WA);
+        let leaves = s.tree.collect_leaves();
+        let (left_id, right_id) = (leaves[0], leaves[1]);
+        let left_w_before = before[&left_id].w;
+        let right_w_before = before[&right_id].w;
+
+        let (start_x, w) = s.edge_span(WA, true).expect("two columns");
+        assert_eq!(w, left_w_before);
+        assert_eq!(start_x, WA.x + crate::theme::GAP);
+
+        let grow_by = 40;
+        let applied = s.resize_edge(WA, true, left_w_before + grow_by);
+        assert_eq!(applied, grow_by);
+        assert_eq!(s.canvas_w_extra, grow_by);
+
+        // `canvas_w` itself isn't updated by `resize_edge` (that's
+        // `Wm::arrange`'s job, layering `canvas_w_extra` on top of its
+        // heuristic each frame); simulate that here to check geometry.
+        s.canvas_w = Some(canvas_w_before + s.canvas_w_extra);
+        let after = s.compute(WA);
+        assert_eq!(after[&left_id].w, left_w_before + grow_by);
+        assert_eq!(after[&right_id].w, right_w_before);
+    }
+
+    /// Backward taskbar cycling must walk the whole list in reverse, not
+    /// flip-flop between the shown window and the last taskbar entry
+    /// (regression: `assign_to_leaf` pushes the displaced window to the
+    /// back, which is exactly where the next backward pop looked).
+    #[test]
+    fn cycle_taskbar_prev_visits_every_window() {
+        let mut s = State::new();
+        for w in [10, 1, 2, 3] {
+            s.pin_client(w);
+        }
+        // Leaf shows 3; taskbar is [10, 1, 2].
+        assert_eq!(s.focused_client(), Some(3));
+
+        let shown: Vec<_> = (0..4).map(|_| s.cycle_taskbar(-1).unwrap()).collect();
+        assert_eq!(shown, vec![2, 1, 10, 3], "prev must rotate, not toggle");
+    }
+
+    /// One step forward then one step back must restore both the shown
+    /// window and the taskbar order.
+    #[test]
+    fn cycle_taskbar_prev_inverts_next() {
+        let mut s = State::new();
+        for w in [10, 1, 2, 3] {
+            s.pin_client(w);
+        }
+        let before = s.taskbar.clone();
+        s.cycle_taskbar(1);
+        s.cycle_taskbar(-1);
+        assert_eq!(s.focused_client(), Some(3));
+        assert_eq!(s.taskbar, before);
+    }
+
+    /// A degenerate single-child branch must not panic `resize_focused`
+    /// (`idx - 1` underflow when there is no sibling).
+    #[test]
+    fn resize_focused_survives_single_child_branch() {
+        let mut s = State::new();
+        let leaf = s.tree.first_leaf(s.tree.root);
+        let branch = s.tree.insert_node(Node::Branch {
+            dir: Dir::H,
+            children: vec![leaf],
+            ratios: vec![1.0],
+        });
+        s.tree.root = branch;
+        s.focused_leaf = leaf;
+        assert!(!s.resize_focused(0.1));
+    }
+
+    /// Closing a middle column moves focus to a surviving neighbour.
+    #[test]
+    fn close_focused_moves_focus_to_neighbour() {
+        let mut s = State::new();
+        s.split_focused(Dir::H); // two columns, focus left
+        s.insert_at_root(1); // middle column, focused
+        assert_eq!(s.tree.collect_leaves().len(), 3);
+        assert!(s.close_focused());
+        let leaves = s.tree.collect_leaves();
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.contains(&s.focused_leaf_valid()));
+    }
+
+    /// Canvas width demand is measured in columns: vertical stacking must
+    /// not increase `h_units`, horizontal splitting must.
+    #[test]
+    fn h_units_counts_columns_not_leaves() {
+        let mut s = State::new();
+        assert_eq!(s.tree.h_units(), 1);
+        for _ in 0..3 {
+            s.split_focused(Dir::V);
+        }
+        assert_eq!(s.tree.collect_leaves().len(), 4);
+        assert_eq!(s.tree.h_units(), 1, "a vertical stack is one column");
+        s.split_focused(Dir::H);
+        assert_eq!(s.tree.h_units(), 2);
+    }
+
+    /// `parent_map` must agree with `find_parent` for every node.
+    #[test]
+    fn parent_map_matches_find_parent() {
+        let mut s = State::new();
+        s.split_focused(Dir::H);
+        s.split_focused(Dir::V);
+        s.insert_at_root(0);
+        let map = s.tree.parent_map();
+        for leaf in s.tree.collect_leaves() {
+            assert_eq!(map.get(&leaf).copied(), s.tree.find_parent(leaf));
+        }
+    }
+
+    /// Same as above, mirrored for the right edge (shrinking instead).
+    #[test]
+    fn resize_edge_shrinks_right_column_and_canvas() {
+        let mut s = State::new();
+        s.split_focused(Dir::H);
+        s.canvas_w = Some(WA.w);
+        let canvas_w_before = s.canvas_w.unwrap();
+
+        let before = s.compute(WA);
+        let leaves = s.tree.collect_leaves();
+        let (left_id, right_id) = (leaves[0], leaves[1]);
+        let left_w_before = before[&left_id].w;
+        let right_w_before = before[&right_id].w;
+
+        let shrink_by = 30;
+        let applied = s.resize_edge(WA, false, right_w_before - shrink_by);
+        assert_eq!(applied, -shrink_by);
+        assert_eq!(s.canvas_w_extra, -shrink_by);
+
+        s.canvas_w = Some(canvas_w_before + s.canvas_w_extra);
+        let after = s.compute(WA);
+        assert_eq!(after[&right_id].w, right_w_before - shrink_by);
+        assert_eq!(after[&left_id].w, left_w_before);
     }
 }
