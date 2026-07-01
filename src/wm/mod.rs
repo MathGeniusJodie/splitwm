@@ -239,23 +239,37 @@ pub fn run(replace: bool) -> R<()> {
     // Black root background + a normal left-pointer cursor. Without setting a
     // root cursor the pointer is invisible over the root and the underlay
     // (which inherits the root's cursor), so give it the standard arrow from
-    // the "cursor" font (glyph 68 = XC_left_ptr, 69 = its mask).
+    // the "cursor" font (glyph 68 = XC_left_ptr; a glyph's mask is always the
+    // next glyph). Resize/disabled cursors for hover feedback come from the
+    // same font: 108 = XC_sb_h_double_arrow, 116 = XC_sb_v_double_arrow,
+    // 0 = XC_X_cursor (closest core glyph to a "not allowed" cursor).
     let cursor_font = conn.generate_id()?;
     conn.open_font(cursor_font, b"cursor")?;
-    let cursor = conn.generate_id()?;
-    conn.create_glyph_cursor(
-        cursor,
-        cursor_font,
-        cursor_font,
-        68,
-        69,
-        0,
-        0,
-        0,
-        0xffff,
-        0xffff,
-        0xffff,
-    )?;
+    let make_cursor = |glyph: u16| -> R<u32> {
+        let c = conn.generate_id()?;
+        conn.create_glyph_cursor(
+            c,
+            cursor_font,
+            cursor_font,
+            glyph,
+            glyph + 1,
+            0,
+            0,
+            0,
+            0xffff,
+            0xffff,
+            0xffff,
+        )?;
+        Ok(c)
+    };
+    let cursors = Cursors {
+        arrow: make_cursor(68)?,
+        h_resize: make_cursor(108)?,
+        v_resize: make_cursor(116)?,
+        disabled: make_cursor(0)?,
+        current: 0,
+    };
+    let cursor = cursors.arrow;
     conn.close_font(cursor_font)?;
     let cw = ChangeWindowAttributesAux::new()
         .background_pixel(screen.black_pixel)
@@ -298,7 +312,10 @@ pub fn run(replace: bool) -> R<()> {
                 EventMask::EXPOSURE
                     | EventMask::BUTTON_PRESS
                     | EventMask::BUTTON_RELEASE
-                    | EventMask::BUTTON1_MOTION,
+                    | EventMask::BUTTON1_MOTION
+                    // Hover motion drives the resize/disabled cursor feedback
+                    // over drag handles and titlebar buttons.
+                    | EventMask::POINTER_MOTION,
             ),
     )?;
     conn.map_window(underlay)?;
@@ -404,6 +421,7 @@ pub fn run(replace: bool) -> R<()> {
         drag: None,
         edge_handle_regions: Vec::new(),
         edge_drag: None,
+        cursors,
         bgrx: Vec::new(),
         hscroll: Vec::new(),
         hscroll_gate: (

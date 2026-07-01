@@ -2,7 +2,7 @@
 
 use super::types::{BtnKind, FrameRect, Placement, TaskTile, Wm};
 use crate::theme;
-use crate::tree::Rect;
+use crate::tree::{Dir, Rect};
 
 impl Wm {
     pub(crate) fn compute_widgets(&mut self, wa: Rect, placed: &[Placement]) {
@@ -147,23 +147,38 @@ impl Wm {
         let scroll_x = self.state.scroll_x;
         let canvas_w = self.state.canvas_w.unwrap_or(wa.w);
         for b in self.state.boundaries(wa) {
-            let vis_x = b.x - scroll_x;
-            if vis_x + hw / 2 <= wa.x || vis_x - hw / 2 >= wa.x + wa.w {
-                continue;
-            }
-            self.handle_regions.push((
+            let rect = if b.dir == Dir::H {
+                // Vertical gap between columns: a full-height pill dragged
+                // along x (scrolls with the canvas).
+                let vis_x = b.pos - scroll_x;
+                if vis_x + hw / 2 <= wa.x || vis_x - hw / 2 >= wa.x + wa.w {
+                    continue;
+                }
                 FrameRect {
                     x: vis_x - hw / 2,
-                    y: b.y,
+                    y: b.cross,
                     w: hw,
-                    h: b.h.max(1),
-                },
-                b,
-            ));
-            if b.root {
-                let py = b.y + (b.h - Self::PLUS_SZ) / 2;
+                    h: b.cross_len.max(1),
+                }
+            } else {
+                // Horizontal gap between stacked rows: a full-width strip
+                // dragged along y.
+                let vis_x = b.cross - scroll_x;
+                if vis_x + b.cross_len <= wa.x || vis_x >= wa.x + wa.w {
+                    continue;
+                }
+                FrameRect {
+                    x: vis_x,
+                    y: b.pos - hw / 2,
+                    w: b.cross_len.max(1),
+                    h: hw,
+                }
+            };
+            self.handle_regions.push((rect, b));
+            if b.root && b.dir == Dir::H {
+                let py = b.cross + (b.cross_len - Self::PLUS_SZ) / 2;
                 self.plus_regions
-                    .push((Self::plus_rect(vis_x, py), b.idx + 1));
+                    .push((Self::plus_rect(b.pos - scroll_x, py), b.idx + 1));
             }
         }
         self.compute_edge_plus_buttons(wa, scroll_x, canvas_w, gap);

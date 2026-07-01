@@ -348,28 +348,60 @@ impl Renderer {
     fn load_wallpaper(&self, path: &str, w: i32, h: i32) -> Option<Framebuffer> {
         let (sw, sh, pixels) = Self::decode_image(path)?;
         let (dw, dh) = (w.max(1) as usize, h.max(1) as usize);
-        // Scale-to-cover with nearest-neighbour sampling, then snap each
-        // pixel to the palette (memoized: wallpapers repeat colours heavily).
+        // Scale-to-cover with nearest-neighbour sampling, then quantize to
+        // the palette with serpentine Floyd-Steinberg error diffusion so the
+        // 16-colour result reads as smooth gradients instead of hard bands.
         let scale = (dw as f32 / sw as f32).max(dh as f32 / sh as f32);
         let ox = (sw as f32).mul_add(-scale, dw as f32) / 2.0;
         let oy = (sh as f32).mul_add(-scale, dh as f32) / 2.0;
-        let mut memo: std::collections::HashMap<u32, Index> = std::collections::HashMap::new();
         let mut fb = Framebuffer::new(dw, dh, palette_color::BLACK);
+        // Two rows of per-channel accumulated error: current and next.
+        let mut err_cur = vec![[0.0f32; 3]; dw];
+        let mut err_next = vec![[0.0f32; 3]; dw];
         for y in 0..dh {
             let sy = (((y as f32 - oy) / scale) as usize).min(sh - 1);
-            for x in 0..dw {
+            let ltr = y % 2 == 0;
+            let xs: Box<dyn Iterator<Item = usize>> =
+                if ltr { Box::new(0..dw) } else { Box::new((0..dw).rev()) };
+            for x in xs {
                 let sx = (((x as f32 - ox) / scale) as usize).min(sw - 1);
                 let c = pixels[sy * sw + sx];
-                let key =
-                    (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b);
-                let index = *memo.entry(key).or_insert_with(|| {
-                    self.palette.nearest_index(PgRgb {
-                        r: c.r,
-                        g: c.g,
-                        b: c.b,
-                    })
+                let want = [
+                    (f32::from(c.r) + err_cur[x][0]).clamp(0.0, 255.0),
+                    (f32::from(c.g) + err_cur[x][1]).clamp(0.0, 255.0),
+                    (f32::from(c.b) + err_cur[x][2]).clamp(0.0, 255.0),
+                ];
+                let index = self.palette.nearest_index(PgRgb {
+                    r: want[0] as u8,
+                    g: want[1] as u8,
+                    b: want[2] as u8,
                 });
                 fb.set_pixel(x, y, index);
+                let got = self.palette.color(index);
+                let err = [
+                    want[0] - f32::from(got.r),
+                    want[1] - f32::from(got.g),
+                    want[2] - f32::from(got.b),
+                ];
+                // Floyd-Steinberg kernel, mirrored on right-to-left rows:
+                //         *   7/16
+                //  3/16  5/16  1/16
+                let ahead = if ltr { x + 1 } else { x.wrapping_sub(1) };
+                let behind = if ltr { x.wrapping_sub(1) } else { x + 1 };
+                for ch in 0..3 {
+                    if ahead < dw {
+                        err_cur[ahead][ch] += err[ch] * (7.0 / 16.0);
+                        err_next[ahead][ch] += err[ch] * (1.0 / 16.0);
+                    }
+                    if behind < dw {
+                        err_next[behind][ch] += err[ch] * (3.0 / 16.0);
+                    }
+                    err_next[x][ch] += err[ch] * (5.0 / 16.0);
+                }
+            }
+            std::mem::swap(&mut err_cur, &mut err_next);
+            for e in &mut err_next {
+                *e = [0.0; 3];
             }
         }
         Some(fb)

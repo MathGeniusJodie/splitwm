@@ -3,10 +3,12 @@
 
 use x11rb::protocol::xinput;
 use x11rb::protocol::xproto::{
-    Allow, ButtonPressEvent, ButtonReleaseEvent, ConfigureNotifyEvent, ConfigureRequestEvent,
-    ConfigureWindowAux, ConnectionExt, ExposeEvent, InputFocus, KeyPressEvent, MapRequestEvent,
+    Allow, ButtonPressEvent, ButtonReleaseEvent, ChangeWindowAttributesAux, ConfigureNotifyEvent,
+    ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, ExposeEvent, InputFocus,
+    KeyPressEvent, MapRequestEvent,
     Mapping, MappingNotifyEvent, ModMask, MotionNotifyEvent, UnmapNotifyEvent,
 };
+use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::CURRENT_TIME;
 
@@ -551,8 +553,9 @@ impl Wm {
                 self.drag = Some(Drag {
                     parent: b.parent,
                     idx: b.idx,
-                    left_x: b.left_x,
-                    combined: b.left_w + b.right_w,
+                    vertical: b.dir == Dir::V,
+                    start: b.start,
+                    combined: b.first + b.second,
                     gap: theme::GAP,
                 });
                 return Ok(());
@@ -634,16 +637,92 @@ impl Wm {
             return Ok(());
         }
         let Some(d) = self.drag else {
+            // Not dragging: hover feedback only.
+            if e.event == self.underlay {
+                let cur = self.hover_cursor(i32::from(e.event_x), i32::from(e.event_y));
+                self.set_underlay_cursor(cur)?;
+            }
             return Ok(());
         };
         if d.combined <= 0 {
             return Ok(());
         }
-        let canvas_mx = i32::from(e.root_x) + self.state.scroll_x;
-        let new_left_w = canvas_mx - d.left_x - d.gap / 2;
-        let frac = f64::from(new_left_w) / f64::from(d.combined);
+        // Only x scrolls; a vertical (row-boundary) drag reads y directly.
+        let canvas_pos = if d.vertical {
+            i32::from(e.root_y)
+        } else {
+            i32::from(e.root_x) + self.state.scroll_x
+        };
+        let new_first = canvas_pos - d.start - d.gap / 2;
+        let frac = f64::from(new_first) / f64::from(d.combined);
         self.state.resize_boundary(d.parent, d.idx, frac);
         self.arrange()?;
+        Ok(())
+    }
+
+    /// Pick the pointer cursor for a hover position on the underlay:
+    /// resize arrows over gap/edge drag handles, the "disabled" cursor over
+    /// a disabled titlebar button, the plain arrow otherwise.
+    fn hover_cursor(&self, mx: i32, my: i32) -> u32 {
+        let c = self.cursors;
+        if let Some((leaf, kind)) = self
+            .btn_regions
+            .iter()
+            .find(|(r, _, _)| rect_contains(*r, mx, my))
+            .map(|(_, l, k)| (*l, *k))
+        {
+            // Mirror `compose`'s enabled/disabled choice for the button art
+            // (a minimized leaf's whole-frame region is always a live
+            // restore button).
+            if let Some(&frame) = self.prev_frame_rect.get(&leaf) {
+                let meta = self.leaf_meta(leaf, frame);
+                let disabled = !meta.minimized
+                    && match kind {
+                        BtnKind::Close | BtnKind::Minimize => meta.parent_dir.is_none(),
+                        BtnKind::Split => !meta.can_split,
+                    };
+                if disabled {
+                    return c.disabled;
+                }
+            }
+            return c.arrow;
+        }
+        if let Some((_, b)) = self
+            .handle_regions
+            .iter()
+            .find(|(r, _)| rect_contains(*r, mx, my))
+        {
+            // The boundary "+" button sits inside the handle's hit region;
+            // keep the arrow over it, matching the click hit-test order.
+            if b.root && self.plus_regions.iter().any(|(r, _)| rect_contains(*r, mx, my)) {
+                return c.arrow;
+            }
+            return if b.dir == Dir::V {
+                c.v_resize
+            } else {
+                c.h_resize
+            };
+        }
+        if self
+            .edge_handle_regions
+            .iter()
+            .any(|(r, _)| rect_contains(*r, mx, my))
+        {
+            return c.h_resize;
+        }
+        c.arrow
+    }
+
+    /// Set the underlay's cursor, skipping the request when unchanged.
+    fn set_underlay_cursor(&mut self, cursor: u32) -> R<()> {
+        if self.cursors.current != cursor {
+            self.cursors.current = cursor;
+            self.conn.change_window_attributes(
+                self.underlay,
+                &ChangeWindowAttributesAux::new().cursor(cursor),
+            )?;
+            self.conn.flush()?;
+        }
         Ok(())
     }
 

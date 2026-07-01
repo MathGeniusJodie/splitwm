@@ -2,7 +2,7 @@
 //! Combines splitwm core.lua + ops.lua + scroll bookkeeping for one tag.
 
 use crate::theme;
-use crate::tree::{Boundary, Dir, Leaf, Node, NodeId, Rect, Tree, Win};
+use crate::tree::{Boundary, Dir, Node, NodeId, Rect, Tree, Win};
 
 pub struct State {
     pub tree: Tree,
@@ -92,13 +92,42 @@ impl State {
         }
         if let Some(l) = self.tree.leaf_mut(dst) {
             l.client = Some(c);
+            if displaced.is_some_and(|p| p != c) {
+                l.prev = displaced;
+            }
         }
         self.focused_leaf = dst;
     }
 
     /// Remove a client entirely (window gone): clear it from its split/taskbar.
+    /// If the leaf it occupied remembers a displaced window (`Leaf::prev`)
+    /// that's still in the taskbar, that window is put back into the split —
+    /// closing a focus-stealing popup restores what it displaced.
     pub fn unpin_client(&mut self, c: Win) {
+        let lid = self.tree.find_leaf_for_client(c);
         self.detach(c);
+        if let Some(lid) = lid {
+            let prev = self.tree.leaf(lid).and_then(|l| l.prev);
+            if let Some(p) = prev {
+                if self.taskbar.contains(&p) {
+                    self.taskbar.retain(|&w| w != p);
+                    if let Some(l) = self.tree.leaf_mut(lid) {
+                        l.client = Some(p);
+                    }
+                }
+            }
+            if let Some(l) = self.tree.leaf_mut(lid) {
+                l.prev = None;
+            }
+        }
+        // The destroyed window can't come back anywhere.
+        for leaf in self.tree.collect_leaves() {
+            if let Some(l) = self.tree.leaf_mut(leaf) {
+                if l.prev == Some(c) {
+                    l.prev = None;
+                }
+            }
+        }
     }
 
     /// Focus whatever split currently shows `c`.
@@ -227,15 +256,9 @@ impl State {
         let leaf = self.focused_leaf_valid();
         // child_a keeps the original split's window *and* its accent colour, so
         // colour stays with the content; child_b gets a fresh colour.
-        let (client, minimized, color) = {
-            let l = self.tree.leaf(leaf).unwrap();
-            (l.client, l.minimized, l.color)
-        };
-        let child_a = self.tree.insert_node(Node::Leaf(Leaf {
-            client,
-            minimized,
-            color,
-        }));
+        let child_a = self
+            .tree
+            .insert_node(Node::Leaf(self.tree.leaf(leaf).unwrap().clone()));
         let child_b = self.tree.make_leaf();
         // Insert a branch in place of `leaf`, with child_a carrying the window.
         self.split_node(leaf, dir, child_a, child_b);
@@ -381,11 +404,11 @@ impl State {
         self.tree.compute(Rect { w: canvas_w, ..wa }, gap)
     }
 
-    /// Vertical gaps between columns, for drag handles / insert buttons.
+    /// Gaps between adjacent splits, for drag handles / insert buttons.
     pub fn boundaries(&self, wa: Rect) -> Vec<Boundary> {
         let gap = theme::GAP;
         let canvas_w = self.canvas_w.unwrap_or(wa.w);
-        self.tree.h_boundaries(Rect { w: canvas_w, ..wa }, gap)
+        self.tree.boundaries(Rect { w: canvas_w, ..wa }, gap)
     }
 
     /// Canvas-space x-span `(start_x, width)` of the leftmost/rightmost
@@ -768,6 +791,49 @@ mod tests {
         s.cycle_taskbar(-1);
         assert_eq!(s.focused_client(), Some(3));
         assert_eq!(s.taskbar, before);
+    }
+
+    /// A popup that displaces the working window and is then destroyed must
+    /// give the split back to the displaced window (pulled from the taskbar).
+    #[test]
+    fn closing_popup_restores_displaced_window() {
+        let mut s = State::new();
+        s.pin_client(1); // working window
+        s.pin_client(99); // popup steals the split; 1 -> taskbar
+        assert_eq!(s.focused_client(), Some(99));
+        assert!(s.taskbar.contains(&1));
+
+        s.unpin_client(99); // popup window destroyed
+        assert_eq!(s.focused_client(), Some(1), "displaced window comes back");
+        assert!(!s.taskbar.contains(&1));
+    }
+
+    /// If the displaced window has since left the taskbar (shown elsewhere or
+    /// itself closed), the split just stays empty — no stale restore.
+    #[test]
+    fn no_restore_when_displaced_window_is_gone() {
+        let mut s = State::new();
+        s.pin_client(1);
+        s.pin_client(99);
+        s.unpin_client(1); // the remembered window itself is destroyed
+        s.unpin_client(99);
+        assert_eq!(s.focused_client(), None);
+        assert!(s.taskbar.is_empty());
+    }
+
+    /// Restoration is single-shot: after a restore the leaf holds no further
+    /// history, so closing the restored window doesn't resurrect anything.
+    #[test]
+    fn restore_is_single_shot() {
+        let mut s = State::new();
+        s.pin_client(1);
+        s.pin_client(2); // prev = 1
+        s.pin_client(3); // prev = 2, taskbar [1, 2]
+        s.unpin_client(3); // restores 2
+        assert_eq!(s.focused_client(), Some(2));
+        s.unpin_client(2); // prev was consumed; 1 stays in the taskbar
+        assert_eq!(s.focused_client(), None);
+        assert_eq!(s.taskbar, vec![1]);
     }
 
     /// A degenerate single-child branch must not panic `resize_focused`

@@ -189,6 +189,8 @@ pub struct Wm {
     /// edge, `false` for the right.
     pub edge_handle_regions: Vec<(FrameRect, bool)>,
     pub edge_drag: Option<EdgeDrag>,
+    /// Startup-created pointer cursors + the one currently on the underlay.
+    pub cursors: Cursors,
     /// Reusable BGRX staging buffer for `PutImage`, so the full-screen
     /// conversion doesn't reallocate each frame.
     pub bgrx: Vec<u8>,
@@ -219,9 +221,29 @@ pub struct HScroll {
 pub struct Drag {
     pub parent: NodeId,
     pub idx: usize,
-    pub left_x: i32,
+    /// True when a horizontal gap (between stacked rows) is being dragged
+    /// along y; false for a vertical gap dragged along x.
+    pub vertical: bool,
+    /// First (left/top) child's start along the drag axis, canvas-space.
+    pub start: i32,
     pub combined: i32,
     pub gap: i32,
+}
+
+/// The pointer cursors the WM ever shows, created once at startup, plus the
+/// one currently set on the underlay (so hover motion only issues a
+/// `ChangeWindowAttributes` when it actually changes).
+#[derive(Clone, Copy)]
+pub struct Cursors {
+    pub arrow: u32,
+    /// Left/right double arrow, over vertical-gap and canvas-edge handles.
+    pub h_resize: u32,
+    /// Up/down double arrow, over horizontal-gap handles.
+    pub v_resize: u32,
+    /// Shown over disabled titlebar buttons (X-shaped `XC_X_cursor`; the
+    /// core cursor font has no dedicated "not-allowed" glyph).
+    pub disabled: u32,
+    pub current: u32,
 }
 
 /// An in-progress edge-of-canvas resize, started by dragging the handle at

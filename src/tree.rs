@@ -40,6 +40,12 @@ impl Rect {
 pub struct Leaf {
     /// The single window shown in this split, if any.
     pub client: Option<Win>,
+    /// The window that was last displaced from this split to the taskbar
+    /// (e.g. by a popup stealing the slot). If the current occupant's window
+    /// is destroyed, this one is pulled back from the taskbar — so closing a
+    /// popup restores what you were working on. Single slot, no history:
+    /// consumed on restore, ignored if the window has left the taskbar.
+    pub prev: Option<Win>,
     pub minimized: bool,
     /// Persistent accent palette index for this split (kept across
     /// splits/closes), used to palette-swap the bitmap window border.
@@ -378,24 +384,27 @@ impl Tree {
     }
 }
 
-/// A vertical gap between two horizontally-adjacent children of an H-branch:
-/// the place a drag handle / "+" button sits. Coordinates are canvas-space.
+/// A gap between two adjacent children of a branch: the place a drag handle
+/// (and, at root level, a "+" button) sits. Coordinates are canvas-space.
+/// `dir` is the parent branch's direction: `H` is a vertical gap dragged
+/// along x, `V` a horizontal gap dragged along y.
 #[derive(Clone, Copy)]
 pub struct Boundary {
     pub parent: NodeId,
-    pub idx: usize, // left child index within parent.children
-    pub x: i32,     // gap centre x
-    pub left_x: i32,
-    pub left_w: i32,
-    pub right_w: i32,
-    pub y: i32,
-    pub h: i32,
-    pub root: bool, // whether `parent` is the tree root (insert eligible)
+    pub idx: usize, // first (left/top) child index within parent.children
+    pub dir: Dir,
+    pub pos: i32,       // gap centre along the drag axis
+    pub start: i32,     // first child's start along the drag axis
+    pub first: i32,     // first child's size along the drag axis
+    pub second: i32,    // second child's size along the drag axis
+    pub cross: i32,     // strip start on the cross axis
+    pub cross_len: i32, // strip extent on the cross axis
+    pub root: bool,     // whether `parent` is the tree root (insert eligible)
 }
 
 impl Tree {
-    /// Vertical gaps between adjacent columns in every H-branch.
-    pub fn h_boundaries(&self, area: Rect, gap: i32) -> Vec<Boundary> {
+    /// Gaps between adjacent children in every branch, both directions.
+    pub fn boundaries(&self, area: Rect, gap: i32) -> Vec<Boundary> {
         let mut out = Vec::new();
         self.boundaries_inner(self.root, area.shrunk(gap), gap, &mut out);
         out
@@ -422,12 +431,13 @@ impl Tree {
                     out.push(Boundary {
                         parent: node,
                         idx: i,
-                        x: cx + cw + gap / 2,
-                        left_x: cx,
-                        left_w: cw,
-                        right_w: sizes[i + 1],
-                        y: at.y,
-                        h: at.h,
+                        dir: Dir::H,
+                        pos: cx + cw + gap / 2,
+                        start: cx,
+                        first: cw,
+                        second: sizes[i + 1],
+                        cross: at.y,
+                        cross_len: at.h,
                         root: node == self.root,
                     });
                 }
@@ -440,6 +450,20 @@ impl Tree {
             let mut cy = at.y;
             for (i, &c) in children.iter().enumerate() {
                 let ch = sizes[i];
+                if i + 1 < children.len() {
+                    out.push(Boundary {
+                        parent: node,
+                        idx: i,
+                        dir: Dir::V,
+                        pos: cy + ch + gap / 2,
+                        start: cy,
+                        first: ch,
+                        second: sizes[i + 1],
+                        cross: at.x,
+                        cross_len: at.w,
+                        root: node == self.root,
+                    });
+                }
                 self.boundaries_inner(c, Rect { y: cy, h: ch, ..at }, gap, out);
                 cy += ch + gap;
             }
