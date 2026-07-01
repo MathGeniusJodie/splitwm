@@ -162,24 +162,6 @@ impl State {
         }
     }
 
-    /// Swap the contents of two leaves (the "swap split" button). Each leaf
-    /// keeps its own persistent colour; only the window/minimized state moves.
-    pub fn swap_leaves(&mut self, a: NodeId, b: NodeId) {
-        if a == b {
-            return;
-        }
-        let read = |id| self.tree.leaf(id).map(|l| (l.client, l.minimized));
-        let (Some(da), Some(db)) = (read(a), read(b)) else {
-            return;
-        };
-        if let Some(l) = self.tree.leaf_mut(a) {
-            (l.client, l.minimized) = db;
-        }
-        if let Some(l) = self.tree.leaf_mut(b) {
-            (l.client, l.minimized) = da;
-        }
-    }
-
     // --- splitting ---
 
     fn split_node(&mut self, leaf: NodeId, dir: Dir, child_a: NodeId, child_b: NodeId) {
@@ -374,16 +356,14 @@ impl State {
     pub fn compute(&self, wa: Rect) -> std::collections::HashMap<NodeId, Rect> {
         let gap = theme::GAP;
         let canvas_w = self.canvas_w.unwrap_or(wa.w);
-        self.tree
-            .compute(wa.x, wa.y, canvas_w, wa.h, gap, theme::tb_h(gap))
+        self.tree.compute(wa.x, wa.y, canvas_w, wa.h, gap)
     }
 
     /// Vertical gaps between columns, for drag handles / insert buttons.
     pub fn boundaries(&self, wa: Rect) -> Vec<Boundary> {
         let gap = theme::GAP;
         let canvas_w = self.canvas_w.unwrap_or(wa.w);
-        self.tree
-            .h_boundaries(wa.x, wa.y, canvas_w, wa.h, gap, theme::tb_h(gap))
+        self.tree.h_boundaries(wa.x, wa.y, canvas_w, wa.h, gap)
     }
 
     /// Set the split ratio at a boundary so the left child occupies fraction
@@ -523,5 +503,48 @@ mod tests {
         s.insert_at_root(1);
         s.canvas_w = Some(WA.w);
         assert_eq!(s.boundaries(WA).len(), 2);
+    }
+
+    #[test]
+    fn splits_get_unique_colors_up_to_palette_size() {
+        let mut s = State::new();
+        for _ in 0..7 {
+            s.split_focused(Dir::H);
+        }
+        let leaves = s.tree.collect_leaves();
+        assert_eq!(leaves.len(), 8);
+        let colors: Vec<_> = leaves
+            .iter()
+            .map(|&l| s.tree.leaf(l).unwrap().color)
+            .collect();
+        let unique: std::collections::HashSet<_> = colors.iter().collect();
+        assert_eq!(
+            unique.len(),
+            8,
+            "expected all 8 leaves to have distinct colors"
+        );
+
+        // A 9th split must reuse a color (only 8 available) but shouldn't panic.
+        s.split_focused(Dir::H);
+        assert_eq!(s.tree.collect_leaves().len(), 9);
+    }
+
+    #[test]
+    fn closing_and_resplitting_still_avoids_collisions() {
+        let mut s = State::new();
+        for _ in 0..3 {
+            s.split_focused(Dir::H);
+        }
+        // Close one, then split again — the freed color should be reusable
+        // without colliding with the remaining leaves.
+        s.close_focused();
+        s.split_focused(Dir::H);
+        let leaves = s.tree.collect_leaves();
+        let colors: Vec<_> = leaves
+            .iter()
+            .map(|&l| s.tree.leaf(l).unwrap().color)
+            .collect();
+        let unique: std::collections::HashSet<_> = colors.iter().collect();
+        assert_eq!(unique.len(), colors.len());
     }
 }

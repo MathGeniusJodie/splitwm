@@ -15,17 +15,71 @@
 use std::rc::Rc;
 
 use fontdue::Font;
+use pixel_graphics::{
+    Framebuffer, Paint as PgPaint, Palette as PgPalette, Sprite, Swap, TRANSPARENT,
+};
 use tiny_skia::{
-    Color, FillRule, Paint, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Rect as SkRect, Stroke,
-    Transform,
+    Color, FillRule, IntSize, Paint, PathBuilder, Pixmap, PixmapMut, PixmapPaint, Rect as SkRect,
+    Stroke, Transform,
 };
 
-use crate::theme;
+use crate::theme::{self, palette_color};
+use crate::Index;
+
+/// Embedded-art PNG bytes, relative to the crate root (where the bitmap
+/// assets live alongside `Cargo.toml`).
+macro_rules! asset {
+    ($name:literal) => {
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/", $name))
+    };
+}
 
 pub struct Renderer {
     font: Font,
+    /// The na16 palette, kept around (beyond building the variants below) so
+    /// `accent_rgb` can look up a colour without a second hardcoded table.
+    palette: PgPalette,
     /// Screen-sized scaled wallpaper; frame backgrounds copy their slice of it.
     wallpaper: Option<Pixmap>,
+    /// Bitmap window border, pre-rendered once per accent palette index by
+    /// `pixel_graphics` palette-swapping `winborder.png`'s titlebar/outline
+    /// colours.
+    border_variants: [NineSlice; 16],
+    /// The `winmin.png` restore strip for a minimized *column* (squished
+    /// narrow, so the strip runs vertically) and `winmin_h.png` for a
+    /// minimized *row* (squished short, strip runs horizontally) — picked in
+    /// `draw_leaf` by the minimized leaf's own aspect ratio. Palette-swapped
+    /// per accent index like the border, so a minimized split keeps its
+    /// colour.
+    minimized: [MinimizedSlice; 16],
+    minimized_h: [MinimizedSliceH; 16],
+    /// Titlebar buttons, palette-swapped like the border so each leaf's
+    /// buttons match its accent, indexed by `BtnIcon::index`. Disabled art
+    /// tracks the accent too, except `LIME` (see
+    /// `load_disabled_button_variants`); `Minimize`/`MinimizeH` are two
+    /// separate slots (not enabled/disabled of the same button) — see
+    /// `BtnIcon::MinimizeH`.
+    buttons: [ButtonVariant; BtnIcon::COUNT],
+}
+
+/// One titlebar button's art, pre-rendered per accent palette index.
+struct ButtonVariant {
+    normal: [Icon; 16],
+    disabled: [Icon; 16],
+}
+
+impl ButtonVariant {
+    fn load(
+        palette: &PgPalette,
+        lut: &[[u8; 4]; 256],
+        bytes: &[u8],
+        disabled_bytes: &[u8],
+    ) -> Self {
+        Self {
+            normal: load_button_variants(palette, lut, bytes),
+            disabled: load_disabled_button_variants(palette, lut, disabled_bytes),
+        }
+    }
 }
 
 /// A decoded application icon (non-premultiplied ARGB pixels, row-major).
@@ -37,7 +91,6 @@ pub struct Icon {
 
 pub struct TabInfo {
     pub label: char,
-    pub color: u32, // ARGB accent for this split
     pub icon: Option<Rc<Icon>>,
 }
 
@@ -46,11 +99,12 @@ pub struct LeafView {
     pub h: i32, // frame height (content height + gap)
     pub tb_h: i32,
     pub bw: i32,
-    pub focused: bool,
-    /// Accent colour of the split (focus-border tint when focused).
-    pub accent: u32,
+    /// Palette index this split's border and titlebar buttons are swapped to.
+    pub accent_index: Index,
     /// The split's single window, if any.
     pub tab: Option<TabInfo>,
+    /// Collapsed to a thin restore strip; renders as `winmin.png` only.
+    pub minimized: bool,
 }
 
 fn argb(c: u32) -> Color {
@@ -61,26 +115,420 @@ fn argb(c: u32) -> Color {
     Color::from_rgba8(r, g, b, a)
 }
 
-const TAB_PAD_H: f32 = 22.0;
-const TAB_SLANT: f32 = 0.364; // tan(20deg)
-const TAB_GAP: f32 = 6.0;
-const TAB_CORNER: f32 = 9.0;
+fn pixmap_to_icon(pm: &Pixmap) -> Icon {
+    let (w, h) = (pm.width(), pm.height());
+    let data = pm.data();
+    let mut argb = Vec::with_capacity((w * h) as usize);
+    for px in data.chunks_exact(4) {
+        let (r, g, b, a) = (
+            u32::from(px[0]),
+            u32::from(px[1]),
+            u32::from(px[2]),
+            u32::from(px[3]),
+        );
+        // Un-premultiply (tiny-skia stores premultiplied RGBA) into straight ARGB.
+        let (r, g, b) = if a == 0 {
+            (0, 0, 0)
+        } else {
+            (r * 255 / a, g * 255 / a, b * 255 / a)
+        };
+        argb.push((a << 24) | (r << 16) | (g << 8) | b);
+    }
+    Icon { w, h, argb }
+}
 
-/// X (leaf-local) and width of the title tab's clickable slot.
-pub fn tab_slot(bw: i32, tb_h: i32, i: i32) -> (f32, f32) {
-    let icon = tb_h as f32 - 4.0;
-    let slot = TAB_PAD_H + icon + TAB_PAD_H + TAB_GAP;
-    let tw = TAB_PAD_H.mul_add(2.0, icon);
-    ((i as f32).mul_add(slot, bw as f32 + 4.0), tw)
+/// Crop a `w`x`h` region out of `src` at (x, y) into a new owned `Pixmap`.
+fn crop(src: &Pixmap, x: u32, y: u32, w: u32, h: u32) -> Pixmap {
+    let mut out = Pixmap::new(w.max(1), h.max(1)).unwrap();
+    let sw = src.width();
+    let sdata = src.data();
+    let odata = out.data_mut();
+    for row in 0..h {
+        let sy = y + row;
+        if sy >= src.height() {
+            break;
+        }
+        for col in 0..w {
+            let sx = x + col;
+            if sx >= sw {
+                break;
+            }
+            let si = ((sy * sw + sx) * 4) as usize;
+            let oi = ((row * w + col) * 4) as usize;
+            odata[oi..oi + 4].copy_from_slice(&sdata[si..si + 4]);
+        }
+    }
+    out
+}
+
+/// Blit `src` at screen offset (x, y), repeating it (tiling) to exactly fill
+/// a `dst_w`x`dst_h` box, one image pixel per screen pixel — no scaling, no
+/// interpolation, so pixel art stays crisp. When `dst_w`/`dst_h` equal
+/// `src`'s size (e.g. a 9-slice corner), this draws the source exactly once.
+fn blit_tile(pm: &mut PixmapMut, src: &Pixmap, x: f32, y: f32, dst_w: f32, dst_h: f32) {
+    let (sw, sh) = (src.width() as i32, src.height() as i32);
+    if sw == 0 || sh == 0 {
+        return;
+    }
+    let pw = pm.width() as i32;
+    let ph = pm.height() as i32;
+    let sdata = src.data();
+    let data = pm.data_mut();
+    let ox = x.round() as i32;
+    let oy = y.round() as i32;
+    let w = dst_w.round() as i32;
+    let h = dst_h.round() as i32;
+    for ty in 0..h {
+        let py = oy + ty;
+        if py < 0 || py >= ph {
+            continue;
+        }
+        let sy = ty.rem_euclid(sh);
+        for tx in 0..w {
+            let px = ox + tx;
+            if px < 0 || px >= pw {
+                continue;
+            }
+            let sx = tx.rem_euclid(sw);
+            let si = ((sy * sw + sx) * 4) as usize;
+            let a = u32::from(sdata[si + 3]);
+            if a == 0 {
+                continue;
+            }
+            let idx = ((py * pw + px) * 4) as usize;
+            // Both src and dst are premultiplied RGBA: plain source-over.
+            for k in 0..3 {
+                let sc = u32::from(sdata[si + k]);
+                let dst = u32::from(data[idx + k]);
+                data[idx + k] = (sc + dst * (255 - a) / 255).min(255) as u8;
+            }
+            data[idx + 3] = 255;
+        }
+    }
+}
+
+/// A bitmap 9-slice: 4 fixed corners plus 4 edges/a center that repeat to
+/// fill an arbitrary target rect, drawn at native resolution (1:1 pixels).
+struct NineSlice {
+    tl: Pixmap,
+    tr: Pixmap,
+    bl: Pixmap,
+    br: Pixmap,
+    top: Pixmap,
+    bottom: Pixmap,
+    left: Pixmap,
+    right: Pixmap,
+    center: Pixmap,
+    l: i32,
+    t: i32,
+    r: i32,
+    b: i32,
+}
+
+impl NineSlice {
+    /// The reference art bakes decorative close/minimize/etc. icons into the
+    /// titlebar band (around native x=191..249); real buttons draw on top of
+    /// those positions separately, so the top/bottom edges' stretchable strip
+    /// is sampled from an icon-free column range instead of the full span
+    /// between the corners (which would smear that art across the bar).
+    const EDGE_SAMPLE_X0: u32 = 20;
+    const EDGE_SAMPLE_X1: u32 = 180;
+
+    fn new(src: &Pixmap, l: i32, t: i32, r: i32, b: i32) -> Self {
+        let (w, h) = (src.width(), src.height());
+        let (lu, tu, ru, bu) = (l as u32, t as u32, r as u32, b as u32);
+        let edge_w = Self::EDGE_SAMPLE_X1 - Self::EDGE_SAMPLE_X0;
+        Self {
+            tl: crop(src, 0, 0, lu, tu),
+            tr: crop(src, w - ru, 0, ru, tu),
+            bl: crop(src, 0, h - bu, lu, bu),
+            br: crop(src, w - ru, h - bu, ru, bu),
+            top: crop(src, Self::EDGE_SAMPLE_X0, 0, edge_w, tu),
+            bottom: crop(src, Self::EDGE_SAMPLE_X0, h - bu, edge_w, bu),
+            left: crop(src, 0, tu, lu, h - tu - bu),
+            right: crop(src, w - ru, tu, ru, h - tu - bu),
+            center: crop(src, Self::EDGE_SAMPLE_X0, tu, edge_w, h - tu - bu),
+            l,
+            t,
+            r,
+            b,
+        }
+    }
+
+    fn draw(&self, pm: &mut PixmapMut, ox: f32, oy: f32, w: f32, h: f32) {
+        let (l, t, r, b) = (self.l as f32, self.t as f32, self.r as f32, self.b as f32);
+        let mid_w = (w - l - r).max(1.0);
+        let mid_h = (h - t - b).max(1.0);
+
+        blit_tile(pm, &self.tl, ox, oy, l, t);
+        blit_tile(pm, &self.tr, ox + w - r, oy, r, t);
+        blit_tile(pm, &self.bl, ox, oy + h - b, l, b);
+        blit_tile(pm, &self.br, ox + w - r, oy + h - b, r, b);
+
+        blit_tile(pm, &self.top, ox + l, oy, mid_w, t);
+        blit_tile(pm, &self.bottom, ox + l, oy + h - b, mid_w, b);
+        blit_tile(pm, &self.left, ox, oy + t, l, mid_h);
+        blit_tile(pm, &self.right, ox + w - r, oy + t, r, mid_h);
+        blit_tile(pm, &self.center, ox + l, oy + t, mid_w, mid_h);
+    }
+}
+
+/// The accent remap shared by the border and its titlebar buttons: the
+/// titlebar/body fill (`LAVENDER`) becomes `index`, the outline (`PURPLE`)
+/// becomes its hand-picked darker counterpart (`theme::DARKER_INDEX`), and
+/// the highlight stroke (`CREAM`) becomes its hand-picked lighter
+/// counterpart (`theme::LIGHTER_INDEX`).
+fn accent_swap(index: Index) -> Swap {
+    Swap::identity()
+        .set(palette_color::LAVENDER, PgPaint::Solid(index))
+        .set(
+            palette_color::PURPLE,
+            PgPaint::Solid(theme::darker_index(index)),
+        )
+        .set(
+            palette_color::CREAM,
+            PgPaint::Solid(theme::lighter_index(index)),
+        )
+}
+
+/// Palette-swap `sprite` via `accent_swap`, for each of the 16 na16 indices —
+/// exact palette colours only, no brightness scaling.
+fn swap_accent_variants(
+    sprite: &Sprite,
+    palette: &PgPalette,
+    lut: &[[u8; 4]; 256],
+) -> [Pixmap; 16] {
+    std::array::from_fn(|index| {
+        let swap = accent_swap(index as Index);
+        render_swapped_sprite(sprite, palette, &swap, lut)
+    })
+}
+
+/// Render `winborder.png` once per na16 palette index (0..16), palette
+/// swapping its titlebar/outline colours — the persistent per-leaf accent.
+fn load_border_variants(palette: &PgPalette, lut: &[[u8; 4]; 256]) -> [NineSlice; 16] {
+    let sprite =
+        Sprite::load_native_bytes(asset!("winborder.png"), palette).expect("winborder.png");
+    swap_accent_variants(&sprite, palette, lut).map(|pm| {
+        NineSlice::new(
+            &pm,
+            theme::BORDER_LEFT,
+            theme::BORDER_TOP,
+            theme::BORDER_RIGHT,
+            theme::BORDER_BOTTOM,
+        )
+    })
+}
+
+/// Render `winmin.png`/`winmin_h.png` once per na16 palette index, palette
+/// swapping their fill/outline/highlight colours like the border — a
+/// minimized leaf's restore strip keeps its split's persistent accent.
+fn load_minimized_variants(palette: &PgPalette, lut: &[[u8; 4]; 256]) -> [MinimizedSlice; 16] {
+    let sprite = Sprite::load_native_bytes(asset!("winmin.png"), palette).expect("winmin.png");
+    swap_accent_variants(&sprite, palette, lut).map(|pm| MinimizedSlice::new(&pm))
+}
+
+fn load_minimized_h_variants(palette: &PgPalette, lut: &[[u8; 4]; 256]) -> [MinimizedSliceH; 16] {
+    let sprite = Sprite::load_native_bytes(asset!("winmin_h.png"), palette).expect("winmin_h.png");
+    swap_accent_variants(&sprite, palette, lut).map(|pm| MinimizedSliceH::new(&pm))
+}
+
+/// Load a titlebar button PNG, palette-swapped to each of the 16 accents via
+/// `accent_swap`, plus one extra `Swap` rule from `extra` layered on top —
+/// e.g. the disabled variant's `LIME` override.
+fn load_button_variants_with(
+    palette: &PgPalette,
+    lut: &[[u8; 4]; 256],
+    bytes: &[u8],
+    extra: impl Fn(Swap) -> Swap,
+) -> [Icon; 16] {
+    let sprite = Sprite::load_native_bytes(bytes, palette).expect("embedded button PNG");
+    std::array::from_fn(|index| {
+        let swap = extra(accent_swap(index as Index));
+        pixmap_to_icon(&render_swapped_sprite(&sprite, palette, &swap, lut))
+    })
+}
+
+fn load_button_variants(palette: &PgPalette, lut: &[[u8; 4]; 256], bytes: &[u8]) -> [Icon; 16] {
+    load_button_variants_with(palette, lut, bytes, |swap| swap)
+}
+
+/// As `load_button_variants`, but for the disabled close/minimize art: it
+/// still tracks the leaf's accent so a disabled button doesn't look jarring
+/// against a coloured border, but any `LIME` pixel is additionally always
+/// remapped to `LAVENDER` — across every accent variant, not just the one
+/// whose accent happens to be `LIME` — since lime reads as too vivid/live
+/// for a disabled control.
+fn load_disabled_button_variants(
+    palette: &PgPalette,
+    lut: &[[u8; 4]; 256],
+    bytes: &[u8],
+) -> [Icon; 16] {
+    load_button_variants_with(palette, lut, bytes, |swap| {
+        swap.set(palette_color::LIME, PgPaint::Solid(palette_color::LAVENDER))
+    })
+}
+
+/// Index -> premultiplied RGBA output table; `TRANSPARENT` maps to a fully
+/// transparent pixel (unlike `Palette::present_lut`, which assumes an
+/// always-opaque root framebuffer).
+fn rgba_lut(palette: &PgPalette) -> [[u8; 4]; 256] {
+    let mut lut = [[0u8; 4]; 256];
+    for (index, entry) in lut.iter_mut().enumerate() {
+        if index as Index == TRANSPARENT {
+            continue;
+        }
+        let c = palette.color(index as Index);
+        *entry = [c.r, c.g, c.b, 255];
+    }
+    lut
+}
+
+/// Draw `sprite` through `swap` into a same-sized `Framebuffer`, then present
+/// it into a tiny-skia `Pixmap` via `lut` so the rest of the pipeline
+/// (`NineSlice`/`blit_tile`/`Icon`) can stay on tiny-skia.
+fn render_swapped_sprite(
+    sprite: &Sprite,
+    palette: &PgPalette,
+    swap: &Swap,
+    lut: &[[u8; 4]; 256],
+) -> Pixmap {
+    let mut fb = Framebuffer::new(sprite.width, sprite.height, TRANSPARENT);
+    fb.draw_sprite_swapped(sprite, 0, 0, palette, swap);
+    let mut bytes = vec![0u8; sprite.width * sprite.height * 4];
+    fb.present_into(&mut bytes, lut);
+    Pixmap::from_vec(
+        bytes,
+        IntSize::from_wh(sprite.width as u32, sprite.height as u32).unwrap(),
+    )
+    .expect("swapped sprite framebuffer size")
+}
+
+/// A minimized leaf's `winmin.png` rendering: a vertical 3-slice (rounded
+/// caps + a stretchy body), since the whole strip is a single restore button.
+struct MinimizedSlice {
+    top: Pixmap,
+    bottom: Pixmap,
+    body: Pixmap,
+}
+
+impl MinimizedSlice {
+    const CAP_H: u32 = 30;
+
+    fn new(src: &Pixmap) -> Self {
+        let (w, h) = (src.width(), src.height());
+        Self {
+            top: crop(src, 0, 0, w, Self::CAP_H),
+            bottom: crop(src, 0, h - Self::CAP_H, w, Self::CAP_H),
+            body: crop(src, 0, Self::CAP_H, w, h - 2 * Self::CAP_H),
+        }
+    }
+
+    fn draw(&self, pm: &mut PixmapMut, ox: f32, oy: f32, w: f32, h: f32) {
+        let cap_h = Self::CAP_H as f32;
+        let mid_h = 2.0f32.mul_add(-cap_h, h).max(1.0);
+        // The strip isn't a tileable horizontal pattern (it's a single narrow
+        // pill), so it's drawn at its exact native size, centred in whatever
+        // width the leaf collapsed to, rather than stretched to fill it.
+        let native_w = self.top.width() as f32;
+        let cx = ox + (w - native_w) / 2.0;
+
+        blit_tile(pm, &self.top, cx, oy, native_w, cap_h);
+        blit_tile(pm, &self.bottom, cx, oy + h - cap_h, native_w, cap_h);
+        blit_tile(pm, &self.body, cx, oy + cap_h, native_w, mid_h);
+    }
+}
+
+/// A minimized *row*'s `winmin_h.png` rendering: the horizontal counterpart
+/// of `MinimizedSlice` — a horizontal 3-slice (rounded caps left/right, a
+/// stretchy body), for a leaf collapsed to a short, wide strip.
+struct MinimizedSliceH {
+    left: Pixmap,
+    right: Pixmap,
+    body: Pixmap,
+}
+
+impl MinimizedSliceH {
+    const CAP_W: u32 = 10;
+
+    fn new(src: &Pixmap) -> Self {
+        let (w, h) = (src.width(), src.height());
+        Self {
+            left: crop(src, 0, 0, Self::CAP_W, h),
+            right: crop(src, w - Self::CAP_W, 0, Self::CAP_W, h),
+            body: crop(src, Self::CAP_W, 0, w - 2 * Self::CAP_W, h),
+        }
+    }
+
+    fn draw(&self, pm: &mut PixmapMut, ox: f32, oy: f32, w: f32, h: f32) {
+        let cap_w = Self::CAP_W as f32;
+        let mid_w = 2.0f32.mul_add(-cap_w, w).max(1.0);
+        // As with `MinimizedSlice`, the strip is a single pill drawn at its
+        // exact native size, centred in whatever height the leaf collapsed
+        // to, rather than stretched to fill it.
+        let native_h = self.left.height() as f32;
+        let cy = oy + (h - native_h) / 2.0;
+
+        blit_tile(pm, &self.left, ox, cy, cap_w, native_h);
+        blit_tile(pm, &self.right, ox + w - cap_w, cy, cap_w, native_h);
+        blit_tile(pm, &self.body, ox + cap_w, cy, mid_w, native_h);
+    }
 }
 
 impl Renderer {
     pub fn new() -> Self {
         let font = load_system_font();
+        let palette = PgPalette::load_bytes(asset!("na16-1x.png")).expect("na16-1x.png");
+        let lut = rgba_lut(&palette);
         Self {
             font,
             wallpaper: None,
+            border_variants: load_border_variants(&palette, &lut),
+            minimized: load_minimized_variants(&palette, &lut),
+            minimized_h: load_minimized_h_variants(&palette, &lut),
+            // Order must match `BtnIcon::index`.
+            buttons: [
+                ButtonVariant::load(
+                    &palette,
+                    &lut,
+                    asset!("close.png"),
+                    asset!("close_disabled.png"),
+                ),
+                ButtonVariant::load(
+                    &palette,
+                    &lut,
+                    asset!("minimize.png"),
+                    asset!("minimize_disabled.png"),
+                ),
+                ButtonVariant::load(
+                    &palette,
+                    &lut,
+                    asset!("minimize_h.png"),
+                    asset!("minimize_h_disabled.png"),
+                ),
+                ButtonVariant::load(
+                    &palette,
+                    &lut,
+                    asset!("hsplit.png"),
+                    asset!("hsplit_disabled.png"),
+                ),
+                ButtonVariant::load(
+                    &palette,
+                    &lut,
+                    asset!("vsplit.png"),
+                    asset!("vsplit_disabled.png"),
+                ),
+            ],
+            palette,
         }
+    }
+
+    /// The ARGB colour for a na16 palette index, e.g. for the taskbar's
+    /// accent highlight — reads the same loaded palette the border/button
+    /// art was swapped through, rather than a second hardcoded RGB table.
+    pub fn accent_rgb(&self, index: Index) -> u32 {
+        let c = self.palette.color(index);
+        0xff00_0000 | (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b)
     }
 
     /// Load+scale a PNG wallpaper to cover `w`x`h`. Returns whether it loaded.
@@ -117,94 +565,40 @@ impl Renderer {
         pm
     }
 
-    /// Draw one leaf's chrome (content panel, focus border, tab bar) into the
-    /// shared screen pixmap at screen offset (ox, oy). The background (gaps and
-    /// the strip behind the tab bar) is whatever was already composited, so
-    /// the wallpaper shows through — no opaque per-leaf box.
+    /// Draw one leaf's chrome into the shared screen pixmap at screen offset
+    /// (ox, oy): a minimized leaf is just the restore strip — `winmin.png`
+    /// for a minimized column (narrow, tall) or `winmin_h.png` for a
+    /// minimized row (short, wide), picked by the leaf's own aspect ratio;
+    /// otherwise the bitmap window border plus a full-width titlebar holding
+    /// the app icon/label.
     pub fn draw_leaf(&self, pm: &mut PixmapMut, ox: f32, oy: f32, v: &LeafView) {
-        let tf = Transform::from_translate(ox, oy);
-        let tb_h = v.tb_h as f32;
-        let bw = v.bw as f32;
-        let content_top = tb_h;
-        let content_h = (v.h as f32) - tb_h;
+        let accent = v.accent_index as usize % 16;
+        if v.minimized {
+            if v.w >= v.h {
+                self.minimized_h[accent].draw(pm, ox, oy, v.w as f32, v.h as f32);
+            } else {
+                self.minimized[accent].draw(pm, ox, oy, v.w as f32, v.h as f32);
+            }
+            return;
+        }
+        self.border_variants[accent].draw(pm, ox, oy, v.w as f32, v.h as f32);
 
-        // Content background panel (rounded) just inside the border.
-        let panel = rounded_rect(
-            bw,
-            content_top,
-            2.0f32.mul_add(-bw, v.w as f32).max(1.0),
-            (content_h - bw).max(1.0),
-            theme::BORDER_RADIUS,
-        );
-        let mut bg = Paint::<'_> {
-            anti_alias: true,
-            ..Default::default()
-        };
-        bg.set_color(argb(0xff00_0000));
-        pm.fill_path(&panel, &bg, FillRule::Winding, tf, None);
-
-        // Focus border around content.
-        let border_col = if v.focused {
-            v.accent | 0xff00_0000
-        } else {
-            theme::COLOR_HANDLE
-        };
-        let mut stroke_paint = Paint::default();
-        stroke_paint.set_color(argb(border_col));
-        stroke_paint.anti_alias = true;
-        let stroke = Stroke {
-            width: bw,
-            ..Default::default()
-        };
-        let border = rounded_rect(
-            bw / 2.0,
-            content_top - bw / 2.0,
-            (v.w as f32 - bw).max(1.0),
-            (content_h - bw / 2.0).max(1.0),
-            theme::BORDER_RADIUS + bw / 2.0,
-        );
-        pm.stroke_path(&border, &stroke_paint, &stroke, tf, None);
-
-        self.draw_tabs(pm, ox, oy, v, tb_h);
+        self.draw_titlebar(pm, ox, oy, v);
     }
 
-    fn draw_tabs(&self, pm: &mut PixmapMut, ox: f32, oy: f32, v: &LeafView, tb_h: f32) {
+    fn draw_titlebar(&self, pm: &mut PixmapMut, ox: f32, oy: f32, v: &LeafView) {
         let Some(tab) = &v.tab else {
             return;
         };
-        let tf = Transform::from_translate(ox, oy);
-        let icon = tb_h - 4.0;
-        let (x, tw) = tab_slot(v.bw, tb_h as i32, 0);
-        let path = tab_path(x, 0.0, tw, tb_h);
-        let mut p = Paint::<'_> {
-            anti_alias: true,
-            ..Default::default()
-        };
-        p.set_color(argb(blend(tab.color, 0xff20_2020)));
-        pm.fill_path(&path, &p, FillRule::Winding, tf, None);
-        let mut sp = Paint::<'_> {
-            anti_alias: true,
-            ..Default::default()
-        };
-        sp.set_color(argb(tab.color | 0xff00_0000));
-        pm.stroke_path(
-            &path,
-            &sp,
-            &Stroke {
-                width: 2.0,
-                ..Default::default()
-            },
-            tf,
-            None,
-        );
-        // Centered app icon, or a letter glyph as fallback (absolute coords).
-        let cx = ox + x + tw / 2.0;
+        let tb_h = v.tb_h as f32;
+        let bw = v.bw as f32;
+        let isz = theme::BTN_SIZE as f32;
+        let cx = ox + bw + isz / 2.0 + 4.0;
         let cy = oy + tb_h / 2.0;
         if let Some(img) = &tab.icon {
-            let isz = (icon * 0.92).round();
             draw_icon(pm, img, cx - isz / 2.0, cy - isz / 2.0, isz);
         } else {
-            self.draw_glyph(pm, tab.label, cx, cy + 2.0, icon * 0.7, theme::COLOR_FG);
+            self.draw_glyph(pm, tab.label, cx, cy + 2.0, isz * 0.7, theme::COLOR_FG);
         }
     }
 
@@ -306,6 +700,12 @@ pub struct TaskItem {
 /// Blit `img` scaled to a `size`x`size` box at (dx, dy), alpha-blending each
 /// source pixel over the (premultiplied RGBA) pixmap.
 fn draw_icon(pm: &mut PixmapMut, img: &Icon, dx: f32, dy: f32, size: f32) {
+    draw_icon_alpha(pm, img, dx, dy, size, 255);
+}
+
+/// As `draw_icon`, but each source pixel's alpha is additionally scaled by
+/// `alpha` (0-255) — used to dim disabled buttons.
+fn draw_icon_alpha(pm: &mut PixmapMut, img: &Icon, dx: f32, dy: f32, size: f32, alpha: u32) {
     if img.w == 0 || img.h == 0 || size < 1.0 {
         return;
     }
@@ -328,7 +728,7 @@ fn draw_icon(pm: &mut PixmapMut, img: &Icon, dx: f32, dy: f32, size: f32) {
                 continue;
             }
             let s = img.argb[(sy * img.w + sx) as usize];
-            let a = (s >> 24) & 0xff;
+            let a = ((s >> 24) & 0xff) * alpha / 255;
             if a == 0 {
                 continue;
             }
@@ -342,21 +742,6 @@ fn draw_icon(pm: &mut PixmapMut, img: &Icon, dx: f32, dy: f32, size: f32) {
             data[idx + 3] = 255;
         }
     }
-}
-
-/// Draw a rounded "pill" gap drag-handle into the screen pixmap.
-pub fn draw_handle(pm: &mut PixmapMut, x: f32, y: f32, w: f32, h: f32, hot: bool) {
-    let path = rounded_rect(x, y, w.max(1.0), h.max(1.0), w / 2.0);
-    let mut p = Paint::<'_> {
-        anti_alias: true,
-        ..Default::default()
-    };
-    p.set_color(argb(if hot {
-        theme::COLOR_FG
-    } else {
-        theme::COLOR_HANDLE
-    }));
-    pm.fill_path(&path, &p, FillRule::Winding, Transform::identity(), None);
 }
 
 /// Draw a translucent rounded "+" insert button centred at (cx, cy).
@@ -390,191 +775,61 @@ pub fn draw_plus(pm: &mut PixmapMut, cx: f32, cy: f32, sz: f32) {
     }
 }
 
-/// The split-control buttons drawn at the right of each leaf's tab bar.
+/// The split-control buttons drawn at the right of every leaf's titlebar.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BtnIcon {
-    MinimizeV,
-    MinimizeH,
-    ExpandV,
-    ExpandH,
-    Swap,
-    VSplit,
-    HSplit,
     Close,
+    /// A leaf whose parent is an H-branch: minimizing collapses it to a
+    /// narrow column, so the button previews that with `minimize.png`.
+    Minimize,
+    /// A leaf whose parent is a V-branch: minimizing collapses it to a
+    /// short row, so the button previews that with `minimize_h.png`.
+    MinimizeH,
+    HSplit,
+    VSplit,
 }
 
-/// Draw one round split-control button centred at (cx, cy): a circular
-/// background plus its 2px stroked glyph, ported from splitwm `icons.lua`.
-pub fn draw_button(
-    pm: &mut PixmapMut,
-    cx: f32,
-    cy: f32,
-    size: f32,
-    icon: BtnIcon,
-    disabled: bool,
-    picked: bool,
-) {
-    let mut bg = Paint::<'_> {
-        anti_alias: true,
-        ..Default::default()
-    };
-    bg.set_color(argb(if picked {
-        theme::COLOR_FG
-    } else {
-        theme::COLOR_BTN_BG
-    }));
-    let mut cb = PathBuilder::new();
-    cb.push_circle(cx, cy, size / 2.0);
-    pm.fill_path(
-        &cb.finish().unwrap(),
-        &bg,
-        FillRule::Winding,
-        Transform::identity(),
-        None,
-    );
+impl BtnIcon {
+    const COUNT: usize = 5;
 
-    let col = if disabled {
-        theme::COLOR_FG_DISABLED
-    } else if picked {
-        theme::COLOR_BG
-    } else {
-        theme::COLOR_FG
-    };
-    if let Some(path) = build_glyph_path(cx, cy, size, icon) {
-        let mut p = Paint::<'_> {
-            anti_alias: true,
-            ..Default::default()
-        };
-        p.set_color(argb(col));
-        let stroke = Stroke {
-            width: 2.0,
-            line_cap: tiny_skia::LineCap::Round,
-            line_join: tiny_skia::LineJoin::Round,
-            ..Default::default()
-        };
-        pm.stroke_path(&path, &p, &stroke, Transform::identity(), None);
+    /// Slot into `Renderer.buttons`; must stay in sync with the array
+    /// `Renderer::new` builds.
+    const fn index(self) -> usize {
+        match self {
+            Self::Close => 0,
+            Self::Minimize => 1,
+            Self::MinimizeH => 2,
+            Self::HSplit => 3,
+            Self::VSplit => 4,
+        }
     }
 }
 
-/// Build the glyph path for a button icon, or None if empty.
-fn build_glyph_path(cx: f32, cy: f32, size: f32, icon: BtnIcon) -> Option<tiny_skia::Path> {
-    // Glyph geometry uses a local (w, h) box; (ox, oy) is its top-left corner.
-    let (w, h) = (size, size);
-    let (ox, oy) = (cx - w / 2.0, cy - h / 2.0);
-    let mut pb = PathBuilder::new();
-    let mut seg = |pts: &[(f32, f32)]| {
-        for (i, &(px, py)) in pts.iter().enumerate() {
-            if i == 0 {
-                pb.move_to(ox + px, oy + py);
-            } else {
-                pb.line_to(ox + px, oy + py);
-            }
-        }
-    };
-    let (cxl, cyl) = (w / 2.0, h / 2.0);
-    match icon {
-        BtnIcon::Close => {
-            let s = 4.0;
-            seg(&[(cxl - s, cyl - s), (cxl + s, cyl + s)]);
-            seg(&[(cxl + s, cyl - s), (cxl - s, cyl + s)]);
-        }
-        BtnIcon::VSplit | BtnIcon::HSplit => {
-            let (bw, bh) = (10.0, 10.0);
-            let (bx, by) = (cxl - bw / 2.0, cyl - bh / 2.0);
-            seg(&[
-                (bx, by),
-                (bx + bw, by),
-                (bx + bw, by + bh),
-                (bx, by + bh),
-                (bx, by),
-            ]);
-            if icon == BtnIcon::VSplit {
-                seg(&[(cxl, by + 1.0), (cxl, by + bh - 1.0)]);
-            } else {
-                seg(&[(bx + 1.0, cyl), (bx + bw - 1.0, cyl)]);
-            }
-        }
-        BtnIcon::MinimizeH => {
-            let (g, a) = (3.0, 4.0);
-            seg(&[
-                (cxl - g - a, cyl - a),
-                (cxl - g, cyl),
-                (cxl - g - a, cyl + a),
-            ]);
-            seg(&[
-                (cxl + g + a, cyl - a),
-                (cxl + g, cyl),
-                (cxl + g + a, cyl + a),
-            ]);
-        }
-        BtnIcon::ExpandH => {
-            let (g, a) = (3.0, 4.0);
-            seg(&[(cxl - g, cyl - a), (cxl - g - a, cyl), (cxl - g, cyl + a)]);
-            seg(&[(cxl + g, cyl - a), (cxl + g + a, cyl), (cxl + g, cyl + a)]);
-        }
-        BtnIcon::MinimizeV => {
-            let (g, a) = (3.0, 4.0);
-            seg(&[
-                (cxl - a, cyl - g - a),
-                (cxl, cyl - g),
-                (cxl + a, cyl - g - a),
-            ]);
-            seg(&[
-                (cxl - a, cyl + g + a),
-                (cxl, cyl + g),
-                (cxl + a, cyl + g + a),
-            ]);
-        }
-        BtnIcon::ExpandV => {
-            let (g, a) = (3.0, 4.0);
-            seg(&[(cxl - a, cyl - g), (cxl, cyl - g - a), (cxl + a, cyl - g)]);
-            seg(&[(cxl - a, cyl + g), (cxl, cyl + g + a), (cxl + a, cyl + g)]);
-        }
-        BtnIcon::Swap => {
-            let (s, ay) = (4.0, 3.0);
-            seg(&[(cxl - s, cyl - ay), (cxl + s, cyl - ay)]);
-            seg(&[
-                (cxl + s - 3.0, cyl - ay - 2.0),
-                (cxl + s, cyl - ay),
-                (cxl + s - 3.0, cyl - ay + 2.0),
-            ]);
-            seg(&[(cxl + s, cyl + ay), (cxl - s, cyl + ay)]);
-            seg(&[
-                (cxl - s + 3.0, cyl + ay - 2.0),
-                (cxl - s, cyl + ay),
-                (cxl - s + 3.0, cyl + ay + 2.0),
-            ]);
-        }
+impl Renderer {
+    /// Draw one bitmap split-control button centred at (cx, cy), palette-swapped
+    /// to `accent_index` to match its leaf's border. Every button swaps in its
+    /// dedicated `*_disabled.png` art when disabled (also accent-swapped, see
+    /// `load_disabled_button_variants`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn draw_button(
+        &self,
+        pm: &mut PixmapMut,
+        cx: f32,
+        cy: f32,
+        size: f32,
+        icon: BtnIcon,
+        disabled: bool,
+        accent_index: Index,
+    ) {
+        let accent = accent_index as usize % 16;
+        let variant = &self.buttons[icon.index()];
+        let img = if disabled {
+            &variant.disabled[accent]
+        } else {
+            &variant.normal[accent]
+        };
+        draw_icon(pm, img, cx - size / 2.0, cy - size / 2.0, size);
     }
-    pb.finish()
-}
-
-const fn blend(top: u32, bottom: u32) -> u32 {
-    let a = ((top >> 24) & 0xff) as u32;
-    let r = ((((top >> 16) & 0xff) * a + ((bottom >> 16) & 0xff) * (255 - a)) / 255) & 0xff;
-    let g = ((((top >> 8) & 0xff) * a + ((bottom >> 8) & 0xff) * (255 - a)) / 255) & 0xff;
-    let b = (((top & 0xff) * a + (bottom & 0xff) * (255 - a)) / 255) & 0xff;
-    0xff00_0000 | (r << 16) | (g << 8) | b
-}
-
-/// A tab: rounded-top trapezoid, wider at the bottom (slanted sides at 20°),
-/// approximating splitwm's `tab_path`.
-fn tab_path(x: f32, y: f32, w: f32, h: f32) -> tiny_skia::Path {
-    let mut pb = PathBuilder::new();
-    let slant = h * TAB_SLANT;
-    let r = TAB_CORNER;
-    let bl = x; // bottom-left
-    let br = x + w; // bottom-right
-    let tl = x + slant; // top-left
-    let tr = x + w - slant; // top-right
-    pb.move_to(bl, y + h);
-    pb.line_to(tl, y + r);
-    pb.quad_to(r.mul_add(TAB_SLANT, tl), y, tl + r, y);
-    pb.line_to(tr - r, y);
-    pb.quad_to(r.mul_add(-TAB_SLANT, tr), y, tr, y + r);
-    pb.line_to(br, y + h);
-    pb.close();
-    pb.finish().unwrap()
 }
 
 fn rounded_rect(x: f32, y: f32, w: f32, h: f32, r: f32) -> tiny_skia::Path {

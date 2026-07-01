@@ -1,0 +1,184 @@
+//! Widget computation (hit-regions, tabs, buttons, taskbar) for the underlay.
+
+use super::types::{BtnKind, FrameRect, Placement, TaskTile, Wm};
+use crate::theme;
+use crate::tree::Rect;
+
+impl Wm {
+    pub(crate) fn compute_widgets(&mut self, wa: Rect, placed: &[Placement]) {
+        self.handle_regions.clear();
+        self.plus_regions.clear();
+        self.tab_regions.clear();
+        self.btn_regions.clear();
+        self.taskbar_regions.clear();
+
+        self.compute_leaf_widgets(placed);
+        self.compute_boundary_widgets(wa);
+    }
+
+    /// Lay out the bottom bar's tiles: one per managed window (in stable
+    /// `bar_order`) across the full screen width. Each tile's accent colour and
+    /// on-screen flag are resolved here, once per arrange, so the per-frame
+    /// compositor needs no tree walks.
+    pub(crate) fn compute_taskbar(&mut self) {
+        let wa = self.wa();
+        let gap = theme::TASKBAR_GAP;
+        let isz = theme::TASKBAR_ICON;
+        let y = wa.y + wa.h - theme::TASKBAR_H + (theme::TASKBAR_H - isz) / 2;
+        // Tiles fill from the left; the launcher "+" sits just after them.
+        let right = wa.x + wa.w - gap;
+        let mut x = wa.x + gap;
+        let mut tiles = Vec::with_capacity(self.bar_order.len());
+        for &win in &self.bar_order {
+            if x + isz > right {
+                break;
+            }
+            let leaf = self.state.tree.find_leaf_for_client(win);
+            tiles.push(TaskTile {
+                rect: FrameRect {
+                    x,
+                    y,
+                    w: isz,
+                    h: isz,
+                },
+                win,
+                accent: leaf.map_or(theme::COLOR_FG, |l| self.leaf_color(l)),
+                on_screen: leaf.is_some(),
+            });
+            x += isz + gap;
+        }
+        self.taskbar_regions = tiles;
+        // Launcher "+" immediately after the last tile (clamped on-screen).
+        self.taskbar_plus = FrameRect {
+            x: x.min(right - isz),
+            y,
+            w: isz,
+            h: isz,
+        };
+    }
+
+    /// Per-leaf titlebar hit-rects, trailing "+" new-tab buttons, and split-control buttons.
+    pub(crate) fn compute_leaf_widgets(&mut self, placed: &[Placement]) {
+        let tb_h = theme::tb_h(theme::GAP);
+        let bw = theme::BORDER_LEFT;
+        for p in placed {
+            let leaf = self.state.tree.leaf(p.leaf);
+            let has_client = leaf.is_some_and(|l| l.client.is_some());
+            let minimized = leaf.is_some_and(|l| l.minimized);
+            if has_client && !minimized {
+                self.tab_regions.push((
+                    FrameRect {
+                        x: p.target.x + bw,
+                        y: p.target.y,
+                        w: (p.target.w - 2 * bw).max(0),
+                        h: tb_h,
+                    },
+                    p.leaf,
+                ));
+            }
+            self.compute_btn_regions(p, tb_h, bw, minimized);
+        }
+    }
+
+    /// Split-control buttons on the right of a leaf's titlebar; a minimized
+    /// leaf instead gets one full-frame region (the whole bitmap is the
+    /// restore button, drawn by `draw_leaf`).
+    pub(crate) fn compute_btn_regions(
+        &mut self,
+        p: &Placement,
+        tb_h: i32,
+        bw: i32,
+        minimized: bool,
+    ) {
+        if minimized {
+            self.btn_regions.push((p.target, p.leaf, BtnKind::Minimize));
+            return;
+        }
+        let bsz = theme::BTN_SIZE;
+        let bsp = theme::BTN_SPACING;
+        let bcy = p.target.y + tb_h / 2 - 2 + theme::BTN_Y_OFFSET;
+        if p.target.w >= theme::min_split_w() {
+            let right = p.target.x + p.target.w - bw - 4;
+            for (i, kind) in [BtnKind::Close, BtnKind::Split, BtnKind::Minimize]
+                .into_iter()
+                .enumerate()
+            {
+                let bcx = right - bsz / 2 - i32::try_from(i).unwrap_or(0) * (bsz + bsp);
+                self.btn_regions.push((
+                    FrameRect {
+                        x: bcx - bsz / 2,
+                        y: bcy - bsz / 2,
+                        w: bsz,
+                        h: bsz,
+                    },
+                    p.leaf,
+                    kind,
+                ));
+            }
+        } else {
+            let bcx = p.target.x + p.target.w / 2;
+            self.btn_regions.push((
+                FrameRect {
+                    x: bcx - bsz / 2,
+                    y: bcy - bsz / 2,
+                    w: bsz,
+                    h: bsz,
+                },
+                p.leaf,
+                BtnKind::Minimize,
+            ));
+        }
+    }
+
+    /// Gap resize handles, boundary "+" buttons, and edge insert buttons.
+    pub(crate) fn compute_boundary_widgets(&mut self, wa: Rect) {
+        let gap = theme::GAP;
+        let hw = (gap - Self::HANDLE_INSET).max(4);
+        let scroll_x = self.state.scroll_x;
+        let canvas_w = self.state.canvas_w.unwrap_or(wa.w);
+        for b in self.state.boundaries(wa) {
+            let vis_x = b.x - scroll_x;
+            if vis_x + hw / 2 <= wa.x || vis_x - hw / 2 >= wa.x + wa.w {
+                continue;
+            }
+            self.handle_regions.push((
+                FrameRect {
+                    x: vis_x - hw / 2,
+                    y: b.y,
+                    w: hw,
+                    h: b.h.max(1),
+                },
+                b,
+            ));
+            if b.root {
+                let py = b.y + (b.h - Self::PLUS_SZ) / 2;
+                self.plus_regions
+                    .push((Self::plus_rect(vis_x, py), b.idx + 1));
+            }
+        }
+        self.compute_edge_plus_buttons(wa, scroll_x, canvas_w, gap);
+    }
+
+    /// Edge "+" buttons at the far left / far right of the canvas.
+    pub(crate) fn compute_edge_plus_buttons(
+        &mut self,
+        wa: Rect,
+        scroll_x: i32,
+        canvas_w: i32,
+        gap: i32,
+    ) {
+        let span_h = (wa.h - 2 * gap).max(Self::PLUS_SZ);
+        let edge_cy = wa.y + gap + (span_h - Self::PLUS_SZ) / 2;
+        for (canvas_x, at) in [
+            (wa.x + gap / 2, 0usize),
+            (wa.x + canvas_w - gap / 2, usize::MAX),
+        ] {
+            let vis_x = canvas_x - scroll_x;
+            if vis_x < wa.x || vis_x > wa.x + wa.w {
+                continue;
+            }
+            self.plus_regions
+                .push((Self::plus_rect(vis_x, edge_cy), at));
+        }
+    }
+}

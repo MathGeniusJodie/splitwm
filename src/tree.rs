@@ -29,8 +29,9 @@ pub struct Leaf {
     /// The single window shown in this split, if any.
     pub client: Option<Win>,
     pub minimized: bool,
-    /// Persistent accent colour for this split (kept across splits/closes).
-    pub color: u32,
+    /// Persistent accent palette index for this split (kept across
+    /// splits/closes), used to palette-swap the bitmap window border.
+    pub color: crate::Index,
 }
 
 pub enum Node {
@@ -54,7 +55,7 @@ impl Tree {
         nodes.insert(
             1,
             Node::Leaf(Leaf {
-                color: crate::theme::leaf_color(1),
+                color: crate::theme::leaf_color_index(1),
                 ..Leaf::default()
             }),
         );
@@ -76,11 +77,27 @@ impl Tree {
         self.nodes.insert(
             id,
             Node::Leaf(Leaf {
-                color: crate::theme::leaf_color(id),
+                color: self.unused_leaf_color(id),
                 ..Leaf::default()
             }),
         );
         id
+    }
+
+    /// An accent index no existing leaf currently has, so two splits never
+    /// look the same while a free colour remains. Falls back to the
+    /// id-cycled colour (which may collide) once every leaf has a distinct
+    /// entry in `theme::LEAF_PALETTE`.
+    fn unused_leaf_color(&self, id: NodeId) -> crate::Index {
+        let used: std::collections::HashSet<crate::Index> = self
+            .collect_leaves()
+            .into_iter()
+            .filter_map(|l| self.leaf(l).map(|l| l.color))
+            .collect();
+        crate::theme::LEAF_PALETTE
+            .into_iter()
+            .find(|c| !used.contains(c))
+            .unwrap_or_else(|| crate::theme::leaf_color_index(id))
     }
 
     pub fn make_branch(&mut self, dir: Dir, ratio: f64, a: NodeId, b: NodeId) -> NodeId {
@@ -193,6 +210,19 @@ impl Tree {
 
 // --- geometry ---
 
+impl Tree {
+    /// (is-minimized, ratio) for each child, the shared input `child_sizes`
+    /// needs — factored out since both the leaf-geometry and boundary walks
+    /// build the exact same thing per branch.
+    fn child_meta(&self, children: &[NodeId], ratios: &[f64]) -> Vec<(bool, f64)> {
+        children
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| (self.leaf(c).is_some_and(|l| l.minimized), ratios[i]))
+            .collect()
+    }
+}
+
 fn child_sizes(children: &[(bool, f64)], usable: i32, min_sz: i32) -> Vec<i32> {
     // children: (is_minimized_leaf, ratio)
     let n = children.len();
@@ -230,15 +260,7 @@ fn child_sizes(children: &[(bool, f64)], usable: i32, min_sz: i32) -> Vec<i32> {
 
 impl Tree {
     /// Compute the screen rect of every leaf. `geos` is keyed by leaf id.
-    pub fn compute(
-        &self,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        gap: i32,
-        tb_h: i32,
-    ) -> HashMap<NodeId, Rect> {
+    pub fn compute(&self, x: i32, y: i32, w: i32, h: i32, gap: i32) -> HashMap<NodeId, Rect> {
         let mut geos = HashMap::new();
         self.compute_inner(
             self.root,
@@ -247,7 +269,6 @@ impl Tree {
             w - 2 * gap,
             h - 2 * gap,
             gap,
-            tb_h,
             &mut geos,
         );
         geos
@@ -262,7 +283,6 @@ impl Tree {
         w: i32,
         h: i32,
         gap: i32,
-        tb_h: i32,
         geos: &mut HashMap<NodeId, Rect>,
     ) {
         match self.nodes.get(&node) {
@@ -276,31 +296,29 @@ impl Tree {
             }) => {
                 let inner = gap;
                 let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
-                let meta: Vec<(bool, f64)> = children
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &c)| {
-                        let is_min = self.leaf(c).is_some_and(|l| l.minimized);
-                        (is_min, ratios[i])
-                    })
-                    .collect();
+                let meta = self.child_meta(children, ratios);
+                // A minimized child collapses to `gap` in the split dimension
+                // (both directions): it's the same size already reserved as
+                // breathing room between normal children, so it stays
+                // visually consistent with the layout's spacing rather than
+                // needing a size of its own.
+                let minimized_size = gap;
                 if *dir == Dir::H {
                     let usable = (w - inner * (n - 1)).max(0);
-                    let sizes = child_sizes(&meta, usable, gap);
+                    let sizes = child_sizes(&meta, usable, minimized_size);
                     let mut cx = x;
                     for (i, &c) in children.iter().enumerate() {
                         let cw = sizes[i];
-                        self.compute_inner(c, cx, y, cw, h, gap, tb_h, geos);
+                        self.compute_inner(c, cx, y, cw, h, gap, geos);
                         cx += cw + inner;
                     }
                 } else {
                     let usable = (h - inner * (n - 1)).max(0);
-                    let min_sz = (tb_h - inner).max(0);
-                    let sizes = child_sizes(&meta, usable, min_sz);
+                    let sizes = child_sizes(&meta, usable, minimized_size);
                     let mut cy = y;
                     for (i, &c) in children.iter().enumerate() {
                         let ch = sizes[i];
-                        self.compute_inner(c, x, cy, w, ch, gap, tb_h, geos);
+                        self.compute_inner(c, x, cy, w, ch, gap, geos);
                         cy += ch + inner;
                     }
                 }
@@ -327,15 +345,7 @@ pub struct Boundary {
 
 impl Tree {
     /// Vertical gaps between adjacent columns in every H-branch.
-    pub fn h_boundaries(
-        &self,
-        x: i32,
-        y: i32,
-        w: i32,
-        h: i32,
-        gap: i32,
-        tb_h: i32,
-    ) -> Vec<Boundary> {
+    pub fn h_boundaries(&self, x: i32, y: i32, w: i32, h: i32, gap: i32) -> Vec<Boundary> {
         let mut out = Vec::new();
         self.boundaries_inner(
             self.root,
@@ -344,7 +354,6 @@ impl Tree {
             w - 2 * gap,
             h - 2 * gap,
             gap,
-            tb_h,
             &mut out,
         );
         out
@@ -359,7 +368,6 @@ impl Tree {
         w: i32,
         h: i32,
         gap: i32,
-        tb_h: i32,
         out: &mut Vec<Boundary>,
     ) {
         let Some(Node::Branch {
@@ -372,11 +380,7 @@ impl Tree {
         };
         let inner = gap;
         let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
-        let meta: Vec<(bool, f64)> = children
-            .iter()
-            .enumerate()
-            .map(|(i, &c)| (self.leaf(c).is_some_and(|l| l.minimized), ratios[i]))
-            .collect();
+        let meta = self.child_meta(children, ratios);
         if *dir == Dir::H {
             let usable = (w - inner * (n - 1)).max(0);
             let sizes = child_sizes(&meta, usable, gap);
@@ -396,17 +400,16 @@ impl Tree {
                         root: node == self.root,
                     });
                 }
-                self.boundaries_inner(c, cx, y, cw, h, gap, tb_h, out);
+                self.boundaries_inner(c, cx, y, cw, h, gap, out);
                 cx += cw + inner;
             }
         } else {
             let usable = (h - inner * (n - 1)).max(0);
-            let min_sz = (tb_h - inner).max(0);
-            let sizes = child_sizes(&meta, usable, min_sz);
+            let sizes = child_sizes(&meta, usable, gap);
             let mut cy = y;
             for (i, &c) in children.iter().enumerate() {
                 let ch = sizes[i];
-                self.boundaries_inner(c, x, cy, w, ch, gap, tb_h, out);
+                self.boundaries_inner(c, x, cy, w, ch, gap, out);
                 cy += ch + inner;
             }
         }

@@ -7,6 +7,7 @@ edition = "2021"
 x11rb = { version = "0.13", features = ["xtest"] }
 tiny-skia = "0.11"
 fontdue = "0.9"
+pixel-graphics = { path = "vendor/pixel-graphics" }
 
 [profile.release]
 opt-level = 3
