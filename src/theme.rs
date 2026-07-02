@@ -93,11 +93,12 @@ pub const BORDER_RIGHT: i32 = 6;
 pub const BORDER_BOTTOM: i32 = 7;
 
 // Bottom taskbar holding windows not shown in any split.
-pub const TASKBAR_H: i32 = 56;
-pub const TASKBAR_ICON: i32 = 36;
+
+pub const TASKBAR_ICON: i32 = 42;
+pub const TASKBAR_H: i32 = TASKBAR_ICON + GAP * 2;
 pub const TASKBAR_GAP: i32 = 10;
 /// Side of the square close ("x") badge in a taskbar tile's bottom-right corner.
-pub const TASKBAR_CLOSE: i32 = 13;
+pub const TASKBAR_CLOSE: i32 = 17;
 
 /// Default `WM_NAME` of the window parked entirely off-screen past the right
 /// edge (see `Wm::manage_dock`), outside the split tree, immune to canvas

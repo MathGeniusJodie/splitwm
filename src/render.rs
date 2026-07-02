@@ -540,7 +540,7 @@ impl Renderer {
 
     /// Draw one taskbar entry: a dithered background tile with the app icon
     /// (or letter-glyph fallback) centred in it. Windows currently shown in a
-    /// split (`highlight`) get a 2px accent outline traced around the icon's
+    /// split (`highlight`) get a 3px accent outline traced around the icon's
     /// own silhouette instead of a box.
     pub fn draw_taskbar_item(
         &self,
@@ -568,8 +568,8 @@ impl Renderer {
         } else {
             if highlight {
                 // Silhouette-outline the fallback glyph the same way.
-                for oy in -2i32..=2 {
-                    for ox in -2i32..=2 {
+                for oy in -3i32..=3 {
+                    for ox in -3i32..=3 {
                         if ox == 0 && oy == 0 {
                             continue;
                         }
@@ -581,9 +581,9 @@ impl Renderer {
         }
     }
 
-    /// Trace a 2px outline in `accent` around `img`'s opaque silhouette: the
+    /// Trace a 3px outline in `accent` around `img`'s opaque silhouette: the
     /// scaled icon's coverage mask, stamped at every offset within Chebyshev
-    /// distance 2, drawn before the icon itself so only the dilated ring
+    /// distance 3, drawn before the icon itself so only the dilated ring
     /// stays visible.
     fn draw_icon_outline(
         &self,
@@ -603,8 +603,8 @@ impl Renderer {
                 if !mask[ty * sz + tx] {
                     continue;
                 }
-                for oy in -2i32..=2 {
-                    for ox in -2i32..=2 {
+                for oy in -3i32..=3 {
+                    for ox in -3i32..=3 {
                         let px = dx + tx as i32 + ox;
                         let py = dy + ty as i32 + oy;
                         if px >= 0 && py >= 0 {
