@@ -180,6 +180,11 @@ impl Wm {
             Event::ButtonRelease(e) => self.on_button_release(e)?,
             Event::MotionNotify(e) => self.on_motion(e)?,
             Event::Expose(e) => self.on_expose(*e)?,
+            // A client (re)set its icon after we managed it (Electron apps
+            // set _NET_WM_ICON only after mapping).
+            Event::PropertyNotify(e) if e.atom == self.atoms.net_wm_icon => {
+                self.on_icon_change(e.window)?;
+            }
             // Keyboard layout / modifier mapping changed: rebind everything.
             Event::MappingNotify(e) => self.on_mapping(e)?,
             // Device hotplug: rebuild the horizontal-scroll device map.

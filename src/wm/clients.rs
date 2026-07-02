@@ -70,10 +70,12 @@ impl Wm {
             );
         }
 
-        // Class -> label; app icon from _NET_WM_ICON.
+        // Class -> label; app icon from _NET_WM_ICON, falling back to the
+        // icon theme (some apps, e.g. Electron ones, set the property late
+        // or not at all — see `on_icon_change` for the late case).
         let class = self.client_identity(win);
         let label = class.chars().next().map_or('?', |c| c.to_ascii_uppercase());
-        let icon = self.fetch_icon(win);
+        let icon = self.fetch_icon(win).or_else(|| self.theme_icon(&class));
         let icon_slot = self.assign_icon_slot(&class);
 
         // Place the client into the focused split (displacing any occupant).
@@ -506,6 +508,32 @@ impl Wm {
         // pixel art matching the rest of the UI, and so the (rotate + snap)
         // hue-rotation for same-app disambiguation stays crisp.
         Some(Rc::new(icon::quantize(self.renderer.palette(), &icon)))
+    }
+
+    /// Resolve `class` against the icon theme (the same lookup the launcher
+    /// menu uses), for clients that don't provide `_NET_WM_ICON`.
+    fn theme_icon(&self, class: &str) -> Option<Rc<Icon>> {
+        let path = crate::menu::find_icon_file(class)
+            .or_else(|| crate::menu::find_icon_file(&class.to_lowercase()))?;
+        let img = icon::load_png(&path)?;
+        Some(Rc::new(icon::quantize(self.renderer.palette(), &img)))
+    }
+
+    /// `_NET_WM_ICON` changed on a managed window: refetch and redraw. Apps
+    /// that set the property only after mapping (Electron, notably) would
+    /// otherwise keep whatever `manage` resolved at map time.
+    pub(crate) fn on_icon_change(&mut self, win: Win) -> R<()> {
+        let Some(class) = self.clients.get(&win).map(|c| c.class.clone()) else {
+            return Ok(());
+        };
+        let Some(icon) = self.fetch_icon(win) else {
+            return Ok(());
+        };
+        let client = self.clients.get_mut(&win).expect("checked above");
+        client.icon = Some(icon);
+        client.icon_rotated = None;
+        self.refresh_icon_rotations(&class);
+        self.arrange()
     }
 
     // --- focus & spawning ---
