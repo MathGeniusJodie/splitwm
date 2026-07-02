@@ -23,14 +23,6 @@ use crate::icon::Icon;
 use crate::theme::{self, palette_color};
 use crate::Index;
 
-/// Embedded-art PNG bytes, relative to the crate root (where the bitmap
-/// assets live alongside `Cargo.toml`).
-macro_rules! asset {
-    ($name:literal) => {
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/", $name))
-    };
-}
-
 /// Dithered "translucent" chrome background: a checker of black and gunmetal
 /// stands in for the old 50%-alpha black fills, keeping everything on the
 /// 16-colour palette.
@@ -69,16 +61,6 @@ pub struct Renderer {
 struct ButtonArt {
     normal: Sprite,
     disabled: Sprite,
-}
-
-impl ButtonArt {
-    fn load(palette: &PgPalette, bytes: &[u8], disabled_bytes: &[u8]) -> Self {
-        Self {
-            normal: Sprite::load_native_bytes(bytes, palette).expect("embedded button PNG"),
-            disabled: Sprite::load_native_bytes(disabled_bytes, palette)
-                .expect("embedded disabled button PNG"),
-        }
-    }
 }
 
 pub struct TabInfo {
@@ -276,7 +258,7 @@ const MIN_CAP_W: usize = 10;
 
 impl Renderer {
     pub fn new() -> Self {
-        let palette = PgPalette::load_bytes(asset!("na16-1x.png")).expect("na16-1x.png");
+        let palette = crate::assets::palette();
         let font = match BitmapFont::load(&FUSION_PIXEL_12_SPEC) {
             Ok(f) => Some(f),
             Err(e) => {
@@ -292,40 +274,36 @@ impl Renderer {
             fg,
             wallpaper: None,
             border: NineSlice {
-                sprite: Sprite::load_native_bytes(asset!("winborder.png"), &palette)
-                    .expect("winborder.png"),
+                sprite: crate::assets::winborder(),
                 l: theme::BORDER_LEFT,
                 t: theme::BORDER_TOP,
                 r: theme::BORDER_RIGHT,
                 b: theme::BORDER_BOTTOM,
             },
-            minimized: Sprite::load_native_bytes(asset!("winmin.png"), &palette)
-                .expect("winmin.png"),
-            minimized_h: Sprite::load_native_bytes(asset!("winmin_h.png"), &palette)
-                .expect("winmin_h.png"),
+            minimized: crate::assets::winmin(),
+            minimized_h: crate::assets::winmin_h(),
             // Order must match `BtnIcon::index`.
             buttons: [
-                ButtonArt::load(&palette, asset!("close.png"), asset!("close_disabled.png")),
-                ButtonArt::load(
-                    &palette,
-                    asset!("minimize.png"),
-                    asset!("minimize_disabled.png"),
-                ),
-                ButtonArt::load(
-                    &palette,
-                    asset!("minimize_h.png"),
-                    asset!("minimize_h_disabled.png"),
-                ),
-                ButtonArt::load(
-                    &palette,
-                    asset!("hsplit.png"),
-                    asset!("hsplit_disabled.png"),
-                ),
-                ButtonArt::load(
-                    &palette,
-                    asset!("vsplit.png"),
-                    asset!("vsplit_disabled.png"),
-                ),
+                ButtonArt {
+                    normal: crate::assets::close(),
+                    disabled: crate::assets::close_disabled(),
+                },
+                ButtonArt {
+                    normal: crate::assets::minimize(),
+                    disabled: crate::assets::minimize_disabled(),
+                },
+                ButtonArt {
+                    normal: crate::assets::minimize_h(),
+                    disabled: crate::assets::minimize_h_disabled(),
+                },
+                ButtonArt {
+                    normal: crate::assets::hsplit(),
+                    disabled: crate::assets::hsplit_disabled(),
+                },
+                ButtonArt {
+                    normal: crate::assets::vsplit(),
+                    disabled: crate::assets::vsplit_disabled(),
+                },
             ],
             palette,
         }

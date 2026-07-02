@@ -25,12 +25,17 @@ impl Wm {
         let wa = self.wa();
         let gap = theme::TASKBAR_GAP;
         let isz = theme::TASKBAR_ICON;
-        let y = wa.y + wa.h - theme::TASKBAR_H + (theme::TASKBAR_H - isz) / 2;
-        // Tiles fill from the left; the launcher "+" sits just after them.
-        let right = wa.x + wa.w - gap;
-        let mut x = wa.x + gap;
-        let mut tiles = Vec::with_capacity(self.bar_order.len());
         let cbs = theme::TASKBAR_CLOSE;
+        // Centre the tile + close-badge group vertically in the bar; the
+        // badge overlaps the tile's bottom edge slightly.
+        let overlap = 4;
+        let pad = (theme::TASKBAR_H - (isz + cbs - overlap)) / 2;
+        let y = wa.y + wa.h - theme::TASKBAR_H + pad;
+        // Tiles fill from the left; the launcher "+" sits just after them.
+        // Left/right edge margins match the split gap.
+        let right = wa.x + wa.w - theme::GAP;
+        let mut x = wa.x + theme::GAP;
+        let mut tiles = Vec::with_capacity(self.bar_order.len());
         for &win in &self.bar_order {
             if x + isz > right {
                 break;
@@ -43,11 +48,12 @@ impl Wm {
                     w: isz,
                     h: isz,
                 },
-                // Close badge in the tile's bottom-right corner; hit-tested
-                // before the tile so clicking it closes instead of focusing.
+                // Close badge below the tile (overlapping its bottom edge),
+                // right-aligned; hit-tested before the tile so clicking it
+                // closes instead of focusing.
                 close: FrameRect {
                     x: x + isz - cbs,
-                    y: y + isz - cbs,
+                    y: y + isz - overlap,
                     w: cbs,
                     h: cbs,
                 },

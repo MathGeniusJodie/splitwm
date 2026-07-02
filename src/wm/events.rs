@@ -203,6 +203,11 @@ impl Wm {
         }
         let aux = ConfigureWindowAux::from_configure_request(e);
         self.conn.configure_window(e.window, &aux)?;
+        // A notification resizing itself keeps its new size, but position
+        // stays ours: re-stack the bottom-right pile around it.
+        if self.notifications.contains(&e.window) {
+            self.place_notifications()?;
+        }
         Ok(())
     }
 
@@ -286,6 +291,9 @@ impl Wm {
             self.docked_w = 0;
             return self.arrange();
         }
+        if self.notifications.contains(&win) {
+            return self.forget_notification(win);
+        }
         if self.clients.contains_key(&win) {
             self.set_wm_state(win, WM_STATE_WITHDRAWN)?;
             self.forget_client(win)?;
@@ -298,6 +306,9 @@ impl Wm {
             self.docked = None;
             self.docked_w = 0;
             return self.arrange();
+        }
+        if self.notifications.contains(&win) {
+            return self.forget_notification(win);
         }
         self.forget_client(win)?;
         Ok(())
@@ -330,6 +341,7 @@ impl Wm {
             .flatten();
         match action {
             Action::SpawnTerminal => self.spawn_terminal(),
+            Action::SpawnLauncher => self.spawn("rofi -show drun"),
             Action::SplitH => self.state.split_focused(Dir::H),
             Action::SplitV => self.state.split_focused(Dir::V),
             Action::Close => {
@@ -661,8 +673,9 @@ impl Wm {
     }
 
     /// Pick the pointer cursor for a hover position on the underlay:
-    /// resize arrows over gap/edge drag handles, the "disabled" cursor over
-    /// a disabled titlebar button, the plain arrow otherwise.
+    /// resize arrows over gap/edge drag handles, the hand over clickable
+    /// buttons, the "disabled" cursor over a disabled titlebar button, and
+    /// the plain arrow otherwise.
     fn hover_cursor(&self, mx: i32, my: i32) -> u32 {
         let c = self.cursors;
         if let Some((leaf, kind)) = self
@@ -685,7 +698,18 @@ impl Wm {
                     return c.disabled;
                 }
             }
-            return c.arrow;
+            return c.hand;
+        }
+        // Taskbar tiles (and their close badges), the launcher "+", and the
+        // tab titles are plain click targets, mirroring `on_button`.
+        if self
+            .taskbar_regions
+            .iter()
+            .any(|t| rect_contains(t.rect, mx, my) || rect_contains(t.close, mx, my))
+            || rect_contains(self.taskbar_plus, mx, my)
+            || self.tab_regions.iter().any(|(r, _)| rect_contains(*r, mx, my))
+        {
+            return c.hand;
         }
         if let Some((_, b)) = self
             .handle_regions
@@ -693,9 +717,10 @@ impl Wm {
             .find(|(r, _)| rect_contains(*r, mx, my))
         {
             // The boundary "+" button sits inside the handle's hit region;
-            // keep the arrow over it, matching the click hit-test order.
+            // it's clickable, so the hand wins, matching the click hit-test
+            // order.
             if b.root && self.plus_regions.iter().any(|(r, _)| rect_contains(*r, mx, my)) {
-                return c.arrow;
+                return c.hand;
             }
             return if b.dir == Dir::V {
                 c.v_resize

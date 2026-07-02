@@ -669,26 +669,30 @@ mod tests {
 
     /// `dock_extra` must open up exactly enough extra scroll room to slide
     /// the docked sidebar fully into view, mirroring `Wm::place_dock`'s
-    /// `x = wa.x + canvas_w - scroll_x` formula, even when there's only one
-    /// column and the canvas alone has no scroll room of its own.
+    /// `x = wa.x + canvas_w - overlap - scroll_x` formula (overlap =
+    /// `DOCK_OVERLAP` clamped to the dock's width, see `Wm::dock_overlap`),
+    /// even when there's only one column and the canvas alone has no scroll
+    /// room of its own.
     #[test]
     fn dock_extra_reveals_sidebar_at_max_scroll() {
         let mut s = State::new();
         s.canvas_w = Some(WA.w); // single leaf: canvas == viewport, no scroll room on its own
         let docked_w = 300;
-        s.dock_extra = docked_w;
+        let overlap = theme::DOCK_OVERLAP.min(docked_w);
+        s.dock_extra = docked_w - overlap;
 
-        assert_eq!(s.max_scroll(WA), docked_w);
+        assert_eq!(s.max_scroll(WA), docked_w - overlap);
 
         let canvas_w = s.canvas_w.unwrap();
-        let dock_x_at = |scroll_x: i32| WA.x + canvas_w - scroll_x;
+        let dock_x_at = |scroll_x: i32| WA.x + canvas_w - overlap - scroll_x;
 
-        // Fully off-screen to the right before scrolling.
-        assert!(dock_x_at(0) >= WA.x + WA.w);
+        // Before scrolling, only the tucked-under overlap strip reaches
+        // on-screen (it sits below the canvas in stacking).
+        assert_eq!(dock_x_at(0), WA.x + WA.w - overlap);
 
         // Scrolling to the clamped max brings it flush to the right edge.
         s.scroll_to(WA, i32::MAX);
-        assert_eq!(s.scroll_target, docked_w);
+        assert_eq!(s.scroll_target, docked_w - overlap);
         assert_eq!(dock_x_at(s.scroll_target), WA.x + WA.w - docked_w);
     }
 

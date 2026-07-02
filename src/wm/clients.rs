@@ -56,6 +56,9 @@ impl Wm {
     /// already-viewable windows (whose next unmap by us must be counted in
     /// `ignore_unmaps`) from fresh `MapRequest`s that are not yet mapped.
     pub(crate) fn manage(&mut self, win: Win, already_mapped: bool) -> R<()> {
+        if self.is_notification(win) {
+            return self.manage_notification(win);
+        }
         let title = self.client_title(win);
         if title.as_ref() == self.dock_title {
             if self.docked.is_none() {
@@ -168,6 +171,96 @@ impl Wm {
         // and canvas width, so no separate initial placement is needed here.
         self.arrange()?;
         self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Whether `win` declares `_NET_WM_WINDOW_TYPE_NOTIFICATION` (the type
+    /// property is a preference-ordered list; any entry counts).
+    fn is_notification(&self, win: Win) -> bool {
+        self.conn
+            .get_property(
+                false,
+                win,
+                self.atoms.net_wm_window_type,
+                AtomEnum::ATOM,
+                0,
+                32,
+            )
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| {
+                Some(
+                    r.value32()?
+                        .any(|a| a == self.atoms.net_wm_window_type_notification),
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    /// Pin `win` as a notification: never in the split tree or taskbar,
+    /// stacked above everything at the bottom-right of the screen (above the
+    /// taskbar strip), at whatever size it requested. Newer notifications
+    /// stack upward above older ones.
+    fn manage_notification(&mut self, win: Win) -> R<()> {
+        self.conn.change_window_attributes(
+            win,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+        )?;
+        self.conn
+            .configure_window(win, &ConfigureWindowAux::new().border_width(0))?;
+        if !self.notifications.contains(&win) {
+            self.notifications.push(win);
+        }
+        self.place_notifications()?;
+        self.conn.map_window(win)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Position every notification: right-aligned to the screen edge (split
+    /// gap margin), stacked bottom-up starting just above the taskbar, each
+    /// raised to the top of the stacking order (oldest at the bottom).
+    pub(crate) fn place_notifications(&self) -> R<()> {
+        let wa = self.wa();
+        let gap = theme::GAP;
+        let mut bottom = wa.y + wa.h - Self::taskbar_h();
+        for &win in &self.notifications {
+            let Some(g) = self
+                .conn
+                .get_geometry(win)
+                .ok()
+                .and_then(|c| c.reply().ok())
+            else {
+                continue;
+            };
+            let (w, h) = (i32::from(g.width), i32::from(g.height));
+            bottom -= gap + h;
+            self.conn.configure_window(
+                win,
+                &ConfigureWindowAux::new()
+                    .x(wa.x + wa.w - gap - w)
+                    .y(bottom)
+                    .stack_mode(StackMode::ABOVE),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Restack every notification to the top, preserving their relative
+    /// order — arrange()/focus() raise tiled clients, so notifications must
+    /// be re-raised afterwards to stay on top of everything.
+    pub(crate) fn raise_notifications(&self) -> R<()> {
+        for &win in &self.notifications {
+            self.conn
+                .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        }
+        Ok(())
+    }
+
+    /// Stop tracking a closed notification and re-stack the survivors.
+    pub(crate) fn forget_notification(&mut self, win: Win) -> R<()> {
+        self.notifications.retain(|&w| w != win);
+        self.place_notifications()?;
         Ok(())
     }
 
@@ -424,6 +517,7 @@ impl Wm {
                     .set_input_focus(InputFocus::POINTER_ROOT, w, CURRENT_TIME)?;
                 self.conn
                     .configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+                self.raise_notifications()?;
                 self.conn.change_property32(
                     PropMode::REPLACE,
                     self.root,

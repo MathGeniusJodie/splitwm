@@ -35,8 +35,10 @@ impl Wm {
         let needed = columns.saturating_mul(min_col_w);
         let canvas_w = needed.max(wa.w) + self.state.canvas_w_extra;
         self.state.canvas_w = Some(canvas_w);
+        // The dock is tucked DOCK_OVERLAP px under the canvas edge, so that
+        // much less scroll room is needed to bring it fully into view.
         self.state.dock_extra = if self.docked.is_some() {
-            self.docked_w
+            self.docked_w - self.dock_overlap()
         } else {
             0
         };
@@ -80,9 +82,10 @@ impl Wm {
         self.compose(wa, &placed, true)?;
         self.place_clients(&placed)?;
         self.place_dock(wa, canvas_w)?;
-        // place_clients/place_dock raise their windows to the top; keep an
-        // open launcher menu above them (an arrange can be triggered while
-        // it's open).
+        // place_clients/place_dock raise their windows to the top; keep
+        // notifications above them, and an open launcher menu above
+        // everything (an arrange can be triggered while it's open).
+        self.raise_notifications()?;
         self.raise_menu()?;
 
         // Cache final rects as the start point for the next transition.
@@ -333,13 +336,21 @@ impl Wm {
         Ok(())
     }
 
-    /// Position the docked sidebar just past the right end of the tiling
-    /// canvas (`canvas_w`, one gap beyond the last column, same as
-    /// `compute`'s trailing inset) in canvas space, then shift by the
-    /// current scroll like any other leaf. It's off-screen at `scroll_x =
-    /// 0` and only slides into view once the canvas is scrolled all the way
-    /// right (`State::dock_extra` extends `max_scroll` to make that
-    /// reachable); a no-op if nothing is docked.
+    /// Position the docked sidebar at the right end of the tiling canvas,
+    /// tucked `theme::DOCK_OVERLAP` px under it (the canvas edge overlaps
+    /// the dock, not the other way round: the dock stacks just above the
+    /// underlay, below every tiled client) in canvas space, then shift by
+    /// the current scroll like any other leaf. It's (mostly) off-screen at
+    /// `scroll_x = 0` and only slides fully into view once the canvas is
+    /// scrolled all the way right (`State::dock_extra` extends `max_scroll`
+    /// to make that reachable); a no-op if nothing is docked.
+    /// `theme::DOCK_OVERLAP` clamped to the dock's own width — an overlap
+    /// wider than the dock would otherwise shove its right edge permanently
+    /// away from the screen edge (fully tucked is the useful maximum).
+    fn dock_overlap(&self) -> i32 {
+        theme::DOCK_OVERLAP.min(self.docked_w)
+    }
+
     fn place_dock(&self, wa: Rect, canvas_w: i32) -> R<()> {
         let Some(win) = self.docked else {
             return Ok(());
@@ -348,7 +359,7 @@ impl Wm {
         // bottom taskbar) — the dock spans the entire screen, overlapping
         // the taskbar strip in its column.
         let full = self.wa();
-        let x = wa.x + canvas_w - self.state.scroll_x;
+        let x = wa.x + canvas_w - self.dock_overlap() - self.state.scroll_x;
         self.conn.configure_window(
             win,
             &ConfigureWindowAux::new()
@@ -357,6 +368,7 @@ impl Wm {
                 .width(u32::try_from(self.docked_w).unwrap_or(1))
                 .height(u32::try_from(full.h.max(1)).unwrap_or(1))
                 .border_width(0)
+                .sibling(self.underlay)
                 .stack_mode(StackMode::ABOVE),
         )?;
         self.conn.map_window(win)?;

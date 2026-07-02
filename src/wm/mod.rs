@@ -20,10 +20,11 @@ use std::collections::HashMap;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xinput::{self, ConnectionExt as _, ScrollType, XIEventMask};
+use x11rb::protocol::render::{self, ConnectionExt as _, PictType, Pictformat};
 use x11rb::protocol::xproto::{
     AtomEnum, ButtonIndex, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux,
-    ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, GrabMode, ModMask, PropMode, StackMode,
-    Window, WindowClass,
+    ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, GrabMode, ImageFormat, ImageOrder,
+    ModMask, PropMode, StackMode, Window, WindowClass,
 };
 use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as _;
@@ -204,6 +205,8 @@ pub fn run(replace: bool) -> R<()> {
             atoms.net_supporting_wm_check,
             atoms.net_wm_name,
             atoms.net_wm_icon,
+            atoms.net_wm_window_type,
+            atoms.net_wm_window_type_notification,
         ],
     )?;
     conn.change_property32(
@@ -238,11 +241,13 @@ pub fn run(replace: bool) -> R<()> {
 
     // Black root background + a normal left-pointer cursor. Without setting a
     // root cursor the pointer is invisible over the root and the underlay
-    // (which inherits the root's cursor), so give it the standard arrow from
-    // the "cursor" font (glyph 68 = XC_left_ptr; a glyph's mask is always the
-    // next glyph). Resize/disabled cursors for hover feedback come from the
-    // same font: 108 = XC_sb_h_double_arrow, 116 = XC_sb_v_double_arrow,
-    // 0 = XC_X_cursor (closest core glyph to a "not allowed" cursor).
+    // (which inherits the root's cursor). The arrow/hand/disabled cursors are
+    // the hand-drawn `cursor_*` sprites, built as ARGB cursors via RENDER;
+    // the core "cursor" font supplies the resize arrows (no drawn art) and
+    // the fallbacks when the server lacks RENDER cursors (glyph 68 =
+    // XC_left_ptr, 108 = XC_sb_h_double_arrow, 116 = XC_sb_v_double_arrow,
+    // 60 = XC_hand2, 0 = XC_X_cursor; a glyph's mask is always the next
+    // glyph).
     let cursor_font = conn.generate_id()?;
     conn.open_font(cursor_font, b"cursor")?;
     let make_cursor = |glyph: u16| -> R<u32> {
@@ -262,15 +267,32 @@ pub fn run(replace: bool) -> R<()> {
         )?;
         Ok(c)
     };
-    let cursors = Cursors {
+    let mut cursors = Cursors {
         arrow: make_cursor(68)?,
         h_resize: make_cursor(108)?,
         v_resize: make_cursor(116)?,
         disabled: make_cursor(0)?,
+        hand: make_cursor(60)?,
         current: 0,
     };
-    let cursor = cursors.arrow;
     conn.close_font(cursor_font)?;
+    if let Some(argb32) = render_argb32_format(&conn)? {
+        let palette = crate::assets::palette();
+        // Hotspots: arrow tip, fingertip, circle center.
+        cursors.arrow =
+            sprite_cursor(&conn, root, argb32, &crate::assets::cursor_pointer(), &palette, (4, 0))?;
+        cursors.hand =
+            sprite_cursor(&conn, root, argb32, &crate::assets::cursor_hand(), &palette, (11, 0))?;
+        cursors.disabled = sprite_cursor(
+            &conn,
+            root,
+            argb32,
+            &crate::assets::cursor_disabled(),
+            &palette,
+            (12, 12),
+        )?;
+    }
+    let cursor = cursors.arrow;
     let cw = ChangeWindowAttributesAux::new()
         .background_pixel(screen.black_pixel)
         .cursor(cursor);
@@ -360,6 +382,8 @@ pub fn run(replace: bool) -> R<()> {
             &CreateWindowAux::new()
                 .override_redirect(1)
                 .background_pixel(screen.black_pixel)
+                // Every menu row is clickable, so the hand covers the menu.
+                .cursor(cursors.hand)
                 .event_mask(menu_mask),
         )?;
     }
@@ -396,6 +420,7 @@ pub fn run(replace: bool) -> R<()> {
         docked_w: 0,
         dock_title: std::env::var("SPLITWM_DOCK_TITLE")
             .unwrap_or_else(|_| theme::DOCK_TITLE.to_string()),
+        notifications: Vec::new(),
         underlay,
         underlay_pix: 0,
         underlay_pix_size: (0, 0),
@@ -472,6 +497,19 @@ pub fn run(replace: bool) -> R<()> {
     // Take over from a previous WM (if any) without dropping whatever it had
     // on screen: adopt already-mapped windows before the first arrange.
     wm.manage_existing_windows()?;
+
+    // Autostart the docked sidebar from its freedesktop entry (the desktop
+    // id must match the dock title, e.g. cozyui.desktop), unless a previous
+    // WM already handed a running one over.
+    if wm.docked.is_none() {
+        match crate::menu::desktop_entry_cmd(&wm.dock_title) {
+            Some(cmd) => wm.spawn(&cmd),
+            None => eprintln!(
+                "splitwm: no {}.desktop entry found; not autostarting the dock",
+                wm.dock_title
+            ),
+        }
+    }
 
     wm.conn.flush()?;
     wm.arrange()?;
@@ -588,6 +626,7 @@ impl Wm {
         let shift = u16::from(ModMask::SHIFT);
         let defs: &[(u16, u32, Action)] = &[
             (MOD4, ks::RETURN, Action::SpawnTerminal),
+            (MOD4, ks::SPACE, Action::SpawnLauncher),
             (MOD4, ks::V, Action::SplitH),
             (MOD4, ks::H, Action::SplitV),
             (MOD4, ks::Q, Action::Close),
@@ -662,4 +701,90 @@ impl Wm {
         }
         Ok(())
     }
+}
+
+/// The server's ARGB32 pict format, or `None` when RENDER cursors (>= 0.5)
+/// aren't available and the core-font glyph cursors should stay.
+fn render_argb32_format(conn: &x11rb::rust_connection::RustConnection) -> R<Option<Pictformat>> {
+    use x11rb::connection::RequestConnection;
+    if conn
+        .extension_information(render::X11_EXTENSION_NAME)?
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let version = conn.render_query_version(0, 8)?.reply()?;
+    if version.major_version == 0 && version.minor_version < 5 {
+        return Ok(None);
+    }
+    let formats = conn.render_query_pict_formats()?.reply()?;
+    Ok(formats
+        .formats
+        .iter()
+        .find(|f| {
+            f.depth == 32
+                && f.type_ == PictType::DIRECT
+                && f.direct.alpha_mask == 0xFF
+                && f.direct.alpha_shift == 24
+                && f.direct.red_shift == 16
+                && f.direct.green_shift == 8
+                && f.direct.blue_shift == 0
+        })
+        .map(|f| f.id))
+}
+
+/// Build an ARGB hardware cursor from a baked palette-indexed sprite.
+fn sprite_cursor(
+    conn: &x11rb::rust_connection::RustConnection,
+    root: Window,
+    format: Pictformat,
+    sprite: &pixel_graphics::Sprite,
+    palette: &pixel_graphics::Palette,
+    (hot_x, hot_y): (u16, u16),
+) -> R<u32> {
+    let msb_first = conn.setup().image_byte_order == ImageOrder::MSB_FIRST;
+    let mut data = Vec::with_capacity(sprite.width * sprite.height * 4);
+    for y in 0..sprite.height {
+        for x in 0..sprite.width {
+            let index = sprite.at(x, y);
+            // RENDER wants premultiplied alpha; with only fully opaque or
+            // fully transparent pixels the colors pass through unchanged.
+            let pixel = if index == pixel_graphics::TRANSPARENT {
+                [0, 0, 0, 0]
+            } else {
+                let c = palette.color(index);
+                if msb_first {
+                    [0xFF, c.r, c.g, c.b]
+                } else {
+                    [c.b, c.g, c.r, 0xFF]
+                }
+            };
+            data.extend_from_slice(&pixel);
+        }
+    }
+
+    let pixmap = conn.generate_id()?;
+    conn.create_pixmap(32, pixmap, root, sprite.width as u16, sprite.height as u16)?;
+    let gc = conn.generate_id()?;
+    conn.create_gc(gc, pixmap, &CreateGCAux::new())?;
+    conn.put_image(
+        ImageFormat::Z_PIXMAP,
+        pixmap,
+        gc,
+        sprite.width as u16,
+        sprite.height as u16,
+        0,
+        0,
+        0,
+        32,
+        &data,
+    )?;
+    let picture = conn.generate_id()?;
+    conn.render_create_picture(picture, pixmap, format, &render::CreatePictureAux::new())?;
+    let cursor = conn.generate_id()?;
+    conn.render_create_cursor(cursor, picture, hot_x, hot_y)?;
+    conn.render_free_picture(picture)?;
+    conn.free_gc(gc)?;
+    conn.free_pixmap(pixmap)?;
+    Ok(cursor)
 }

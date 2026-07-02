@@ -35,6 +35,7 @@ pub mod ks {
     pub const Q: u32 = 0x71;
     pub const L: u32 = 0x6c;
     pub const C: u32 = 0x63;
+    pub const SPACE: u32 = 0x20;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -51,6 +52,8 @@ pub enum Action {
     Grow,
     Shrink,
     SpawnTerminal,
+    /// Launch rofi in desktop-application (drun) mode.
+    SpawnLauncher,
     Quit,
     /// Ask the focused window to close via `WM_DELETE_WINDOW`, falling back
     /// to disconnecting its client if it doesn't speak the protocol.
@@ -68,6 +71,8 @@ pub struct Atoms {
     pub net_active_window: Atom,
     pub net_supporting_wm_check: Atom,
     pub net_wm_name: Atom,
+    pub net_wm_window_type: Atom,
+    pub net_wm_window_type_notification: Atom,
     pub utf8_string: Atom,
 }
 
@@ -75,7 +80,7 @@ impl Atoms {
     pub fn intern(conn: &RustConnection) -> R<Self> {
         // Send every InternAtom before reading any reply, so interning costs
         // one round trip instead of ten.
-        let names: [&[u8]; 10] = [
+        let names: [&[u8]; 12] = [
             b"WM_PROTOCOLS",
             b"WM_DELETE_WINDOW",
             b"WM_STATE",
@@ -85,14 +90,16 @@ impl Atoms {
             b"_NET_ACTIVE_WINDOW",
             b"_NET_SUPPORTING_WM_CHECK",
             b"_NET_WM_NAME",
+            b"_NET_WM_WINDOW_TYPE",
+            b"_NET_WM_WINDOW_TYPE_NOTIFICATION",
             b"UTF8_STRING",
         ];
         let cookies = names.map(|n| conn.intern_atom(false, n));
-        let mut atoms = [0 as Atom; 10];
+        let mut atoms = [0 as Atom; 12];
         for (slot, cookie) in atoms.iter_mut().zip(cookies) {
             *slot = cookie?.reply()?.atom;
         }
-        let [wm_protocols, wm_delete_window, wm_state, net_wm_icon, net_supported, net_client_list, net_active_window, net_supporting_wm_check, net_wm_name, utf8_string] =
+        let [wm_protocols, wm_delete_window, wm_state, net_wm_icon, net_supported, net_client_list, net_active_window, net_supporting_wm_check, net_wm_name, net_wm_window_type, net_wm_window_type_notification, utf8_string] =
             atoms;
         Ok(Self {
             wm_protocols,
@@ -104,6 +111,8 @@ impl Atoms {
             net_active_window,
             net_supporting_wm_check,
             net_wm_name,
+            net_wm_window_type,
+            net_wm_window_type_notification,
             utf8_string,
         })
     }
@@ -151,6 +160,12 @@ pub struct Wm {
     /// `WM_NAME` that marks the dock window (`SPLITWM_DOCK_TITLE`, default
     /// `theme::DOCK_TITLE`).
     pub dock_title: String,
+    /// Notification windows (`_NET_WM_WINDOW_TYPE_NOTIFICATION`), in mapping
+    /// order. Like `docked`, they live outside `clients`/the split
+    /// tree/`bar_order`: no chrome, no taskbar entry, no focus cycling.
+    /// They stack above everything at the bottom-right of the screen
+    /// (see `Wm::place_notifications`), at whatever size they requested.
+    pub notifications: Vec<Win>,
     pub underlay: Window,
     /// Server-side pixmap holding the underlay's composited image, set as the
     /// underlay's `background_pixmap` so the server repaints exposed regions
@@ -247,9 +262,12 @@ pub struct Cursors {
     pub h_resize: u32,
     /// Up/down double arrow, over horizontal-gap handles.
     pub v_resize: u32,
-    /// Shown over disabled titlebar buttons (X-shaped `XC_X_cursor`; the
-    /// core cursor font has no dedicated "not-allowed" glyph).
+    /// Shown over disabled titlebar buttons (the hand-drawn circled-X
+    /// sprite; `XC_X_cursor` when the server lacks RENDER cursors).
     pub disabled: u32,
+    /// Pointing hand over clickable things: live titlebar buttons, boundary
+    /// "+" buttons, and the launcher menu (`XC_hand2` fallback).
+    pub hand: u32,
     pub current: u32,
 }
 

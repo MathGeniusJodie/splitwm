@@ -107,6 +107,14 @@ pub const TASKBAR_CLOSE: i32 = 17;
 /// Overridable at runtime with the `SPLITWM_DOCK_TITLE` environment variable.
 pub const DOCK_TITLE: &str = "cozyui";
 
+/// How far the docked sidebar is tucked under the right end of the split
+/// canvas, in px: `Wm::place_dock` shifts the dock left by this much from
+/// the canvas edge, and the canvas (stacked above it) overlaps it by the
+/// same amount. The first `GAP` px only close the canvas's trailing margin;
+/// beyond that the last column's windows themselves cover the dock's edge.
+/// 0 restores the flush side-by-side layout.
+pub const DOCK_OVERLAP: i32 = 300;
+
 pub const SPLIT_RATIO: f64 = 0.618;
 pub const RESIZE_STEP: f64 = 0.05;
 pub const SCROLL_STEP: i32 = 100;

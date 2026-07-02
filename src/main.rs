@@ -1,3 +1,4 @@
+mod assets;
 mod icon;
 mod menu;
 mod oklch;

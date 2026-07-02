@@ -197,6 +197,41 @@ fn scan() -> BTreeMap<String, Vec<App>> {
     by_cat
 }
 
+/// Resolve `<id>.desktop` from the standard application dirs into a
+/// spawnable command: its cleaned `Exec` line, prefixed with a `cd` into its
+/// `Path=` working directory when one is set. Unlike the launcher scan this
+/// ignores NoDisplay/Hidden — autostart doesn't care about menu visibility.
+pub fn desktop_entry_cmd(id: &str) -> Option<String> {
+    let file = app_dirs()
+        .into_iter()
+        .map(|d| d.join(format!("{id}.desktop")))
+        .find_map(|p| std::fs::read_to_string(p).ok())?;
+    let (mut in_entry, mut exec, mut path) = (false, None, None);
+    for line in file.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_entry {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        match k.trim() {
+            "Exec" if exec.is_none() => exec = Some(clean_exec(v.trim())),
+            "Path" if path.is_none() => path = Some(v.trim().to_string()),
+            _ => {}
+        }
+    }
+    let exec = exec.filter(|e| !e.is_empty())?;
+    Some(match path {
+        Some(p) if !p.is_empty() => format!("cd '{p}' && {exec}"),
+        _ => exec,
+    })
+}
+
 /// A quick-launch shortcut shown at the top of the main menu.
 struct Quick {
     label: &'static str,
@@ -219,6 +254,16 @@ const QUICK: &[Quick] = &[
         label: "Files",
         env: "FILEMANAGER",
         default: "xdg-open .",
+    },
+    Quick {
+        label: "Obsidian",
+        env: "OBSIDIAN",
+        default: "obsidian",
+    },
+    Quick {
+        label: "Claude",
+        env: "CLAUDE_DESKTOP",
+        default: "claude-desktop",
     },
 ];
 
