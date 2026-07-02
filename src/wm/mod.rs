@@ -404,6 +404,9 @@ pub fn run(replace: bool) -> R<()> {
         sub_cw: 0,
         sub_hi: None,
         target_leaf: crate::tree::NodeId::default(),
+        icon_cache: HashMap::new(),
+        main_icons: Vec::new(),
+        sub_icons: Vec::new(),
     };
 
     let debug_scroll = std::env::var_os("SPLITWM_DEBUG_SCROLL").is_some();

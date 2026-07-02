@@ -15,6 +15,29 @@ pub struct Icon {
     pub argb: Vec<u32>,
 }
 
+/// Decode a PNG file (e.g. a launcher icon resolved from the icon theme)
+/// into an `Icon`.
+pub fn load_png(path: &std::path::Path) -> Option<Icon> {
+    let (w, h, pixels) = pixel_graphics::decode_png_with_size(path.to_str()?).ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let argb = pixels
+        .iter()
+        .map(|p| {
+            (u32::from(p.a) << 24)
+                | (u32::from(p.r) << 16)
+                | (u32::from(p.g) << 8)
+                | u32::from(p.b)
+        })
+        .collect();
+    Some(Icon {
+        w: w as u32,
+        h: h as u32,
+        argb,
+    })
+}
+
 /// Snap every non-transparent pixel in `icon` to the nearest na16 palette
 /// colour (alpha is kept as-is), so app icons render as flat pixel art
 /// matching the rest of the UI's 16-colour chrome.

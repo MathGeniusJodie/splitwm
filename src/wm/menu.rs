@@ -8,11 +8,40 @@ use crate::menu::{frame_size, Item, MENU_BORDER, MENU_ROW_H};
 use crate::tree::NodeId;
 
 impl Wm {
+    /// Resolve one menu column's `Icon=` names into decoded icons via the
+    /// cache (failed lookups are cached as `None` and never retried).
+    fn resolve_menu_icons(
+        &mut self,
+        names: &[Option<String>],
+    ) -> Vec<Option<std::rc::Rc<crate::icon::Icon>>> {
+        names
+            .iter()
+            .map(|n| {
+                let n = n.as_ref()?;
+                self.menu
+                    .icon_cache
+                    .entry(n.clone())
+                    .or_insert_with(|| {
+                        let img = crate::menu::find_icon_file(n)
+                            .and_then(|p| crate::icon::load_png(&p))?;
+                        Some(std::rc::Rc::new(crate::icon::quantize(
+                            self.renderer.palette(),
+                            &img,
+                        )))
+                    })
+                    .clone()
+            })
+            .collect()
+    }
+
     /// Open the launcher menu for `leaf`, with its bottom-right corner anchored
     /// at screen (ax, ay) so it rises above the bottom taskbar.
     pub(crate) fn open_menu(&mut self, leaf: NodeId, ax: i32, ay: i32) -> R<()> {
         let labels = self.menu.tree.main.labels.clone();
-        let cw = self.renderer.menu_content_w(&labels, true);
+        let icon_names = self.menu.tree.main.icons.clone();
+        self.menu.main_icons = self.resolve_menu_icons(&icon_names);
+        let any_icon = self.menu.main_icons.iter().any(Option::is_some);
+        let cw = self.renderer.menu_content_w(&labels, true, any_icon);
         let rows = i32::try_from(labels.len()).unwrap_or(0);
         let (w, h) = frame_size(rows, cw);
         let wa = self.wa();
@@ -79,6 +108,7 @@ impl Wm {
             &m.labels,
             &m.arrows,
             &seps,
+            &self.menu.main_icons,
             self.menu.main_cw,
             self.menu.main_hi,
         );
@@ -107,6 +137,7 @@ impl Wm {
             &sub.labels,
             &sub.arrows,
             &seps,
+            &self.menu.sub_icons,
             self.menu.sub_cw,
             self.menu.sub_hi,
         );
@@ -128,7 +159,10 @@ impl Wm {
             return Ok(());
         };
         let labels = self.menu.tree.subs[idx].labels.clone();
-        let cw = self.renderer.menu_content_w(&labels, false);
+        let icon_names = self.menu.tree.subs[idx].icons.clone();
+        self.menu.sub_icons = self.resolve_menu_icons(&icon_names);
+        let any_icon = self.menu.sub_icons.iter().any(Option::is_some);
+        let cw = self.renderer.menu_content_w(&labels, false, any_icon);
         let rows = i32::try_from(labels.len()).unwrap_or(0);
         let (w, h) = frame_size(rows, cw);
         let wa = self.wa();

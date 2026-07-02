@@ -297,6 +297,13 @@ pub struct MenuUi {
     pub sub_cw: i32,
     pub sub_hi: Option<usize>,
     pub target_leaf: NodeId,
+    /// Decoded app icons keyed by the desktop entry's `Icon=` value; `None`
+    /// caches a failed lookup so it isn't retried on every open.
+    pub icon_cache: std::collections::HashMap<String, Option<Rc<crate::icon::Icon>>>,
+    /// Per-row icons of the currently shown main column / submenu, resolved
+    /// from `icon_cache` when the column opens.
+    pub main_icons: Vec<Option<Rc<crate::icon::Icon>>>,
+    pub sub_icons: Vec<Option<Rc<crate::icon::Icon>>>,
 }
 
 /// The three split-control buttons on the right of every leaf's tab bar

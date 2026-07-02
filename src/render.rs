@@ -777,6 +777,8 @@ use crate::menu::{frame_size, MENU_BORDER, MENU_ROW_H};
 
 const MENU_PAD_X: i32 = 12;
 const MENU_ARROW_W: i32 = 16;
+const MENU_ICON_SZ: i32 = 16;
+const MENU_ICON_GAP: i32 = 8;
 
 impl Renderer {
     /// Pixel width of a left-aligned string in the UI font. Without a font,
@@ -789,23 +791,27 @@ impl Renderer {
     }
 
     /// Inner content width (excludes the black border) for a menu column.
-    pub fn menu_content_w(&self, labels: &[String], any_arrow: bool) -> i32 {
+    /// `any_icon` reserves a leading icon column so labels stay aligned.
+    pub fn menu_content_w(&self, labels: &[String], any_arrow: bool, any_icon: bool) -> i32 {
         let mut w = 0;
         for l in labels {
             w = w.max(self.text_width(l));
         }
         let arrow = if any_arrow { MENU_ARROW_W } else { 0 };
-        w + 2 * MENU_PAD_X + arrow
+        let icon = if any_icon { MENU_ICON_SZ + MENU_ICON_GAP } else { 0 };
+        w + 2 * MENU_PAD_X + arrow + icon
     }
 
     /// Render a menu column to its own framebuffer. `content_w` is the inner
     /// width (shared across a menu + submenu so columns line up); `seps`
-    /// marks divider rows, `hi` is the hovered row.
+    /// marks divider rows, `icons` per-row app icons (any Some indents every
+    /// label by the icon column), `hi` is the hovered row.
     pub fn draw_menu(
         &self,
         labels: &[String],
         arrows: &[bool],
         seps: &[bool],
+        icons: &[Option<Rc<Icon>>],
         content_w: i32,
         hi: Option<usize>,
     ) -> Framebuffer {
@@ -848,15 +854,15 @@ impl Renderer {
                     palette_color::GUNMETAL,
                 );
             }
+            let icon_col = icons.iter().any(Option::is_some);
+            if let Some(img) = icons.get(i).and_then(Option::as_ref) {
+                let iy = ry + (MENU_ROW_H - MENU_ICON_SZ) / 2;
+                self.draw_icon(&mut fb, img, b + MENU_PAD_X, iy, MENU_ICON_SZ);
+            }
             if let Some(font) = &self.font {
+                let tx = b + MENU_PAD_X + if icon_col { MENU_ICON_SZ + MENU_ICON_GAP } else { 0 };
                 let ty = ry + (MENU_ROW_H - font.cell_h() as i32) / 2;
-                font.draw_text(
-                    &mut fb,
-                    label,
-                    (b + MENU_PAD_X) as usize,
-                    ty.max(0) as usize,
-                    self.fg,
-                );
+                font.draw_text(&mut fb, label, tx as usize, ty.max(0) as usize, self.fg);
             }
             if arrows.get(i).copied().unwrap_or(false) {
                 // Small right-pointing triangle (▸): stacked shrinking rows.
