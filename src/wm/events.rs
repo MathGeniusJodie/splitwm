@@ -736,10 +736,9 @@ impl Wm {
     }
 
     fn on_expose(&mut self, e: ExposeEvent) -> R<()> {
-        // Recompose the underlay once the exposure run completes.
-        if e.count == 0 && e.window == self.underlay {
-            self.arrange()?;
-        } else if self.menu.open && e.window == self.menu.main_win {
+        // The underlay needs no handling here: its composited image is its
+        // `background_pixmap`, so the server repaints exposed areas itself.
+        if self.menu.open && e.window == self.menu.main_win {
             self.paint_menu_main()?;
         } else if self.menu.open && e.window == self.menu.sub_win {
             self.paint_menu_sub()?;

@@ -4,7 +4,9 @@
 use std::collections::HashMap;
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt, ImageFormat, StackMode, Window};
+use x11rb::protocol::xproto::{
+    ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, ImageFormat, StackMode, Window,
+};
 
 use super::clients::{WM_STATE_ICONIC, WM_STATE_NORMAL};
 use super::types::{ease_out_back, lerp_rect, BtnKind, FrameRect, LeafMeta, Placement, Wm, R};
@@ -179,7 +181,26 @@ impl Wm {
         let mut buf = std::mem::take(&mut self.bgrx);
         self.renderer.present(&fb, &mut buf);
         self.bgrx = buf;
-        self.put_image(self.underlay, w as u16, h as u16, &self.bgrx)?;
+        // Blit into a pixmap installed as the underlay's background, not the
+        // window itself: the server then repaints regions exposed by moving
+        // (shaped) clients synchronously from the pixmap, instead of flashing
+        // the black background pixel until our Expose handler catches up.
+        let (pw, ph) = (w as u16, h as u16);
+        if self.underlay_pix_size != (pw, ph) {
+            if self.underlay_pix != 0 {
+                self.conn.free_pixmap(self.underlay_pix)?;
+            }
+            let pix = self.conn.generate_id()?;
+            self.conn.create_pixmap(self.depth, pix, self.underlay, pw, ph)?;
+            self.underlay_pix = pix;
+            self.underlay_pix_size = (pw, ph);
+            self.conn.change_window_attributes(
+                self.underlay,
+                &ChangeWindowAttributesAux::new().background_pixmap(pix),
+            )?;
+        }
+        self.put_image(self.underlay_pix, pw, ph, &self.bgrx)?;
+        self.conn.clear_area(false, self.underlay, 0, 0, 0, 0)?;
         Ok(())
     }
 

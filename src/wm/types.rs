@@ -152,6 +152,13 @@ pub struct Wm {
     /// `theme::DOCK_TITLE`).
     pub dock_title: String,
     pub underlay: Window,
+    /// Server-side pixmap holding the underlay's composited image, set as the
+    /// underlay's `background_pixmap` so the server repaints exposed regions
+    /// itself (no black flash while a shaped client moves over it).
+    pub underlay_pix: Window,
+    /// Current size of `underlay_pix`; recreated by `compose` on mismatch
+    /// (RandR resize).
+    pub underlay_pix_size: (u16, u16),
     /// Never-mapped window owning the ICCCM `WM_S<n>` manager selection for
     /// the whole process lifetime; a `SelectionClear` naming it means
     /// another WM has taken over (e.g. via its own `--replace`), so we quit

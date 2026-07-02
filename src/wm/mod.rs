@@ -397,6 +397,8 @@ pub fn run(replace: bool) -> R<()> {
         dock_title: std::env::var("SPLITWM_DOCK_TITLE")
             .unwrap_or_else(|_| theme::DOCK_TITLE.to_string()),
         underlay,
+        underlay_pix: 0,
+        underlay_pix_size: (0, 0),
         sel_owner,
         running: true,
         max_req_bytes,
