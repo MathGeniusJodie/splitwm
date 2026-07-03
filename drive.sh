@@ -7,8 +7,19 @@ SHOTS=/tmp/splitshots
 mkdir -p "$SHOTS"; rm -f "$SHOTS"/*.png
 export DISPLAY_HOST="${DISPLAY:-:0}"
 
-cleanup() { kill $WM_PID 2>/dev/null; kill $XEPHYR_PID 2>/dev/null; }
+# Initialised before the trap: under `set -u` an early exit would otherwise
+# expand unset variables inside cleanup.
+WM_PID=""
+XEPHYR_PID=""
+cleanup() {
+    [ -n "$WM_PID" ] && kill "$WM_PID" 2>/dev/null
+    [ -n "$XEPHYR_PID" ] && kill "$XEPHYR_PID" 2>/dev/null
+}
 trap cleanup EXIT
+
+# cargo test/check don't produce the binary this script runs; build it here
+# so the drive never exercises a stale target/debug/splitwm.
+cargo build --manifest-path "$DIR/Cargo.toml" 2>/tmp/build.log || { cat /tmp/build.log; exit 1; }
 
 DISPLAY="$DISPLAY_HOST" Xephyr :1 -ac -screen 1280x800 >/tmp/xephyr.log 2>&1 &
 XEPHYR_PID=$!

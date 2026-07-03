@@ -5,7 +5,8 @@
 # failed assertion. Requires: Xephyr, xdotool, xprop, xterm.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
-DPY=":7"
+# Overridable so parallel runs (or another session's Xephyr) don't collide.
+DPY=":${SPLITWM_ITEST_DPY:-7}"
 FAILS=0
 WM_PID=""
 XEPHYR_PID=""
@@ -38,7 +39,8 @@ wait_for() {
 hexid() { printf '0x%x' "$1"; }
 wm_state() { xprop -display "$DPY" -id "$1" WM_STATE 2>/dev/null | sed -n 's/.*window state: //p'; }
 client_list() { xprop -display "$DPY" -root _NET_CLIENT_LIST 2>/dev/null; }
-in_client_list() { client_list | grep -qi "$(hexid "$1")"; }
+# Anchored so 0x40000 cannot match 0x400001: an id ends at a comma or EOL.
+in_client_list() { client_list | grep -qiE "$(hexid "$1")(,|$)"; }
 not_in_client_list() { ! in_client_list "$1"; }
 active_win() { xprop -display "$DPY" -root _NET_ACTIVE_WINDOW | grep -oi '0x[0-9a-f]*'; }
 key() { DISPLAY="$DPY" xdotool key --clearmodifiers "$1"; sleep 0.3; }
@@ -102,8 +104,10 @@ spawn_xterm W3 || exit 1
 wait_for "w3 in _NET_CLIENT_LIST" in_client_list "$W3"
 DISPLAY="$DPY" xdotool windowunmap --sync "$W3"
 wait_for "withdrawn w3 leaves _NET_CLIENT_LIST" not_in_client_list "$W3"
+# A forcible remap would flip WM_STATE back to Normal; Withdrawn proves the
+# WM honoured the withdrawal and left the window unmapped.
 wait_for "withdrawn w3 is not forcibly remapped" \
-    sh -c "! DISPLAY=$DPY xdotool search --onlyvisible --pid 0 2>/dev/null | grep -qx $W3"
+    sh -c "[ \"\$(xprop -display $DPY -id $W3 WM_STATE | sed -n 's/.*window state: //p')\" = Withdrawn ]"
 
 # --- restore on exit: a taskbar'd (Iconic) client is remapped ---
 spawn_xterm W4 || exit 1 # fills the split the earlier close emptied
