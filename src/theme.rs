@@ -278,6 +278,7 @@ pub mod ks {
     pub const L: u32 = 0x6c;
     pub const C: u32 = 0x63;
     pub const SPACE: u32 = 0x20;
+    pub const F4: u32 = 0xffc1;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -303,6 +304,7 @@ pub enum Action {
 
 /// Raw X modifier bits, so this module needs no x11rb dependency.
 pub const MOD4: u16 = 0x40; // ModMask::M4
+pub const MOD1: u16 = 0x08; // ModMask::M1 (Alt)
 pub const SHIFT: u16 = 0x01; // ModMask::SHIFT
 
 /// The key bindings `Wm::grab_keys` installs: (modifier mask, keysym, action).
@@ -330,6 +332,7 @@ pub const BINDINGS: &[(u16, u32, Action)] = &[
     (MOD4, ks::EQUAL, Action::Grow),
     (MOD4, ks::MINUS, Action::Shrink),
     (MOD4 | SHIFT, ks::C, Action::CloseWindow),
+    (MOD1, ks::F4, Action::CloseWindow),
 ];
 
 // --- taskbar quick-launch entries ---

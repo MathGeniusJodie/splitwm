@@ -11,7 +11,6 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::protocol::Event;
 
-use super::clients::WmState;
 use super::types::{
     clamp_dim, rect_contains, Action, BtnKind, Drag, EdgeDrag, FloatDrag, FrameRect, Wm, MOD4, R,
 };
@@ -614,11 +613,11 @@ impl Wm {
             return self.forget_notification(win);
         }
         if self.floats.iter().any(|f| f.win == win) {
-            self.set_wm_state(win, WmState::Withdrawn)?;
+            self.withdraw_wm_state(win)?;
             return self.forget_float(win);
         }
         if self.clients.contains_key(&win) {
-            self.set_wm_state(win, WmState::Withdrawn)?;
+            self.withdraw_wm_state(win)?;
             self.forget_client(win)?;
         }
         Ok(())
@@ -722,11 +721,23 @@ impl Wm {
             Action::Grow => self.animate &= self.state.resize_focused(theme::RESIZE_STEP),
             Action::Shrink => self.animate &= self.state.resize_focused(-theme::RESIZE_STEP),
             Action::CloseWindow => {
-                // A focused float (dialog) is the keyboard target before the
-                // focused split's client.
-                if let Some(c) = self.focused_float.or_else(|| self.state.focused_client()) {
+                // The fullscreen window covers everything, so it's the one
+                // the user means regardless of where tree focus sits; then a
+                // focused float (dialog), then the focused split's client.
+                if let Some(c) = self
+                    .fullscreen
+                    .or(self.focused_float)
+                    .or_else(|| self.state.focused_client())
+                {
                     self.close_client(c)?;
                 }
+                // Nothing in the layout changed, so skip the commit
+                // epilogue: its re-arrange + re-focus would target the
+                // closing window while the client is already acting on the
+                // delete request, and a fast-exiting client turns that into
+                // a spray of BadWindow errors. (The taskbar close button
+                // returns without committing for the same reason.)
+                return Ok(());
             }
         }
         if let Some(rect) = pre_split {

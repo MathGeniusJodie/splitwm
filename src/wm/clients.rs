@@ -764,6 +764,30 @@ impl Wm {
         Ok(())
     }
 
+    /// Mark a window Withdrawn (ICCCM) on its way out of management. The
+    /// write races the window's own destruction — an UnmapNotify can come
+    /// from the client quitting outright, with the DestroyNotify already
+    /// behind it on the wire — so the request is checked and a BadWindow
+    /// deliberately swallowed: it only means there is no window left to
+    /// mark. Every other error still surfaces.
+    pub(crate) fn withdraw_wm_state(&self, win: Win) -> R<()> {
+        let cookie = self.conn.change_property32(
+            PropMode::REPLACE,
+            win,
+            self.atoms.wm_state,
+            self.atoms.wm_state,
+            &[WmState::Withdrawn as u32, 0],
+        )?;
+        match cookie.check() {
+            Err(x11rb::errors::ReplyError::X11Error(e))
+                if e.error_kind == x11rb::protocol::ErrorKind::Window =>
+            {
+                Ok(())
+            }
+            r => Ok(r?),
+        }
+    }
+
     /// A managed client (re)set its `WM_CLASS` or title: if it now matches
     /// the dock identity (and nothing is docked yet), pull it out of tiling
     /// and dock it — a toolkit that sets its identifying property only
