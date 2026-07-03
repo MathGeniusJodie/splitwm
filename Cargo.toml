@@ -12,10 +12,16 @@ libc = "0.2"
 # notification daemon); binds the system libdbus, driven from its own thread.
 dbus = "0.9"
 # Chrome art is baked by build.rs; png-loading stays on for decoding user
-# wallpaper PNGs at runtime (non-PNG wallpapers are converted to PNG by
-# shelling out to ImageMagick).
+# wallpapers and theme icons at runtime (non-PNG images — JPEG wallpapers,
+# SVG icons — are converted to PNG by shelling out to ImageMagick).
 pixel-graphics = { path = "../pixel-graphics" }
 pixel-fonts = { path = "../pixel-fonts", default-features = false, features = ["baked"] }
+# Freedesktop icon-theme lookup and .desktop parsing (taskbar icons, dock
+# autostart) — spec-following code not worth maintaining by hand.
+freedesktop-icons = { version = "0.4.0", default-features = false }
+freedesktop-desktop-entry = { version = "0.8.1", default-features = false }
+# Generated X11 keysym constants for theme::BINDINGS.
+xkeysym = "0.2.1"
 
 [build-dependencies]
 pixel-graphics = { path = "../pixel-graphics" }

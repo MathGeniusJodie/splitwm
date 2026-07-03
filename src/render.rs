@@ -361,14 +361,7 @@ impl Renderer {
         }
     }
 
-    /// Present an indexed framebuffer as X11 BGRX bytes, reusing `out`'s
-    /// allocation so the full-screen buffer isn't reallocated each frame.
-    pub fn present(&self, fb: &Framebuffer, out: &mut Vec<u8>) {
-        out.resize(fb.width * fb.height * Framebuffer::BYTES_PER_PIXEL, 0);
-        fb.present_into(out, &self.lut);
-    }
-
-    /// `present` into a caller-provided slice of exactly
+    /// Present an indexed framebuffer as X11 BGRX bytes into a slice of exactly
     /// `w * h * BYTES_PER_PIXEL` bytes — e.g. the MIT-SHM mapping, so the
     /// full-screen frame is written once, directly where the server reads it.
     pub fn present_into_slice(&self, fb: &Framebuffer, out: &mut [u8]) {
@@ -467,7 +460,7 @@ impl Renderer {
         let bytes = if bytes.starts_with(&PNG_SIG) {
             bytes
         } else {
-            Self::magick_to_png(path)?
+            crate::icon::magick_to_png(path)?
         };
         // Widest wallpaper dimension worth decoding; a hostile header can
         // otherwise demand a multi-gigabyte allocation (and an O(w*h)
@@ -479,34 +472,6 @@ impl Renderer {
             return None;
         }
         decode_png_bytes(&bytes).ok()
-    }
-
-    /// Convert a non-PNG wallpaper to PNG bytes with ImageMagick (`magick`,
-    /// falling back to the IM6 `convert` name), so one native decode path
-    /// handles every format — including its pre-decode declared-size check.
-    /// Runs once at startup/root-resize on a user-chosen file; a missing
-    /// ImageMagick just means no wallpaper, with a hint on stderr.
-    fn magick_to_png(path: &str) -> Option<Vec<u8>> {
-        for prog in ["magick", "convert"] {
-            match std::process::Command::new(prog)
-                .arg(path)
-                .arg("png:-")
-                .output()
-            {
-                Ok(out) if out.status.success() => return Some(out.stdout),
-                Ok(out) => {
-                    eprintln!(
-                        "splitwm: {prog} failed on wallpaper {path}: {}",
-                        String::from_utf8_lossy(&out.stderr).trim()
-                    );
-                    return None;
-                }
-                // Not installed under this name; try the next.
-                Err(_) => {}
-            }
-        }
-        eprintln!("splitwm: non-PNG wallpaper {path} needs ImageMagick (magick/convert) installed");
-        None
     }
 
     /// A screen-sized framebuffer initialised with the wallpaper (or the
@@ -689,7 +654,7 @@ impl Renderer {
     pub fn draw_taskbar_item(
         &self,
         fb: &mut Framebuffer,
-        r: TaskItem,
+        r: crate::tree::Rect,
         icon: Option<&Icon>,
         label: char,
         accent: Index,
@@ -867,15 +832,6 @@ pub(crate) fn insert_capped<K: std::hash::Hash + Eq, V>(
         map.clear();
     }
     map.insert(key, value);
-}
-
-/// A taskbar tile rectangle (screen coords) for the renderer.
-#[derive(Clone, Copy)]
-pub struct TaskItem {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
 }
 
 /// Pixel offset (down and right) of a taskbar icon's drop shadow from the

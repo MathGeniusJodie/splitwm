@@ -20,6 +20,7 @@ use super::types::{clamp_dim, Client, FloatWin, FocusModel, Wm, R};
 /// enough that a real icon change still lands promptly.
 const ICON_FETCH_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(500);
 use crate::icon::{self, Icon};
+use crate::launch::shell_quote;
 use crate::theme;
 use crate::tree::Win;
 
@@ -1127,7 +1128,7 @@ impl Wm {
     fn theme_icon(&self, class: &str) -> Option<Rc<Icon>> {
         let path = crate::launch::find_icon_file(class)
             .or_else(|| crate::launch::find_icon_file(&class.to_lowercase()))?;
-        let img = icon::load_png(&path)?;
+        let img = icon::load_image(&path)?;
         Some(Rc::new(icon::quantize(self.renderer.palette(), &img)))
     }
 
@@ -1376,11 +1377,6 @@ impl Wm {
                 .is_ok_and(|s| s.success())
         })
     }
-}
-
-/// Single-quote `s` for use as one `sh` word.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Walk a `_NET_WM_ICON` value (a list of `width, height, w*h ARGB pixels`

@@ -116,7 +116,7 @@ impl Wm {
             }
         };
         self.shape_to_opaque(win, &fb)?;
-        self.paint_note(win, &fb)?;
+        self.blit_fb(win, &fb)?;
         Ok(())
     }
 
@@ -126,11 +126,7 @@ impl Wm {
             return Ok(());
         };
         let fb = self.renderer.draw_note(&p.note.summary, &p.note.body);
-        self.paint_note(win, &fb)
-    }
-
-    fn paint_note(&mut self, win: Window, fb: &Framebuffer) -> R<()> {
-        self.blit_fb(win, fb)
+        self.blit_fb(win, &fb)
     }
 
     /// Shape a window to a framebuffer's opaque pixels: one 1-px-tall

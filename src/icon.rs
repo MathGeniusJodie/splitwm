@@ -65,12 +65,50 @@ pub fn png_declared_dims(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-/// Decode a PNG file (e.g. a launcher icon resolved from the icon theme)
-/// into an `Icon`. Icon paths come from `.desktop` `Icon=` entries — found
-/// on disk rather than trusted — so the declared size is checked before the
-/// decoder is allowed to allocate for it.
-pub fn load_png(path: &std::path::Path) -> Option<Icon> {
+/// Convert a non-PNG image to PNG bytes with ImageMagick (`magick`, falling
+/// back to the IM6 `convert` name), so one native decode path handles every
+/// format — SVG icons and JPEG/WebP wallpapers alike — including its
+/// pre-decode declared-size check. `-background none` keeps SVG/transparent
+/// sources' alpha instead of flattening onto white. Runs on user-chosen
+/// files (wallpaper, theme icons), never per frame; a missing ImageMagick
+/// just means that image is skipped, with a hint on stderr.
+pub(crate) fn magick_to_png(path: &str) -> Option<Vec<u8>> {
+    for prog in ["magick", "convert"] {
+        match std::process::Command::new(prog)
+            .args(["-background", "none"])
+            .arg(path)
+            .arg("png:-")
+            .output()
+        {
+            Ok(out) if out.status.success() => return Some(out.stdout),
+            Ok(out) => {
+                eprintln!(
+                    "splitwm: {prog} failed on {path}: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return None;
+            }
+            // Not installed under this name; try the next.
+            Err(_) => {}
+        }
+    }
+    eprintln!("splitwm: non-PNG image {path} needs ImageMagick (magick/convert) installed");
+    None
+}
+
+/// Decode an icon image file (e.g. a launcher icon resolved from the icon
+/// theme) into an `Icon`: PNGs natively, anything else (SVG, XPM, …)
+/// through `magick_to_png` first. Icon paths come from `.desktop` `Icon=`
+/// entries — found on disk rather than trusted — so the declared size is
+/// checked before the decoder is allowed to allocate for it.
+pub fn load_image(path: &std::path::Path) -> Option<Icon> {
+    const PNG_SIG: [u8; 4] = [0x89, b'P', b'N', b'G'];
     let bytes = std::fs::read(path).ok()?;
+    let bytes = if bytes.starts_with(&PNG_SIG) {
+        bytes
+    } else {
+        magick_to_png(&path.to_string_lossy())?
+    };
     let (dw, dh) = png_declared_dims(&bytes)?;
     if dw == 0 || dh == 0 || dw > MAX_ICON_DIM || dh > MAX_ICON_DIM {
         return None;

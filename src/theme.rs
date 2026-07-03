@@ -262,27 +262,9 @@ pub const fn icon_hue_rotation(slot: usize) -> f32 {
 // Everything a user might retune lives here rather than in `wm`: the keysym
 // constants, the action set, and the binding table `Wm::grab_keys` installs.
 
-/// X11 keysyms used by `BINDINGS`.
-pub mod ks {
-    pub const RETURN: u32 = 0xff0d;
-    pub const TAB: u32 = 0xff09;
-    pub const LEFT: u32 = 0xff51;
-    pub const RIGHT: u32 = 0xff53;
-    pub const BRACKETLEFT: u32 = 0x5b;
-    pub const BRACKETRIGHT: u32 = 0x5d;
-    pub const MINUS: u32 = 0x2d;
-    pub const EQUAL: u32 = 0x3d;
-    pub const V: u32 = 0x76;
-    pub const H: u32 = 0x68;
-    pub const Q: u32 = 0x71;
-    pub const L: u32 = 0x6c;
-    pub const C: u32 = 0x63;
-    pub const SPACE: u32 = 0x20;
-    pub const F4: u32 = 0xffc1;
-    pub const XF86_AUDIO_LOWER_VOLUME: u32 = 0x1008_ff11;
-    pub const XF86_AUDIO_MUTE: u32 = 0x1008_ff12;
-    pub const XF86_AUDIO_RAISE_VOLUME: u32 = 0x1008_ff13;
-}
+/// X11 keysyms used by `BINDINGS` (raw `u32` values from the `xkeysym`
+/// crate's generated tables).
+pub use xkeysym::key as ks;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
@@ -320,29 +302,29 @@ pub const SHIFT: u16 = 0x01; // ModMask::SHIFT
 /// ends its session only by being replaced (another WM's `--replace` taking
 /// the manager selection) or killed, never by a stray chord.
 pub const BINDINGS: &[(u16, u32, Action)] = &[
-    (MOD4, ks::RETURN, Action::SpawnTerminal),
-    (MOD4, ks::SPACE, Action::SpawnLauncher),
-    (MOD4, ks::V, Action::SplitH),
-    (MOD4, ks::H, Action::SplitV),
-    (MOD4, ks::Q, Action::Close),
-    (MOD4, ks::TAB, Action::FocusNext),
-    (MOD4 | SHIFT, ks::TAB, Action::FocusPrev),
-    (MOD4, ks::RIGHT, Action::FocusNext),
-    (MOD4, ks::LEFT, Action::FocusPrev),
-    (MOD4, ks::BRACKETRIGHT, Action::NextTab),
-    (MOD4, ks::BRACKETLEFT, Action::PrevTab),
-    (MOD4 | SHIFT, ks::BRACKETRIGHT, Action::MoveTabNext),
-    (MOD4 | SHIFT, ks::BRACKETLEFT, Action::MoveTabPrev),
-    (MOD4, ks::L, Action::Grow),
-    (MOD4 | SHIFT, ks::L, Action::Shrink),
-    (MOD4, ks::EQUAL, Action::Grow),
-    (MOD4, ks::MINUS, Action::Shrink),
-    (MOD4 | SHIFT, ks::C, Action::CloseWindow),
+    (MOD4, ks::Return, Action::SpawnTerminal),
+    (MOD4, ks::space, Action::SpawnLauncher),
+    (MOD4, ks::v, Action::SplitH),
+    (MOD4, ks::h, Action::SplitV),
+    (MOD4, ks::q, Action::Close),
+    (MOD4, ks::Tab, Action::FocusNext),
+    (MOD4 | SHIFT, ks::Tab, Action::FocusPrev),
+    (MOD4, ks::Right, Action::FocusNext),
+    (MOD4, ks::Left, Action::FocusPrev),
+    (MOD4, ks::bracketright, Action::NextTab),
+    (MOD4, ks::bracketleft, Action::PrevTab),
+    (MOD4 | SHIFT, ks::bracketright, Action::MoveTabNext),
+    (MOD4 | SHIFT, ks::bracketleft, Action::MoveTabPrev),
+    (MOD4, ks::l, Action::Grow),
+    (MOD4 | SHIFT, ks::l, Action::Shrink),
+    (MOD4, ks::equal, Action::Grow),
+    (MOD4, ks::minus, Action::Shrink),
+    (MOD4 | SHIFT, ks::c, Action::CloseWindow),
     (MOD1, ks::F4, Action::CloseWindow),
     // Media keys carry no modifier: the keysym itself is the whole chord.
-    (0, ks::XF86_AUDIO_RAISE_VOLUME, Action::VolumeUp),
-    (0, ks::XF86_AUDIO_LOWER_VOLUME, Action::VolumeDown),
-    (0, ks::XF86_AUDIO_MUTE, Action::VolumeMuteToggle),
+    (0, ks::XF86_AudioRaiseVolume, Action::VolumeUp),
+    (0, ks::XF86_AudioLowerVolume, Action::VolumeDown),
+    (0, ks::XF86_AudioMute, Action::VolumeMuteToggle),
 ];
 
 // --- taskbar quick-launch entries ---

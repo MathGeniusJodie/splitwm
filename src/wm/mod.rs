@@ -302,9 +302,6 @@ pub fn run(replace: bool) -> R<()> {
 
     let cursors = setup_cursors_and_root_style(&conn, &screen, root)?;
 
-    // Conservative cap for chunking PutImage (X core caps near 256 KiB).
-    let max_req_bytes = 200_000usize;
-
     // One graphics context, reused for every frame blit (all frames share the
     // root's depth/visual, so a single GC created on root works for all).
     let gc = conn.generate_id()?;
@@ -360,7 +357,6 @@ pub fn run(replace: bool) -> R<()> {
         underlay_pix_size: (0, 0),
         sel_owner,
         running: true,
-        max_req_bytes,
         atoms,
         workarea,
         wallpaper_path: std::env::var("SPLITWM_WALLPAPER").ok(),
@@ -368,7 +364,7 @@ pub fn run(replace: bool) -> R<()> {
         animate: false,
         anim: None,
         anim_seq: 0,
-        shm: ShmState::Untried,
+        shm: None,
         prev_frame_rect: HashMap::new(),
         widgets: Widgets::default(),
         quick,
@@ -378,7 +374,6 @@ pub fn run(replace: bool) -> R<()> {
             edge: None,
         },
         cursors,
-        bgrx: Vec::new(),
         hscroll: Vec::new(),
         hscroll_frac: 0.0,
         hscroll_gate: None,
@@ -700,7 +695,7 @@ fn quick_slots(renderer: &Renderer) -> Vec<QuickSlot> {
         .into_iter()
         .map(|q| {
             let icon = crate::launch::find_icon_file(q.icon)
-                .and_then(|p| crate::icon::load_png(&p))
+                .and_then(|p| crate::icon::load_image(&p))
                 .map(|img| std::rc::Rc::new(crate::icon::quantize(renderer.palette(), &img)));
             QuickSlot {
                 cmd: q.cmd,

@@ -302,7 +302,6 @@ pub struct Wm {
     pub keymap: HashMap<u32, u8>,
     pub bindings: Vec<(u16, u8, Action)>,
     pub running: bool,
-    pub max_req_bytes: usize,
     pub atoms: Atoms,
     /// Root geometry, cached at startup and refreshed by the root's own
     /// `ConfigureNotify` (RandR resize) — `arrange` consults it several
@@ -319,8 +318,11 @@ pub struct Wm {
     pub anim: Option<LayoutAnim>,
     /// Monotonic counter stamping each `LayoutAnim` (see `LayoutAnim::seq`).
     pub anim_seq: u64,
-    /// MIT-SHM frame-blit segment (see `ShmState`).
-    pub shm: ShmState,
+    /// MIT-SHM frame-blit segment, created on first blit and recreated when
+    /// a frame outgrows it (see `ShmSeg`). MIT-SHM 1.2 is required: there
+    /// is no core-protocol fallback, so a server without it can't run
+    /// splitwm at all.
+    pub shm: Option<ShmSeg>,
     pub prev_frame_rect: HashMap<NodeId, FrameRect>,
     /// Every hit-testable widget rect for the current layout, rebuilt as one
     /// unit by `compute_widgets` each arrange (see `Widgets`).
@@ -332,9 +334,6 @@ pub struct Wm {
     pub drags: DragState,
     /// Startup-created pointer cursors + the one currently on the underlay.
     pub cursors: Cursors,
-    /// Reusable BGRX staging buffer for `PutImage`, so the full-screen
-    /// conversion doesn't reallocate each frame.
-    pub bgrx: Vec<u8>,
     /// Slave devices with a horizontal scroll valuator (trackpads, scroll
     /// wheels with tilt), rebuilt whenever the device hierarchy changes.
     pub hscroll: Vec<HScroll>,
@@ -670,16 +669,6 @@ pub struct LayoutAnim {
     /// Each animated leaf's start rect paired with its target placement —
     /// one entry per leaf, so start and target can't desync.
     pub placed: Vec<(FrameRect, Placement)>,
-}
-
-/// The MIT-SHM segment shared with the X server for frame blits: created
-/// lazily on first use, grown (recreated) when a frame outgrows it, or
-/// permanently absent when the extension is (falls back to chunked
-/// `PutImage`).
-pub enum ShmState {
-    Untried,
-    Active(ShmSeg),
-    Unavailable,
 }
 
 /// A memfd-backed shared memory segment attached to the server via

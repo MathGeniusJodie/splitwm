@@ -11,9 +11,9 @@ use x11rb::protocol::xproto::{
 use super::clients::WmState;
 use super::types::{
     clamp_dim, ease_out_back, lerp_rect, BtnKind, Dock, FrameRect, LayoutAnim, LeafMeta, Placement,
-    ShmSeg, ShmState, Wm, R,
+    ShmSeg, Wm, R,
 };
-use crate::render::{LeafView, TabInfo, TaskItem};
+use crate::render::{LeafView, TabInfo};
 use crate::theme;
 use crate::tree::{Dir, NodeId, Rect, Win};
 
@@ -193,12 +193,7 @@ impl Wm {
                 let icon = self.icon_for(t.win);
                 self.renderer.draw_taskbar_item(
                     m,
-                    TaskItem {
-                        x: t.rect.x,
-                        y: t.rect.y,
-                        w: t.rect.w,
-                        h: t.rect.h,
-                    },
+                    t.rect,
                     icon.as_deref(),
                     self.clients.get(&t.win).map_or('?', |c| c.label),
                     t.accent,
@@ -217,12 +212,7 @@ impl Wm {
                 };
                 self.renderer.draw_taskbar_item(
                     m,
-                    TaskItem {
-                        x: r.x,
-                        y: r.y,
-                        w: r.w,
-                        h: r.h,
-                    },
+                    r,
                     q.icon.as_deref(),
                     q.label,
                     theme::palette_color::CREAM,
@@ -568,73 +558,66 @@ impl Wm {
         self.anim_frame(t)
     }
 
-    // --- frame blits (MIT-SHM with a chunked-PutImage fallback) ---
+    // --- frame blits (MIT-SHM, required) ---
 
-    /// Blit a rendered framebuffer to a drawable. With MIT-SHM the pixels
-    /// are presented straight into the shared segment and shipped as one
-    /// zero-copy `ShmPutImage`. The segment holds two frame-sized halves
-    /// used alternately: the put goes out unchecked (errors surface as
+    /// Blit a rendered framebuffer to a drawable: the pixels are presented
+    /// straight into the shared segment and shipped as one zero-copy
+    /// `ShmPutImage`. The segment holds two frame-sized halves used
+    /// alternately: the put goes out unchecked (errors surface as
     /// `Event::Error` like every other unchecked request), and reuse of a
     /// half is serialised by a round trip before overwriting it while a put
     /// reading it may still be in flight. In steady state that costs one
     /// round trip every other blit, and (X being FIFO) the reply queues
     /// behind the immediately preceding put — an intentional pacing point:
     /// rendering never gets more than one full frame ahead of the server.
-    /// Without MIT-SHM, present into the staging buffer and fall back to
-    /// chunked core-protocol `PutImage`.
     pub(crate) fn blit_fb(&mut self, drawable: Window, fb: &pixel_graphics::Framebuffer) -> R<()> {
         let (w, h) = (fb.width as u16, fb.height as u16);
         let len = fb.width * fb.height * 4;
-        self.ensure_shm(len);
-        if let ShmState::Active(seg) = &mut self.shm {
-            if seg.pending[seg.half] {
-                // Any round trip confirms every earlier request (the X
-                // stream is FIFO), including both halves' puts.
-                self.conn.get_input_focus()?.reply()?;
-                seg.pending = [false; 2];
-            }
-            self.renderer.present_into_slice(fb, seg.slice(len));
-            let (seg_id, offset) = (seg.seg, seg.offset());
-            use x11rb::protocol::shm::ConnectionExt as _;
-            self.conn.shm_put_image(
-                drawable,
-                self.gc,
-                w,
-                h,
-                0,
-                0,
-                w,
-                h,
-                0,
-                0,
-                self.depth,
-                u8::from(ImageFormat::Z_PIXMAP),
-                false,
-                seg_id,
-                offset as u32,
-            )?;
-            seg.pending[seg.half] = true;
-            seg.half ^= 1;
-            return Ok(());
+        self.ensure_shm(len)?;
+        let seg = self.shm.as_mut().expect("ensure_shm succeeded");
+        if seg.pending[seg.half] {
+            // Any round trip confirms every earlier request (the X
+            // stream is FIFO), including both halves' puts.
+            self.conn.get_input_focus()?.reply()?;
+            seg.pending = [false; 2];
         }
-        let mut buf = std::mem::take(&mut self.bgrx);
-        self.renderer.present(fb, &mut buf);
-        self.bgrx = buf;
-        self.put_image(drawable, w, h, &self.bgrx)
+        self.renderer.present_into_slice(fb, seg.slice(len));
+        let (seg_id, offset) = (seg.seg, seg.offset());
+        use x11rb::protocol::shm::ConnectionExt as _;
+        self.conn.shm_put_image(
+            drawable,
+            self.gc,
+            w,
+            h,
+            0,
+            0,
+            w,
+            h,
+            0,
+            0,
+            self.depth,
+            u8::from(ImageFormat::Z_PIXMAP),
+            false,
+            seg_id,
+            offset as u32,
+        )?;
+        let seg = self.shm.as_mut().expect("checked above");
+        seg.pending[seg.half] = true;
+        seg.half ^= 1;
+        Ok(())
     }
 
     /// Make sure the SHM segment exists and each of its two halves holds at
     /// least `len` bytes, creating it on first use and recreating it when a
-    /// frame outgrows it (RandR growth). Failure is remembered: without the
-    /// extension every blit falls back to `put_image` with no per-frame
-    /// re-probing.
-    fn ensure_shm(&mut self, len: usize) {
-        match &self.shm {
-            ShmState::Unavailable => return,
-            ShmState::Active(seg) if seg.half_len() >= len => return,
-            _ => {}
+    /// frame outgrows it (RandR growth). There is no fallback: a server
+    /// without MIT-SHM 1.2 fd-passing can't run splitwm, and the error from
+    /// the session's first blit (inside the startup arrange) is what says
+    /// so and exits.
+    fn ensure_shm(&mut self, len: usize) -> R<()> {
+        if self.shm.as_ref().is_some_and(|seg| seg.half_len() >= len) {
+            return Ok(());
         }
-        if let ShmState::Active(seg) = std::mem::replace(&mut self.shm, ShmState::Unavailable) {
+        if let Some(seg) = self.shm.take() {
             use x11rb::protocol::shm::ConnectionExt as _;
             // Detach the outgrown segment server-side; the mapping itself is
             // unmapped by `ShmSeg`'s Drop.
@@ -645,13 +628,11 @@ impl Wm {
         // Doubled: the segment holds two alternating frame halves.
         let wa = self.wa();
         let len = 2 * len.max((wa.w.max(1) as usize) * (wa.h.max(1) as usize) * 4);
-        match self.create_shm(len) {
-            Ok(seg) => self.shm = ShmState::Active(seg),
-            Err(e) => {
-                eprintln!("splitwm: MIT-SHM unavailable ({e}); using chunked PutImage");
-                self.shm = ShmState::Unavailable;
-            }
-        }
+        let seg = self
+            .create_shm(len)
+            .map_err(|e| super::types::WmError::from(format!("MIT-SHM required: {e}")))?;
+        self.shm = Some(seg);
+        Ok(())
     }
 
     /// Create a memfd-backed shared segment of `len` bytes, map it, and
@@ -721,32 +702,4 @@ impl Wm {
         Ok(unsafe { ShmSeg::new(seg, ptr.cast(), len) })
     }
 
-    /// Chunked core-protocol `PutImage` fallback for servers without MIT-SHM.
-    pub(crate) fn put_image(&self, drawable: Window, w: u16, h: u16, data: &[u8]) -> R<()> {
-        let gc = self.gc;
-        let stride = w as usize * 4;
-        // Chunk by rows to stay under the maximum request length.
-        let overhead = 64;
-        let max_rows = (((self.max_req_bytes.saturating_sub(overhead)) / stride).max(1)) as u16;
-        let mut y = 0u16;
-        while y < h {
-            let rows = max_rows.min(h - y);
-            let start = y as usize * stride;
-            let end = start + rows as usize * stride;
-            self.conn.put_image(
-                ImageFormat::Z_PIXMAP,
-                drawable,
-                gc,
-                w,
-                rows,
-                0,
-                i16::try_from(y).unwrap_or(i16::MAX),
-                0,
-                self.depth,
-                &data[start..end],
-            )?;
-            y += rows;
-        }
-        Ok(())
-    }
 }
