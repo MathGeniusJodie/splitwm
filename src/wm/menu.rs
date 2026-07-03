@@ -14,6 +14,11 @@ impl Wm {
         &mut self,
         names: &[Option<String>],
     ) -> Vec<Option<std::rc::Rc<crate::icon::Icon>>> {
+        // Same wholesale-clear policy as the renderer's icon caches: menus
+        // are bounded in practice, but no cache here grows without a cap.
+        if self.menu.icon_cache.len() >= 512 {
+            self.menu.icon_cache.clear();
+        }
         names
             .iter()
             .map(|n| {
@@ -166,8 +171,7 @@ impl Wm {
         let rows = i32::try_from(labels.len()).unwrap_or(0);
         let (w, h) = frame_size(rows, cw);
         let wa = self.wa();
-        let row_y =
-            self.menu.main.y + MENU_BORDER + i32::try_from(cat).unwrap_or(0) * MENU_ROW_H;
+        let row_y = self.menu.main.y + MENU_BORDER + i32::try_from(cat).unwrap_or(0) * MENU_ROW_H;
         let y = (row_y - MENU_BORDER).min(wa.y + wa.h - h).max(wa.y);
         // Prefer the right side; flip left if it would overflow.
         let right_x = self.menu.main.x + self.menu.main.w - MENU_BORDER;
@@ -241,6 +245,25 @@ impl Wm {
             }
         }
         self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Pointer left a menu window: drop its hover highlight. The main
+    /// column falls back to highlighting the open category (so a pointer
+    /// travelling through the submenu keeps the row it came from lit)
+    /// rather than clearing outright.
+    pub(crate) fn on_menu_leave(&mut self, win: Window) -> R<()> {
+        if win == self.menu.main_win {
+            if self.menu.main_hi != self.menu.open_cat {
+                self.menu.main_hi = self.menu.open_cat;
+                self.paint_menu_main()?;
+                self.conn.flush()?;
+            }
+        } else if win == self.menu.sub_win && self.menu.sub_hi.is_some() {
+            self.menu.sub_hi = None;
+            self.paint_menu_sub()?;
+            self.conn.flush()?;
+        }
         Ok(())
     }
 

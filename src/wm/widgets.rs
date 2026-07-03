@@ -27,18 +27,33 @@ impl Wm {
         let pad = (theme::TASKBAR_H - (isz + cbs - overlap)) / 2;
         let y = wa.y + wa.h - theme::TASKBAR_H + pad;
         // Tiles fill from the left; the launcher "+" sits just after them.
-        // Left/right edge margins match the split gap.
+        // Left/right edge margins match the split gap. When the bar can't
+        // hold every window at full pitch, the stride compresses (tiles
+        // overlap like fanned cards, rightmost on top — draw order and the
+        // reversed hit-tests in `on_button` agree on that) instead of
+        // silently dropping tiles: a window without a tile would be
+        // unreachable by mouse entirely.
         let right = wa.x + wa.w - theme::GAP;
-        let mut x = wa.x + theme::GAP;
+        let left = wa.x + theme::GAP;
+        let full_stride = isz + gap;
+        let n = i32::try_from(self.bar_order.len()).unwrap_or(i32::MAX);
+        let stride = if n > 1 {
+            // Reserve the launcher "+"'s slot, then fit n tiles in the rest.
+            let avail = right - left - full_stride - isz;
+            (avail / (n - 1)).clamp(10, full_stride)
+        } else {
+            full_stride
+        };
+        let mut x = left;
         let mut tiles = Vec::with_capacity(self.bar_order.len());
         for &win in &self.bar_order {
-            if x + isz > right {
-                break;
-            }
+            // Even at minimum stride a pathological window count can run
+            // past the edge; pin the excess at the right rather than lose it.
+            let tx = x.min(right - isz);
             let leaf = self.state.tree.find_leaf_for_client(win);
             tiles.push(TaskTile {
                 rect: FrameRect {
-                    x,
+                    x: tx,
                     y,
                     w: isz,
                     h: isz,
@@ -47,7 +62,7 @@ impl Wm {
                 // right-aligned; hit-tested before the tile so clicking it
                 // closes instead of focusing.
                 close: FrameRect {
-                    x: x + isz - cbs,
+                    x: tx + isz - cbs,
                     y: y + isz - overlap,
                     w: cbs,
                     h: cbs,
@@ -56,7 +71,7 @@ impl Wm {
                 accent: leaf.map_or(theme::palette_color::CREAM, |l| self.leaf_color_index(l)),
                 on_screen: leaf.is_some(),
             });
-            x += isz + gap;
+            x += stride;
         }
         self.widgets.taskbar_regions = tiles;
         // Launcher "+" immediately after the last tile (clamped on-screen).
@@ -102,7 +117,9 @@ impl Wm {
         minimized: bool,
     ) {
         if minimized {
-            self.widgets.btn_regions.push((p.target, p.leaf, BtnKind::Minimize));
+            self.widgets
+                .btn_regions
+                .push((p.target, p.leaf, BtnKind::Minimize));
             return;
         }
         let bsz = theme::BTN_SIZE;
@@ -178,7 +195,8 @@ impl Wm {
             self.widgets.handle_regions.push((rect, b));
             if b.root && b.dir == Dir::H {
                 let py = b.cross + (b.cross_len - Self::PLUS_SZ) / 2;
-                self.widgets.plus_regions
+                self.widgets
+                    .plus_regions
                     .push((Self::plus_rect(b.pos - scroll_x, py), b.idx + 1));
             }
         }
@@ -239,7 +257,8 @@ impl Wm {
             if vis_x < wa.x || vis_x > wa.x + wa.w {
                 continue;
             }
-            self.widgets.plus_regions
+            self.widgets
+                .plus_regions
                 .push((Self::plus_rect(vis_x, edge_cy), at));
         }
     }

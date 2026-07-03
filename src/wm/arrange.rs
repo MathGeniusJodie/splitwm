@@ -37,8 +37,8 @@ impl Wm {
         self.state.canvas_w = Some(canvas_w);
         // The dock is tucked DOCK_OVERLAP px under the canvas edge, so that
         // much less scroll room is needed to bring it fully into view.
-        self.state.dock_extra = if self.docked.is_some() {
-            self.docked_w - self.dock_overlap()
+        self.state.dock_extra = if self.dock.win.is_some() {
+            self.dock.w - self.dock_overlap()
         } else {
             0
         };
@@ -72,6 +72,11 @@ impl Wm {
             });
         }
 
+        // Parent lookups for this layout, from one arena walk — per-event
+        // consumers (`hover_cursor`, `click_split_button`) read this rather
+        // than paying `find_parent`'s full scan per call.
+        self.parents = self.state.tree.parent_map();
+
         // Drag-handle / "+" / tab hit-regions for the current layout.
         self.compute_widgets(wa, &placed);
         self.compute_taskbar();
@@ -88,10 +93,27 @@ impl Wm {
         // it's open).
         self.raise_floats()?;
         // Fullscreen covers floats too; only notifications and the menu stay
-        // above it.
-        if let Some(fs) = self.fullscreen.filter(|w| self.clients.contains_key(w)) {
-            self.conn
-                .configure_window(fs, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        // above it. A fullscreen *float* also gets its full-workarea
+        // geometry re-pinned here (its frame stays unmapped; `raise_floats`
+        // above may have restacked the pair, so re-raise the client last).
+        if let Some(fs) = self.fullscreen {
+            if self.clients.contains_key(&fs) {
+                self.conn.configure_window(
+                    fs,
+                    &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+                )?;
+            } else if self.floats.iter().any(|f| f.win == fs) {
+                let full = self.wa();
+                self.conn.configure_window(
+                    fs,
+                    &ConfigureWindowAux::new()
+                        .x(full.x)
+                        .y(full.y)
+                        .width(u32::try_from(full.w.max(1)).unwrap_or(1))
+                        .height(u32::try_from(full.h.max(1)).unwrap_or(1))
+                        .stack_mode(StackMode::ABOVE),
+                )?;
+            }
         }
         self.raise_notifications()?;
         self.raise_menu()?;
@@ -202,7 +224,8 @@ impl Wm {
                 self.conn.free_pixmap(self.underlay_pix)?;
             }
             let pix = self.conn.generate_id()?;
-            self.conn.create_pixmap(self.depth, pix, self.underlay, pw, ph)?;
+            self.conn
+                .create_pixmap(self.depth, pix, self.underlay, pw, ph)?;
             self.underlay_pix = pix;
             self.underlay_pix_size = (pw, ph);
             self.conn.change_window_attributes(
@@ -245,22 +268,21 @@ impl Wm {
     }
 
     /// Parent direction / split-eligibility metadata used to choose each
-    /// split-control button's icon and enabled state.
+    /// split-control button's icon and enabled state. Parent lookups come
+    /// from `self.parents` (rebuilt each arrange), so per-motion callers
+    /// like `hover_cursor` don't pay a full arena scan.
     pub(crate) fn leaf_meta(&self, leaf: NodeId, frame: FrameRect) -> LeafMeta {
-        self.leaf_meta_inner(leaf, frame, self.state.tree.find_parent(leaf))
+        self.leaf_meta_inner(leaf, frame, self.parents.get(&leaf).copied())
     }
 
-    /// `leaf_meta` for every placement at once, with parent lookups served
-    /// from a single `parent_map` walk instead of one full-arena
-    /// `find_parent` scan per leaf.
+    /// `leaf_meta` for every placement at once.
     fn leaf_metas(&self, placed: &[Placement]) -> HashMap<NodeId, LeafMeta> {
-        let parents = self.state.tree.parent_map();
         placed
             .iter()
             .map(|p| {
                 (
                     p.leaf,
-                    self.leaf_meta_inner(p.leaf, p.target, parents.get(&p.leaf).copied()),
+                    self.leaf_meta_inner(p.leaf, p.target, self.parents.get(&p.leaf).copied()),
                 )
             })
             .collect()
@@ -389,11 +411,11 @@ impl Wm {
     /// wider than the dock would otherwise shove its right edge permanently
     /// away from the screen edge (fully tucked is the useful maximum).
     fn dock_overlap(&self) -> i32 {
-        theme::DOCK_OVERLAP.min(self.docked_w)
+        theme::DOCK_OVERLAP.min(self.dock.w)
     }
 
     fn place_dock(&self, wa: Rect, canvas_w: i32) -> R<()> {
-        let Some(win) = self.docked else {
+        let Some(win) = self.dock.win else {
             return Ok(());
         };
         // Full monitor height, not `la()`'s (which is trimmed for the
@@ -406,7 +428,7 @@ impl Wm {
             &ConfigureWindowAux::new()
                 .x(x)
                 .y(full.y)
-                .width(u32::try_from(self.docked_w).unwrap_or(1))
+                .width(u32::try_from(self.dock.w).unwrap_or(1))
                 .height(u32::try_from(full.h.max(1)).unwrap_or(1))
                 .border_width(0)
                 .sibling(self.underlay)

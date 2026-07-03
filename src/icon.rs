@@ -47,10 +47,7 @@ pub fn load_png(path: &std::path::Path) -> Option<Icon> {
     let argb = pixels
         .iter()
         .map(|p| {
-            (u32::from(p.a) << 24)
-                | (u32::from(p.r) << 16)
-                | (u32::from(p.g) << 8)
-                | u32::from(p.b)
+            (u32::from(p.a) << 24) | (u32::from(p.r) << 16) | (u32::from(p.g) << 8) | u32::from(p.b)
         })
         .collect();
     Some(Icon::new(w as u32, h as u32, argb))
@@ -86,8 +83,5 @@ fn quantize_argb(palette: &Palette, px: u32) -> u32 {
         b: (px & 0xff) as u8,
     };
     let snapped = palette.color(palette.nearest_index(rgb));
-    (a << 24)
-        | (u32::from(snapped.r) << 16)
-        | (u32::from(snapped.g) << 8)
-        | u32::from(snapped.b)
+    (a << 24) | (u32::from(snapped.r) << 16) | (u32::from(snapped.g) << 8) | u32::from(snapped.b)
 }

@@ -80,6 +80,9 @@ pub struct Atoms {
     pub net_wm_window_type_dialog: Atom,
     pub net_wm_state: Atom,
     pub net_wm_state_fullscreen: Atom,
+    pub net_workarea: Atom,
+    pub net_number_of_desktops: Atom,
+    pub net_current_desktop: Atom,
     pub wm_take_focus: Atom,
     pub utf8_string: Atom,
     /// Wakeup ClientMessage type from the notification-daemon thread (see
@@ -91,7 +94,7 @@ impl Atoms {
     pub fn intern(conn: &RustConnection) -> R<Self> {
         // Send every InternAtom before reading any reply, so interning costs
         // one round trip instead of ten.
-        let names: [&[u8]; 17] = [
+        let names: [&[u8]; 20] = [
             b"WM_PROTOCOLS",
             b"WM_DELETE_WINDOW",
             b"WM_STATE",
@@ -106,16 +109,19 @@ impl Atoms {
             b"_NET_WM_WINDOW_TYPE_DIALOG",
             b"_NET_WM_STATE",
             b"_NET_WM_STATE_FULLSCREEN",
+            b"_NET_WORKAREA",
+            b"_NET_NUMBER_OF_DESKTOPS",
+            b"_NET_CURRENT_DESKTOP",
             b"WM_TAKE_FOCUS",
             b"UTF8_STRING",
             crate::notify::PING_ATOM.as_bytes(),
         ];
         let cookies = names.map(|n| conn.intern_atom(false, n));
-        let mut atoms = [0 as Atom; 17];
+        let mut atoms = [0 as Atom; 20];
         for (slot, cookie) in atoms.iter_mut().zip(cookies) {
             *slot = cookie?.reply()?.atom;
         }
-        let [wm_protocols, wm_delete_window, wm_state, net_wm_icon, net_supported, net_client_list, net_active_window, net_supporting_wm_check, net_wm_name, net_wm_window_type, net_wm_window_type_notification, net_wm_window_type_dialog, net_wm_state, net_wm_state_fullscreen, wm_take_focus, utf8_string, splitwm_note] =
+        let [wm_protocols, wm_delete_window, wm_state, net_wm_icon, net_supported, net_client_list, net_active_window, net_supporting_wm_check, net_wm_name, net_wm_window_type, net_wm_window_type_notification, net_wm_window_type_dialog, net_wm_state, net_wm_state_fullscreen, net_workarea, net_number_of_desktops, net_current_desktop, wm_take_focus, utf8_string, splitwm_note] =
             atoms;
         Ok(Self {
             wm_protocols,
@@ -132,6 +138,9 @@ impl Atoms {
             net_wm_window_type_dialog,
             net_wm_state,
             net_wm_state_fullscreen,
+            net_workarea,
+            net_number_of_desktops,
+            net_current_desktop,
             wm_take_focus,
             utf8_string,
             splitwm_note,
@@ -225,42 +234,31 @@ pub struct Wm {
     /// `CURRENT_TIME` for `SetInputFocus`/`WM_TAKE_FOCUS` (ICCCM wants real
     /// timestamps so a slow client can't steal focus back across a race).
     pub last_event_time: u32,
+    /// Wall-clock moment `last_event_time` was harvested. Server timestamps
+    /// can't be compared to local clocks, but the harvest *age* can: past
+    /// `STALE_TIMESTAMP`, `give_focus` fetches a fresh server time (see
+    /// `Wm::fresh_timestamp`) instead of passing a stale one, which the
+    /// server would silently ignore if focus moved more recently.
+    pub last_event_instant: std::time::Instant,
+    /// `(keycode, when)` of the last layout-mutating keypress, used to
+    /// swallow keyboard auto-repeat for the destructive actions (split/
+    /// close): holding Mod4+V must not create ~20 splits a second.
+    pub last_layout_key: Option<(u8, std::time::Instant)>,
+    /// Parent lookup for every node, rebuilt from one arena walk per
+    /// `arrange` — per-event callers (`hover_cursor`, `click_split_button`)
+    /// read this instead of paying `Tree::find_parent`'s full arena scan.
+    pub parents: HashMap<NodeId, (NodeId, usize)>,
     /// Events drained mid-animation (`run_layout_animation` polls so a
     /// keypress/click can cut the animation short); the main loop consumes
     /// these before blocking for new ones.
     pub pending_events: Vec<x11rb::protocol::Event>,
     /// Stable insertion order of managed windows, for the bottom bar.
     pub bar_order: Vec<Win>,
-    /// The window pinned past the right end of the scrolling canvas, only
-    /// revealed by scrolling all the way right (see `Wm::dock_title`),
-    /// if one is currently mapped. It lives outside `clients`/the split
-    /// tree/`bar_order` entirely: no chrome, no taskbar entry, not part of
-    /// focus cycling, and normal tiled columns never lay out under it.
-    pub docked: Option<Win>,
-    /// Width of `docked`, captured from its own requested geometry when it
-    /// was first managed.
-    pub docked_w: i32,
-    /// `WM_NAME` that marks the dock window (`SPLITWM_DOCK_TITLE`, default
-    /// `theme::DOCK_TITLE`).
-    pub dock_title: String,
-    /// Notification windows (`_NET_WM_WINDOW_TYPE_NOTIFICATION`), in mapping
-    /// order. Like `docked`, they live outside `clients`/the split
-    /// tree/`bar_order`: no chrome, no taskbar entry, no focus cycling.
-    /// They stack above everything at the bottom-right of the screen
-    /// (see `Wm::place_notifications`), at whatever size they requested —
-    /// tracked here (updated on ConfigureRequest) so restacking the pile
-    /// doesn't cost a `GetGeometry` round trip per window.
-    pub notifications: Vec<ForeignNote>,
-    /// Speech-bubble popups for notifications *we* serve as the session's
-    /// `org.freedesktop.Notifications` daemon (see `crate::notify` and
-    /// `Wm::on_note_ping`). Own override-redirect windows, drawn by the
-    /// renderer, stacked bottom-right above the `notifications` pile.
-    pub note_popups: Vec<NotePopup>,
-    /// Incoming notification events from the daemon thread.
-    pub note_rx: std::sync::mpsc::Receiver<crate::notify::NoteMsg>,
-    /// Ids of popups the user click-dismissed, reported back to the daemon
-    /// thread so it emits the matching `NotificationClosed` signal.
-    pub note_dismiss: std::sync::mpsc::Sender<u32>,
+    /// The dock window and its tracked geometry/title (see `DockState`).
+    pub dock: DockState,
+    /// Foreign notification windows and our own served-notification popups
+    /// (see `NoteState`).
+    pub notes: NoteState,
     pub underlay: Window,
     /// Server-side pixmap holding the underlay's composited image, set as the
     /// underlay's `background_pixmap` so the server repaints exposed regions
@@ -296,11 +294,8 @@ pub struct Wm {
     /// unit by `compute_widgets` each arrange (see `Widgets`).
     pub widgets: Widgets,
     pub menu: MenuUi,
-    pub drag: Option<Drag>,
-    /// An in-progress float move, started by pressing button 1 on a float's
-    /// frame window.
-    pub float_drag: Option<FloatDrag>,
-    pub edge_drag: Option<EdgeDrag>,
+    /// In-progress gap/float/edge drags (see `DragState`).
+    pub drags: DragState,
     /// Startup-created pointer cursors + the one currently on the underlay.
     pub cursors: Cursors,
     /// Reusable BGRX staging buffer for `PutImage`, so the full-screen
@@ -322,6 +317,54 @@ pub struct Wm {
     /// every tiled client and float. Its split slot is kept, so leaving
     /// fullscreen drops it straight back into the layout.
     pub fullscreen: Option<Win>,
+}
+
+/// The window pinned past the right end of the scrolling canvas, and its
+/// tracked geometry/title.
+pub struct DockState {
+    /// The window pinned past the right end of the scrolling canvas, only
+    /// revealed by scrolling all the way right (see `DockState::title`),
+    /// if one is currently mapped. It lives outside `clients`/the split
+    /// tree/`bar_order` entirely: no chrome, no taskbar entry, not part of
+    /// focus cycling, and normal tiled columns never lay out under it.
+    pub win: Option<Win>,
+    /// Width of `win`, captured from its own requested geometry when it
+    /// was first managed.
+    pub w: i32,
+    /// `WM_NAME` that marks the dock window (`SPLITWM_DOCK_TITLE`, default
+    /// `theme::DOCK_TITLE`).
+    pub title: String,
+}
+
+/// Foreign notification windows and our own served-notification popups.
+pub struct NoteState {
+    /// Notification windows (`_NET_WM_WINDOW_TYPE_NOTIFICATION`), in mapping
+    /// order. Like the dock window, they live outside `clients`/the split
+    /// tree/`bar_order`: no chrome, no taskbar entry, no focus cycling.
+    /// They stack above everything at the bottom-right of the screen
+    /// (see `Wm::place_notifications`), at whatever size they requested —
+    /// tracked here (updated on ConfigureRequest) so restacking the pile
+    /// doesn't cost a `GetGeometry` round trip per window.
+    pub foreign: Vec<ForeignNote>,
+    /// Speech-bubble popups for notifications *we* serve as the session's
+    /// `org.freedesktop.Notifications` daemon (see `crate::notify` and
+    /// `Wm::on_note_ping`). Own override-redirect windows, drawn by the
+    /// renderer, stacked bottom-right above the `foreign` pile.
+    pub popups: Vec<NotePopup>,
+    /// Incoming notification events from the daemon thread.
+    pub rx: std::sync::mpsc::Receiver<crate::notify::NoteMsg>,
+    /// Ids of popups the user click-dismissed, reported back to the daemon
+    /// thread so it emits the matching `NotificationClosed` signal.
+    pub dismiss: std::sync::mpsc::Sender<u32>,
+}
+
+/// In-progress gap/float/edge drags.
+pub struct DragState {
+    pub split: Option<Drag>,
+    /// An in-progress float move, started by pressing button 1 on a float's
+    /// frame window.
+    pub float: Option<FloatDrag>,
+    pub edge: Option<EdgeDrag>,
 }
 
 /// Every hit-testable widget rect computed for the current layout: gap drag

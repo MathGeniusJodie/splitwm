@@ -69,13 +69,13 @@ impl Wm {
             return self.manage_float(win);
         }
         let title = self.client_title(win);
-        if title.as_ref() == self.dock_title {
-            if self.docked.is_none() {
+        if title.as_ref() == self.dock.title {
+            if self.dock.win.is_none() {
                 return self.manage_dock(win);
             }
             eprintln!(
                 "splitwm: second '{}' dock window {win:#x}; tiling it normally",
-                self.dock_title
+                self.dock.title
             );
         }
 
@@ -145,6 +145,11 @@ impl Wm {
                 WM_STATE_ICONIC
             },
         )?;
+        // EWMH allows requesting fullscreen by setting the property before
+        // mapping; the ClientMessage path only covers later requests.
+        if self.wants_fullscreen(win) {
+            self.set_fullscreen(win, true)?;
+        }
         Ok(())
     }
 
@@ -162,8 +167,8 @@ impl Wm {
             .ok()
             .and_then(|c| c.reply().ok())
             .map_or(240, |g| i32::from(g.width));
-        self.docked = Some(win);
-        self.docked_w = width.max(1);
+        self.dock.win = Some(win);
+        self.dock.w = width.max(1);
 
         self.conn.change_window_attributes(
             win,
@@ -190,13 +195,40 @@ impl Wm {
         Ok(())
     }
 
+    /// Every atom in the ATOM-list property `prop` on `win`; empty on any
+    /// failure. The shared read behind protocol/window-type/state checks.
+    fn prop_atoms(&self, win: Win, prop: u32) -> Vec<u32> {
+        self.conn
+            .get_property(false, win, prop, AtomEnum::ATOM, 0, 32)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| Some(r.value32()?.collect()))
+            .unwrap_or_default()
+    }
+
+    /// Whether `win` lists `atom` in `WM_PROTOCOLS`.
+    fn supports_protocol(&self, win: Win, atom: u32) -> bool {
+        self.prop_atoms(win, self.atoms.wm_protocols)
+            .contains(&atom)
+    }
+
+    /// Whether `win`'s `_NET_WM_STATE` *property* (set before mapping, per
+    /// EWMH) already asks for fullscreen — the ClientMessage path only
+    /// covers requests made after the window is managed.
+    fn wants_fullscreen(&self, win: Win) -> bool {
+        self.prop_atoms(win, self.atoms.net_wm_state)
+            .contains(&self.atoms.net_wm_state_fullscreen)
+    }
+
     /// Whether `win` should float instead of tiling: a transient
     /// (`WM_TRANSIENT_FOR`), a declared dialog
     /// (`_NET_WM_WINDOW_TYPE_DIALOG`), or a fixed-size window
     /// (`WM_NORMAL_HINTS` min == max — it can't be resized, so stretching
     /// it into a split only produces gravel).
     fn wants_float(&self, win: Win) -> bool {
-        if self.transient_for(win).is_some() || self.is_window_type(win, self.atoms.net_wm_window_type_dialog) {
+        if self.transient_for(win).is_some()
+            || self.is_window_type(win, self.atoms.net_wm_window_type_dialog)
+        {
             return true;
         }
         self.size_hints(win).is_some_and(|h| {
@@ -211,7 +243,14 @@ impl Wm {
     fn transient_for(&self, win: Win) -> Option<Win> {
         let r = self
             .conn
-            .get_property(false, win, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, 0, 1)
+            .get_property(
+                false,
+                win,
+                AtomEnum::WM_TRANSIENT_FOR,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )
             .ok()?
             .reply()
             .ok()?;
@@ -234,13 +273,7 @@ impl Wm {
             .and_then(|c| c.reply().ok().flatten())
             .and_then(|h| h.input)
             .unwrap_or(true);
-        let take_focus = self
-            .conn
-            .get_property(false, win, self.atoms.wm_protocols, AtomEnum::ATOM, 0, 32)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .and_then(|r| Some(r.value32()?.any(|a| a == self.atoms.wm_take_focus)))
-            .unwrap_or(false);
+        let take_focus = self.supports_protocol(win, self.atoms.wm_take_focus);
         FocusModel { input, take_focus }
     }
 
@@ -264,7 +297,9 @@ impl Wm {
             .get_geometry(win)
             .ok()
             .and_then(|c| c.reply().ok());
-        let (mut w, mut h) = geo.map_or((400, 300), |g| (i32::from(g.width).max(1), i32::from(g.height).max(1)));
+        let (mut w, mut h) = geo.map_or((400, 300), |g| {
+            (i32::from(g.width).max(1), i32::from(g.height).max(1))
+        });
         // An adopted window a previous WM stretched into a split can be
         // bigger than its own maximum; snap it back to the size it wants.
         if let Some((maxw, maxh)) = self.size_hints(win).and_then(|hints| hints.max_size) {
@@ -274,7 +309,12 @@ impl Wm {
         let around = parent
             .and_then(|p| self.state.tree.find_leaf_for_client(p))
             .and_then(|l| self.prev_frame_rect.get(&l).copied())
-            .map_or(self.la(), |f| crate::tree::Rect { x: f.x, y: f.y, w: f.w, h: f.h });
+            .map_or(self.la(), |f| crate::tree::Rect {
+                x: f.x,
+                y: f.y,
+                w: f.w,
+                h: f.h,
+            });
         let wa = self.la();
         let x = (around.x + (around.w - w) / 2).clamp(wa.x, (wa.x + wa.w - w).max(wa.x));
         let y = (around.y + (around.h - h) / 2).clamp(wa.y, (wa.y + wa.h - h).max(wa.y));
@@ -361,6 +401,10 @@ impl Wm {
         self.set_wm_state(win, WM_STATE_NORMAL)?;
         self.focus_float(win)?;
         self.raise_notifications()?;
+        // Same pre-map `_NET_WM_STATE` fullscreen honouring as tiled clients.
+        if self.wants_fullscreen(win) {
+            self.set_fullscreen(win, true)?;
+        }
         self.conn.flush()?;
         Ok(())
     }
@@ -370,8 +414,10 @@ impl Wm {
         let Some(f) = self.floats.iter().find(|f| f.win == win) else {
             return Ok(());
         };
-        self.conn
-            .configure_window(f.frame, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        self.conn.configure_window(
+            f.frame,
+            &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+        )?;
         self.conn.configure_window(
             win,
             &ConfigureWindowAux::new()
@@ -429,10 +475,8 @@ impl Wm {
         let y = y.clamp(wa.y + tb, wa.y + wa.h - theme::tb_h());
         (f.x, f.y) = (x, y);
         let frame = f.frame;
-        self.conn.configure_window(
-            frame,
-            &ConfigureWindowAux::new().x(x - bw).y(y - tb),
-        )?;
+        self.conn
+            .configure_window(frame, &ConfigureWindowAux::new().x(x - bw).y(y - tb))?;
         self.conn
             .configure_window(win, &ConfigureWindowAux::new().x(x).y(y))?;
         Ok(())
@@ -463,10 +507,13 @@ impl Wm {
             return Ok(());
         };
         let gone = self.floats.remove(idx);
+        if self.fullscreen == Some(win) {
+            self.fullscreen = None;
+        }
         self.conn.destroy_window(gone.frame)?;
         self.update_client_list()?;
-        if self.float_drag.is_some_and(|d| d.win == win) {
-            self.float_drag = None;
+        if self.drags.float.is_some_and(|d| d.win == win) {
+            self.drags.float = None;
         }
         let parent = gone.parent;
         if self.focused_float == Some(win) {
@@ -499,19 +546,8 @@ impl Wm {
     }
 
     fn is_window_type(&self, win: Win, wanted: u32) -> bool {
-        self.conn
-            .get_property(
-                false,
-                win,
-                self.atoms.net_wm_window_type,
-                AtomEnum::ATOM,
-                0,
-                32,
-            )
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .and_then(|r| Some(r.value32()?.any(|a| a == wanted)))
-            .unwrap_or(false)
+        self.prop_atoms(win, self.atoms.net_wm_window_type)
+            .contains(&wanted)
     }
 
     /// Pin `win` as a notification: never in the split tree or taskbar,
@@ -525,7 +561,7 @@ impl Wm {
         )?;
         self.conn
             .configure_window(win, &ConfigureWindowAux::new().border_width(0))?;
-        if !self.notifications.iter().any(|n| n.win == win) {
+        if !self.notes.foreign.iter().any(|n| n.win == win) {
             // One geometry query at manage time; size updates thereafter
             // come from the window's own ConfigureRequests.
             let (w, h) = self
@@ -534,7 +570,9 @@ impl Wm {
                 .ok()
                 .and_then(|c| c.reply().ok())
                 .map_or((1, 1), |g| (i32::from(g.width), i32::from(g.height)));
-            self.notifications.push(super::types::ForeignNote { win, w, h });
+            self.notes
+                .foreign
+                .push(super::types::ForeignNote { win, w, h });
         }
         self.place_notifications()?;
         self.conn.map_window(win)?;
@@ -549,7 +587,7 @@ impl Wm {
         let wa = self.wa();
         let gap = theme::GAP;
         let mut bottom = wa.y + wa.h - Self::taskbar_h();
-        for n in &self.notifications {
+        for n in &self.notes.foreign {
             bottom -= gap + n.h;
             self.conn.configure_window(
                 n.win,
@@ -566,20 +604,24 @@ impl Wm {
     /// order — arrange()/focus() raise tiled clients, so notifications must
     /// be re-raised afterwards to stay on top of everything.
     pub(crate) fn raise_notifications(&self) -> R<()> {
-        for n in &self.notifications {
-            self.conn
-                .configure_window(n.win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        for n in &self.notes.foreign {
+            self.conn.configure_window(
+                n.win,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
         }
-        for p in &self.note_popups {
-            self.conn
-                .configure_window(p.win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        for p in &self.notes.popups {
+            self.conn.configure_window(
+                p.win,
+                &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+            )?;
         }
         Ok(())
     }
 
     /// Stop tracking a closed notification and re-stack the survivors.
     pub(crate) fn forget_notification(&mut self, win: Win) -> R<()> {
-        self.notifications.retain(|n| n.win != win);
+        self.notes.foreign.retain(|n| n.win != win);
         self.place_notifications()?;
         Ok(())
     }
@@ -607,14 +649,7 @@ impl Wm {
     /// the protocol (giving it a chance to prompt/save); fall back to
     /// disconnecting its client only when it doesn't.
     pub(crate) fn close_client(&self, win: Win) -> R<()> {
-        let supports_delete = self
-            .conn
-            .get_property(false, win, self.atoms.wm_protocols, AtomEnum::ATOM, 0, 32)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .and_then(|r| Some(r.value32()?.any(|a| a == self.atoms.wm_delete_window)))
-            .unwrap_or(false);
-        if supports_delete {
+        if self.supports_protocol(win, self.atoms.wm_delete_window) {
             let msg = ClientMessageEvent::new(
                 32,
                 win,
@@ -639,7 +674,7 @@ impl Wm {
             self.conn.map_window(win)?;
             self.set_wm_state(win, WM_STATE_NORMAL)?;
         }
-        if let Some(dock) = self.docked {
+        if let Some(dock) = self.dock.win {
             self.conn.map_window(dock)?;
         }
         for f in &self.floats {
@@ -667,12 +702,35 @@ impl Wm {
         Ok(())
     }
 
+    /// A managed client (re)set its title: if it now matches the dock title
+    /// (and nothing is docked yet), pull it out of tiling and dock it —
+    /// toolkits that set `WM_NAME` only after mapping would otherwise leave
+    /// the dock tiled as an ordinary window forever.
+    pub(crate) fn on_title_change(&mut self, win: Win) -> R<()> {
+        if self.dock.win.is_some()
+            || !self.clients.contains_key(&win)
+            || self.client_title(win).as_ref() != self.dock.title
+        {
+            return Ok(());
+        }
+        self.clients.remove(&win);
+        self.bar_order.retain(|&w| w != win);
+        self.ignore_unmaps.remove(&win);
+        if self.fullscreen == Some(win) {
+            self.fullscreen = None;
+        }
+        self.state.unpin_client(win);
+        self.update_client_list()?;
+        self.manage_dock(win)
+    }
+
     /// Refresh `_NET_CLIENT_LIST` on the root: managed tiled windows in
-    /// `bar_order` (mapping order) plus the floats — they're managed client
-    /// windows too, and panels/pagers should see them.
+    /// `bar_order` (mapping order) plus the floats and the dock — they're
+    /// managed client windows too, and panels/pagers should see them.
     pub(crate) fn update_client_list(&self) -> R<()> {
         let mut list = self.bar_order.clone();
         list.extend(self.floats.iter().map(|f| f.win));
+        list.extend(self.dock.win);
         self.conn.change_property32(
             PropMode::REPLACE,
             self.root,
@@ -685,20 +743,25 @@ impl Wm {
 
     // --- EWMH fullscreen ---
 
-    /// Apply an `_NET_WM_STATE_FULLSCREEN` change for a managed tiled client:
-    /// track it, mirror the state onto the window's `_NET_WM_STATE` property,
-    /// and re-arrange (which positions/stacks the fullscreen window). Only
-    /// one window is fullscreen at a time; a second request replaces the
-    /// first (its property is cleared so it doesn't believe it's still
-    /// fullscreen).
+    /// Apply an `_NET_WM_STATE_FULLSCREEN` change for a managed window —
+    /// tiled client or float: track it, mirror the state onto the window's
+    /// `_NET_WM_STATE` property, and re-arrange (which positions/stacks the
+    /// fullscreen window). Only one window is fullscreen at a time; a
+    /// second request replaces the first (its property is cleared so it
+    /// doesn't believe it's still fullscreen).
     pub(crate) fn set_fullscreen(&mut self, win: Win, on: bool) -> R<()> {
-        if !self.clients.contains_key(&win) {
+        let is_client = self.clients.contains_key(&win);
+        let is_float = self.floats.iter().any(|f| f.win == win);
+        if !is_client && !is_float {
             return Ok(());
         }
         if on {
             if let Some(prev) = self.fullscreen.replace(win) {
                 if prev != win {
                     self.set_net_wm_state_fullscreen(prev, false)?;
+                    // If the replaced window was a fullscreen float, put its
+                    // frame and geometry back (no-op for tiled clients).
+                    self.restore_float_geometry(prev)?;
                 }
             }
             self.set_net_wm_state_fullscreen(win, true)?;
@@ -708,10 +771,56 @@ impl Wm {
             }
             self.fullscreen = None;
             self.set_net_wm_state_fullscreen(win, false)?;
+            if is_float {
+                self.restore_float_geometry(win)?;
+            }
         }
-        self.state.activate_client(win);
-        self.arrange()?;
-        self.focus(Some(win))?;
+        if is_client {
+            self.state.activate_client(win);
+            self.arrange()?;
+            self.focus(Some(win))?;
+        } else {
+            // Float: `arrange`'s fullscreen block applies/keeps the
+            // full-workarea geometry while it's active.
+            self.arrange()?;
+            if on {
+                // Hide the chrome frame; the client alone covers the screen.
+                if let Some(f) = self.floats.iter().find(|f| f.win == win) {
+                    self.conn.unmap_window(f.frame)?;
+                }
+            }
+            self.focus_float(win)?;
+        }
+        Ok(())
+    }
+
+    /// Re-show a float's chrome frame and restore its remembered geometry
+    /// after leaving fullscreen. No-op for windows that aren't floats.
+    fn restore_float_geometry(&mut self, win: Win) -> R<()> {
+        let Some(f) = self.floats.iter().find(|f| f.win == win) else {
+            return Ok(());
+        };
+        let (bw, tb) = Self::float_insets();
+        let (frame, x, y, w, h) = (f.frame, f.x, f.y, f.w, f.h);
+        self.conn.map_window(frame)?;
+        self.conn.configure_window(
+            frame,
+            &ConfigureWindowAux::new()
+                .x(x - bw)
+                .y(y - tb)
+                .width(u32::try_from(w + 2 * bw).unwrap_or(1))
+                .height(u32::try_from(h + tb + bw).unwrap_or(1)),
+        )?;
+        self.conn.configure_window(
+            win,
+            &ConfigureWindowAux::new()
+                .x(x)
+                .y(y)
+                .width(u32::try_from(w).unwrap_or(1))
+                .height(u32::try_from(h).unwrap_or(1)),
+        )?;
+        self.paint_float_frame(frame)?;
+        self.restack_float(win)?;
         Ok(())
     }
 
@@ -924,13 +1033,46 @@ impl Wm {
 
     // --- focus & spawning ---
 
+    /// A guaranteed-fresh server timestamp: append zero bytes to a property
+    /// on our never-mapped selection owner (which has `PROPERTY_CHANGE`
+    /// selected) and read the time off the resulting PropertyNotify — the
+    /// standard ICCCM trick. Events drained while waiting are stashed in
+    /// `pending_events` for the main loop, preserving their order.
+    fn fresh_timestamp(&mut self) -> R<u32> {
+        self.conn.change_property8(
+            PropMode::APPEND,
+            self.sel_owner,
+            AtomEnum::WM_CLASS,
+            AtomEnum::STRING,
+            &[],
+        )?;
+        self.conn.flush()?;
+        loop {
+            let ev = self.conn.wait_for_event()?;
+            if let x11rb::protocol::Event::PropertyNotify(e) = &ev {
+                if e.window == self.sel_owner {
+                    self.last_event_time = e.time;
+                    self.last_event_instant = std::time::Instant::now();
+                    return Ok(e.time);
+                }
+            }
+            self.pending_events.push(ev);
+        }
+    }
+
     /// Deliver input focus per the ICCCM model: `SetInputFocus` only when
     /// `WM_HINTS.input` allows it, plus a `WM_TAKE_FOCUS` handshake for
-    /// clients that asked for one — with the last real input timestamp, not
+    /// clients that asked for one — with a real timestamp, not
     /// `CURRENT_TIME`, so a slow client can't steal focus back across a race.
-    fn give_focus(&self, win: Win, model: FocusModel) -> R<()> {
-        let time = if self.last_event_time == 0 {
-            CURRENT_TIME
+    /// A `SetInputFocus` older than the server's last focus change is
+    /// silently ignored, so a harvested timestamp that has gone stale
+    /// (nothing we receive carries times while the user types into a
+    /// client) is replaced with a freshly fetched one.
+    fn give_focus(&mut self, win: Win, model: FocusModel) -> R<()> {
+        let stale = self.last_event_time == 0
+            || self.last_event_instant.elapsed() > std::time::Duration::from_secs(2);
+        let time = if stale {
+            self.fresh_timestamp().unwrap_or(CURRENT_TIME)
         } else {
             self.last_event_time
         };

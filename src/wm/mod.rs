@@ -20,8 +20,8 @@ mod widgets;
 use std::collections::HashMap;
 
 use x11rb::connection::Connection;
-use x11rb::protocol::xinput::{self, ConnectionExt as _, ScrollType, XIEventMask};
 use x11rb::protocol::render::{self, ConnectionExt as _, PictType, Pictformat};
+use x11rb::protocol::xinput::{self, ConnectionExt as _, ScrollType, XIEventMask};
 use x11rb::protocol::xproto::{
     AtomEnum, ButtonIndex, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux,
     ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, GrabMode, ImageFormat, ImageOrder,
@@ -147,6 +147,11 @@ fn claim_manager_selection(
         loop {
             match conn.poll_for_event()? {
                 Some(Event::DestroyNotify(e)) if e.window == previous_owner => break,
+                // A third WM raced us for the selection while we waited:
+                // don't limp on to fight it over the redirect.
+                Some(Event::SelectionClear(e)) if e.owner == sel_owner => {
+                    return Err("lost the WM_Sn selection during --replace handover".into());
+                }
                 _ if std::time::Instant::now() >= deadline => {
                     // Best-effort: the SUBSTRUCTURE_REDIRECT grab right
                     // after this call is the real gate, so proceed even if
@@ -211,7 +216,26 @@ pub fn run(replace: bool) -> R<()> {
             atoms.net_wm_window_type_dialog,
             atoms.net_wm_state,
             atoms.net_wm_state_fullscreen,
+            atoms.net_workarea,
+            atoms.net_number_of_desktops,
+            atoms.net_current_desktop,
         ],
+    )?;
+    // Single-desktop EWMH bookkeeping: pagers/taskbars that consult these
+    // misbehave (or guess) when they're absent entirely.
+    conn.change_property32(
+        PropMode::REPLACE,
+        root,
+        atoms.net_number_of_desktops,
+        AtomEnum::CARDINAL,
+        &[1],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        root,
+        atoms.net_current_desktop,
+        AtomEnum::CARDINAL,
+        &[0],
     )?;
     conn.change_property32(
         PropMode::REPLACE,
@@ -288,10 +312,22 @@ pub fn run(replace: bool) -> R<()> {
             conn.free_cursor(old)?;
         }
         // Hotspots: arrow tip, fingertip, circle center.
-        cursors.arrow =
-            sprite_cursor(&conn, root, argb32, &crate::assets::cursor_pointer(), &palette, (4, 0))?;
-        cursors.hand =
-            sprite_cursor(&conn, root, argb32, &crate::assets::cursor_hand(), &palette, (11, 0))?;
+        cursors.arrow = sprite_cursor(
+            &conn,
+            root,
+            argb32,
+            &crate::assets::cursor_pointer(),
+            &palette,
+            (4, 0),
+        )?;
+        cursors.hand = sprite_cursor(
+            &conn,
+            root,
+            argb32,
+            &crate::assets::cursor_hand(),
+            &palette,
+            (11, 0),
+        )?;
         cursors.disabled = sprite_cursor(
             &conn,
             root,
@@ -437,16 +473,23 @@ pub fn run(replace: bool) -> R<()> {
         floats: Vec::new(),
         focused_float: None,
         last_event_time: 0,
+        last_event_instant: std::time::Instant::now(),
+        last_layout_key: None,
+        parents: HashMap::new(),
         pending_events: Vec::new(),
         bar_order: Vec::new(),
-        docked: None,
-        docked_w: 0,
-        dock_title: std::env::var("SPLITWM_DOCK_TITLE")
-            .unwrap_or_else(|_| theme::DOCK_TITLE.to_string()),
-        notifications: Vec::new(),
-        note_popups: Vec::new(),
-        note_rx,
-        note_dismiss,
+        dock: DockState {
+            win: None,
+            w: 0,
+            title: std::env::var("SPLITWM_DOCK_TITLE")
+                .unwrap_or_else(|_| theme::DOCK_TITLE.to_string()),
+        },
+        notes: NoteState {
+            foreign: Vec::new(),
+            popups: Vec::new(),
+            rx: note_rx,
+            dismiss: note_dismiss,
+        },
         underlay,
         underlay_pix: 0,
         underlay_pix_size: (0, 0),
@@ -461,9 +504,11 @@ pub fn run(replace: bool) -> R<()> {
         prev_frame_rect: HashMap::new(),
         widgets: Widgets::default(),
         menu,
-        drag: None,
-        float_drag: None,
-        edge_drag: None,
+        drags: DragState {
+            split: None,
+            float: None,
+            edge: None,
+        },
         cursors,
         bgrx: Vec::new(),
         hscroll: Vec::new(),
@@ -479,6 +524,7 @@ pub fn run(replace: bool) -> R<()> {
 
     wm.build_keymap()?;
     wm.grab_keys()?;
+    wm.update_net_workarea()?;
     wm.set_wallpaper();
     // Warm the cached systemd-run probe now: it's a synchronous D-Bus round
     // trip, and paying for it lazily would block the event loop on the
@@ -488,31 +534,11 @@ pub fn run(replace: bool) -> R<()> {
     // device) report a smooth XInput2 scroll valuator; listen for its raw
     // motion globally so panning tracks the swipe instead of jumping in
     // fixed wheel-click steps. Selecting on root doesn't steal the events
-    // from whichever client the pointer is over.
-    let xi_version = wm.conn.xinput_xi_query_version(2, 1)?.reply()?;
-    wm.build_hscroll_map()?;
-    wm.conn
-        .xinput_xi_select_events(
-            root,
-            &[
-                xinput::EventMask {
-                    deviceid: XI_ALL_MASTER_DEVICES,
-                    mask: vec![XIEventMask::RAW_MOTION],
-                },
-                xinput::EventMask {
-                    deviceid: XI_ALL_DEVICES,
-                    mask: vec![XIEventMask::HIERARCHY],
-                },
-            ],
-        )?
-        .check()?;
-    if wm.debug_scroll {
-        eprintln!(
-            "splitwm: XInput2 {}.{}, hscroll devices: {}",
-            xi_version.major_version,
-            xi_version.minor_version,
-            wm.hscroll.len()
-        );
+    // from whichever client the pointer is over. Smooth panning is pure
+    // sugar: a server without XInput2 (some Xvfb/Xephyr setups) must not
+    // stop the WM from starting, so failures only disable it.
+    if let Err(e) = wm.setup_xinput(root) {
+        eprintln!("splitwm: XInput2 unavailable ({e}); smooth scrolling disabled");
     }
 
     // Take over from a previous WM (if any) without dropping whatever it had
@@ -522,12 +548,12 @@ pub fn run(replace: bool) -> R<()> {
     // Autostart the docked sidebar from its freedesktop entry (the desktop
     // id must match the dock title, e.g. cozyui.desktop), unless a previous
     // WM already handed a running one over.
-    if wm.docked.is_none() {
-        match crate::menu::desktop_entry_cmd(&wm.dock_title) {
+    if wm.dock.win.is_none() {
+        match crate::menu::desktop_entry_cmd(&wm.dock.title) {
             Some(cmd) => wm.spawn(&cmd),
             None => eprintln!(
                 "splitwm: no {}.desktop entry found; not autostarting the dock",
-                wm.dock_title
+                wm.dock.title
             ),
         }
     }
@@ -578,9 +604,13 @@ pub fn run(replace: bool) -> R<()> {
         let batch_len = batch.len();
         let t0 = std::time::Instant::now();
         // A handling error (e.g. a reply from a window that raced us and
-        // died) must not take down the whole session; connection-level
-        // failures resurface at the next flush/wait and end the loop there.
+        // died) must not take down the whole session — but a broken
+        // connection must: retrying the loop on one would just spin on the
+        // dead socket, so tell the two apart instead of logging both.
         if let Err(e) = wm.handle_batch(batch) {
+            if is_connection_error(e.as_ref()) {
+                return Err(e);
+            }
             eprintln!("splitwm: error handling event batch: {e}");
         }
         if debug_scroll {
@@ -658,6 +688,9 @@ impl Wm {
         let defs: &[(u16, u32, Action)] = &[
             (MOD4, ks::RETURN, Action::SpawnTerminal),
             (MOD4, ks::SPACE, Action::SpawnLauncher),
+            // Keys are named for the divider the user sees, actions for the
+            // branch direction: Mod4+V draws a Vertical divider, i.e. an
+            // H-branch (side-by-side children), and vice versa.
             (MOD4, ks::V, Action::SplitH),
             (MOD4, ks::H, Action::SplitV),
             (MOD4, ks::Q, Action::Close),
@@ -698,6 +731,72 @@ impl Wm {
         Ok(())
     }
 
+    /// Publish `_NET_WORKAREA` (the layout area: workarea minus the bottom
+    /// taskbar strip) for the single desktop. Re-run on root resize.
+    pub(crate) fn update_net_workarea(&self) -> R<()> {
+        let la = self.la();
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms.net_workarea,
+            AtomEnum::CARDINAL,
+            &[
+                la.x as u32,
+                la.y as u32,
+                la.w.max(1) as u32,
+                la.h.max(1) as u32,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Negotiate XInput2 and select the raw-motion/hierarchy events driving
+    /// smooth horizontal-scroll panning. Errors here (extension missing,
+    /// version too old) are non-fatal: the caller just runs without it.
+    fn setup_xinput(&mut self, root: Window) -> R<()> {
+        use x11rb::connection::RequestConnection;
+        if self
+            .conn
+            .extension_information(xinput::X11_EXTENSION_NAME)?
+            .is_none()
+        {
+            return Err("XInput extension not present".into());
+        }
+        let xi_version = self.conn.xinput_xi_query_version(2, 1)?.reply()?;
+        if xi_version.major_version < 2 {
+            return Err(format!(
+                "XInput {}.{} < 2.1",
+                xi_version.major_version, xi_version.minor_version
+            )
+            .into());
+        }
+        self.build_hscroll_map()?;
+        self.conn
+            .xinput_xi_select_events(
+                root,
+                &[
+                    xinput::EventMask {
+                        deviceid: XI_ALL_MASTER_DEVICES,
+                        mask: vec![XIEventMask::RAW_MOTION],
+                    },
+                    xinput::EventMask {
+                        deviceid: XI_ALL_DEVICES,
+                        mask: vec![XIEventMask::HIERARCHY],
+                    },
+                ],
+            )?
+            .check()?;
+        if self.debug_scroll {
+            eprintln!(
+                "splitwm: XInput2 {}.{}, hscroll devices: {}",
+                xi_version.major_version,
+                xi_version.minor_version,
+                self.hscroll.len()
+            );
+        }
+        Ok(())
+    }
+
     // --- trackpad / horizontal-scroll device discovery ---
 
     /// Rescan every input device for a horizontal scroll valuator. Run once
@@ -734,6 +833,18 @@ impl Wm {
         }
         Ok(())
     }
+}
+
+/// Whether a batch-handling error means the X connection itself is gone
+/// (socket closed, server shut down) rather than one failed request.
+fn is_connection_error(e: &(dyn std::error::Error + 'static)) -> bool {
+    if e.is::<x11rb::errors::ConnectionError>() {
+        return true;
+    }
+    matches!(
+        e.downcast_ref::<x11rb::errors::ReplyError>(),
+        Some(x11rb::errors::ReplyError::ConnectionError(_))
+    )
 }
 
 /// The server's ARGB32 pict format, or `None` when RENDER cursors (>= 0.5)

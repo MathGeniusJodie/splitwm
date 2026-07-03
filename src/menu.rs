@@ -181,7 +181,10 @@ fn data_dirs() -> Vec<std::path::PathBuf> {
 
 /// Standard application directories (XDG data dirs + per-user).
 fn app_dirs() -> Vec<std::path::PathBuf> {
-    data_dirs().into_iter().map(|d| d.join("applications")).collect()
+    data_dirs()
+        .into_iter()
+        .map(|d| d.join("applications"))
+        .collect()
 }
 
 /// Icon sizes worth loading for 16px menu rows, best first: native 16, then
@@ -204,7 +207,13 @@ pub fn find_icon_file(icon: &str) -> Option<std::path::PathBuf> {
         return hit.clone();
     }
     let found = find_icon_file_uncached(icon);
-    cache.lock().unwrap().insert(icon.to_string(), found.clone());
+    let mut cache = cache.lock().unwrap();
+    // Same wholesale-clear-at-cap policy as the renderer's icon caches:
+    // bounded in practice, but nothing here should grow without a lid.
+    if cache.len() >= 1024 {
+        cache.clear();
+    }
+    cache.insert(icon.to_string(), found.clone());
     found
 }
 
@@ -251,7 +260,10 @@ fn scan() -> BTreeMap<String, Vec<App>> {
             }
             if let Ok(text) = std::fs::read_to_string(&p) {
                 if let Some((name, exec, cat, icon)) = parse_desktop(&text) {
-                    by_cat.entry(cat).or_default().push(App { name, exec, icon });
+                    by_cat
+                        .entry(cat)
+                        .or_default()
+                        .push(App { name, exec, icon });
                 }
             }
         }
@@ -411,8 +423,7 @@ mod tests {
     #[test]
     fn hidden_nodisplay_and_non_apps_are_skipped() {
         for extra in ["NoDisplay=true", "Hidden=true", "Type=Link"] {
-            let text =
-                format!("[Desktop Entry]\nType=Application\nName=X\nExec=x\n{extra}\n");
+            let text = format!("[Desktop Entry]\nType=Application\nName=X\nExec=x\n{extra}\n");
             assert!(parse_desktop(&text).is_none(), "{extra} should filter");
         }
     }

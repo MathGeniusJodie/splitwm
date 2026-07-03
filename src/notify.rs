@@ -133,9 +133,18 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
         let Some(msg) = conn.channel().blocking_pop_message(wait)? else {
             continue;
         };
-        if msg.msg_type() != MessageType::MethodCall
-            || msg.interface().as_deref() != Some(IFACE)
-        {
+        if msg.msg_type() != MessageType::MethodCall {
+            continue;
+        }
+        if msg.interface().as_deref() != Some(IFACE) {
+            // Calls to other interfaces (Introspectable, Properties — sent
+            // by busctl/d-feet and some client libraries on first contact)
+            // must still get *a* reply: dropping them leaves the caller
+            // blocked until its timeout. `default_reply` builds the
+            // standard UnknownMethod error (and honours NO_REPLY_EXPECTED).
+            if let Some(err) = dbus::channel::default_reply(&msg) {
+                reply(conn.channel(), err)?;
+            }
             continue;
         }
         match msg.member().as_deref() {
@@ -205,7 +214,13 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
                     .append1("1.2");
                 reply(conn.channel(), r)?;
             }
-            _ => {}
+            // Unknown members on our own interface get the standard error
+            // reply too, for the same don't-leave-callers-hanging reason.
+            _ => {
+                if let Some(err) = dbus::channel::default_reply(&msg) {
+                    reply(conn.channel(), err)?;
+                }
+            }
         }
     }
 }

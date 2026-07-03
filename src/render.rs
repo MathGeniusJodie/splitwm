@@ -64,11 +64,18 @@ pub struct Renderer {
     /// entry can never be served for a new one (a pointer key could, via
     /// allocator address reuse). Entries for dropped icons are dead weight,
     /// so the whole map is cleared once it exceeds `ICON_CACHE_CAP`.
-    icon_idx_cache: RefCell<HashMap<(u64, i32), Vec<u8>>>,
-    /// Same idea for `scaled_mask`'s coverage mask, used by the taskbar's
-    /// highlight outline.
-    icon_mask_cache: RefCell<HashMap<(u64, i32), Vec<bool>>>,
+    /// `Rc` payloads so a cache hit is a refcount bump, not a buffer copy.
+    icon_idx_cache: IconCache<u8>,
+    /// The taskbar highlight's pre-dilated outline ring (`(size+6)²`,
+    /// Chebyshev radius 3 around the icon's silhouette, minus the icon's
+    /// own footprint), cached the same way — recomputing the dilation was
+    /// ~50 stores per opaque icon pixel per frame.
+    icon_ring_cache: IconCache<bool>,
 }
+
+/// A per-(icon id, size) render cache; `Rc` payloads make a hit a refcount
+/// bump rather than a buffer copy.
+type IconCache<T> = RefCell<HashMap<(u64, i32), Rc<[T]>>>;
 
 /// One titlebar button's art: the normal and dedicated disabled sprite.
 struct ButtonArt {
@@ -333,7 +340,7 @@ impl Renderer {
             ],
             palette,
             icon_idx_cache: RefCell::new(HashMap::new()),
-            icon_mask_cache: RefCell::new(HashMap::new()),
+            icon_ring_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -372,8 +379,11 @@ impl Renderer {
         for y in 0..dh {
             let sy = (((y as f32 - oy) / scale) as usize).min(sh - 1);
             let ltr = y % 2 == 0;
-            let xs: Box<dyn Iterator<Item = usize>> =
-                if ltr { Box::new(0..dw) } else { Box::new((0..dw).rev()) };
+            let xs: Box<dyn Iterator<Item = usize>> = if ltr {
+                Box::new(0..dw)
+            } else {
+                Box::new((0..dw).rev())
+            };
             for x in xs {
                 let sx = (((x as f32 - ox) / scale) as usize).min(sw - 1);
                 let c = pixels[sy * sw + sx];
@@ -434,7 +444,10 @@ impl Renderer {
             return None;
         }
         // Grayscale JPEGs decode to 1 byte/pixel, colour to 3 (RGB).
-        let comps = data.len().checked_div(w * h).filter(|&c| c == 1 || c == 3)?;
+        let comps = data
+            .len()
+            .checked_div(w * h)
+            .filter(|&c| c == 1 || c == 3)?;
         if data.len() < w * h * comps {
             return None;
         }
@@ -477,8 +490,7 @@ impl Renderer {
             }
             return;
         }
-        self.border
-            .draw(fb, &self.palette, &swap, ox, oy, v.w, v.h);
+        self.border.draw(fb, &self.palette, &swap, ox, oy, v.w, v.h);
         self.draw_titlebar(fb, ox, oy, v);
     }
 
@@ -497,8 +509,16 @@ impl Renderer {
             tile_swapped(fb, s, src, cx, y, sw as i32, dh, &self.palette, swap);
         };
         part(PgRect::new(0, 0, sw, MIN_CAP_H), oy, cap);
-        part(PgRect::new(0, sh - MIN_CAP_H, sw, MIN_CAP_H), oy + h - cap, cap);
-        part(PgRect::new(0, MIN_CAP_H, sw, sh - 2 * MIN_CAP_H), oy + cap, mid_h);
+        part(
+            PgRect::new(0, sh - MIN_CAP_H, sw, MIN_CAP_H),
+            oy + h - cap,
+            cap,
+        );
+        part(
+            PgRect::new(0, MIN_CAP_H, sw, sh - 2 * MIN_CAP_H),
+            oy + cap,
+            mid_h,
+        );
     }
 
     /// The horizontal counterpart of `draw_minimized`, from `winmin_h.png`,
@@ -521,8 +541,16 @@ impl Renderer {
             tile_swapped(fb, s, src, x, cy, dw, sh as i32, &self.palette, swap);
         };
         part(PgRect::new(0, 0, MIN_CAP_W, sh), ox, cap);
-        part(PgRect::new(sw - MIN_CAP_W, 0, MIN_CAP_W, sh), ox + w - cap, cap);
-        part(PgRect::new(MIN_CAP_W, 0, sw - 2 * MIN_CAP_W, sh), ox + cap, mid_w);
+        part(
+            PgRect::new(sw - MIN_CAP_W, 0, MIN_CAP_W, sh),
+            ox + w - cap,
+            cap,
+        );
+        part(
+            PgRect::new(MIN_CAP_W, 0, sw - 2 * MIN_CAP_W, sh),
+            ox + cap,
+            mid_w,
+        );
     }
 
     fn draw_titlebar(&self, fb: &mut Framebuffer, ox: i32, oy: i32, v: &LeafView) {
@@ -599,10 +627,9 @@ impl Renderer {
         }
     }
 
-    /// Trace a 3px outline in `accent` around `img`'s opaque silhouette: the
-    /// scaled icon's coverage mask, stamped at every offset within Chebyshev
-    /// distance 3, drawn before the icon itself so only the dilated ring
-    /// stays visible.
+    /// Trace a 3px outline in `accent` around `img`'s opaque silhouette,
+    /// from the cached pre-dilated ring (see `cached_ring`): one store per
+    /// ring pixel per frame instead of re-running the dilation.
     fn draw_icon_outline(
         &self,
         fb: &mut Framebuffer,
@@ -612,23 +639,19 @@ impl Renderer {
         size: i32,
         accent: Index,
     ) {
-        let Some(mask) = self.cached_mask(img, size) else {
+        let Some(ring) = self.cached_ring(img, size) else {
             return;
         };
-        let sz = size as usize;
-        for ty in 0..sz {
-            for tx in 0..sz {
-                if !mask[ty * sz + tx] {
+        let rsz = (size + 6) as usize;
+        for ty in 0..rsz {
+            for tx in 0..rsz {
+                if !ring[ty * rsz + tx] {
                     continue;
                 }
-                for oy in -3i32..=3 {
-                    for ox in -3i32..=3 {
-                        let px = dx + tx as i32 + ox;
-                        let py = dy + ty as i32 + oy;
-                        if px >= 0 && py >= 0 {
-                            fb.set_pixel(px as usize, py as usize, accent);
-                        }
-                    }
+                let px = dx - 3 + tx as i32;
+                let py = dy - 3 + ty as i32;
+                if px >= 0 && py >= 0 {
+                    fb.set_pixel(px as usize, py as usize, accent);
                 }
             }
         }
@@ -671,10 +694,10 @@ impl Renderer {
     /// The `size`x`size` nearest-scaled palette-index buffer for `img`
     /// (`TRANSPARENT_INDEX` where alpha < 50%), computed once per
     /// icon+size and reused every frame after.
-    fn cached_icon_indices(&self, img: &Icon, size: i32) -> Vec<u8> {
+    fn cached_icon_indices(&self, img: &Icon, size: i32) -> Rc<[u8]> {
         let key = (img.id(), size);
         if let Some(v) = self.icon_idx_cache.borrow().get(&key) {
-            return v.clone();
+            return Rc::clone(v);
         }
         let sz = size as usize;
         let mut idx = vec![TRANSPARENT_INDEX; sz * sz];
@@ -693,32 +716,59 @@ impl Renderer {
                 });
             }
         }
+        let idx: Rc<[u8]> = idx.into();
         let mut cache = self.icon_idx_cache.borrow_mut();
         if cache.len() >= ICON_CACHE_CAP {
             cache.clear();
         }
-        cache.insert(key, idx.clone());
+        cache.insert(key, Rc::clone(&idx));
         idx
     }
 
-    /// The `size`x`size` nearest-scaled opacity mask of `img` (alpha >= 50%),
-    /// row-major, cached the same way as `cached_icon_indices`; `None` for
-    /// empty inputs.
-    fn cached_mask(&self, img: &Icon, size: i32) -> Option<Vec<bool>> {
+    /// The `(size+6)²` dilated outline ring for `img`'s silhouette (every
+    /// pixel within Chebyshev distance 3 of an opaque icon pixel, minus the
+    /// icon's own footprint — the icon is drawn over it anyway), cached the
+    /// same way as `cached_icon_indices`; `None` for empty inputs.
+    fn cached_ring(&self, img: &Icon, size: i32) -> Option<Rc<[bool]>> {
         if img.w == 0 || img.h == 0 || size < 1 {
             return None;
         }
         let key = (img.id(), size);
-        if let Some(v) = self.icon_mask_cache.borrow().get(&key) {
-            return Some(v.clone());
+        if let Some(v) = self.icon_ring_cache.borrow().get(&key) {
+            return Some(Rc::clone(v));
         }
         let mask = scaled_mask(img, size)?;
-        let mut cache = self.icon_mask_cache.borrow_mut();
+        let sz = size as usize;
+        let rsz = sz + 6;
+        let mut ring = vec![false; rsz * rsz];
+        for ty in 0..sz {
+            for tx in 0..sz {
+                if !mask[ty * sz + tx] {
+                    continue;
+                }
+                for oy in 0..7 {
+                    for ox in 0..7 {
+                        ring[(ty + oy) * rsz + tx + ox] = true;
+                    }
+                }
+            }
+        }
+        // Punch the icon's own footprint back out: only the visible ring
+        // remains, so drawing it never repaints under-icon pixels.
+        for ty in 0..sz {
+            for tx in 0..sz {
+                if mask[ty * sz + tx] {
+                    ring[(ty + 3) * rsz + tx + 3] = false;
+                }
+            }
+        }
+        let ring: Rc<[bool]> = ring.into();
+        let mut cache = self.icon_ring_cache.borrow_mut();
         if cache.len() >= ICON_CACHE_CAP {
             cache.clear();
         }
-        cache.insert(key, mask.clone());
-        Some(mask)
+        cache.insert(key, Rc::clone(&ring));
+        Some(ring)
     }
 }
 
@@ -780,9 +830,30 @@ pub fn draw_plus(fb: &mut Framebuffer, cx: i32, cy: i32, sz: i32) {
 /// tile: a dark square with a cross, always visible so the close affordance
 /// needs no hover state.
 pub fn draw_close_badge(fb: &mut Framebuffer, x: i32, y: i32, sz: i32) {
-    fill_paint(fb, x + 1, y, sz - 2, sz, PgPaint::Solid(palette_color::BLACK));
-    fill_paint(fb, x, y + 1, 1, sz - 2, PgPaint::Solid(palette_color::BLACK));
-    fill_paint(fb, x + sz - 1, y + 1, 1, sz - 2, PgPaint::Solid(palette_color::BLACK));
+    fill_paint(
+        fb,
+        x + 1,
+        y,
+        sz - 2,
+        sz,
+        PgPaint::Solid(palette_color::BLACK),
+    );
+    fill_paint(
+        fb,
+        x,
+        y + 1,
+        1,
+        sz - 2,
+        PgPaint::Solid(palette_color::BLACK),
+    );
+    fill_paint(
+        fb,
+        x + sz - 1,
+        y + 1,
+        1,
+        sz - 2,
+        PgPaint::Solid(palette_color::BLACK),
+    );
 
     // 2px-thick diagonal cross.
     let inset = sz * 32 / 100;
@@ -897,7 +968,11 @@ impl Renderer {
             w = w.max(self.text_width(l));
         }
         let arrow = if any_arrow { MENU_ARROW_W } else { 0 };
-        let icon = if any_icon { MENU_ICON_SZ + MENU_ICON_GAP } else { 0 };
+        let icon = if any_icon {
+            MENU_ICON_SZ + MENU_ICON_GAP
+        } else {
+            0
+        };
         w + 2 * MENU_PAD_X + arrow + icon
     }
 
@@ -959,7 +1034,13 @@ impl Renderer {
                 self.draw_icon(&mut fb, img, b + MENU_PAD_X, iy, MENU_ICON_SZ);
             }
             if let Some(font) = &self.font {
-                let tx = b + MENU_PAD_X + if icon_col { MENU_ICON_SZ + MENU_ICON_GAP } else { 0 };
+                let tx = b
+                    + MENU_PAD_X
+                    + if icon_col {
+                        MENU_ICON_SZ + MENU_ICON_GAP
+                    } else {
+                        0
+                    };
                 let ty = ry + (MENU_ROW_H - font.cell_h() as i32) / 2;
                 font.draw_text(&mut fb, label, tx as usize, ty.max(0) as usize, self.fg);
             }
@@ -1025,8 +1106,10 @@ impl Renderer {
             .map(|(l, _)| self.text_width(l) as usize)
             .max()
             .unwrap_or(0);
-        let w = (text_w + NOTE_PAD_LEFT + NOTE_PAD_RIGHT)
-            .clamp(bubble.width, NOTE_TEXT_MAX_W + NOTE_PAD_LEFT + NOTE_PAD_RIGHT);
+        let w = (text_w + NOTE_PAD_LEFT + NOTE_PAD_RIGHT).clamp(
+            bubble.width,
+            NOTE_TEXT_MAX_W + NOTE_PAD_LEFT + NOTE_PAD_RIGHT,
+        );
         let h = (lines.len().max(1) * line_h + NOTE_PAD_TOP + NOTE_PAD_BOTTOM)
             .max(BUBBLE_CAP_TOP + BUBBLE_CAP_BOTTOM + 1);
 

@@ -27,14 +27,14 @@ impl Wm {
     pub(crate) fn on_note_ping(&mut self) -> R<()> {
         let mut changed = false;
         loop {
-            match self.note_rx.try_recv() {
+            match self.notes.rx.try_recv() {
                 Ok(NoteMsg::Show(note)) => {
                     self.show_note(note)?;
                     changed = true;
                 }
                 Ok(NoteMsg::Close(id)) => {
-                    if let Some(i) = self.note_popups.iter().position(|p| p.note.id == id) {
-                        self.conn.destroy_window(self.note_popups.remove(i).win)?;
+                    if let Some(i) = self.notes.popups.iter().position(|p| p.note.id == id) {
+                        self.conn.destroy_window(self.notes.popups.remove(i).win)?;
                         changed = true;
                     }
                 }
@@ -53,7 +53,7 @@ impl Wm {
     fn show_note(&mut self, note: Note) -> R<()> {
         let fb = self.renderer.draw_note(&note.summary, &note.body);
         let (w, h) = (fb.width as i32, fb.height as i32);
-        let win = match self.note_popups.iter_mut().find(|p| p.note.id == note.id) {
+        let win = match self.notes.popups.iter_mut().find(|p| p.note.id == note.id) {
             Some(p) => {
                 p.note = note;
                 (p.w, p.h) = (w, h);
@@ -81,14 +81,14 @@ impl Wm {
                         .cursor(self.cursors.hand)
                         .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
                 )?;
-                self.note_popups.push(NotePopup { win, note, w, h });
+                self.notes.popups.push(NotePopup { win, note, w, h });
                 self.conn.map_window(win)?;
                 // Cap live popups: the daemon caps outstanding notifications
                 // too (see `notify::MAX_NOTES`), but a burst can still land
                 // more `Show`s here before an eviction round-trips back —
                 // drop our own oldest rather than let the pile grow.
-                if self.note_popups.len() > MAX_NOTE_POPUPS {
-                    self.conn.destroy_window(self.note_popups.remove(0).win)?;
+                if self.notes.popups.len() > MAX_NOTE_POPUPS {
+                    self.conn.destroy_window(self.notes.popups.remove(0).win)?;
                 }
                 win
             }
@@ -100,7 +100,7 @@ impl Wm {
 
     /// Re-render and blit one popup (initial paint and Expose).
     pub(crate) fn paint_note_win(&mut self, win: Window) -> R<()> {
-        let Some(p) = self.note_popups.iter().find(|p| p.win == win) else {
+        let Some(p) = self.notes.popups.iter().find(|p| p.win == win) else {
             return Ok(());
         };
         let fb = self.renderer.draw_note(&p.note.summary, &p.note.body);
@@ -158,7 +158,7 @@ impl Wm {
         let wa = self.wa();
         let gap = theme::GAP;
         let mut bottom = wa.y + wa.h - Self::taskbar_h();
-        for p in &self.note_popups {
+        for p in &self.notes.popups {
             bottom -= gap + p.h;
             self.conn.configure_window(
                 p.win,
@@ -174,11 +174,11 @@ impl Wm {
     /// Click anywhere on a popup dismisses it; the daemon thread emits the
     /// `NotificationClosed(id, 2 /* by user */)` signal.
     pub(crate) fn dismiss_note(&mut self, win: Window) -> R<bool> {
-        let Some(i) = self.note_popups.iter().position(|p| p.win == win) else {
+        let Some(i) = self.notes.popups.iter().position(|p| p.win == win) else {
             return Ok(false);
         };
-        let p = self.note_popups.remove(i);
-        let _ = self.note_dismiss.send(p.note.id);
+        let p = self.notes.popups.remove(i);
+        let _ = self.notes.dismiss.send(p.note.id);
         self.conn.destroy_window(p.win)?;
         self.place_note_popups()?;
         self.conn.flush()?;

@@ -1,15 +1,14 @@
 //! Event dispatch and input handling for the WM core: keyboard, pointer,
 //! scroll coalescing, and the client map/unmap/destroy protocol events.
 
+use x11rb::connection::Connection;
 use x11rb::protocol::xinput;
 use x11rb::protocol::xproto::{
     Allow, ButtonPressEvent, ButtonReleaseEvent, ChangeWindowAttributesAux, ConfigWindow,
-    ConfigureNotifyEvent, ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, ExposeEvent,
-    InputFocus,
-    KeyPressEvent, MapRequestEvent,
-    Mapping, MappingNotifyEvent, ModMask, MotionNotifyEvent, UnmapNotifyEvent,
+    ConfigureNotifyEvent, ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, EventMask,
+    ExposeEvent, InputFocus, KeyPressEvent, MapRequestEvent, Mapping, MappingNotifyEvent, ModMask,
+    MotionNotifyEvent, UnmapNotifyEvent,
 };
-use x11rb::connection::Connection;
 use x11rb::protocol::Event;
 use x11rb::CURRENT_TIME;
 
@@ -95,7 +94,8 @@ impl Wm {
         }
         let p = self.conn.query_pointer(self.root)?.reply()?;
         let allowed =
-            if p.child == x11rb::NONE || p.child == self.underlay || Some(p.child) == self.docked {
+            if p.child == x11rb::NONE || p.child == self.underlay || Some(p.child) == self.dock.win
+            {
                 true
             } else {
                 u16::from(p.mask) & MOD4 != 0
@@ -125,11 +125,12 @@ impl Wm {
         // last motion would drop the final hover update on the window left
         // behind. One pointer means this stays at most 2-3 entries.
         let mut pending_motion: Vec<MotionNotifyEvent> = Vec::new();
-        let coalesce = |pending: &mut Vec<MotionNotifyEvent>, e: MotionNotifyEvent| {
-            match pending.iter_mut().find(|p| p.event == e.event) {
-                Some(slot) => *slot = e,
-                None => pending.push(e),
-            }
+        let coalesce = |pending: &mut Vec<MotionNotifyEvent>, e: MotionNotifyEvent| match pending
+            .iter_mut()
+            .find(|p| p.event == e.event)
+        {
+            Some(slot) => *slot = e,
+            None => pending.push(e),
         };
         // Raw scroll deltas from one batch are summed and applied as a single
         // scroll + arrange, for the same reason motion is coalesced: a swipe
@@ -181,14 +182,23 @@ impl Wm {
     }
 
     fn handle_event(&mut self, ev: &Event) -> R<()> {
-        // Track the last real input timestamp for ICCCM focus handoffs
+        // Track the last real server timestamp for ICCCM focus handoffs
         // (`Wm::give_focus` wants a real time, not CURRENT_TIME).
-        match ev {
-            Event::KeyPress(e) => self.last_event_time = e.time,
-            Event::ButtonPress(e) => self.last_event_time = e.time,
-            Event::ButtonRelease(e) => self.last_event_time = e.time,
-            Event::MotionNotify(e) => self.last_event_time = e.time,
-            _ => {}
+        // PropertyNotify counts too: clients update properties while the
+        // user types into them, which no input event of ours would see —
+        // and `last_event_instant` records the harvest so `give_focus` can
+        // tell when even this has gone stale.
+        let time = match ev {
+            Event::KeyPress(e) => Some(e.time),
+            Event::ButtonPress(e) => Some(e.time),
+            Event::ButtonRelease(e) => Some(e.time),
+            Event::MotionNotify(e) => Some(e.time),
+            Event::PropertyNotify(e) => Some(e.time),
+            _ => None,
+        };
+        if let Some(t) = time {
+            self.last_event_time = t;
+            self.last_event_instant = std::time::Instant::now();
         }
         match ev {
             Event::MapRequest(e) => self.on_map_request(*e)?,
@@ -206,6 +216,25 @@ impl Wm {
             // set _NET_WM_ICON only after mapping).
             Event::PropertyNotify(e) if e.atom == self.atoms.net_wm_icon => {
                 self.on_icon_change(e.window)?;
+            }
+            // A managed client (re)set its title. The dock is identified by
+            // title alone (see `Wm::manage`), and some toolkits only set it
+            // after mapping — a late-titled dock would otherwise tile as a
+            // normal window forever.
+            Event::PropertyNotify(e)
+                if e.atom == self.atoms.net_wm_name
+                    || e.atom == u32::from(x11rb::protocol::xproto::AtomEnum::WM_NAME) =>
+            {
+                self.on_title_change(e.window)?;
+            }
+            // Pointer left a menu window: retire its hover highlight (the
+            // main column keeps highlighting an open category so the
+            // submenu still reads as attached to its row).
+            Event::LeaveNotify(e)
+                if self.menu.open
+                    && (e.event == self.menu.main_win || e.event == self.menu.sub_win) =>
+            {
+                self.on_menu_leave(e.event)?;
             }
             // Keyboard layout / modifier mapping changed: rebind everything.
             Event::MappingNotify(e) => self.on_mapping(e)?,
@@ -246,8 +275,13 @@ impl Wm {
 
     fn on_configure_request(&mut self, e: &ConfigureRequestEvent) -> R<()> {
         // Honour requests for windows we don't (yet) manage; managed clients
-        // are positioned by arrange().
+        // are positioned by arrange(). ICCCM 4.1.5: a WM that doesn't grant
+        // a ConfigureRequest must still answer with a synthetic
+        // ConfigureNotify carrying the actual geometry — clients that
+        // resize themselves and block waiting for the echo (xterm's
+        // `resize`) hang without it.
         if self.clients.contains_key(&e.window) {
+            self.send_synthetic_configure(e.window)?;
             return Ok(());
         }
         // A float resizing itself keeps its new size but our position (the
@@ -285,7 +319,7 @@ impl Wm {
         self.conn.configure_window(e.window, &aux)?;
         // A notification resizing itself keeps its new size, but position
         // stays ours: record the size and re-stack the bottom-right pile.
-        if let Some(n) = self.notifications.iter_mut().find(|n| n.win == e.window) {
+        if let Some(n) = self.notes.foreign.iter_mut().find(|n| n.win == e.window) {
             if u16::from(e.value_mask) & u16::from(ConfigWindow::WIDTH) != 0 {
                 n.w = i32::from(e.width).max(1);
             }
@@ -294,6 +328,30 @@ impl Wm {
             }
             self.place_notifications()?;
         }
+        Ok(())
+    }
+
+    /// Echo a managed window's current geometry back as a synthetic
+    /// ConfigureNotify (ICCCM 4.1.5, for denied ConfigureRequests). The
+    /// window is a root child, so `GetGeometry`'s x/y are already
+    /// root-relative, as the synthetic event requires.
+    fn send_synthetic_configure(&self, win: u32) -> R<()> {
+        let g = self.conn.get_geometry(win)?.reply()?;
+        let ev = ConfigureNotifyEvent {
+            response_type: x11rb::protocol::xproto::CONFIGURE_NOTIFY_EVENT,
+            sequence: 0,
+            event: win,
+            window: win,
+            above_sibling: x11rb::NONE,
+            x: g.x,
+            y: g.y,
+            width: g.width,
+            height: g.height,
+            border_width: 0,
+            override_redirect: false,
+        };
+        self.conn
+            .send_event(false, win, EventMask::STRUCTURE_NOTIFY, ev)?;
         Ok(())
     }
 
@@ -314,6 +372,7 @@ impl Wm {
                 .height(u32::try_from(h.max(1)).unwrap_or(1)),
         )?;
         self.set_wallpaper();
+        self.update_net_workarea()?;
         self.arrange()
     }
 
@@ -405,12 +464,12 @@ impl Wm {
             }
             return Ok(());
         }
-        if self.docked == Some(win) {
-            self.docked = None;
-            self.docked_w = 0;
+        if self.dock.win == Some(win) {
+            self.dock.win = None;
+            self.dock.w = 0;
             return self.arrange();
         }
-        if self.notifications.iter().any(|n| n.win == win) {
+        if self.notes.foreign.iter().any(|n| n.win == win) {
             return self.forget_notification(win);
         }
         if self.floats.iter().any(|f| f.win == win) {
@@ -425,12 +484,12 @@ impl Wm {
     }
 
     fn on_destroy(&mut self, win: u32) -> R<()> {
-        if self.docked == Some(win) {
-            self.docked = None;
-            self.docked_w = 0;
+        if self.dock.win == Some(win) {
+            self.dock.win = None;
+            self.dock.w = 0;
             return self.arrange();
         }
-        if self.notifications.iter().any(|n| n.win == win) {
+        if self.notes.foreign.iter().any(|n| n.win == win) {
             return self.forget_notification(win);
         }
         if self.floats.iter().any(|f| f.win == win) {
@@ -456,6 +515,20 @@ impl Wm {
                 return Ok(());
             }
             _ => {}
+        }
+        // Swallow keyboard auto-repeat for the layout-mutating actions:
+        // holding Mod4+V must not carve ~20 splits a second, each queueing
+        // its own animation. Resize/focus actions deliberately keep
+        // repeating (holding Grow is how you resize by feel).
+        if matches!(action, Action::SplitH | Action::SplitV | Action::Close) {
+            let now = std::time::Instant::now();
+            if self.last_layout_key.is_some_and(|(kc, at)| {
+                kc == e.detail && now.duration_since(at) < std::time::Duration::from_millis(200)
+            }) {
+                self.last_layout_key = Some((e.detail, now));
+                return Ok(());
+            }
+            self.last_layout_key = Some((e.detail, now));
         }
         // Layout-changing actions get an animated transition.
         self.animate = matches!(
@@ -598,7 +671,7 @@ impl Wm {
         if e.detail == 1 {
             if let Some(f) = self.floats.iter().find(|f| f.frame == e.event) {
                 let (win, fx, fy) = (f.win, f.x, f.y);
-                self.float_drag = Some(FloatDrag {
+                self.drags.float = Some(FloatDrag {
                     win,
                     dx: i32::from(e.root_x) - fx,
                     dy: i32::from(e.root_y) - fy,
@@ -622,7 +695,8 @@ impl Wm {
         // Split-control buttons (left = primary, right = opposite split dir).
         if (e.detail == 1 || e.detail == 3) && e.event == self.underlay {
             let (mx, my) = (i32::from(e.event_x), i32::from(e.event_y));
-            if let Some((leaf, kind)) = self.widgets
+            if let Some((leaf, kind)) = self
+                .widgets
                 .btn_regions
                 .iter()
                 .find(|(r, _, _)| rect_contains(*r, mx, my))
@@ -636,9 +710,13 @@ impl Wm {
             let (mx, my) = (i32::from(e.event_x), i32::from(e.event_y));
             // The corner "x" badge on a bottom-bar tile: politely close that
             // window (checked before the tile itself so the badge wins).
-            if let Some(win) = self.widgets
+            // Reverse iteration matches draw order: compressed tiles overlap
+            // left-to-right, so the topmost (rightmost) one takes the click.
+            if let Some(win) = self
+                .widgets
                 .taskbar_regions
                 .iter()
+                .rev()
                 .find(|t| rect_contains(t.close, mx, my))
                 .map(|t| t.win)
             {
@@ -646,9 +724,11 @@ impl Wm {
             }
             // A bottom-bar icon: focus its split if already on-screen,
             // otherwise bring that window into the focused split.
-            if let Some(win) = self.widgets
+            if let Some(win) = self
+                .widgets
                 .taskbar_regions
                 .iter()
+                .rev()
                 .find(|t| rect_contains(t.rect, mx, my))
                 .map(|t| t.win)
             {
@@ -673,7 +753,8 @@ impl Wm {
             }
             // Click the title (tab) to focus it — an empty leaf's tab
             // focuses the leaf too, matching a click on its body.
-            if let Some(leaf) = self.widgets
+            if let Some(leaf) = self
+                .widgets
                 .tab_regions
                 .iter()
                 .find(|(r, _)| rect_contains(*r, mx, my))
@@ -688,7 +769,8 @@ impl Wm {
             // hit region (the handle spans the full boundary height so it's
             // easy to grab; "+" is a small target in its middle) — check the
             // narrower "+" rect first so it isn't shadowed by the handle.
-            if let Some(at) = self.widgets
+            if let Some(at) = self
+                .widgets
                 .plus_regions
                 .iter()
                 .find(|(r, _)| rect_contains(*r, mx, my))
@@ -698,13 +780,14 @@ impl Wm {
                 self.animate = true;
                 return self.commit_layout();
             }
-            if let Some(b) = self.widgets
+            if let Some(b) = self
+                .widgets
                 .handle_regions
                 .iter()
                 .find(|(r, b)| b.resizable && rect_contains(*r, mx, my))
                 .map(|(_, b)| *b)
             {
-                self.drag = Some(Drag {
+                self.drags.split = Some(Drag {
                     parent: b.parent,
                     idx: b.idx,
                     vertical: b.dir == Dir::V,
@@ -717,7 +800,8 @@ impl Wm {
             // Outer canvas-edge resize handles: the screen-space x of
             // whichever end of the leftmost/rightmost column isn't being
             // dragged stays fixed for the whole gesture (see `EdgeDrag`).
-            if let Some(&(_, left)) = self.widgets
+            if let Some(&(_, left)) = self
+                .widgets
                 .edge_handle_regions
                 .iter()
                 .find(|(r, _)| rect_contains(*r, mx, my))
@@ -725,7 +809,7 @@ impl Wm {
                 if let Some((start_x, w)) = self.state.edge_span(wa, left) {
                     let canvas_anchor = if left { start_x + w } else { start_x };
                     let anchor_x = canvas_anchor - self.state.scroll_x;
-                    self.edge_drag = Some(EdgeDrag { left, anchor_x });
+                    self.drags.edge = Some(EdgeDrag { left, anchor_x });
                 }
                 return Ok(());
             }
@@ -752,7 +836,7 @@ impl Wm {
             } else if self.floats.iter().any(|f| f.win == e.event) {
                 self.focus_float(e.event)?;
                 self.raise_notifications()?;
-            } else if self.docked == Some(e.event) {
+            } else if self.dock.win == Some(e.event) {
                 // Outside the tree/`clients`, so `focus()` (which only knows
                 // tiled windows) can't take it; set input focus directly.
                 self.conn
@@ -770,7 +854,7 @@ impl Wm {
         if self.menu.open && (e.event == self.menu.main_win || e.event == self.menu.sub_win) {
             return self.on_menu_motion(e.event, i32::from(e.event_y));
         }
-        if let Some(fd) = self.float_drag {
+        if let Some(fd) = self.drags.float {
             self.move_float(
                 fd.win,
                 i32::from(e.root_x) - fd.dx,
@@ -779,7 +863,7 @@ impl Wm {
             self.conn.flush()?;
             return Ok(());
         }
-        if let Some(ed) = self.edge_drag {
+        if let Some(ed) = self.drags.edge {
             let wa = self.la();
             let mouse_x = i32::from(e.root_x);
             // Screen-space width: `anchor_x` is the fixed far edge, so the
@@ -803,7 +887,7 @@ impl Wm {
             self.arrange()?;
             return Ok(());
         }
-        let Some(d) = self.drag else {
+        let Some(d) = self.drags.split else {
             // Not dragging: hover feedback only.
             if e.event == self.underlay {
                 let cur = self.hover_cursor(i32::from(e.event_x), i32::from(e.event_y));
@@ -833,7 +917,8 @@ impl Wm {
     /// the plain arrow otherwise.
     fn hover_cursor(&self, mx: i32, my: i32) -> u32 {
         let c = self.cursors;
-        if let Some((leaf, kind)) = self.widgets
+        if let Some((leaf, kind)) = self
+            .widgets
             .btn_regions
             .iter()
             .find(|(r, _, _)| rect_contains(*r, mx, my))
@@ -857,16 +942,22 @@ impl Wm {
         }
         // Taskbar tiles (and their close badges), the launcher "+", and the
         // tab titles are plain click targets, mirroring `on_button`.
-        if self.widgets
+        if self
+            .widgets
             .taskbar_regions
             .iter()
             .any(|t| rect_contains(t.rect, mx, my) || rect_contains(t.close, mx, my))
             || rect_contains(self.widgets.taskbar_plus, mx, my)
-            || self.widgets.tab_regions.iter().any(|(r, _)| rect_contains(*r, mx, my))
+            || self
+                .widgets
+                .tab_regions
+                .iter()
+                .any(|(r, _)| rect_contains(*r, mx, my))
         {
             return c.hand;
         }
-        if let Some((_, b)) = self.widgets
+        if let Some((_, b)) = self
+            .widgets
             .handle_regions
             .iter()
             .find(|(r, _)| rect_contains(*r, mx, my))
@@ -874,7 +965,13 @@ impl Wm {
             // The boundary "+" button sits inside the handle's hit region;
             // it's clickable, so the hand wins, matching the click hit-test
             // order.
-            if b.root && self.widgets.plus_regions.iter().any(|(r, _)| rect_contains(*r, mx, my)) {
+            if b.root
+                && self
+                    .widgets
+                    .plus_regions
+                    .iter()
+                    .any(|(r, _)| rect_contains(*r, mx, my))
+            {
                 return c.hand;
             }
             // A gap next to a minimized leaf can't be dragged (its size is
@@ -888,7 +985,8 @@ impl Wm {
                 c.h_resize
             };
         }
-        if self.widgets
+        if self
+            .widgets
             .edge_handle_regions
             .iter()
             .any(|(r, _)| rect_contains(*r, mx, my))
@@ -917,9 +1015,9 @@ impl Wm {
         if e.detail != 1 {
             return Ok(());
         }
-        self.float_drag = None;
-        let dragged = self.drag.take().is_some();
-        let edge_dragged = self.edge_drag.take().is_some();
+        self.drags.float = None;
+        let dragged = self.drags.split.take().is_some();
+        let edge_dragged = self.drags.edge.take().is_some();
         if dragged || edge_dragged {
             self.arrange()?;
         }
