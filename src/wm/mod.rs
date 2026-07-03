@@ -42,6 +42,54 @@ use crate::tree::Rect;
 
 pub use types::*;
 
+/// Block until the connection has an event or `deadline` passes: the one
+/// wait primitive behind the event loop's frame pacing, `fresh_timestamp`,
+/// and the `--replace` handover — everywhere the old code slept in a
+/// poll-and-nap loop. Waits on the connection's socket with `poll(2)`, so
+/// events are picked up the moment they arrive instead of on the next tick.
+/// `None` deadline blocks indefinitely; returns `Ok(None)` on deadline.
+/// Callers must have flushed anything the awaited event depends on.
+pub(crate) fn wait_event_deadline(
+    conn: &x11rb::rust_connection::RustConnection,
+    deadline: Option<std::time::Instant>,
+) -> R<Option<Event>> {
+    use std::os::unix::io::AsRawFd;
+    loop {
+        // Drain x11rb's internal buffer first: bytes already read off the
+        // socket won't show up as POLLIN again.
+        if let Some(ev) = conn.poll_for_event()? {
+            return Ok(Some(ev));
+        }
+        let timeout_ms = match deadline {
+            None => -1,
+            Some(d) => {
+                let remaining = d.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
+                // Round up so a sub-millisecond remainder can't busy-loop.
+                i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX).max(1)
+            }
+        };
+        let mut pfd = libc::pollfd {
+            fd: conn.stream().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if r < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e.into());
+        }
+        // r == 0 (timeout): loop around, re-check the deadline, return None.
+        // r > 0 (readable or hung up): poll_for_event now makes progress —
+        // on hangup it surfaces the connection error, which must propagate.
+    }
+}
+
 fn fp3232_to_f64(v: xinput::Fp3232) -> f64 {
     f64::from(v.integral) + f64::from(v.frac) / 4_294_967_296.0
 }
@@ -145,20 +193,20 @@ fn claim_manager_selection(
     if previous_owner != x11rb::NONE {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
-            match conn.poll_for_event()? {
+            match wait_event_deadline(conn, Some(deadline))? {
                 Some(Event::DestroyNotify(e)) if e.window == previous_owner => break,
                 // A third WM raced us for the selection while we waited:
                 // don't limp on to fight it over the redirect.
                 Some(Event::SelectionClear(e)) if e.owner == sel_owner => {
                     return Err("lost the WM_Sn selection during --replace handover".into());
                 }
-                _ if std::time::Instant::now() >= deadline => {
-                    // Best-effort: the SUBSTRUCTURE_REDIRECT grab right
-                    // after this call is the real gate, so proceed even if
-                    // the old WM never confirmed.
-                    break;
-                }
-                _ => std::thread::sleep(std::time::Duration::from_millis(20)),
+                // Pre-redirect noise (we manage nothing yet, and
+                // `manage_existing_windows` rescans after the takeover).
+                Some(_) => {}
+                // Deadline: best-effort — the SUBSTRUCTURE_REDIRECT grab
+                // right after this call is the real gate, so proceed even
+                // if the old WM never confirmed.
+                None => break,
             }
         }
     }
@@ -262,10 +310,7 @@ pub fn run(replace: bool) -> R<()> {
         cursors,
         bgrx: Vec::new(),
         hscroll: Vec::new(),
-        hscroll_gate: (
-            std::time::Instant::now() - std::time::Duration::from_secs(1),
-            true,
-        ),
+        hscroll_gate: None,
         ignore_unmaps: HashMap::new(),
         fullscreen: None,
         conn,
@@ -647,8 +692,10 @@ fn cuts_animation(ev: &Event) -> bool {
 }
 
 fn event_loop(wm: &mut Wm) -> R<()> {
-    // Animation frame pacing (~60 Hz); frames are full-screen recomposites,
-    // so an unpaced loop would pin a core for no visible benefit.
+    // One rendered frame per interval (~60 Hz), vsync-style: rendering more
+    // often than the screen refreshes is pure waste (frames are full-screen
+    // software recomposites), so both scroll bursts and layout animations
+    // are paced to this.
     const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
     while wm.running {
         wm.conn.flush()?;
@@ -662,35 +709,36 @@ fn event_loop(wm: &mut Wm) -> R<()> {
         // handling whatever has arrived between frames.
         let mut batch = std::mem::take(&mut wm.pending_events);
         if batch.is_empty() && wm.anim.is_none() {
-            batch.push(wm.conn.wait_for_event()?);
+            match wait_event_deadline(&wm.conn, None)? {
+                Some(ev) => batch.push(ev),
+                None => unreachable!("no deadline was given"),
+            }
         }
         while let Some(ev) = wm.conn.poll_for_event()? {
             batch.push(ev);
         }
         // A trackpad reports horizontal-scroll `XI_RawMotion` at up to a few
-        // hundred Hz, often faster than the socket delivers them to us in one
-        // go — without this, each report can land in its own batch and force
-        // its own full-screen recomposite, and rendering falls behind the
-        // swipe (a visible backlog that keeps "catching up" after the finger
-        // stops). Give a fast burst a few ms to land in the same batch so one
-        // recomposite picks up many reports' worth of delta at once.
+        // hundred Hz — handled one per batch, each report would force its
+        // own full-screen recomposite and rendering falls behind the swipe
+        // (a visible backlog that keeps "catching up" after the finger
+        // stops). Since only one frame per FRAME interval is worth drawing
+        // anyway, keep collecting events on the socket until this frame's
+        // deadline, then handle the whole burst as one scroll + recomposite.
         //
         // Gate on an actual scroll *delta*, not the mere presence of raw
         // motion: RAW_MOTION fires for every plain pointer movement too, and
-        // sleeping on those would add 8 ms of input latency (and constant
-        // wakeups) whenever the mouse moves. Also gate on the pointer-
-        // position check (`hscroll_allowed`): a swipe inside a client window
-        // without Mod4 held is ignored by `apply_hscroll`, and sleeping for
-        // it would add latency to input the WM won't act on.
+        // waiting on those would add up to a frame of input latency (and
+        // constant wakeups) whenever the mouse moves. Also gate on the
+        // pointer-position check (`hscroll_allowed`): a swipe inside a
+        // client window without Mod4 held is ignored by `apply_hscroll`.
         let has_scroll = batch.iter().any(|e| match e {
             Event::XinputRawMotion(e) => wm.hscroll_delta(e) != 0.0,
             _ => false,
         });
-        // Skip the batching sleep while animating: the loop is already
-        // frame-paced, which fattens batches the same way.
+        // Skip while animating: the loop is already frame-paced below.
         if wm.anim.is_none() && has_scroll && wm.hscroll_allowed().unwrap_or(false) {
-            std::thread::sleep(std::time::Duration::from_millis(8));
-            while let Some(ev) = wm.conn.poll_for_event()? {
+            let deadline = frame_start + FRAME;
+            while let Some(ev) = wait_event_deadline(&wm.conn, Some(deadline))? {
                 batch.push(ev);
             }
         }
@@ -728,9 +776,16 @@ fn event_loop(wm: &mut Wm) -> R<()> {
                 eprintln!("splitwm: error stepping layout animation: {e}");
                 wm.anim = None;
             }
-            // Pace only while a next frame is still owed.
+            // Pace only while a next frame is still owed — but wait out the
+            // remainder on the socket, not asleep: input arriving mid-frame
+            // lands in the very next batch (where it can cut the animation)
+            // instead of waiting for the frame timer.
             if wm.anim.is_some() {
-                std::thread::sleep(FRAME.saturating_sub(frame_start.elapsed()));
+                wm.conn.flush()?;
+                let deadline = frame_start + FRAME;
+                if let Some(ev) = wait_event_deadline(&wm.conn, Some(deadline))? {
+                    wm.pending_events.push(ev);
+                }
             }
         }
     }

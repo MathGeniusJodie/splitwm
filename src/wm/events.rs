@@ -10,7 +10,6 @@ use x11rb::protocol::xproto::{
     MotionNotifyEvent, UnmapNotifyEvent,
 };
 use x11rb::protocol::Event;
-use x11rb::CURRENT_TIME;
 
 use super::clients::WM_STATE_WITHDRAWN;
 use super::types::{
@@ -115,9 +114,10 @@ impl Wm {
     /// whole burst, short enough that moving the pointer under/off a window
     /// mid-swipe is still honoured almost immediately.
     pub(crate) fn hscroll_allowed(&mut self) -> R<bool> {
-        let (last, allowed) = self.hscroll_gate;
-        if last.elapsed() < std::time::Duration::from_millis(30) {
-            return Ok(allowed);
+        if let Some((last, allowed)) = self.hscroll_gate {
+            if last.elapsed() < std::time::Duration::from_millis(30) {
+                return Ok(allowed);
+            }
         }
         let p = self.conn.query_pointer(self.root)?.reply()?;
         let allowed =
@@ -133,7 +133,7 @@ impl Wm {
                 p.child, self.underlay, p.mask, allowed
             );
         }
-        self.hscroll_gate = (std::time::Instant::now(), allowed);
+        self.hscroll_gate = Some((std::time::Instant::now(), allowed));
         Ok(allowed)
     }
 
@@ -188,6 +188,12 @@ impl Wm {
                 // Xephyr setups) the legacy clicks are the *only* scroll
                 // input there is, so horizontal ticks (6 = left, 7 = right)
                 // feed the pan directly, one wheel-click per event.
+                //
+                // Vertical ticks (4 = up, 5 = down) are consumed and
+                // deliberately dropped in both cases: the WM has no
+                // vertical-scroll behaviour of its own, and clients still
+                // receive their own copies (these only reach us over the
+                // underlay/root, never from inside a client window).
                 Event::ButtonPress(e) if (4..=7).contains(&e.detail) => {
                     if self.hscroll.is_empty() {
                         match e.detail {
@@ -445,6 +451,13 @@ impl Wm {
     /// split in view, land the scroll, re-arrange, and focus the focused
     /// split's client.
     pub(crate) fn commit_layout(&mut self) -> R<()> {
+        // A layout mutation invalidates any in-progress gap/edge drag: the
+        // drag's `parent`/`idx` snapshot may now name a removed node or a
+        // shifted child slot, and further motion would silently resize the
+        // wrong boundary. (Float drags don't reference the tree; they keep
+        // going.)
+        self.drags.split = None;
+        self.drags.edge = None;
         let wa = self.la();
         self.state.ensure_in_view(wa);
         self.state.scroll_x = self.state.scroll_target;
@@ -886,8 +899,10 @@ impl Wm {
             } else if self.dock.win == Some(e.event) {
                 // Outside the tree/`clients`, so `focus()` (which only knows
                 // tiled windows) can't take it; set input focus directly.
+                // The press's own timestamp, not CURRENT_TIME — same race
+                // `give_focus` guards against.
                 self.conn
-                    .set_input_focus(InputFocus::POINTER_ROOT, e.event, CURRENT_TIME)?;
+                    .set_input_focus(InputFocus::POINTER_ROOT, e.event, e.time)?;
             }
         }
         Ok(())

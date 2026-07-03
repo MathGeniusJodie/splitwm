@@ -165,7 +165,9 @@ impl Wm {
         let foreign_h: i32 = self.notes.foreign.iter().map(|n| gap + n.h).sum();
         let mut bottom = wa.y + wa.h - Self::taskbar_h() - foreign_h;
         for p in &self.notes.popups {
-            bottom -= gap + p.h;
+            // Same top-of-workarea clamp as `place_notifications`: a deep
+            // pile overlaps at the top edge instead of leaving the screen.
+            bottom = (bottom - gap - p.h).max(wa.y);
             self.conn.configure_window(
                 p.win,
                 &ConfigureWindowAux::new()

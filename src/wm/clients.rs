@@ -587,7 +587,11 @@ impl Wm {
         let gap = theme::GAP;
         let mut bottom = wa.y + wa.h - Self::taskbar_h();
         for n in &self.notes.foreign {
-            bottom -= gap + n.h;
+            // Clamp to the top of the workarea: a deep enough pile would
+            // otherwise place the overflow at negative y — visible nowhere
+            // and (click-to-dismiss being the only dismissal) undismissable.
+            // Overflowing bubbles overlap at the top edge instead.
+            bottom = (bottom - gap - n.h).max(wa.y);
             self.conn.configure_window(
                 n.win,
                 &ConfigureWindowAux::new()
@@ -1055,14 +1059,14 @@ impl Wm {
             &[],
         )?;
         self.conn.flush()?;
-        // Deadline-bounded, not a bare `wait_for_event` loop: if the notify
-        // is lost or the server wedges with the socket still open, blocking
-        // forever here bricks the whole WM. On timeout, degrade to
-        // CURRENT_TIME — a possibly-ignored focus request beats a hang.
-        // Connection errors still propagate.
+        // Deadline-bounded, not an unbounded wait: if the notify is lost or
+        // the server wedges with the socket still open, blocking forever
+        // here bricks the whole WM. On timeout, degrade to CURRENT_TIME —
+        // a possibly-ignored focus request beats a hang. Connection errors
+        // still propagate.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            match self.conn.poll_for_event()? {
+            match super::wait_event_deadline(&self.conn, Some(deadline))? {
                 Some(x11rb::protocol::Event::PropertyNotify(e))
                     if e.window == self.sel_owner =>
                 {
@@ -1071,8 +1075,7 @@ impl Wm {
                     return Ok(e.time);
                 }
                 Some(ev) => self.pending_events.push(ev),
-                None if std::time::Instant::now() >= deadline => return Ok(CURRENT_TIME),
-                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                None => return Ok(CURRENT_TIME),
             }
         }
     }
@@ -1162,13 +1165,17 @@ impl Wm {
     /// the shared session scope and log a spurious UnitExists error.
     #[allow(clippy::unused_self)]
     pub(crate) fn spawn(&self, cmd: &str) {
+        // Both paths hand `cmd` to `/bin/sh -c` as one quoted word, so a
+        // command line containing `;`/`&&` behaves identically whether or
+        // not systemd-run is available (the old bare `{cmd} &` fallback
+        // backgrounded only the last statement of a compound command).
         let line = if Self::have_systemd_run() {
             format!(
                 "systemd-run --user --scope --slice=app.slice --collect --quiet -- /bin/sh -c {} &",
                 shell_quote(cmd)
             )
         } else {
-            format!("{cmd} &")
+            format!("/bin/sh -c {} &", shell_quote(cmd))
         };
         match std::process::Command::new("/bin/sh")
             .arg("-c")

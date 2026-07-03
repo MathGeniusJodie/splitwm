@@ -85,15 +85,16 @@ impl State {
             return;
         }
         self.detach(c);
+        // `detach` just cleared `c` from wherever it lived (including `dst`),
+        // so whatever still occupies `dst` cannot be `c` itself.
         let displaced = self.tree.leaf(dst).and_then(|l| l.client);
+        debug_assert_ne!(displaced, Some(c), "detach left {c:#x} in dst");
         if let Some(prev) = displaced {
-            if prev != c {
-                self.push_taskbar(prev);
-            }
+            self.push_taskbar(prev);
         }
         if let Some(l) = self.tree.leaf_mut(dst) {
             l.client = Some(c);
-            if displaced.is_some_and(|p| p != c) {
+            if displaced.is_some() {
                 l.prev = displaced;
             }
         }
@@ -649,12 +650,16 @@ impl State {
                 }
             }
         } else {
-            let branch = self.tree.make_branch(Dir::H, theme::SPLIT_RATIO, root, new);
-            if at == 0 {
-                if let Some(Node::Branch { children, .. }) = self.tree.get_mut(branch) {
-                    children.swap(0, 1);
-                }
-            }
+            // The existing content keeps the larger `SPLIT_RATIO` share on
+            // whichever side it lands; building the branch in its final
+            // order (rather than swapping children afterwards) keeps the
+            // ratios paired with the right children by construction.
+            let branch = if at == 0 {
+                self.tree
+                    .make_branch(Dir::H, 1.0 - theme::SPLIT_RATIO, new, root)
+            } else {
+                self.tree.make_branch(Dir::H, theme::SPLIT_RATIO, root, new)
+            };
             self.tree.root = branch;
         }
         self.focused_leaf = new;
@@ -720,6 +725,31 @@ mod tests {
             s.tree.get(s.tree.root),
             Some(Node::Branch { dir: Dir::H, .. })
         ));
+    }
+
+    /// Wrapping a lone leaf must keep the *existing* content on the larger
+    /// `SPLIT_RATIO` share regardless of which side the new column lands
+    /// (regression: `at == 0` swapped children but not ratios, so a
+    /// left-edge insert handed the empty column the bigger share).
+    #[test]
+    fn insert_at_root_keeps_existing_content_share_on_both_sides() {
+        for (at, existing_idx) in [(0usize, 1usize), (usize::MAX, 0usize)] {
+            let mut s = State::new();
+            let existing = s.tree.first_leaf(s.tree.root);
+            s.insert_at_root(at);
+            let (children, ratios) = match s.tree.get(s.tree.root) {
+                Some(Node::Branch {
+                    children, ratios, ..
+                }) => (children.clone(), ratios.clone()),
+                _ => panic!("root not a branch"),
+            };
+            assert_eq!(children[existing_idx], existing, "at={at}");
+            assert!(
+                (ratios[existing_idx] - theme::SPLIT_RATIO).abs() < 1e-9,
+                "at={at}: existing content got ratio {}",
+                ratios[existing_idx]
+            );
+        }
     }
 
     #[test]

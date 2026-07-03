@@ -767,11 +767,12 @@ impl Renderer {
             }
         }
         let idx: Rc<[u8]> = idx.into();
-        let mut cache = self.icon_idx_cache.borrow_mut();
-        if cache.len() >= ICON_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(key, Rc::clone(&idx));
+        insert_capped(
+            &mut self.icon_idx_cache.borrow_mut(),
+            ICON_CACHE_CAP,
+            key,
+            Rc::clone(&idx),
+        );
         idx
     }
 
@@ -813,11 +814,12 @@ impl Renderer {
             }
         }
         let ring: Rc<[bool]> = ring.into();
-        let mut cache = self.icon_ring_cache.borrow_mut();
-        if cache.len() >= ICON_CACHE_CAP {
-            cache.clear();
-        }
-        cache.insert(key, Rc::clone(&ring));
+        insert_capped(
+            &mut self.icon_ring_cache.borrow_mut(),
+            ICON_CACHE_CAP,
+            key,
+            Rc::clone(&ring),
+        );
         Some(ring)
     }
 }
@@ -832,6 +834,22 @@ const TRANSPARENT_INDEX: Index = Index::MAX;
 /// `_NET_WM_ICON` updates) then costs an occasional re-render instead of
 /// unbounded growth. Live icons repopulate on the next frame.
 const ICON_CACHE_CAP: usize = 256;
+
+/// Insert into a cache map, wholesale-clearing it first once it reaches
+/// `cap`: the shared "bounded in practice, but nothing should grow without
+/// a lid" policy of every cache here and in `menu` (entries are cheap to
+/// recompute, so occasional total eviction beats per-entry bookkeeping).
+pub(crate) fn insert_capped<K: std::hash::Hash + Eq, V>(
+    map: &mut HashMap<K, V>,
+    cap: usize,
+    key: K,
+    value: V,
+) {
+    if map.len() >= cap {
+        map.clear();
+    }
+    map.insert(key, value);
+}
 
 /// The `size`x`size` nearest-scaled opacity mask of `img` (alpha >= 50%),
 /// row-major; `None` for empty inputs.
@@ -1056,6 +1074,9 @@ impl Renderer {
         let mut fb = Framebuffer::new(w, h, palette_color::BLACK);
         let b = MENU_BORDER;
         let cw = content_w;
+        // Whether any row has an icon (labels then share one indented text
+        // column) — computed once, not per row.
+        let icon_col = icons.iter().any(Option::is_some);
         for (i, label) in labels.iter().enumerate() {
             let ry = b + i as i32 * MENU_ROW_H;
             if seps.get(i).copied().unwrap_or(false) {
@@ -1089,7 +1110,6 @@ impl Renderer {
                     palette_color::GUNMETAL,
                 );
             }
-            let icon_col = icons.iter().any(Option::is_some);
             if let Some(img) = icons.get(i).and_then(Option::as_ref) {
                 let iy = ry + (MENU_ROW_H - MENU_ICON_SZ) / 2;
                 self.draw_icon(&mut fb, img, b + MENU_PAD_X, iy, MENU_ICON_SZ);

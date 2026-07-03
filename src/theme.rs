@@ -25,61 +25,54 @@ pub mod palette_color {
     pub const BLACK: Index = 15;
 }
 
-/// Hand-picked darker counterpart for each na16 index, used to colour the
-/// window-border/button outline stroke (`palette_color::PURPLE`) a shade
-/// darker than the accent used for the fill (`palette_color::LAVENDER`) —
-/// e.g. a `ROSE` accent gets a `CRIMSON` outline. Deliberately a fixed,
-/// editable table rather than something computed from RGB distance, so the
-/// pairing can be retuned by eye.
-pub const DARKER_INDEX: [Index; 16] = [
-    palette_color::GUNMETAL, // LAVENDER
-    palette_color::PLUM,     // GUNMETAL
-    palette_color::BLACK,    // PLUM
-    palette_color::PLUM,     // BROWN
-    palette_color::BROWN,    // PEACH
-    palette_color::BROWN,    // CREAM
-    palette_color::GREEN,    // LIME
-    palette_color::PLUM,     // GREEN
-    palette_color::BROWN,    // ORANGE
-    palette_color::PLUM,     // CRIMSON
-    palette_color::CRIMSON,  // ROSE
-    palette_color::PLUM,     // PURPLE
-    palette_color::BLUE,     // CYAN
-    palette_color::PINE,     // BLUE
-    palette_color::BLACK,    // PINE
-    palette_color::BLACK,    // BLACK
+/// Hand-picked darker/lighter counterpart for each na16 colour: the darker
+/// shade colours the window-border/button outline stroke and the lighter one
+/// its highlight stroke, relative to the accent used for the fill — e.g. a
+/// `ROSE` accent gets a `CRIMSON` outline and a `PEACH` highlight.
+/// Deliberately a fixed, hand-editable table rather than something computed
+/// from RGB distance, so each pairing can be retuned by eye. Rows are
+/// `(accent, darker, lighter)` and are looked up by matching the accent, so
+/// row order doesn't matter (the old pair of parallel arrays indexed by
+/// palette position silently desynced if either was reordered).
+const SHADES: [(Index, Index, Index); 16] = [
+    (palette_color::LAVENDER, palette_color::GUNMETAL, palette_color::CREAM),
+    (palette_color::GUNMETAL, palette_color::PLUM, palette_color::LAVENDER),
+    (palette_color::PLUM, palette_color::BLACK, palette_color::PURPLE),
+    (palette_color::BROWN, palette_color::PLUM, palette_color::PEACH),
+    (palette_color::PEACH, palette_color::BROWN, palette_color::CREAM),
+    (palette_color::CREAM, palette_color::BROWN, palette_color::CREAM),
+    (palette_color::LIME, palette_color::GREEN, palette_color::CREAM),
+    (palette_color::GREEN, palette_color::PLUM, palette_color::LIME),
+    (palette_color::ORANGE, palette_color::BROWN, palette_color::CREAM),
+    (palette_color::CRIMSON, palette_color::PLUM, palette_color::ROSE),
+    (palette_color::ROSE, palette_color::CRIMSON, palette_color::PEACH),
+    (palette_color::PURPLE, palette_color::PLUM, palette_color::LAVENDER),
+    (palette_color::CYAN, palette_color::BLUE, palette_color::CREAM),
+    (palette_color::BLUE, palette_color::PINE, palette_color::CYAN),
+    (palette_color::PINE, palette_color::BLACK, palette_color::GREEN),
+    (palette_color::BLACK, palette_color::BLACK, palette_color::PLUM),
 ];
 
-pub const fn darker_index(index: Index) -> Index {
-    DARKER_INDEX[(index as usize) % DARKER_INDEX.len()]
+/// The `SHADES` row for `index`, found by matching the accent column. An
+/// index with no row (only possible if `SHADES` loses an entry) degrades to
+/// a black outline / cream highlight rather than panicking.
+const fn shade(index: Index) -> (Index, Index, Index) {
+    let mut i = 0;
+    while i < SHADES.len() {
+        if SHADES[i].0 == index {
+            return SHADES[i];
+        }
+        i += 1;
+    }
+    (index, palette_color::BLACK, palette_color::CREAM)
 }
 
-/// Hand-picked lighter counterpart for each na16 index, used to colour the
-/// window-border/button highlight stroke (`palette_color::CREAM`) a shade
-/// lighter than the accent used for the fill (`palette_color::LAVENDER`) —
-/// e.g. a `ROSE` accent gets a `PEACH` highlight, `BLUE` gets `CYAN`. Same
-/// deliberately hand-editable table as `DARKER_INDEX`, not computed.
-pub const LIGHTER_INDEX: [Index; 16] = [
-    palette_color::CREAM,    // LAVENDER
-    palette_color::LAVENDER, // GUNMETAL
-    palette_color::PURPLE,   // PLUM
-    palette_color::PEACH,    // BROWN
-    palette_color::CREAM,    // PEACH
-    palette_color::CREAM,    // CREAM
-    palette_color::CREAM,    // LIME
-    palette_color::LIME,     // GREEN
-    palette_color::CREAM,    // ORANGE
-    palette_color::ROSE,     // CRIMSON
-    palette_color::PEACH,    // ROSE
-    palette_color::LAVENDER, // PURPLE
-    palette_color::CREAM,    // CYAN
-    palette_color::CYAN,     // BLUE
-    palette_color::GREEN,    // PINE
-    palette_color::PLUM,     // BLACK
-];
+pub const fn darker_index(index: Index) -> Index {
+    shade(index).1
+}
 
 pub const fn lighter_index(index: Index) -> Index {
-    LIGHTER_INDEX[(index as usize) % LIGHTER_INDEX.len()]
+    shade(index).2
 }
 
 // --- metrics (rc.lua overrides applied) ---
@@ -305,3 +298,21 @@ pub const QUICK: &[Quick] = &[
         default: "claude-desktop",
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every na16 palette index must have exactly one `SHADES` row, so no
+    /// accent silently falls through to `shade`'s fallback.
+    #[test]
+    fn shades_cover_every_palette_index_once() {
+        for i in 0..16u8 {
+            assert_eq!(
+                SHADES.iter().filter(|s| s.0 == i).count(),
+                1,
+                "palette index {i} must have exactly one SHADES row"
+            );
+        }
+    }
+}

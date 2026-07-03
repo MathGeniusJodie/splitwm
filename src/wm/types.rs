@@ -25,88 +25,53 @@ pub type R<T> = Result<T, Box<dyn std::error::Error>>;
 // rest of `wm` keeps its existing imports.
 pub use crate::theme::{Action, MOD4};
 
-/// Interned atoms used for ICCCM/EWMH interop, fetched once at startup.
-pub struct Atoms {
-    pub wm_protocols: Atom,
-    pub wm_delete_window: Atom,
-    pub wm_state: Atom,
-    pub net_wm_icon: Atom,
-    pub net_supported: Atom,
-    pub net_client_list: Atom,
-    pub net_active_window: Atom,
-    pub net_supporting_wm_check: Atom,
-    pub net_wm_name: Atom,
-    pub net_wm_window_type: Atom,
-    pub net_wm_window_type_notification: Atom,
-    pub net_wm_window_type_dialog: Atom,
-    pub net_wm_state: Atom,
-    pub net_wm_state_fullscreen: Atom,
-    pub net_workarea: Atom,
-    pub net_number_of_desktops: Atom,
-    pub net_current_desktop: Atom,
-    pub wm_take_focus: Atom,
-    pub utf8_string: Atom,
-    /// Wakeup ClientMessage type from the notification-daemon thread (see
-    /// `crate::notify`): "drain the note channel and update popups".
-    pub splitwm_note: Atom,
+/// Declare the `Atoms` struct and its `intern`: each field is written next
+/// to the atom name it holds, so the pairing is checked by construction —
+/// the old positional array + destructuring pattern compiled fine when the
+/// two lists drifted out of order, silently binding fields to wrong atoms.
+macro_rules! atoms {
+    ($($(#[$doc:meta])* $field:ident => $name:expr,)+) => {
+        /// Interned atoms used for ICCCM/EWMH interop, fetched once at startup.
+        pub struct Atoms {
+            $($(#[$doc])* pub $field: Atom,)+
+        }
+
+        impl Atoms {
+            pub fn intern(conn: &RustConnection) -> R<Self> {
+                // Send every InternAtom before reading any reply, so
+                // interning costs one round trip instead of one per atom.
+                $(let $field = conn.intern_atom(false, $name)?;)+
+                Ok(Self {
+                    $($field: $field.reply()?.atom,)+
+                })
+            }
+        }
+    };
 }
 
-impl Atoms {
-    pub fn intern(conn: &RustConnection) -> R<Self> {
-        // Send every InternAtom before reading any reply, so interning costs
-        // one round trip instead of ten.
-        let names: [&[u8]; 20] = [
-            b"WM_PROTOCOLS",
-            b"WM_DELETE_WINDOW",
-            b"WM_STATE",
-            b"_NET_WM_ICON",
-            b"_NET_SUPPORTED",
-            b"_NET_CLIENT_LIST",
-            b"_NET_ACTIVE_WINDOW",
-            b"_NET_SUPPORTING_WM_CHECK",
-            b"_NET_WM_NAME",
-            b"_NET_WM_WINDOW_TYPE",
-            b"_NET_WM_WINDOW_TYPE_NOTIFICATION",
-            b"_NET_WM_WINDOW_TYPE_DIALOG",
-            b"_NET_WM_STATE",
-            b"_NET_WM_STATE_FULLSCREEN",
-            b"_NET_WORKAREA",
-            b"_NET_NUMBER_OF_DESKTOPS",
-            b"_NET_CURRENT_DESKTOP",
-            b"WM_TAKE_FOCUS",
-            b"UTF8_STRING",
-            crate::notify::PING_ATOM.as_bytes(),
-        ];
-        let cookies = names.map(|n| conn.intern_atom(false, n));
-        let mut atoms = [0 as Atom; 20];
-        for (slot, cookie) in atoms.iter_mut().zip(cookies) {
-            *slot = cookie?.reply()?.atom;
-        }
-        let [wm_protocols, wm_delete_window, wm_state, net_wm_icon, net_supported, net_client_list, net_active_window, net_supporting_wm_check, net_wm_name, net_wm_window_type, net_wm_window_type_notification, net_wm_window_type_dialog, net_wm_state, net_wm_state_fullscreen, net_workarea, net_number_of_desktops, net_current_desktop, wm_take_focus, utf8_string, splitwm_note] =
-            atoms;
-        Ok(Self {
-            wm_protocols,
-            wm_delete_window,
-            wm_state,
-            net_wm_icon,
-            net_supported,
-            net_client_list,
-            net_active_window,
-            net_supporting_wm_check,
-            net_wm_name,
-            net_wm_window_type,
-            net_wm_window_type_notification,
-            net_wm_window_type_dialog,
-            net_wm_state,
-            net_wm_state_fullscreen,
-            net_workarea,
-            net_number_of_desktops,
-            net_current_desktop,
-            wm_take_focus,
-            utf8_string,
-            splitwm_note,
-        })
-    }
+atoms! {
+    wm_protocols => b"WM_PROTOCOLS",
+    wm_delete_window => b"WM_DELETE_WINDOW",
+    wm_state => b"WM_STATE",
+    net_wm_icon => b"_NET_WM_ICON",
+    net_supported => b"_NET_SUPPORTED",
+    net_client_list => b"_NET_CLIENT_LIST",
+    net_active_window => b"_NET_ACTIVE_WINDOW",
+    net_supporting_wm_check => b"_NET_SUPPORTING_WM_CHECK",
+    net_wm_name => b"_NET_WM_NAME",
+    net_wm_window_type => b"_NET_WM_WINDOW_TYPE",
+    net_wm_window_type_notification => b"_NET_WM_WINDOW_TYPE_NOTIFICATION",
+    net_wm_window_type_dialog => b"_NET_WM_WINDOW_TYPE_DIALOG",
+    net_wm_state => b"_NET_WM_STATE",
+    net_wm_state_fullscreen => b"_NET_WM_STATE_FULLSCREEN",
+    net_workarea => b"_NET_WORKAREA",
+    net_number_of_desktops => b"_NET_NUMBER_OF_DESKTOPS",
+    net_current_desktop => b"_NET_CURRENT_DESKTOP",
+    wm_take_focus => b"WM_TAKE_FOCUS",
+    utf8_string => b"UTF8_STRING",
+    /// Wakeup ClientMessage type from the notification-daemon thread (see
+    /// `crate::notify`): "drain the note channel and update popups".
+    splitwm_note => crate::notify::PING_ATOM.as_bytes(),
 }
 
 pub struct Client {
@@ -274,8 +239,9 @@ pub struct Wm {
     pub hscroll: Vec<HScroll>,
     /// Cached result of the last "is scrolling allowed here" pointer query
     /// and when it was taken, so a fast scroll burst doesn't force a
-    /// `QueryPointer` round trip for every single event.
-    pub hscroll_gate: (std::time::Instant, bool),
+    /// `QueryPointer` round trip for every single event. `None` until the
+    /// first query.
+    pub hscroll_gate: Option<(std::time::Instant, bool)>,
     /// Per-window count of `UnmapNotify` events we caused ourselves (layout
     /// hiding a client) and must swallow; any unmap beyond the count is the
     /// client withdrawing itself (ICCCM) and unmanages it.

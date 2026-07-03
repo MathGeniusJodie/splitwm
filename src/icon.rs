@@ -99,6 +99,20 @@ fn map_argb(icon: &Icon, f: impl Fn(u32) -> u32) -> Icon {
     Icon::new(icon.w, icon.h, icon.argb.iter().map(|&px| f(px)).collect())
 }
 
+fn quantize_argb(palette: &Palette, px: u32) -> u32 {
+    let a = px >> 24;
+    if a == 0 {
+        return px;
+    }
+    let rgb = Rgb {
+        r: ((px >> 16) & 0xff) as u8,
+        g: ((px >> 8) & 0xff) as u8,
+        b: (px & 0xff) as u8,
+    };
+    let snapped = palette.color(palette.nearest_index(rgb));
+    (a << 24) | (u32::from(snapped.r) << 16) | (u32::from(snapped.g) << 8) | u32::from(snapped.b)
+}
+
 #[cfg(test)]
 mod tests {
     use super::png_declared_dims;
@@ -120,18 +134,4 @@ mod tests {
         bytes.extend(32u32.to_be_bytes());
         assert_eq!(png_declared_dims(&bytes), Some((16, 32)));
     }
-}
-
-fn quantize_argb(palette: &Palette, px: u32) -> u32 {
-    let a = px >> 24;
-    if a == 0 {
-        return px;
-    }
-    let rgb = Rgb {
-        r: ((px >> 16) & 0xff) as u8,
-        g: ((px >> 8) & 0xff) as u8,
-        b: (px & 0xff) as u8,
-    };
-    let snapped = palette.color(palette.nearest_index(rgb));
-    (a << 24) | (u32::from(snapped.r) << 16) | (u32::from(snapped.g) << 8) | u32::from(snapped.b)
 }

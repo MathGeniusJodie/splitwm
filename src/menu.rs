@@ -230,12 +230,12 @@ pub fn find_icon_file(icon: &str) -> Option<std::path::PathBuf> {
     let mut cache = cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Same wholesale-clear-at-cap policy as the renderer's icon caches:
-    // bounded in practice, but nothing here should grow without a lid.
-    if cache.len() >= 1024 {
-        cache.clear();
-    }
-    cache.insert(icon.to_string(), (found.clone(), std::time::Instant::now()));
+    crate::render::insert_capped(
+        &mut cache,
+        1024,
+        icon.to_string(),
+        (found.clone(), std::time::Instant::now()),
+    );
     found
 }
 
