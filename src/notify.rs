@@ -41,9 +41,12 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 /// stay coherent.
 pub const MAX_NOTES: usize = 8;
 
-/// Freedesktop `NotificationClosed` reasons the WM reports back over the
-/// dismiss channel (the daemon relays them onto the bus verbatim).
+/// Freedesktop `NotificationClosed` reasons. The daemon emits
+/// expired/closed itself; dismissed/undefined are reported by the WM over
+/// the dismiss channel and relayed onto the bus verbatim.
+pub const CLOSE_REASON_EXPIRED: u32 = 1; // expire_timeout elapsed
 pub const CLOSE_REASON_DISMISSED: u32 = 2; // dismissed by the user (click)
+pub const CLOSE_REASON_CLOSED: u32 = 3; // closed by a CloseNotification call
 pub const CLOSE_REASON_UNDEFINED: u32 = 4; // evicted for space; no exact fit
 
 pub struct Note {
@@ -115,11 +118,20 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
     let (xc, screen) = x11rb::connect(None)?;
     let root = xc.setup().roots[screen].root;
     let ping_atom = xc.intern_atom(false, PING_ATOM.as_bytes())?.reply()?.atom;
-    let ping = |()| -> R<()> {
-        let ev = ClientMessageEvent::new(32, root, ping_atom, [0u32; 5]);
-        xc.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT, ev)?;
-        xc.flush()?;
-        Ok(())
+    // Best-effort: the ping only wakes the WM's blocking event loop early —
+    // a transient send failure must not kill the daemon thread (the WM still
+    // drains the channel on its next wakeup), so log and continue, matching
+    // `emit_closed`'s policy.
+    let ping = || {
+        let sent = (|| -> R<()> {
+            let ev = ClientMessageEvent::new(32, root, ping_atom, [0u32; 5]);
+            xc.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT, ev)?;
+            xc.flush()?;
+            Ok(())
+        })();
+        if let Err(e) = sent {
+            eprintln!("splitwm: failed to ping the WM event loop: {e}");
+        }
     };
 
     let conn = match connect_bus() {
@@ -133,7 +145,7 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
                 body: format!("splitwm could not become the notification daemon: {e}"),
                 urgency: 2,
             }));
-            let _ = ping(());
+            ping();
             return Err(e);
         }
     };
@@ -175,8 +187,8 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
             to_wm
                 .send(NoteMsg::Close(id))
                 .map_err(|_| "wm channel closed")?;
-            emit_closed(conn.channel(), id, 1); // 1 = expired
-            ping(())?;
+            emit_closed(conn.channel(), id, CLOSE_REASON_EXPIRED);
+            ping();
         }
 
         // Sleep until the next expiry, but never so long that a dismissal
@@ -239,31 +251,39 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
                         .send(NoteMsg::Close(evict))
                         .map_err(|_| "wm channel closed")?;
                     // No spec reason fits "evicted for space" exactly;
-                    // 4 = "undefined/reserved" is the closest fit.
-                    emit_closed(conn.channel(), evict, 4);
+                    // undefined/reserved is the closest fit.
+                    emit_closed(conn.channel(), evict, CLOSE_REASON_UNDEFINED);
                 }
                 to_wm
                     .send(NoteMsg::Show(note))
                     .map_err(|_| "wm channel closed")?;
-                ping(())?;
+                ping();
                 reply(conn.channel(), msg.method_return().append1(id))?;
             }
             Some("CloseNotification") => {
-                if let Ok(id) = msg.read1::<u32>() {
-                    // Only act/signal for ids that are actually still
-                    // outstanding — closing an already-gone id shouldn't
-                    // emit a spurious NotificationClosed.
-                    if order.contains(&id) {
+                // The spec requires an error reply when the id doesn't name
+                // an outstanding notification — success would also make the
+                // daemon emit a spurious NotificationClosed.
+                match msg.read1::<u32>() {
+                    Ok(id) if order.contains(&id) => {
                         expiries.remove(&id);
                         order.retain(|&o| o != id);
                         to_wm
                             .send(NoteMsg::Close(id))
                             .map_err(|_| "wm channel closed")?;
-                        emit_closed(conn.channel(), id, 3); // 3 = closed by call
-                        ping(())?;
+                        emit_closed(conn.channel(), id, CLOSE_REASON_CLOSED);
+                        ping();
+                        reply(conn.channel(), msg.method_return())?;
                     }
+                    _ => reply(
+                        conn.channel(),
+                        msg.error(
+                            &"org.freedesktop.Notifications.Error.InvalidId".into(),
+                            &std::ffi::CString::new("no such notification")
+                                .expect("static string has no NUL"),
+                        ),
+                    )?,
                 }
-                reply(conn.channel(), msg.method_return())?;
             }
             Some("GetCapabilities") => {
                 reply(conn.channel(), msg.method_return().append1(vec!["body"]))?;
@@ -312,6 +332,11 @@ fn parse_notify(
     let hints: PropMap = it.read().ok()?;
     let timeout: i32 = it.read().ok()?;
 
+    // Ownership is keyed by the bus *unique* name: an app that drops off
+    // the bus and reconnects gets a new unique name, so it cannot replace
+    // its own still-live notification — its replaces_id is treated as a
+    // new notification. Accepted: the alternative (matching on well-known
+    // names or app_name) would reopen the spoofing hole this check closes.
     let id = if replaces != 0
         && outstanding.contains(&replaces)
         && owners.get(&replaces).is_some_and(|o| o == sender)
@@ -362,30 +387,55 @@ fn reply(ch: &Channel, msg: Message) -> R<()> {
 /// drop tags and decode the standard entities.
 fn strip_markup(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    // A '<' only opens a tag if *its own* '>' arrives before any other '<'
-    // and the content looks like a tag ("<b>", "</a>", "<a href=...>") —
-    // plain text like "1 < 2 > 3" or "<3" must pass through literally.
-    // Each candidate span is consumed at most once, so this stays O(n)
-    // even on hostile input (this is an unauthenticated D-Bus endpoint).
+    // A '<' only opens a tag if it is followed by tag-shaped content
+    // ("<b>", "</a>", "<a href=...>") closed by a '>' outside any quoted
+    // attribute value, before any unquoted '<' — plain text like
+    // "1 < 2 > 3" or "<3" must pass through literally, and a '>' inside a
+    // quoted attribute value (href="a>b") does not end the tag. The
+    // tag-shape check on the first character bounds the quote-aware scan
+    // to genuine tag candidates, so hostile input (this is an
+    // unauthenticated D-Bus endpoint) stays O(n) in practice.
     let mut i = 0;
     while i < s.len() {
         let rest = &s[i..];
         let c = rest.chars().next().expect("i is on a char boundary");
         if c == '<' {
-            if let Some(rel) = rest[1..].find(['<', '>']) {
-                let inner = &rest[1..1 + rel];
-                if rest.as_bytes()[1 + rel] == b'>'
-                    && inner.starts_with(|c: char| c.is_ascii_alphabetic() || c == '/')
-                {
-                    i += 1 + rel + 1; // skip the whole tag
-                    continue;
-                }
+            if let Some(end) = tag_end(&rest[1..]) {
+                i += 1 + end + 1; // skip the whole tag
+                continue;
             }
         }
         out.push(c);
         i += c.len_utf8();
     }
     decode_entities(&out)
+}
+
+/// Byte offset (within `inner`, the text after a '<') of the '>' closing a
+/// tag-shaped span, or `None` when the span isn't a tag: content must start
+/// like a tag name, and the '>' must come before any '<', ignoring both
+/// characters inside single- or double-quoted attribute values.
+fn tag_end(inner: &str) -> Option<usize> {
+    if !inner.starts_with(|c: char| c.is_ascii_alphabetic() || c == '/') {
+        return None;
+    }
+    let mut quote: Option<u8> = None;
+    for (j, &b) in inner.as_bytes().iter().enumerate() {
+        match quote {
+            Some(q) => {
+                if b == q {
+                    quote = None;
+                }
+            }
+            None => match b {
+                b'"' | b'\'' => quote = Some(b),
+                b'>' => return Some(j),
+                b'<' => return None,
+                _ => {}
+            },
+        }
+    }
+    None
 }
 
 /// The character a spec entity name (between `&` and `;`) stands for: the
@@ -478,6 +528,16 @@ mod tests {
         assert_eq!(strip_markup("see a<3 b>4 lol"), "see a<3 b>4 lol");
         assert_eq!(strip_markup("x <- y -> z"), "x <- y -> z");
         assert_eq!(strip_markup("<b>1<2</b>"), "1<2");
+    }
+
+    #[test]
+    fn gt_inside_quoted_attribute_does_not_end_the_tag() {
+        assert_eq!(strip_markup(r#"<a href="x>y">link</a>"#), "link");
+        assert_eq!(strip_markup("<a title='a>b'>t</a>"), "t");
+        // A quote of the other kind inside a quoted value is plain data.
+        assert_eq!(strip_markup(r#"<a title="it's>fine">t</a>"#), "t");
+        // An unterminated quoted value never closes: not a tag.
+        assert_eq!(strip_markup(r#"<a href=" oops"#), r#"<a href=" oops"#);
     }
 
     #[test]
