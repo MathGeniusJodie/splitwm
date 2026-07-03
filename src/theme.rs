@@ -1,4 +1,5 @@
-//! Resolved colors and layout metrics, ported from splitwm/theme.lua + rc.lua.
+//! Resolved colors, layout metrics, and keyboard configuration — everything
+//! a user might retune lives here rather than in `wm`.
 
 use crate::Index;
 
@@ -75,8 +76,11 @@ pub const fn lighter_index(index: Index) -> Index {
     shade(index).2
 }
 
-// --- metrics (rc.lua overrides applied) ---
-pub const GAP: i32 = 20; // beautiful.splitwm_gap
+// --- metrics ---
+
+/// Margin between splits (and around the canvas); also the width of the
+/// gap drag handles.
+pub const GAP: i32 = 20;
 
 // Bitmap window-border 9-slice insets, at winborder.png's native resolution
 // (drawn 1:1, one image pixel per screen pixel).

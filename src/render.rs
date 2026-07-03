@@ -191,7 +191,7 @@ struct NineSlice {
 }
 
 impl NineSlice {
-    /// The reference art bakes decorative close/minimize/etc. icons into the
+    /// The border art bakes decorative close/minimize/etc. icons into the
     /// titlebar band (around native x=191..249); real buttons draw on top of
     /// those positions separately, so the top/bottom edges' stretchable strip
     /// is sampled from an icon-free column range instead of the full span

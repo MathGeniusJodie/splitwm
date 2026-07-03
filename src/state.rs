@@ -1,6 +1,5 @@
-//! Layout state plus every mutation of the split tree / tab stacks —
-//! there is exactly one layout (no workspaces/tags).
-//! Combines splitwm core.lua + ops.lua + scroll bookkeeping.
+//! Layout state plus every mutation of the split tree / tab stacks and the
+//! scroll bookkeeping — there is exactly one layout (no workspaces/tags).
 
 use crate::theme;
 use crate::tree::{Boundary, Dir, Node, NodeId, Rect, Tree, Win};

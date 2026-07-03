@@ -1,4 +1,4 @@
-//! Pure split-tree math, ported from splitwm/tree.lua.
+//! Pure split-tree math.
 //!
 //! Splits form an n-ary tree (horizontal branches are n-ary, vertical too).
 //! Each leaf owns a tab stack of client windows. Nodes live in an arena keyed

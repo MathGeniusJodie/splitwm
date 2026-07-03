@@ -1,7 +1,7 @@
 //! Application launcher menu: scans freedesktop `.desktop` entries and groups
-//! them into the same category structure the reference's `menu.lua` builds, so
-//! clicking a leaf's "+" opens a cascading app menu (quick items + category
-//! submenus). Pure data + layout; the X windows and rendering live in `wm`.
+//! them by main category, so clicking a leaf's "+" opens a cascading app menu
+//! (quick items + category submenus). Pure data + layout; the X windows and
+//! rendering live in `wm`.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -75,7 +75,7 @@ pub struct MenuTree {
     pub subs: Vec<Menu>,
 }
 
-/// freedesktop main-category → display name, in the reference's sorted order.
+/// freedesktop main-category → display name, in display order.
 const CATEGORIES: &[(&str, &str)] = &[
     ("AudioVideo", "AudioVideo"),
     ("Development", "Development"),

@@ -947,7 +947,7 @@ impl Wm {
 
     /// Rescan every input device for a horizontal scroll valuator. Run once
     /// at startup and again on every `XI_HierarchyChanged` (device
-    /// plug/unplug), mirroring scrollpipe.c's `build_map`.
+    /// plug/unplug).
     pub(crate) fn build_hscroll_map(&mut self) -> R<()> {
         let reply = self.conn.xinput_xi_query_device(XI_ALL_DEVICES)?.reply()?;
         self.hscroll.clear();

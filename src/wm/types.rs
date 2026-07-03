@@ -110,8 +110,8 @@ impl From<&str> for WmError {
 }
 
 // Keyboard configuration (keysyms, actions, the binding table) lives in
-// `theme` with the rest of the user-tunable config; re-exported here so the
-// rest of `wm` keeps its existing imports.
+// `theme` with the rest of the user-tunable config; re-exported here so
+// `wm` code imports it alongside the other shared types.
 pub use crate::theme::{Action, MOD4};
 
 /// Declare the `Atoms` struct and its `intern`: each field is written next
@@ -583,7 +583,7 @@ pub struct Placement {
     pub focused: bool,
 }
 
-/// ease-out-back (slight overshoot then settle), matching animation.lua.
+/// ease-out-back: slight overshoot past the target, then settle.
 pub fn ease_out_back(t: f32) -> f32 {
     let c = 1.1_f32;
     let t = t - 1.0;
