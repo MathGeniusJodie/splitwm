@@ -335,10 +335,12 @@ pub struct Wm {
     /// `QueryPointer` round trip for every single event. `None` until the
     /// first query.
     pub hscroll_gate: Option<(std::time::Instant, bool)>,
-    /// Per-window count of `UnmapNotify` events we caused ourselves (layout
-    /// hiding a client) and must swallow; any unmap beyond the count is the
-    /// client withdrawing itself (ICCCM) and unmanages it.
-    pub ignore_unmaps: HashMap<Win, u32>,
+    /// Per-window (u16-truncated) sequence numbers of `UnmapWindow` requests
+    /// we issued ourselves (layout hiding a client), so `on_unmap` can match
+    /// the resulting `UnmapNotify` by sequence and swallow it; any unmap
+    /// with no matching record is the client withdrawing itself (ICCCM) and
+    /// unmanages it.
+    pub ignore_unmaps: HashMap<Win, Vec<u16>>,
     /// The managed client currently in EWMH fullscreen
     /// (`_NET_WM_STATE_FULLSCREEN`), if any: covers the whole workarea above
     /// every tiled client and float. Its split slot is kept, so leaving

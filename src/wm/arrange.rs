@@ -32,7 +32,6 @@ impl Wm {
             0
         };
         self.state.update_canvas(wa, dock_extra);
-        let canvas_w = self.state.canvas_w(wa);
 
         let leaves = self.state.tree.collect_leaves();
         let geos = self.state.compute(wa);
@@ -114,35 +113,14 @@ impl Wm {
             self.compose(wa, &placed, true)?;
         }
         self.place_clients(&placed)?;
-        self.place_dock(wa, canvas_w)?;
+        self.place_dock()?;
         // place_clients/place_dock raise their windows to the top; keep
-        // floats above tiled clients, notifications above those, and an open
-        // launcher menu above everything (an arrange can be triggered while
-        // it's open).
+        // floats above tiled clients, fullscreen above those, notifications
+        // above that, and an open launcher menu above everything (an arrange
+        // can be triggered while it's open). `Wm::focus` re-applies the same
+        // raise order after its own raises.
         self.raise_floats()?;
-        // Fullscreen covers floats too; only notifications and the menu stay
-        // above it. A fullscreen *float* also gets its full-workarea
-        // geometry re-pinned here (its frame stays unmapped; `raise_floats`
-        // above may have restacked the pair, so re-raise the client last).
-        if let Some(fs) = self.fullscreen {
-            if self.clients.contains_key(&fs) {
-                self.conn.configure_window(
-                    fs,
-                    &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-                )?;
-            } else if self.floats.iter().any(|f| f.win == fs) {
-                let full = self.wa();
-                self.conn.configure_window(
-                    fs,
-                    &ConfigureWindowAux::new()
-                        .x(full.x)
-                        .y(full.y)
-                        .width(clamp_dim(full.w.max(1)))
-                        .height(clamp_dim(full.h.max(1)))
-                        .stack_mode(StackMode::ABOVE),
-                )?;
-            }
-        }
+        self.raise_fullscreen()?;
         self.raise_notifications()?;
         self.raise_menu()?;
 
@@ -372,13 +350,7 @@ impl Wm {
                 )?;
                 self.conn.map_window(c)?;
                 visible.insert(c);
-                let newly_mapped = self
-                    .clients
-                    .get_mut(&c)
-                    .is_some_and(|cl| !std::mem::replace(&mut cl.mapped, true));
-                if newly_mapped {
-                    self.set_wm_state(c, WM_STATE_NORMAL)?;
-                }
+                self.note_mapped(c)?;
             }
         }
         // The fullscreen client covers the whole workarea above every tiled
@@ -399,13 +371,7 @@ impl Wm {
             )?;
             self.conn.map_window(fs)?;
             visible.insert(fs);
-            let newly_mapped = self
-                .clients
-                .get_mut(&fs)
-                .is_some_and(|cl| !std::mem::replace(&mut cl.mapped, true));
-            if newly_mapped {
-                self.set_wm_state(fs, WM_STATE_NORMAL)?;
-            }
+            self.note_mapped(fs)?;
         }
         let to_hide: Vec<Win> = self
             .clients
@@ -414,12 +380,58 @@ impl Wm {
             .map(|(&w, _)| w)
             .collect();
         for w in to_hide {
-            *self.ignore_unmaps.entry(w).or_insert(0) += 1;
-            self.conn.unmap_window(w)?;
+            // Record the unmap request's sequence number so `on_unmap` can
+            // recognise the resulting UnmapNotify as self-inflicted.
+            let cookie = self.conn.unmap_window(w)?;
+            self.ignore_unmaps
+                .entry(w)
+                .or_default()
+                .push(cookie.sequence_number() as u16);
             if let Some(cl) = self.clients.get_mut(&w) {
                 cl.mapped = false;
             }
             self.set_wm_state(w, WM_STATE_ICONIC)?;
+        }
+        Ok(())
+    }
+
+    /// Record that `win` is mapped, setting the ICCCM `WM_STATE` to Normal
+    /// on the unmapped -> mapped edge (per-transition, not per-arrange).
+    fn note_mapped(&mut self, win: Win) -> R<()> {
+        let newly_mapped = self
+            .clients
+            .get_mut(&win)
+            .is_some_and(|cl| !std::mem::replace(&mut cl.mapped, true));
+        if newly_mapped {
+            self.set_wm_state(win, WM_STATE_NORMAL)?;
+        }
+        Ok(())
+    }
+
+    /// Re-raise the fullscreen window (if any) above tiled clients and
+    /// floats; only notifications and the menu stay above it. A fullscreen
+    /// *float* also gets its full-workarea geometry re-pinned here (its
+    /// frame stays unmapped; `raise_floats` may have restacked the pair, so
+    /// the client is re-raised last). Callers raise notifications/menu after
+    /// this, completing the stacking policy `arrange` establishes.
+    pub(crate) fn raise_fullscreen(&self) -> R<()> {
+        let Some(fs) = self.fullscreen else {
+            return Ok(());
+        };
+        if self.clients.contains_key(&fs) {
+            self.conn
+                .configure_window(fs, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        } else if self.floats.iter().any(|f| f.win == fs) {
+            let full = self.wa();
+            self.conn.configure_window(
+                fs,
+                &ConfigureWindowAux::new()
+                    .x(full.x)
+                    .y(full.y)
+                    .width(clamp_dim(full.w.max(1)))
+                    .height(clamp_dim(full.h.max(1)))
+                    .stack_mode(StackMode::ABOVE),
+            )?;
         }
         Ok(())
     }
@@ -439,22 +451,33 @@ impl Wm {
         theme::DOCK_OVERLAP.min(self.dock.w)
     }
 
-    fn place_dock(&self, wa: Rect, canvas_w: i32) -> R<()> {
+    /// The dock's pinned screen geometry `(x, y, w, h)`: parked at the right
+    /// end of the tiling canvas, tucked `dock_overlap` px under it, shifted
+    /// by the current scroll like any other leaf. Full monitor height, not
+    /// `la()`'s (which is trimmed for the bottom taskbar) — the dock spans
+    /// the entire screen, overlapping the taskbar strip in its column. The
+    /// single formula behind `place_dock` (configuring) and
+    /// `tracked_geometry` (answering denied ConfigureRequests).
+    pub(crate) fn dock_geometry(&self) -> (i32, i32, i32, i32) {
+        let wa = self.la();
+        let full = self.wa();
+        let canvas_w = self.state.canvas_w(wa);
+        let x = wa.x + canvas_w - self.dock_overlap() - self.state.scroll_x();
+        (x, full.y, self.dock.w.max(1), full.h.max(1))
+    }
+
+    fn place_dock(&self) -> R<()> {
         let Some(win) = self.dock.win else {
             return Ok(());
         };
-        // Full monitor height, not `la()`'s (which is trimmed for the
-        // bottom taskbar) — the dock spans the entire screen, overlapping
-        // the taskbar strip in its column.
-        let full = self.wa();
-        let x = wa.x + canvas_w - self.dock_overlap() - self.state.scroll_x();
+        let (x, y, w, h) = self.dock_geometry();
         self.conn.configure_window(
             win,
             &ConfigureWindowAux::new()
                 .x(x)
-                .y(full.y)
-                .width(clamp_dim(self.dock.w))
-                .height(clamp_dim(full.h.max(1)))
+                .y(y)
+                .width(clamp_dim(w))
+                .height(clamp_dim(h))
                 .border_width(0)
                 .sibling(self.underlay)
                 .stack_mode(StackMode::ABOVE),

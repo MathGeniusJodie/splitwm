@@ -300,7 +300,9 @@ impl Wm {
                 self.on_note_ping()?;
             }
             // EWMH fullscreen request (data32: [action, prop1, prop2, ..]).
-            Event::ClientMessage(e) if e.type_ == self.atoms.net_wm_state => {
+            // The spec mandates format 32; a malformed 8/16-format message
+            // must not have its bytes reinterpreted as data32 words.
+            Event::ClientMessage(e) if e.type_ == self.atoms.net_wm_state && e.format == 32 => {
                 let d = e.data.as_data32();
                 let fs = self.atoms.net_wm_state_fullscreen;
                 if d[1] == fs || d[2] == fs {
@@ -349,24 +351,8 @@ impl Wm {
             if u16::from(e.value_mask) & u16::from(ConfigWindow::HEIGHT) != 0 {
                 f.h = i32::from(e.height).max(1);
             }
-            let (bw, tb) = Self::float_insets();
             let (frame, w, h, x, y) = (f.frame, f.w, f.h, f.x, f.y);
-            self.conn.configure_window(
-                e.window,
-                &ConfigureWindowAux::new()
-                    .x(x)
-                    .y(y)
-                    .width(clamp_dim(w))
-                    .height(clamp_dim(h)),
-            )?;
-            self.conn.configure_window(
-                frame,
-                &ConfigureWindowAux::new()
-                    .x(x - bw)
-                    .y(y - tb)
-                    .width(clamp_dim(w + 2 * bw))
-                    .height(clamp_dim(h + tb + bw)),
-            )?;
+            self.configure_float_frame(e.window, frame, x, y, w, h)?;
             self.paint_float_frame(frame)?;
             return Ok(());
         }
@@ -438,11 +424,7 @@ impl Wm {
     /// pinned column. `None` for anything else (hidden clients, unknowns).
     fn tracked_geometry(&self, win: Win) -> Option<(i32, i32, i32, i32)> {
         if self.dock.win == Some(win) {
-            let wa = self.la();
-            let full = self.wa();
-            let canvas_w = self.state.canvas_w(wa);
-            let x = wa.x + canvas_w - self.dock_overlap() - self.state.scroll_x();
-            return Some((x, full.y, self.dock.w.max(1), full.h.max(1)));
+            return Some(self.dock_geometry());
         }
         if self.fullscreen == Some(win) {
             let full = self.wa();
@@ -594,12 +576,27 @@ impl Wm {
             return Ok(());
         }
         let win = e.window;
-        if let Some(n) = self.ignore_unmaps.get_mut(&win) {
-            *n -= 1;
-            if *n == 0 {
+        if let Some(seqs) = self.ignore_unmaps.get_mut(&win) {
+            // A self-inflicted UnmapNotify carries the sequence number of
+            // the UnmapWindow request that caused it, so it is matched by
+            // sequence rather than merely counted: an unmap the WM issues
+            // for a window the client has just withdrawn generates no event
+            // (already unmapped), and a bare counter would swallow the
+            // client's own withdraw notification in its place. Records with
+            // sequences at or behind this event (modular u16 comparison)
+            // are pruned — their events either just matched or will never
+            // arrive. Residual race: sequence numbers on the wire are u16,
+            // so a record could alias a withdraw issued exactly 65536
+            // requests later; pruning keeps records too short-lived for
+            // that in practice.
+            let matched = seqs.iter().any(|&s| s == e.sequence);
+            seqs.retain(|&s| s.wrapping_sub(e.sequence) < 0x8000 && s != e.sequence);
+            if seqs.is_empty() {
                 self.ignore_unmaps.remove(&win);
             }
-            return Ok(());
+            if matched {
+                return Ok(());
+            }
         }
         if self.dock.win == Some(win) {
             self.dock.win = None;

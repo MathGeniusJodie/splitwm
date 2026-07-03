@@ -108,7 +108,7 @@ impl Wm {
     }
 
     /// Start managing `win`. `already_mapped` distinguishes adopted
-    /// already-viewable windows (whose next unmap by us must be counted in
+    /// already-viewable windows (whose next unmap by us must be recorded in
     /// `ignore_unmaps`, and whose arrange/focus work is batched by
     /// `manage_existing_windows`) from fresh `MapRequest`s that are not yet
     /// mapped.
@@ -172,10 +172,15 @@ impl Wm {
         // after the loop — once for all adopted windows.
         if !already_mapped {
             self.update_client_list()?;
-            self.arrange()?;
-            self.focus(Some(win))?;
-            // arrange() has mapped it (or left it hidden); record the ICCCM
-            // state.
+            // The full layout epilogue, not a bare arrange: the focused leaf
+            // may be scrolled out of view, and only `commit_layout`'s
+            // ensure_in_view/land_scroll brings it (and the new window) back
+            // into the viewport where place_clients maps it. A new window
+            // takes the keyboard, so any focused dialog yields it first.
+            self.focused_float = None;
+            self.commit_layout()?;
+            // The arrange has mapped it (or left it hidden); record the
+            // ICCCM state.
             self.sync_wm_state(win)?;
         }
         // EWMH allows requesting fullscreen by setting the property before
@@ -204,9 +209,12 @@ impl Wm {
         self.dock.w = width.max(1);
 
         self.select_and_grab(win, EventMask::STRUCTURE_NOTIFY, true)?;
+        // The dock is a mapped managed client too: give it the ICCCM
+        // WM_STATE some toolkits misbehave without (see `set_wm_state`).
+        self.set_wm_state(win, WM_STATE_NORMAL)?;
 
-        // arrange() calls place_dock() with the freshly computed workarea
-        // and canvas width, so no separate initial placement is needed here.
+        // arrange() calls place_dock() against the freshly computed canvas,
+        // so no separate initial placement is needed here.
         self.arrange()?;
         self.conn.flush()?;
         Ok(())
@@ -372,15 +380,7 @@ impl Wm {
                         | EventMask::BUTTON1_MOTION,
                 ),
         )?;
-        self.conn.configure_window(
-            win,
-            &ConfigureWindowAux::new()
-                .x(x)
-                .y(y)
-                .width(clamp_dim(w))
-                .height(clamp_dim(h))
-                .border_width(0),
-        )?;
+        self.configure_float_frame(win, frame, x, y, w, h)?;
         let focus = self.focus_model(win);
         self.floats.push(FloatWin {
             win,
@@ -408,6 +408,40 @@ impl Wm {
             self.set_fullscreen(win, true)?;
         }
         self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Configure a float pair to its tracked geometry: the client window at
+    /// `(x, y, w, h)` and the chrome frame around it, extended by
+    /// `float_insets`. The single geometry formula behind float manage,
+    /// self-resize (ConfigureRequest) and fullscreen restore.
+    pub(crate) fn configure_float_frame(
+        &self,
+        win: Win,
+        frame: Win,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) -> R<()> {
+        let (bw, tb) = Self::float_insets();
+        self.conn.configure_window(
+            win,
+            &ConfigureWindowAux::new()
+                .x(x)
+                .y(y)
+                .width(clamp_dim(w))
+                .height(clamp_dim(h))
+                .border_width(0),
+        )?;
+        self.conn.configure_window(
+            frame,
+            &ConfigureWindowAux::new()
+                .x(x - bw)
+                .y(y - tb)
+                .width(clamp_dim(w + 2 * bw))
+                .height(clamp_dim(h + tb + bw)),
+        )?;
         Ok(())
     }
 
@@ -574,6 +608,9 @@ impl Wm {
         }
         self.place_notifications()?;
         self.conn.map_window(win)?;
+        // Notifications are mapped managed windows too: record the ICCCM
+        // WM_STATE (see `set_wm_state`).
+        self.set_wm_state(win, WM_STATE_NORMAL)?;
         self.conn.flush()?;
         Ok(())
     }
@@ -735,6 +772,11 @@ impl Wm {
         }
         self.state.unpin_client(win);
         self.update_client_list()?;
+        // Drop the click-to-focus grab `manage` installed: `manage_dock`
+        // re-issues the identical passive grab, and grabbing a combination
+        // that is already grabbed raises BadAccess.
+        self.conn
+            .ungrab_button(ButtonIndex::M1, win, ModMask::ANY)?;
         self.manage_dock(win)
     }
 
@@ -814,25 +856,9 @@ impl Wm {
         let Some(f) = self.floats.iter().find(|f| f.win == win) else {
             return Ok(());
         };
-        let (bw, tb) = Self::float_insets();
         let (frame, x, y, w, h) = (f.frame, f.x, f.y, f.w, f.h);
         self.conn.map_window(frame)?;
-        self.conn.configure_window(
-            frame,
-            &ConfigureWindowAux::new()
-                .x(x - bw)
-                .y(y - tb)
-                .width(clamp_dim(w + 2 * bw))
-                .height(clamp_dim(h + tb + bw)),
-        )?;
-        self.conn.configure_window(
-            win,
-            &ConfigureWindowAux::new()
-                .x(x)
-                .y(y)
-                .width(clamp_dim(w))
-                .height(clamp_dim(h)),
-        )?;
+        self.configure_float_frame(win, frame, x, y, w, h)?;
         self.paint_float_frame(frame)?;
         self.restack_float(win)?;
         Ok(())
@@ -1101,16 +1127,7 @@ impl Wm {
     /// (nothing we receive carries times while the user types into a
     /// client) is replaced with a freshly fetched one.
     fn give_focus(&mut self, win: Win, model: FocusModel) -> R<()> {
-        let stale = self.last_event_time == 0
-            || self.last_event_instant.elapsed() > std::time::Duration::from_secs(2);
-        // `?`, not unwrap_or: fresh_timestamp already degrades to
-        // CURRENT_TIME on timeout, so an Err from it is a real (likely
-        // connection) failure that must not be silently eaten here.
-        let time = if stale {
-            self.fresh_timestamp()?
-        } else {
-            self.last_event_time
-        };
+        let time = self.focus_timestamp()?;
         if model.input {
             self.conn
                 .set_input_focus(InputFocus::POINTER_ROOT, win, time)?;
@@ -1127,15 +1144,36 @@ impl Wm {
         Ok(())
     }
 
+    /// The timestamp `SetInputFocus`/`WM_TAKE_FOCUS` should carry: the last
+    /// harvested event time while it's fresh, a freshly fetched server time
+    /// once it has gone stale (a stale timestamp is silently ignored if
+    /// focus moved more recently).
+    fn focus_timestamp(&mut self) -> R<u32> {
+        let stale = self.last_event_time == 0
+            || self.last_event_instant.elapsed() > std::time::Duration::from_secs(2);
+        // `?`, not unwrap_or: fresh_timestamp already degrades to
+        // CURRENT_TIME on timeout, so an Err from it is a real (likely
+        // connection) failure that must not be silently eaten here.
+        if stale {
+            self.fresh_timestamp()
+        } else {
+            Ok(self.last_event_time)
+        }
+    }
+
     pub(crate) fn focus(&mut self, win: Option<Win>) -> R<()> {
         match win {
             Some(w) if self.clients.contains_key(&w) => {
                 self.focused_float = None;
                 let model = self.clients[&w].focus;
                 self.give_focus(w, model)?;
+                // Raising the focused client puts it above everything;
+                // re-apply arrange's stacking policy above it (floats, then
+                // fullscreen, then notifications; the menu below).
                 self.conn
                     .configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
                 self.raise_floats()?;
+                self.raise_fullscreen()?;
                 self.raise_notifications()?;
                 self.conn.change_property32(
                     PropMode::REPLACE,
@@ -1147,8 +1185,9 @@ impl Wm {
             }
             _ => {
                 self.focused_float = None;
+                let time = self.focus_timestamp()?;
                 self.conn
-                    .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
+                    .set_input_focus(InputFocus::POINTER_ROOT, self.root, time)?;
                 self.conn.change_property32(
                     PropMode::REPLACE,
                     self.root,
@@ -1245,7 +1284,12 @@ fn best_icon_block(vals: &[u32], want: u32) -> Option<(u32, u32, usize)> {
     while i + 2 <= vals.len() {
         let (w, h) = (vals[i], vals[i + 1]);
         let start = i + 2;
-        let count = (w as usize).checked_mul(h as usize)?;
+        // An overflowing w*h header makes the block's extent unknowable, so
+        // the walk can't step past it — stop, keeping any best already
+        // found from the valid leading blocks.
+        let Some(count) = (w as usize).checked_mul(h as usize) else {
+            break;
+        };
         if w == 0 || h == 0 || start + count > vals.len() {
             break;
         }
@@ -1304,6 +1348,11 @@ mod tests {
     fn valid_leading_block_survives_trailing_garbage() {
         let mut vals = block(16, 16);
         vals.extend([32, 32, 0]); // truncated second block
+        assert_eq!(best_icon_block(&vals, 16).map(|b| b.0), Some(16));
+        // A trailing block whose w*h overflows must not discard the valid
+        // best already found.
+        let mut vals = block(16, 16);
+        vals.extend([u32::MAX, u32::MAX, 0]);
         assert_eq!(best_icon_block(&vals, 16).map(|b| b.0), Some(16));
     }
 }
