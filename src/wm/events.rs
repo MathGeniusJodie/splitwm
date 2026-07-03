@@ -458,14 +458,8 @@ impl Wm {
             return None;
         }
         let r = self.prev_frame_rect.get(&leaf)?;
-        let (bw, tb) = (theme::BORDER_LEFT, theme::tb_h());
-        let (min_w, min_h) = client.map_or((1, 1), |c| c.min_size);
-        Some((
-            r.x + bw,
-            r.y + tb,
-            (r.w - 2 * bw).max(min_w).max(1),
-            (r.h - tb - bw).max(min_h).max(1),
-        ))
+        let min_size = client.map_or((1, 1), |c| c.min_size);
+        Some(super::types::client_rect_in_frame(*r, min_size))
     }
 
     /// The screen changed size (RandR): refresh the cached workarea, resize
@@ -710,27 +704,8 @@ impl Wm {
         match action {
             Action::SpawnTerminal => self.spawn_terminal(),
             Action::SpawnLauncher => self.spawn("rofi -show drun"),
-            // Same gating as the titlebar Split button (which checks
-            // `leaf_meta.can_split` and skips minimized leaves): splitting
-            // a minimized leaf from the keyboard would clone the minimized
-            // flag into `child_a`, a state the button logic considers
-            // invalid, and produce split frames already too small for the
-            // direction, whose windows then overhang and paint over
-            // neighbours.
-            Action::SplitH => {
-                if self.can_split_focused(Dir::H) {
-                    self.state.split_focused(Dir::H);
-                } else {
-                    self.animate = false;
-                }
-            }
-            Action::SplitV => {
-                if self.can_split_focused(Dir::V) {
-                    self.state.split_focused(Dir::V);
-                } else {
-                    self.animate = false;
-                }
-            }
+            Action::SplitH => self.try_split(Dir::H),
+            Action::SplitV => self.try_split(Dir::V),
             Action::Close => {
                 self.state.close_focused();
             }
@@ -778,8 +753,23 @@ impl Wm {
         self.commit_layout()
     }
 
-    /// Whether the focused leaf can be split in `dir`, mirroring the
-    /// titlebar Split button's thresholds (`leaf_meta`'s `can_v`/`can_h`):
+    /// Split the focused leaf in `dir` if it's eligible; otherwise cancel
+    /// the animation queued for the action. Gated the same way as the
+    /// titlebar Split button (which checks `leaf_meta.can_split` and skips
+    /// minimized leaves): splitting a minimized leaf would clone the
+    /// minimized flag into `child_a`, a state the button logic considers
+    /// invalid, and produce split frames already too small for the
+    /// direction, whose windows then overhang and paint over neighbours.
+    fn try_split(&mut self, dir: Dir) {
+        if self.can_split_focused(dir) {
+            self.state.split_focused(dir);
+        } else {
+            self.animate = false;
+        }
+    }
+
+    /// Whether the focused leaf can be split in `dir` (the same
+    /// `theme::split_fits` threshold the titlebar Split button uses):
     /// never a minimized leaf, and the frame must fit two children of the
     /// direction's minimum size plus the gap between them.
     fn can_split_focused(&self, dir: Dir) -> bool {
@@ -798,11 +788,7 @@ impl Wm {
                 None => return false,
             },
         };
-        let gap = theme::GAP;
-        match dir {
-            Dir::H => w >= 2 * theme::min_split_w() + gap,
-            Dir::V => h >= 2 * theme::tb_h() + gap,
-        }
+        theme::split_fits(dir, w, h)
     }
 
     /// Act on a split-control button click. `secondary` is a right-click,

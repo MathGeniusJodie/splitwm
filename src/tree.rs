@@ -388,29 +388,22 @@ impl Tree {
         }
     }
 
-    /// Lay out `node`'s children within `at`: per-child rects (in layout
-    /// order) plus the sizes and (minimized, ratio) metadata they were built
-    /// from — the shared geometry behind `compute_inner` and
-    /// `boundaries_inner`, so leaf placement and boundary handles can never
-    /// disagree. `None` when `node` isn't a branch. A minimized child
-    /// collapses to `gap` in the split dimension (both directions): it's the
-    /// same size already reserved as breathing room between normal children,
-    /// so it stays visually consistent with the layout's spacing rather than
-    /// needing a size of its own.
-    #[allow(clippy::type_complexity)]
-    fn layout_children(
-        &self,
-        node: NodeId,
-        at: Rect,
-        gap: i32,
-    ) -> Option<(Dir, Vec<(NodeId, Rect)>, Vec<i32>, Vec<(bool, f64)>)> {
+    /// Visit each of `node`'s children with its laid-out slot — the shared
+    /// geometry behind `compute_inner` and `boundaries_inner`, so leaf
+    /// placement and boundary handles can never disagree. No-op when `node`
+    /// isn't a branch. A minimized child collapses to `gap` in the split
+    /// dimension (both directions): it's the same size already reserved as
+    /// breathing room between normal children, so it stays visually
+    /// consistent with the layout's spacing rather than needing a size of
+    /// its own.
+    fn walk_children(&self, node: NodeId, at: Rect, gap: i32, f: &mut impl FnMut(ChildSlot)) {
         let Some(Node::Branch {
             dir,
             children,
             ratios,
         }) = self.nodes.get(&node)
         else {
-            return None;
+            return;
         };
         let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
         let meta = self.child_meta(children, ratios);
@@ -418,20 +411,22 @@ impl Tree {
         let usable = (span - gap * (n - 1)).max(0);
         let sizes = child_sizes(&meta, usable, gap);
         let mut pos = if *dir == Dir::H { at.x } else { at.y };
-        let rects = children
-            .iter()
-            .zip(&sizes)
-            .map(|(&c, &sz)| {
-                let r = if *dir == Dir::H {
-                    Rect { x: pos, w: sz, ..at }
-                } else {
-                    Rect { y: pos, h: sz, ..at }
-                };
-                pos += sz + gap;
-                (c, r)
-            })
-            .collect();
-        Some((*dir, rects, sizes, meta))
+        for (i, (&child, &sz)) in children.iter().zip(&sizes).enumerate() {
+            let rect = if *dir == Dir::H {
+                Rect { x: pos, w: sz, ..at }
+            } else {
+                Rect { y: pos, h: sz, ..at }
+            };
+            f(ChildSlot {
+                idx: i,
+                child,
+                dir: *dir,
+                rect,
+                next_size: sizes.get(i + 1).copied(),
+                resizable: i + 1 < meta.len() && !meta[i].0 && !meta[i + 1].0,
+            });
+            pos += sz + gap;
+        }
     }
 
     fn compute_inner(&self, node: NodeId, at: Rect, gap: i32, geos: &mut HashMap<NodeId, Rect>) {
@@ -439,13 +434,28 @@ impl Tree {
             geos.insert(node, at);
             return;
         }
-        let Some((_, rects, _, _)) = self.layout_children(node, at, gap) else {
-            return;
-        };
-        for (c, r) in rects {
-            self.compute_inner(c, r, gap, geos);
-        }
+        self.walk_children(node, at, gap, &mut |s| {
+            self.compute_inner(s.child, s.rect, gap, geos);
+        });
     }
+}
+
+/// One child's laid-out slot within its branch, as visited by
+/// `Tree::walk_children`.
+struct ChildSlot {
+    /// Index within the parent's children.
+    idx: usize,
+    child: NodeId,
+    /// The parent branch's direction.
+    dir: Dir,
+    rect: Rect,
+    /// The next sibling's size along `dir`; `None` for the last child (no
+    /// gap follows it).
+    next_size: Option<i32>,
+    /// Whether the gap after this child can be dragged: false when either
+    /// neighbour is a minimized leaf, whose pixel size is pinned to `gap`
+    /// regardless of ratio.
+    resizable: bool,
 }
 
 #[cfg(test)]
@@ -528,31 +538,28 @@ impl Tree {
     }
 
     fn boundaries_inner(&self, node: NodeId, at: Rect, gap: i32, out: &mut Vec<Boundary>) {
-        let Some((dir, rects, sizes, meta)) = self.layout_children(node, at, gap) else {
-            return;
-        };
-        for (i, &(c, r)) in rects.iter().enumerate() {
-            if i + 1 < rects.len() {
-                let (drag_start, drag_size, cross, cross_len) = if dir == Dir::H {
-                    (r.x, r.w, at.y, at.h)
+        self.walk_children(node, at, gap, &mut |s| {
+            if let Some(second) = s.next_size {
+                let (drag_start, drag_size, cross, cross_len) = if s.dir == Dir::H {
+                    (s.rect.x, s.rect.w, at.y, at.h)
                 } else {
-                    (r.y, r.h, at.x, at.w)
+                    (s.rect.y, s.rect.h, at.x, at.w)
                 };
                 out.push(Boundary {
                     parent: node,
-                    idx: i,
-                    dir,
+                    idx: s.idx,
+                    dir: s.dir,
                     pos: drag_start + drag_size + gap / 2,
                     start: drag_start,
                     first: drag_size,
-                    second: sizes[i + 1],
+                    second,
                     cross,
                     cross_len,
                     root: node == self.root,
-                    resizable: !meta[i].0 && !meta[i + 1].0,
+                    resizable: s.resizable,
                 });
             }
-            self.boundaries_inner(c, r, gap, out);
-        }
+            self.boundaries_inner(s.child, s.rect, gap, out);
+        });
     }
 }

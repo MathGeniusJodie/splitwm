@@ -141,6 +141,18 @@ pub const fn tb_h() -> i32 {
     BORDER_TOP
 }
 
+/// Whether a `w`x`h` frame is big enough to split into a `dir` branch: it
+/// must fit two children of the direction's minimum size plus the gap
+/// between them. The single threshold behind both the titlebar Split
+/// button's enabled state (`Wm::leaf_meta`) and the keyboard split gate
+/// (`Wm::can_split_focused`), so the two can't drift apart.
+pub fn split_fits(dir: crate::tree::Dir, w: i32, h: i32) -> bool {
+    match dir {
+        crate::tree::Dir::H => w >= 2 * min_split_w() + GAP,
+        crate::tree::Dir::V => h >= 2 * tb_h() + GAP,
+    }
+}
+
 // Palette indices cycled through to give each split its own persistent
 // accent, used both to tint the bitmap window border (palette-swapping
 // LAVENDER) and to colour the taskbar highlight. Excludes indices reserved

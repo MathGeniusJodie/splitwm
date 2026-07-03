@@ -600,6 +600,22 @@ pub fn clamp_dim(v: i32) -> u32 {
     v.max(1) as u32
 }
 
+/// Screen geometry `(x, y, w, h)` of the client window inside a leaf frame
+/// rect: inset by the border and titlebar, never below the client's
+/// `WM_NORMAL_HINTS` minimum (the split clips instead of handing the app
+/// geometry it can't honour). The single inset formula behind both
+/// `Wm::place_clients` (configuring) and `Wm::tracked_geometry` (answering
+/// denied ConfigureRequests), so the two can't drift apart.
+pub fn client_rect_in_frame(r: FrameRect, (min_w, min_h): (i32, i32)) -> (i32, i32, i32, i32) {
+    let (bw, tb) = (crate::theme::BORDER_LEFT, crate::theme::tb_h());
+    (
+        r.x + bw,
+        r.y + tb,
+        (r.w - 2 * bw).max(min_w).max(1),
+        (r.h - tb - bw).max(min_h).max(1),
+    )
+}
+
 pub const fn rect_contains(r: FrameRect, x: i32, y: i32) -> bool {
     x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }

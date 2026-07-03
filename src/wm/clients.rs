@@ -64,17 +64,23 @@ impl Wm {
         self.focus(f)?;
         let adopted: Vec<Win> = self.clients.keys().copied().collect();
         for win in adopted {
-            let mapped = self.clients.get(&win).is_some_and(|c| c.mapped);
-            self.set_wm_state(
-                win,
-                if mapped {
-                    WM_STATE_NORMAL
-                } else {
-                    WM_STATE_ICONIC
-                },
-            )?;
+            self.sync_wm_state(win)?;
         }
         Ok(())
+    }
+
+    /// Record the ICCCM `WM_STATE` matching whether we currently have the
+    /// window mapped (Normal) or hidden (Iconic).
+    fn sync_wm_state(&self, win: Win) -> R<()> {
+        let mapped = self.clients.get(&win).is_some_and(|c| c.mapped);
+        self.set_wm_state(
+            win,
+            if mapped {
+                WM_STATE_NORMAL
+            } else {
+                WM_STATE_ICONIC
+            },
+        )
     }
 
     /// Shared adoption prologue: select the events we need from `win`, strip
@@ -170,15 +176,7 @@ impl Wm {
             self.focus(Some(win))?;
             // arrange() has mapped it (or left it hidden); record the ICCCM
             // state.
-            let mapped = self.clients.get(&win).is_some_and(|c| c.mapped);
-            self.set_wm_state(
-                win,
-                if mapped {
-                    WM_STATE_NORMAL
-                } else {
-                    WM_STATE_ICONIC
-                },
-            )?;
+            self.sync_wm_state(win)?;
         }
         // EWMH allows requesting fullscreen by setting the property before
         // mapping; the ClientMessage path only covers later requests.

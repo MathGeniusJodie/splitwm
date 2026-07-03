@@ -328,14 +328,12 @@ impl Wm {
             Some(Node::Branch { dir, .. }) => Some(*dir),
             _ => None,
         });
-        let gap = theme::GAP;
         let wider = frame.w >= frame.h;
-        let can_v = frame.w >= 2 * theme::min_split_w() + gap;
-        let can_h = frame.h >= 2 * theme::tb_h() + gap;
+        let split_dir = if wider { Dir::H } else { Dir::V };
         LeafMeta {
             parent_dir,
             wider,
-            can_split: if wider { can_v } else { can_h },
+            can_split: theme::split_fits(split_dir, frame.w, frame.h),
             minimized: self.state.tree.leaf(leaf).is_some_and(|l| l.minimized),
         }
     }
@@ -346,8 +344,6 @@ impl Wm {
     /// (`ignore_unmaps`, consumed by `on_unmap`), and each transition
     /// updates the ICCCM `WM_STATE` (Normal/Iconic).
     fn place_clients(&mut self, placed: &[Placement]) -> R<()> {
-        let tb_h = theme::tb_h();
-        let bw = theme::BORDER_LEFT;
         let mut visible: std::collections::HashSet<Win> = std::collections::HashSet::new();
         let fullscreen = self.fullscreen.filter(|w| self.clients.contains_key(w));
         for p in placed {
@@ -358,20 +354,18 @@ impl Wm {
                     // whole workarea; don't fight it with split geometry.
                     continue;
                 }
-                let r = p.target;
-                // Never configure a client below its WM_NORMAL_HINTS
-                // minimum, so apps aren't handed geometry they can't
-                // honour. Nothing clips the window to its split: one held
-                // at its minimum overhangs the frame and paints over the
-                // neighbouring split until the column is widened again.
-                let (min_w, min_h) = self.clients.get(&c).map_or((1, 1), |cl| cl.min_size);
-                let cw = (r.w - 2 * bw).max(min_w).max(1);
-                let ch = (r.h - tb_h - bw).max(min_h).max(1);
+                // Nothing clips the window to its split: one held at its
+                // WM_NORMAL_HINTS minimum (see `client_rect_in_frame`)
+                // overhangs the frame and paints over the neighbouring
+                // split until the column is widened again.
+                let min_size = self.clients.get(&c).map_or((1, 1), |cl| cl.min_size);
+                let (cx, cy, cw, ch) =
+                    super::types::client_rect_in_frame(p.target, min_size);
                 self.conn.configure_window(
                     c,
                     &ConfigureWindowAux::new()
-                        .x(r.x + bw)
-                        .y(r.y + tb_h)
+                        .x(cx)
+                        .y(cy)
                         .width(clamp_dim(cw))
                         .height(clamp_dim(ch))
                         .border_width(0)
