@@ -697,6 +697,9 @@ impl Wm {
         self.ignore_unmaps.remove(&win);
         self.state.unpin_client(win);
         self.update_client_list()?;
+        // Unpinning may have dropped a column; don't leave the viewport
+        // scrolled past the narrower canvas.
+        self.clamp_scroll();
         self.arrange()?;
         let next = self.state.focused_client();
         self.focus(next)?;

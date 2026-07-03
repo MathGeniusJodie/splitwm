@@ -468,6 +468,7 @@ impl Wm {
         )?;
         self.set_wallpaper();
         self.update_net_workarea()?;
+        self.clamp_scroll();
         self.arrange()
     }
 
@@ -497,6 +498,10 @@ impl Wm {
         // going.)
         self.drags.split = None;
         self.drags.edge = None;
+        // Re-clamp before ensure_in_view: the mutation may have shrunk the
+        // scroll range (closed column), and ensure_in_view must judge
+        // visibility from an in-range scroll.
+        self.clamp_scroll();
         let wa = self.la();
         self.state.ensure_in_view(wa);
         self.state.land_scroll();
@@ -606,6 +611,9 @@ impl Wm {
         }
         if self.dock.docked.is_some_and(|d| d.win == win) {
             self.dock.docked = None;
+            // The dock's scroll headroom is gone; don't leave the viewport
+            // parked in it.
+            self.clamp_scroll();
             return self.arrange();
         }
         if self.notes.foreign.iter().any(|n| n.win == win) {
@@ -625,6 +633,7 @@ impl Wm {
     fn on_destroy(&mut self, win: u32) -> R<()> {
         if self.dock.docked.is_some_and(|d| d.win == win) {
             self.dock.docked = None;
+            self.clamp_scroll();
             return self.arrange();
         }
         if self.notes.foreign.iter().any(|n| n.win == win) {

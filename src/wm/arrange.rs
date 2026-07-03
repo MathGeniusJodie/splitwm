@@ -21,13 +21,11 @@ impl Wm {
     pub(crate) fn arrange(&mut self) -> R<()> {
         let wa = self.la();
 
-        // Canvas width, scroll clamping and the dock's extra scroll room are
-        // `State`'s own invariants (see `State::update_canvas`); the WM only
-        // supplies the inputs it alone knows. The dock is tucked
-        // DOCK_OVERLAP px under the canvas edge, so that much less scroll
-        // room is needed to bring it fully into view.
-        let dock_extra = self.dock.docked.map_or(0, |d| d.w - d.overlap());
-        self.state.update_canvas(wa, dock_extra);
+        // Canvas width and the dock's extra scroll room are `State`'s own
+        // invariants (see `State::update_canvas`); the WM only supplies the
+        // inputs it alone knows. Scroll is left alone: arranging repaints,
+        // it doesn't reposition the viewport (see `Wm::clamp_scroll`).
+        self.state.update_canvas(wa, self.dock_extra());
 
         let leaves = self.state.tree.collect_leaves();
         let geos = self.state.compute(wa);
@@ -442,6 +440,24 @@ impl Wm {
             )?;
         }
         Ok(())
+    }
+
+    /// The extra scroll room the docked sidebar needs (zero when nothing is
+    /// docked): its width minus the strip already tucked under the canvas
+    /// edge. One of `State::update_canvas`'s inputs.
+    pub(crate) fn dock_extra(&self) -> i32 {
+        self.dock.docked.map_or(0, |d| d.w - d.overlap())
+    }
+
+    /// Pull the scroll back into range against the current tree/viewport/
+    /// dock (see `State::clamp_scroll`). Called by mutations that shrink
+    /// the scroll range — structural layout changes (`commit_layout`,
+    /// `forget_client`), viewport resizes, dock removal — never by plain
+    /// repaints, so an edge-drag margin survives until the layout actually
+    /// changes under it.
+    pub(crate) fn clamp_scroll(&mut self) {
+        let wa = self.la();
+        self.state.clamp_scroll(wa, self.dock_extra());
     }
 
     /// The dock's pinned screen geometry `(x, y, w, h)`: parked at the right

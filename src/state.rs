@@ -546,9 +546,15 @@ impl State {
     /// legitimately take the canvas narrower than the viewport (leaving
     /// margin on the far side); `resize_edge`'s per-column `min_split_w`
     /// clamp is what keeps that sane. `dock_extra` is the extra scroll room
-    /// the docked sidebar needs (zero when nothing is docked). Scroll
-    /// positions are re-clamped to the new range, so a viewport shrink or a
-    /// canvas-narrowing layout change can't leave them past `max_scroll`.
+    /// the docked sidebar needs (zero when nothing is docked).
+    ///
+    /// Scroll positions are deliberately *not* re-clamped here: an
+    /// edge-of-canvas drag parks them outside `[0, max_scroll]` to hold a
+    /// wallpaper margin at the dragged edge (see `shift_scroll`), and this
+    /// runs on every arrange, so clamping here would yank that margin shut
+    /// on the next hover repaint. Mutations that change the scroll range
+    /// out from under the user (structural layout changes, viewport
+    /// resizes, dock removal) call `clamp_scroll` explicitly instead.
     pub fn update_canvas(&mut self, wa: Rect, dock_extra: i32) {
         let gap = theme::GAP;
         let columns = self.tree.h_units().max(1);
@@ -556,6 +562,18 @@ impl State {
         let needed = columns.saturating_mul(min_col_w);
         self.canvas_w = needed.max(wa.w) + self.canvas_w_extra;
         self.dock_extra = dock_extra;
+    }
+
+    /// Pull both scroll positions back into `[0, max_scroll]`, recomputing
+    /// the canvas first so the range reflects the tree as it is *now* (the
+    /// caller typically just mutated it; clamping against the stale width
+    /// would be a no-op). This is the companion to `update_canvas` not
+    /// clamping: structural layout changes, viewport resizes and dock
+    /// removal shrink the scroll range and must not strand the viewport
+    /// past the content, while edge-drag margins (scroll out of range on
+    /// purpose) survive everything that doesn't call this.
+    pub fn clamp_scroll(&mut self, wa: Rect, dock_extra: i32) {
+        self.update_canvas(wa, dock_extra);
         let max_scroll = self.max_scroll(wa);
         self.scroll_target = self.scroll_target.clamp(0, max_scroll);
         self.scroll_x = self.scroll_x.clamp(0, max_scroll);
@@ -573,15 +591,24 @@ impl State {
     }
 
     /// Shift both offsets by `delta` without clamping — used by the
-    /// edge-resize drag to keep on-screen columns stationary while the
-    /// canvas width changes underneath. The caller's follow-up arrange runs
-    /// `update_canvas`, which re-clamps against the *new* canvas width;
-    /// clamping here against the stale one would cancel part of the shift.
+    /// left-edge resize drag to keep on-screen columns stationary while the
+    /// canvas width changes underneath (`Tree::compute` lays out from a
+    /// fixed origin, so resizing column 0 moves every other column in
+    /// canvas space). A left-edge shrink legitimately takes the scroll
+    /// negative; see `max_scroll` for what out-of-range scroll means.
     pub fn shift_scroll(&mut self, delta: i32) {
         self.scroll_x += delta;
         self.scroll_target += delta;
     }
 
+    /// Upper end of the *scrollable* range. The current scroll can sit
+    /// outside `[0, max_scroll]`, and that state is meaningful: negative
+    /// scroll is a wallpaper margin left of the canvas (left-edge shrink,
+    /// via `shift_scroll`), scroll past `max_scroll` is margin right of it
+    /// (a right-edge shrink narrows the canvas under an unmoved scroll).
+    /// Such a margin holds until a scroll gesture (`scroll_to` clamps) or
+    /// a range-shrinking mutation (`clamp_scroll`) repositions the
+    /// viewport.
     pub fn max_scroll(&self, wa: Rect) -> i32 {
         (self.canvas_w(wa) + self.dock_extra - wa.w).max(0)
     }
@@ -1421,5 +1448,60 @@ mod tests {
         let after = s.compute(WA);
         assert_eq!(after[&right_id].w, right_w_before - shrink_by);
         assert_eq!(after[&left_id].w, left_w_before);
+    }
+
+    /// A left-edge shrink compensates with `shift_scroll`, taking the
+    /// scroll negative — the wallpaper margin left of the canvas. That
+    /// margin must survive `update_canvas` (run on every arrange, i.e.
+    /// every hover repaint) and close only at `clamp_scroll`.
+    #[test]
+    fn left_edge_margin_survives_update_canvas() {
+        let mut s = State::new();
+        s.split_focused(Dir::H);
+        s.update_canvas(WA, 0);
+
+        let (_, w) = s.edge_span(WA, true).expect("two columns");
+        let shrink_by = 50;
+        let applied = s.resize_edge(WA, true, w - shrink_by);
+        assert_eq!(applied, -shrink_by);
+        s.shift_scroll(applied);
+
+        s.update_canvas(WA, 0);
+        assert_eq!(s.scroll_x(), -shrink_by);
+
+        s.clamp_scroll(WA, 0);
+        assert_eq!(s.scroll_x(), 0);
+    }
+
+    /// A right-edge shrink narrows the canvas under an unmoved scroll;
+    /// when the canvas was scrolled to its end this leaves the scroll past
+    /// `max_scroll` — the on-screen margin at the dragged edge. Same
+    /// lifetime as the left margin: arranges keep it, `clamp_scroll` ends
+    /// it.
+    #[test]
+    fn right_edge_margin_survives_update_canvas() {
+        let mut s = State::new();
+        // Enough columns to out-span the viewport and open scroll room.
+        s.split_focused(Dir::H);
+        s.split_focused(Dir::H);
+        s.split_focused(Dir::H);
+        s.update_canvas(WA, 0);
+        let max_before = s.max_scroll(WA);
+        assert!(max_before > 0, "canvas should out-span the viewport");
+        s.scroll_to(WA, i32::MAX);
+        s.land_scroll();
+        assert_eq!(s.scroll_x(), max_before);
+
+        let (_, w) = s.edge_span(WA, false).expect("four columns");
+        let shrink_by = 60;
+        let applied = s.resize_edge(WA, false, w - shrink_by);
+        assert_eq!(applied, -shrink_by);
+
+        s.update_canvas(WA, 0);
+        assert_eq!(s.max_scroll(WA), max_before - shrink_by);
+        assert_eq!(s.scroll_x(), s.max_scroll(WA) + shrink_by);
+
+        s.clamp_scroll(WA, 0);
+        assert_eq!(s.scroll_x(), s.max_scroll(WA));
     }
 }
