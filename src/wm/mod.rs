@@ -234,6 +234,8 @@ pub fn run(replace: bool) -> R<()> {
     let screen = conn.setup().roots[screen_num].clone();
     let root = screen.root;
 
+    check_root_visual(&screen)?;
+
     let sel_owner = claim_manager_selection(&conn, screen_num, root, &screen, replace)?;
 
     grab_substructure_redirect(&conn, root)?;
@@ -338,6 +340,43 @@ pub fn run(replace: bool) -> R<()> {
         Ok(Err(e)) => Err(e),
         Ok(Ok(())) => restored,
     }
+}
+
+/// Refuse to start on a root visual the renderer can't present to. Every
+/// frame blit assumes a depth-24 TrueColor visual with 0xff0000/0xff00/0xff
+/// channel masks (the BGRX byte layout `Renderer::present` emits); on any
+/// other visual class, depth or mask layout the blits would render garbage
+/// or be rejected outright, so failing loudly here beats an unusable session.
+fn check_root_visual(screen: &x11rb::protocol::xproto::Screen) -> R<()> {
+    use x11rb::protocol::xproto::VisualClass;
+    let visual = screen
+        .allowed_depths
+        .iter()
+        .flat_map(|d| d.visuals.iter().map(move |v| (d.depth, v)))
+        .find(|(_, v)| v.visual_id == screen.root_visual);
+    let Some((depth, v)) = visual else {
+        return Err(format!(
+            "root visual {:#x} not in allowed_depths",
+            screen.root_visual
+        )
+        .into());
+    };
+    if screen.root_depth != 24
+        || depth != 24
+        || v.class != VisualClass::TRUE_COLOR
+        || v.red_mask != 0x00ff_0000
+        || v.green_mask != 0x0000_ff00
+        || v.blue_mask != 0x0000_00ff
+    {
+        return Err(format!(
+            "unsupported root visual: depth {} class {:?} masks r={:#x} g={:#x} b={:#x} \
+             (splitwm renders BGRX for a depth-24 TrueColor visual with \
+             0xff0000/0xff00/0xff masks)",
+            depth, v.class, v.red_mask, v.green_mask, v.blue_mask
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Become the window manager. STRUCTURE_NOTIFY is included so the root's
@@ -617,24 +656,12 @@ fn create_menu_windows(
     }
     Ok(MenuUi {
         tree: crate::menu::build(),
-        main_win: menu_main,
-        sub_win: menu_sub,
         open: false,
-        main: FrameRect {
-            x: 0,
-            y: 0,
-            w: 1,
-            h: 1,
-        },
-        main_cw: 0,
-        main_hi: None,
+        main: MenuColumn::new(menu_main),
+        sub: MenuColumn::new(menu_sub),
         open_cat: None,
-        sub_cw: 0,
-        sub_hi: None,
         target_leaf: crate::tree::NodeId::default(),
         icon_cache: HashMap::new(),
-        main_icons: Vec::new(),
-        sub_icons: Vec::new(),
     })
 }
 

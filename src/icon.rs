@@ -21,9 +21,17 @@ pub struct Icon {
 }
 
 impl Icon {
-    pub fn new(w: u32, h: u32, argb: Vec<u32>) -> Self {
+    pub fn new(w: u32, h: u32, mut argb: Vec<u32>) -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
         static NEXT: AtomicU64 = AtomicU64::new(0);
+        // Renderers index `argb[y*w + x]` unchecked, so `len >= w*h` must
+        // hold by construction. Icon data can originate from
+        // client-controlled properties: pad a short buffer with transparent
+        // pixels rather than panic.
+        let need = (w as usize).saturating_mul(h as usize);
+        if argb.len() < need {
+            argb.resize(need, 0);
+        }
         Self {
             w,
             h,

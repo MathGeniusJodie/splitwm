@@ -200,6 +200,13 @@ impl Wm {
                 // receive their own copies (these only reach us over the
                 // underlay/root, never from inside a client window).
                 Event::ButtonPress(e) if (4..=7).contains(&e.detail) => {
+                    // Vertical wheel over an open menu column scrolls its
+                    // rows (a column taller than the screen clamps and
+                    // scrolls; see `on_menu_scroll`).
+                    if self.menu.open && self.is_menu_window(e.event) && matches!(e.detail, 4 | 5) {
+                        self.on_menu_scroll(e.event, e.detail == 5)?;
+                        continue;
+                    }
                     if self.hscroll.is_empty() {
                         match e.detail {
                             6 => pending_hscroll -= 1.0,
@@ -285,10 +292,7 @@ impl Wm {
             // Pointer left a menu window: retire its hover highlight (the
             // main column keeps highlighting an open category so the
             // submenu still reads as attached to its row).
-            Event::LeaveNotify(e)
-                if self.menu.open
-                    && (e.event == self.menu.main_win || e.event == self.menu.sub_win) =>
-            {
+            Event::LeaveNotify(e) if self.menu.open && self.is_menu_window(e.event) => {
                 self.on_menu_leave(e.event)?;
             }
             // Keyboard layout / modifier mapping changed: rebind everything.
@@ -589,7 +593,7 @@ impl Wm {
             // so a record could alias a withdraw issued exactly 65536
             // requests later; pruning keeps records too short-lived for
             // that in practice.
-            let matched = seqs.iter().any(|&s| s == e.sequence);
+            let matched = seqs.contains(&e.sequence);
             seqs.retain(|&s| s.wrapping_sub(e.sequence) < 0x8000 && s != e.sequence);
             if seqs.is_empty() {
                 self.ignore_unmaps.remove(&win);
@@ -870,9 +874,9 @@ impl Wm {
         // Clicks inside the launcher menu select an item; clicks elsewhere
         // dismiss it before falling through to normal handling.
         if self.menu.open {
-            if e.event == self.menu.main_win || e.event == self.menu.sub_win {
+            if self.is_menu_window(e.event) {
                 if e.detail == 1 {
-                    self.on_menu_click(e.event, i32::from(e.event_y))?;
+                    self.on_menu_click(e.event, i32::from(e.event_x), i32::from(e.event_y))?;
                 }
                 return Ok(());
             }
@@ -995,8 +999,8 @@ impl Wm {
     }
 
     fn on_motion(&mut self, e: &MotionNotifyEvent) -> R<()> {
-        if self.menu.open && (e.event == self.menu.main_win || e.event == self.menu.sub_win) {
-            return self.on_menu_motion(e.event, i32::from(e.event_y));
+        if self.menu.open && self.is_menu_window(e.event) {
+            return self.on_menu_motion(e.event, i32::from(e.event_x), i32::from(e.event_y));
         }
         if let Some(fd) = self.drags.float {
             self.move_float(
@@ -1219,9 +1223,9 @@ impl Wm {
     fn on_expose(&mut self, e: ExposeEvent) -> R<()> {
         // The underlay needs no handling here: its composited image is its
         // `background_pixmap`, so the server repaints exposed areas itself.
-        if self.menu.open && e.window == self.menu.main_win {
+        if self.menu.open && e.window == self.menu.main.win {
             self.paint_menu_main()?;
-        } else if self.menu.open && e.window == self.menu.sub_win {
+        } else if self.menu.open && e.window == self.menu.sub.win {
             self.paint_menu_sub()?;
         } else if self.floats.iter().any(|f| f.frame == e.window) {
             self.paint_float_frame(e.window)?;

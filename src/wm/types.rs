@@ -518,24 +518,63 @@ pub struct EdgeDrag {
 /// in its own override-redirect window composited like the underlay.
 pub struct MenuUi {
     pub tree: crate::menu::MenuTree,
-    pub main_win: Window,
-    pub sub_win: Window,
     pub open: bool,
-    pub main: FrameRect,
-    pub main_cw: i32,
-    pub main_hi: Option<usize>,
+    pub main: MenuColumn,
+    pub sub: MenuColumn,
     pub open_cat: Option<usize>,
-    pub sub_cw: i32,
-    pub sub_hi: Option<usize>,
     pub target_leaf: NodeId,
     /// Decoded app icons keyed by the desktop entry's `Icon=` value. Only
     /// successes are cached; failures retry on the next open so icons
-    /// installed mid-session are picked up (see `Wm::resolve_menu_icons`).
+    /// installed mid-session are picked up (see `Wm::resolve_icon_slot`).
     pub icon_cache: std::collections::HashMap<String, Rc<crate::icon::Icon>>,
-    /// Per-row icons of the currently shown main column / submenu, resolved
-    /// from `icon_cache` when the column opens.
-    pub main_icons: Vec<Option<Rc<crate::icon::Icon>>>,
-    pub sub_icons: Vec<Option<Rc<crate::icon::Icon>>>,
+}
+
+/// One menu column (the main menu or the open submenu): its window plus the
+/// per-open view state, shared so the open/paint/hit/scroll logic is written
+/// once for both (see `Wm::paint_column`).
+pub struct MenuColumn {
+    pub win: Window,
+    /// On-screen window rect of the (possibly height-clamped) column.
+    pub rect: FrameRect,
+    /// Inner content width.
+    pub cw: i32,
+    /// Hovered row, in absolute (scroll-independent) row indices.
+    pub hi: Option<usize>,
+    /// Per-row icons, resolved lazily as rows become visible.
+    pub icons: Vec<IconSlot>,
+    /// First visible row; nonzero only when the column has more rows than
+    /// fit on screen and has been wheel-scrolled.
+    pub scroll: usize,
+    /// Total row count of the column's data.
+    pub rows: usize,
+}
+
+impl MenuColumn {
+    pub fn new(win: Window) -> Self {
+        Self {
+            win,
+            rect: FrameRect {
+                x: 0,
+                y: 0,
+                w: 1,
+                h: 1,
+            },
+            cw: 0,
+            hi: None,
+            icons: Vec::new(),
+            scroll: 0,
+            rows: 0,
+        }
+    }
+}
+
+/// A menu row's icon: decoded lazily the first time the row is on screen,
+/// so opening a large column doesn't stat+decode every row's icon up front.
+pub enum IconSlot {
+    /// Not looked up yet; holds the desktop entry's `Icon=` value.
+    Pending(Option<String>),
+    /// Looked up (successfully or not) for this open of the column.
+    Ready(Option<Rc<crate::icon::Icon>>),
 }
 
 /// The three split-control buttons on the right of every leaf's tab bar

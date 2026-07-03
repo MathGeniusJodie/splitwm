@@ -17,7 +17,7 @@ use std::rc::Rc;
 
 use pixel_fonts::{BitmapFont, FUSION_PIXEL_12_SPEC};
 use pixel_graphics::{
-    decode_png_with_size, Framebuffer, Paint as PgPaint, Palette as PgPalette, PresentLut,
+    decode_png_bytes, Framebuffer, Paint as PgPaint, Palette as PgPalette, PresentLut,
     Rect as PgRect, Rgb as PgRgb, Rgba, Sprite, Swap,
 };
 
@@ -161,9 +161,14 @@ fn tile_swapped(
         (cx1 - cx0) as usize,
         (cy1 - cy0) as usize,
     );
-    let mut y = oy;
+    // Start at the first tile that reaches the clip rect: a leaf mostly
+    // scrolled off-screen would otherwise walk (and fully clip) every
+    // off-screen tile.
+    let (sw_i, sh_i) = (src.w as i32, src.h as i32);
+    let x0 = ox + ((cx0 - ox) / sw_i).max(0) * sw_i;
+    let mut y = oy + ((cy0 - oy) / sh_i).max(0) * sh_i;
     while y < oy + h {
-        let mut x = ox;
+        let mut x = x0;
         while x < ox + w {
             fb.draw_sprite_full(
                 sprite,
@@ -402,12 +407,10 @@ impl Renderer {
         for y in 0..dh {
             let sy = (((y as f32 - oy) / scale) as usize).min(sh - 1);
             let ltr = y % 2 == 0;
-            let xs: Box<dyn Iterator<Item = usize>> = if ltr {
-                Box::new(0..dw)
-            } else {
-                Box::new((0..dw).rev())
-            };
-            for x in xs {
+            // Index flip instead of a boxed reversed iterator: this loop
+            // body runs once per output pixel.
+            for xi in 0..dw {
+                let x = if ltr { xi } else { dw - 1 - xi };
                 let sx = (((x as f32 - ox) / scale) as usize).min(sw - 1);
                 let c = pixels[sy * sw + sx];
                 let want = [
@@ -463,7 +466,10 @@ impl Renderer {
             if dw as usize > MAX_DIM || dh as usize > MAX_DIM {
                 return None;
             }
-            return decode_png_with_size(path).ok();
+            // Decode the bytes already read and size-checked — re-reading
+            // the path would decode whatever the file holds *now*, not what
+            // was validated.
+            return decode_png_bytes(&bytes).ok();
         }
         let mut dec = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&bytes));
         // Headers first: reject oversized dimensions before `decode`
@@ -659,10 +665,13 @@ impl Renderer {
         let h = font.cell_h() as i32;
         let x = cx - w / 2;
         let y = cy - h / 2;
-        if x < 0 || y < 0 {
+        // The font API's y origin is unsigned; a glyph poking past the top
+        // edge is dropped (callers never place labels there). Negative x is
+        // real (taskbar tiles fanning off the left edge) and clips instead.
+        if y < 0 {
             return;
         }
-        font.draw_text(fb, s, x as usize, y as usize, color);
+        font.draw_text_clipped(fb, s, x as isize, y as usize, color, 0, fb.width);
     }
 
     /// Draw one taskbar entry: a dithered background tile with the app icon
@@ -694,7 +703,10 @@ impl Renderer {
             self.draw_icon(fb, img, dx, dy, isz);
         } else {
             if highlight {
-                // Silhouette-outline the fallback glyph the same way.
+                // Silhouette-outline the fallback glyph the same way. The
+                // 48 restrikes per frame are accepted: this path only runs
+                // for highlighted windows that provide no icon at all, and a
+                // single glyph is a few dozen pixels.
                 for oy in -3i32..=3 {
                     for ox in -3i32..=3 {
                         if ox == 0 && oy == 0 {
@@ -877,6 +889,9 @@ const ICON_CACHE_CAP: usize = 256;
 /// `cap`: the shared "bounded in practice, but nothing should grow without
 /// a lid" policy of every cache here and in `menu` (entries are cheap to
 /// recompute, so occasional total eviction beats per-entry bookkeeping).
+/// The clear discards *live* entries along with dead ones, so a working set
+/// hovering at `cap` re-renders everything on the frame after each clear —
+/// accepted because real working sets sit far below the caps.
 pub(crate) fn insert_capped<K: std::hash::Hash + Eq, V>(
     map: &mut HashMap<K, V>,
     cap: usize,
@@ -1067,6 +1082,26 @@ const MENU_ARROW_W: i32 = 16;
 const MENU_ICON_SZ: i32 = 16;
 const MENU_ICON_GAP: i32 = 8;
 
+/// One menu column's *visible* row slice, bundled for `draw_menu`. The
+/// parallel slices are cut from the same range by the caller
+/// (`Wm::paint_column`), so they can't drift in length.
+pub struct MenuView<'a> {
+    pub labels: &'a [String],
+    /// Rows that open a submenu get a trailing arrow glyph.
+    pub arrows: &'a [bool],
+    /// Divider rows.
+    pub seps: &'a [bool],
+    pub icons: &'a [Option<Rc<Icon>>],
+    /// Inner content width (shared across a menu + submenu so they line up).
+    pub content_w: i32,
+    /// Hovered row, relative to the visible slice.
+    pub hi: Option<usize>,
+    /// Whether labels share the indented icon column — decided over the
+    /// *whole* column, not the visible slice, so scrolling a column whose
+    /// icons are unevenly distributed doesn't shift its labels sideways.
+    pub icon_col: bool,
+}
+
 impl Renderer {
     /// Pixel width of a left-aligned string in the UI font. Without a font,
     /// a rough estimate keeps menu geometry sane.
@@ -1093,28 +1128,23 @@ impl Renderer {
         w + 2 * MENU_PAD_X + arrow + icon
     }
 
-    /// Render a menu column to its own framebuffer. `content_w` is the inner
-    /// width (shared across a menu + submenu so columns line up); `seps`
-    /// marks divider rows, `icons` per-row app icons (any Some indents every
-    /// label by the icon column), `hi` is the hovered row.
-    pub fn draw_menu(
-        &self,
-        labels: &[String],
-        arrows: &[bool],
-        seps: &[bool],
-        icons: &[Option<Rc<Icon>>],
-        content_w: i32,
-        hi: Option<usize>,
-    ) -> Framebuffer {
+    /// Render a menu column's visible rows to its own framebuffer.
+    pub fn draw_menu(&self, v: &MenuView) -> Framebuffer {
+        let &MenuView {
+            labels,
+            arrows,
+            seps,
+            icons,
+            content_w,
+            hi,
+            icon_col,
+        } = v;
         let rows = labels.len() as i32;
         let (fw, fh) = frame_size(rows, content_w);
         let (w, h) = (fw.max(1) as usize, fh.max(1) as usize);
         let mut fb = Framebuffer::new(w, h, palette_color::BLACK);
         let b = MENU_BORDER;
         let cw = content_w;
-        // Whether any row has an icon (labels then share one indented text
-        // column) — computed once, not per row.
-        let icon_col = icons.iter().any(Option::is_some);
         for (i, label) in labels.iter().enumerate() {
             let ry = b + i as i32 * MENU_ROW_H;
             if seps.get(i).copied().unwrap_or(false) {

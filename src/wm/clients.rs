@@ -35,7 +35,7 @@ impl Wm {
     pub(crate) fn manage_existing_windows(&mut self) -> R<()> {
         let children = self.conn.query_tree(self.root)?.reply()?.children;
         for win in children {
-            if win == self.underlay || win == self.menu.main_win || win == self.menu.sub_win {
+            if win == self.underlay || self.is_menu_window(win) {
                 continue;
             }
             let Ok(attrs) = self.conn.get_window_attributes(win)?.reply() else {
