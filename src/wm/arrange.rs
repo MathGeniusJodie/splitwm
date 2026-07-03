@@ -10,8 +10,8 @@ use x11rb::protocol::xproto::{
 
 use super::clients::{WM_STATE_ICONIC, WM_STATE_NORMAL};
 use super::types::{
-    ease_out_back, lerp_rect, BtnKind, FrameRect, LayoutAnim, LeafMeta, Placement, ShmSeg,
-    ShmState, Wm, R,
+    clamp_dim, ease_out_back, lerp_rect, BtnKind, FrameRect, LayoutAnim, LeafMeta, Placement,
+    ShmSeg, ShmState, Wm, R,
 };
 use crate::render::{LeafView, TabInfo, TaskItem};
 use crate::theme;
@@ -145,8 +145,8 @@ impl Wm {
                     &ConfigureWindowAux::new()
                         .x(full.x)
                         .y(full.y)
-                        .width(u32::try_from(full.w.max(1)).unwrap_or(1))
-                        .height(u32::try_from(full.h.max(1)).unwrap_or(1))
+                        .width(clamp_dim(full.w.max(1)))
+                        .height(clamp_dim(full.h.max(1)))
                         .stack_mode(StackMode::ABOVE),
                 )?;
             }
@@ -375,8 +375,8 @@ impl Wm {
                     &ConfigureWindowAux::new()
                         .x(r.x + bw)
                         .y(r.y + tb_h)
-                        .width(u32::try_from(cw).unwrap_or(1))
-                        .height(u32::try_from(ch).unwrap_or(1))
+                        .width(clamp_dim(cw))
+                        .height(clamp_dim(ch))
                         .border_width(0)
                         .stack_mode(StackMode::ABOVE),
                 )?;
@@ -402,8 +402,8 @@ impl Wm {
                 &ConfigureWindowAux::new()
                     .x(full.x)
                     .y(full.y)
-                    .width(u32::try_from(full.w.max(1)).unwrap_or(1))
-                    .height(u32::try_from(full.h.max(1)).unwrap_or(1))
+                    .width(clamp_dim(full.w.max(1)))
+                    .height(clamp_dim(full.h.max(1)))
                     .border_width(0)
                     .stack_mode(StackMode::ABOVE),
             )?;
@@ -463,8 +463,8 @@ impl Wm {
             &ConfigureWindowAux::new()
                 .x(x)
                 .y(full.y)
-                .width(u32::try_from(self.dock.w).unwrap_or(1))
-                .height(u32::try_from(full.h.max(1)).unwrap_or(1))
+                .width(clamp_dim(self.dock.w))
+                .height(clamp_dim(full.h.max(1)))
                 .border_width(0)
                 .sibling(self.underlay)
                 .stack_mode(StackMode::ABOVE),
@@ -667,7 +667,10 @@ impl Wm {
         // surface here, where the caller can fall back, not as a later
         // async error on the first blit.
         self.conn.shm_attach_fd(seg, fd, false)?.check()?;
-        Ok(ShmSeg::new(seg, ptr.cast(), len))
+        // SAFETY: ptr is a fresh MAP_SHARED mapping of exactly `len` bytes,
+        // owned solely by the returned ShmSeg (the fd was moved into the
+        // server attach; only the mapping remains on our side).
+        Ok(unsafe { ShmSeg::new(seg, ptr.cast(), len) })
     }
 
     /// Chunked core-protocol `PutImage` fallback for servers without MIT-SHM.

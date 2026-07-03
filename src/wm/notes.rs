@@ -15,11 +15,12 @@ use super::types::{NotePopup, Wm, R};
 use crate::notify::{Note, NoteMsg};
 use crate::theme;
 
-/// Cap on live popup windows; kept coherent with `notify::MAX_NOTES` (the
-/// daemon thread's own outstanding-notification cap) — the daemon evicts its
-/// oldest tracked id at the same threshold, so this is mostly a backstop for
-/// popups that reached us before an eviction round-trips.
-const MAX_NOTE_POPUPS: usize = 8;
+/// Cap on live popup windows; aliased directly to `notify::MAX_NOTES` (the
+/// daemon thread's own outstanding-notification cap) so the two can't drift
+/// — the daemon evicts its oldest tracked id at the same threshold, so this
+/// is mostly a backstop for popups that reached us before an eviction
+/// round-trips.
+const MAX_NOTE_POPUPS: usize = crate::notify::MAX_NOTES;
 
 impl Wm {
     /// The daemon thread's ClientMessage wakeup: drain the channel and

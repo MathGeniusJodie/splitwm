@@ -289,6 +289,9 @@ fn accent_swap(index: Index) -> Swap {
 const MIN_CAP_H: usize = 30;
 const MIN_CAP_W: usize = 10;
 
+/// Gap between the window border and the titlebar's app icon/label, in px.
+const TITLEBAR_ICON_PAD: i32 = 4;
+
 impl Renderer {
     pub fn new() -> Self {
         let palette = crate::assets::palette();
@@ -355,6 +358,11 @@ impl Renderer {
     /// `w * h * BYTES_PER_PIXEL` bytes — e.g. the MIT-SHM mapping, so the
     /// full-screen frame is written once, directly where the server reads it.
     pub fn present_into_slice(&self, fb: &Framebuffer, out: &mut [u8]) {
+        // Fail loudly at the boundary rather than handing a short slice to
+        // present_into — `out` is typically the MIT-SHM mapping, and a
+        // framebuffer/segment resize race must not become a deep panic (or
+        // worse) inside pixel-graphics.
+        assert_eq!(out.len(), fb.width * fb.height * Framebuffer::BYTES_PER_PIXEL);
         fb.present_into(out, &self.lut);
     }
 
@@ -504,47 +512,24 @@ impl Renderer {
     pub fn draw_leaf(&self, fb: &mut Framebuffer, ox: i32, oy: i32, v: &LeafView) {
         let swap = accent_swap(v.accent_index);
         if v.minimized {
-            if v.w >= v.h {
-                self.draw_minimized_h(fb, &swap, ox, oy, v.w, v.h);
-            } else {
-                self.draw_minimized(fb, &swap, ox, oy, v.w, v.h);
-            }
+            self.draw_minimized_axis(fb, &swap, ox, oy, v.w, v.h, v.w < v.h);
             return;
         }
         self.border.draw(fb, &self.palette, &swap, ox, oy, v.w, v.h);
         self.draw_titlebar(fb, ox, oy, v);
     }
 
-    /// A minimized column's `winmin.png` rendering: a vertical 3-slice
-    /// (rounded caps + a stretchy body), the whole strip a single restore
-    /// button. The strip isn't a tileable horizontal pattern (it's a single
-    /// narrow pill), so it's drawn at its exact native width, centred in
-    /// whatever width the leaf collapsed to.
-    fn draw_minimized(&self, fb: &mut Framebuffer, swap: &Swap, ox: i32, oy: i32, w: i32, h: i32) {
-        let s = &self.minimized;
-        let (sw, sh) = (s.width, s.height);
-        let cap = MIN_CAP_H as i32;
-        let mid_h = (h - 2 * cap).max(1);
-        let cx = ox + (w - sw as i32) / 2;
-        let mut part = |src: PgRect, y: i32, dh: i32| {
-            tile_swapped(fb, s, src, cx, y, sw as i32, dh, &self.palette, swap);
-        };
-        part(PgRect::new(0, 0, sw, MIN_CAP_H), oy, cap);
-        part(
-            PgRect::new(0, sh - MIN_CAP_H, sw, MIN_CAP_H),
-            oy + h - cap,
-            cap,
-        );
-        part(
-            PgRect::new(0, MIN_CAP_H, sw, sh - 2 * MIN_CAP_H),
-            oy + cap,
-            mid_h,
-        );
-    }
-
-    /// The horizontal counterpart of `draw_minimized`, from `winmin_h.png`,
-    /// for a leaf collapsed to a short, wide strip; native height, centred.
-    fn draw_minimized_h(
+    /// A minimized leaf's restore-strip rendering: a 3-slice (rounded caps +
+    /// a stretchy body) along the strip's long axis, the whole strip a
+    /// single restore button. `vertical` selects the axis and, with it, the
+    /// sprite: `winmin.png`/`MIN_CAP_H` for a minimized column (narrow,
+    /// tall, caps stacked top/bottom) or `winmin_h.png`/`MIN_CAP_W` for a
+    /// minimized row (short, wide, caps side by side). The strip isn't a
+    /// tileable pattern along its short axis (it's a single pill), so it's
+    /// drawn at its exact native cross-axis size, centred in whatever space
+    /// the leaf collapsed to.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_minimized_axis(
         &self,
         fb: &mut Framebuffer,
         swap: &Swap,
@@ -552,26 +537,61 @@ impl Renderer {
         oy: i32,
         w: i32,
         h: i32,
+        vertical: bool,
     ) {
-        let s = &self.minimized_h;
-        let (sw, sh) = (s.width, s.height);
-        let cap = MIN_CAP_W as i32;
-        let mid_w = (w - 2 * cap).max(1);
-        let cy = oy + (h - sh as i32) / 2;
-        let mut part = |src: PgRect, x: i32, dw: i32| {
-            tile_swapped(fb, s, src, x, cy, dw, sh as i32, &self.palette, swap);
+        let (s, cap) = if vertical {
+            (&self.minimized, MIN_CAP_H)
+        } else {
+            (&self.minimized_h, MIN_CAP_W)
         };
-        part(PgRect::new(0, 0, MIN_CAP_W, sh), ox, cap);
-        part(
-            PgRect::new(sw - MIN_CAP_W, 0, MIN_CAP_W, sh),
-            ox + w - cap,
-            cap,
-        );
-        part(
-            PgRect::new(MIN_CAP_W, 0, sw - 2 * MIN_CAP_W, sh),
-            ox + cap,
-            mid_w,
-        );
+        let (sw, sh) = (s.width, s.height);
+        let cap_i = cap as i32;
+        // (src rect, dest x, dest y, dest w, dest h) for the leading cap,
+        // trailing cap, and stretchy middle, laid out along the chosen axis.
+        let parts: [(PgRect, i32, i32, i32, i32); 3] = if vertical {
+            let mid_h = (h - 2 * cap_i).max(1);
+            let cx = ox + (w - sw as i32) / 2;
+            [
+                (PgRect::new(0, 0, sw, cap), cx, oy, sw as i32, cap_i),
+                (
+                    PgRect::new(0, sh - cap, sw, cap),
+                    cx,
+                    oy + h - cap_i,
+                    sw as i32,
+                    cap_i,
+                ),
+                (
+                    PgRect::new(0, cap, sw, sh - 2 * cap),
+                    cx,
+                    oy + cap_i,
+                    sw as i32,
+                    mid_h,
+                ),
+            ]
+        } else {
+            let mid_w = (w - 2 * cap_i).max(1);
+            let cy = oy + (h - sh as i32) / 2;
+            [
+                (PgRect::new(0, 0, cap, sh), ox, cy, cap_i, sh as i32),
+                (
+                    PgRect::new(sw - cap, 0, cap, sh),
+                    ox + w - cap_i,
+                    cy,
+                    cap_i,
+                    sh as i32,
+                ),
+                (
+                    PgRect::new(cap, 0, sw - 2 * cap, sh),
+                    ox + cap_i,
+                    cy,
+                    mid_w,
+                    sh as i32,
+                ),
+            ]
+        };
+        for (src, x, y, dw, dh) in parts {
+            tile_swapped(fb, s, src, x, y, dw, dh, &self.palette, swap);
+        }
     }
 
     fn draw_titlebar(&self, fb: &mut Framebuffer, ox: i32, oy: i32, v: &LeafView) {
@@ -579,7 +599,9 @@ impl Renderer {
             return;
         };
         let isz = theme::BTN_SIZE;
-        let cx = ox + v.bw + isz / 2 + 4;
+        // Left padding between the window border and the app icon/label,
+        // so the icon doesn't sit flush against the border art.
+        let cx = ox + v.bw + isz / 2 + TITLEBAR_ICON_PAD;
         let cy = oy + v.tb_h / 2;
         if let Some(img) = &tab.icon {
             self.draw_icon(fb, img, cx - isz / 2, cy - isz / 2, isz);
@@ -839,6 +861,12 @@ pub struct TaskItem {
     pub h: i32,
 }
 
+/// Half-length of each "+" arm as a percentage of the icon's overall size
+/// (clamped to a 2px minimum so the arms stay visible at the smallest icon
+/// sizes); picked by eye to look proportionate against `draw_plus`'s notched
+/// tile.
+const PLUS_ARM_PCT: i32 = 28;
+
 /// Draw a dithered pixel-art "+" insert button centred at (cx, cy).
 pub fn draw_plus(fb: &mut Framebuffer, cx: i32, cy: i32, sz: i32) {
     let half = sz / 2;
@@ -849,10 +877,15 @@ pub fn draw_plus(fb: &mut Framebuffer, cx: i32, cy: i32, sz: i32) {
     fill_paint(fb, x + sz - 2, y + 2, 2, sz - 4, CHROME_BG);
 
     // 2px-thick plus arms.
-    let arm = (sz * 28 / 100).max(2);
+    let arm = (sz * PLUS_ARM_PCT / 100).max(2);
     fill(fb, cx - arm, cy - 1, 2 * arm, 2, palette_color::CREAM);
     fill(fb, cx - 1, cy - arm, 2, 2 * arm, palette_color::CREAM);
 }
+
+/// Inset of the diagonal cross's endpoints from the badge's corners, as a
+/// percentage of the badge's overall size; picked by eye so the "x" strokes
+/// clear the 1px border drawn around the badge.
+const CLOSE_BADGE_INSET_PCT: i32 = 32;
 
 /// Draw the small close ("x") badge in the bottom-right corner of a taskbar
 /// tile: a dark square with a cross, always visible so the close affordance
@@ -884,7 +917,7 @@ pub fn draw_close_badge(fb: &mut Framebuffer, x: i32, y: i32, sz: i32) {
     );
 
     // 2px-thick diagonal cross.
-    let inset = sz * 32 / 100;
+    let inset = sz * CLOSE_BADGE_INSET_PCT / 100;
     let span = sz - 2 * inset;
     for i in 0..span {
         for t in 0..2 {

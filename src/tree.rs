@@ -84,9 +84,14 @@ impl Tree {
         }
     }
 
-    const fn gen_id(&mut self) -> NodeId {
+    fn gen_id(&mut self) -> NodeId {
         let id = self.next_id;
-        self.next_id += 1;
+        // Id uniqueness is the arena's core invariant: every live node is
+        // addressed by its id, so a silent wraparound here would hand out an
+        // id that already aliases a live node instead of failing loudly.
+        self.next_id = id
+            .checked_add(1)
+            .unwrap_or_else(|| panic!("Tree::gen_id: NodeId space exhausted (next_id={id})"));
         id
     }
 
@@ -237,6 +242,13 @@ impl Tree {
     }
 
     /// (parent id, index of `target` within parent.children), or None for root.
+    ///
+    /// Scans the whole arena, so it's O(n) per call. Fine for one-off
+    /// mutations triggered by user actions (splits, closes, resizes), where
+    /// `n` is tens of nodes and calls happen at most a few times per action.
+    /// For per-frame loops that need a parent lookup for every leaf, use
+    /// `parent_map` instead — it builds the full mapping in one arena walk,
+    /// avoiding the O(n²) blowup of calling `find_parent` once per leaf.
     pub fn find_parent(&self, target: NodeId) -> Option<(NodeId, usize)> {
         for (&id, node) in &self.nodes {
             if let Node::Branch { children, .. } = node {

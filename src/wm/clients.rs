@@ -13,7 +13,7 @@ use x11rb::protocol::xproto::{
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::CURRENT_TIME;
 
-use super::types::{Client, FloatWin, FocusModel, Wm, R};
+use super::types::{clamp_dim, Client, FloatWin, FocusModel, Wm, R};
 use crate::icon::{self, Icon};
 use crate::theme;
 use crate::tree::Win;
@@ -369,8 +369,8 @@ impl Wm {
             &ConfigureWindowAux::new()
                 .x(x)
                 .y(y)
-                .width(u32::try_from(w).unwrap_or(1))
-                .height(u32::try_from(h).unwrap_or(1))
+                .width(clamp_dim(w))
+                .height(clamp_dim(h))
                 .border_width(0),
         )?;
         let focus = self.focus_model(win);
@@ -461,9 +461,13 @@ impl Wm {
             return Ok(());
         };
         // Clamp so the titlebar can't leave the screen (the frame is the
-        // only handle there is to drag it back with).
-        let x = x.clamp(wa.x - f.w + theme::tb_h(), wa.x + wa.w - theme::tb_h());
-        let y = y.clamp(wa.y + tb, wa.y + wa.h - theme::tb_h());
+        // only handle there is to drag it back with). `on_screen_strip` is
+        // how much of the float must stay reachable on either axis; it
+        // happens to equal the titlebar height, but is used here as a
+        // general leftover-strip size, not as a titlebar measurement.
+        let on_screen_strip = theme::tb_h();
+        let x = x.clamp(wa.x - f.w + on_screen_strip, wa.x + wa.w - on_screen_strip);
+        let y = y.clamp(wa.y + tb, wa.y + wa.h - on_screen_strip);
         (f.x, f.y) = (x, y);
         let frame = f.frame;
         self.conn
@@ -808,16 +812,16 @@ impl Wm {
             &ConfigureWindowAux::new()
                 .x(x - bw)
                 .y(y - tb)
-                .width(u32::try_from(w + 2 * bw).unwrap_or(1))
-                .height(u32::try_from(h + tb + bw).unwrap_or(1)),
+                .width(clamp_dim(w + 2 * bw))
+                .height(clamp_dim(h + tb + bw)),
         )?;
         self.conn.configure_window(
             win,
             &ConfigureWindowAux::new()
                 .x(x)
                 .y(y)
-                .width(u32::try_from(w).unwrap_or(1))
-                .height(u32::try_from(h).unwrap_or(1)),
+                .width(clamp_dim(w))
+                .height(clamp_dim(h)),
         )?;
         self.paint_float_frame(frame)?;
         self.restack_float(win)?;
@@ -913,6 +917,10 @@ impl Wm {
     /// distinguishable while a free slot remains. Freeing is implicit: once
     /// a window is unmanaged it drops out of `self.clients`, so its slot no
     /// longer counts as used.
+    // Only `theme::ICON_HUE_STEPS` distinct hues exist for disambiguating
+    // same-class windows; once that many are already in use, this silently
+    // returns `None` (no rotated icon) for the next one instead of erroring
+    // or reusing a hue, so windows past the step count share an icon look.
     fn assign_icon_slot(&self, class: &str) -> Option<usize> {
         let used: std::collections::HashSet<usize> = self
             .clients

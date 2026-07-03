@@ -35,9 +35,11 @@ pub const PING_ATOM: &str = "SPLITWM_NOTE";
 /// `expire_timeout: -1` ("server decides") becomes this.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Cap on outstanding notifications; matches `wm::notes`'s popup cap, which
-/// this daemon's `Show`/`Close` traffic ultimately drives.
-const MAX_NOTES: usize = 8;
+/// Cap on outstanding notifications; also used by `wm::notes` as its popup
+/// cap (re-exported as `crate::wm::notes::MAX_NOTE_POPUPS`), since this
+/// daemon's `Show`/`Close` traffic ultimately drives that popup pile and the
+/// two must stay coherent.
+pub const MAX_NOTES: usize = 8;
 
 pub struct Note {
     pub id: u32,
@@ -282,28 +284,28 @@ fn reply(ch: &Channel, msg: Message) -> R<()> {
 /// drop tags and decode the standard entities.
 fn strip_markup(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    // Byte index of the last '>' — a '<' only opens a tag if a '>' follows
-    // it somewhere. Precomputed once: scanning the remainder per '<' would
-    // be O(n²) on hostile input, and this is an unauthenticated D-Bus
-    // endpoint.
-    let last_gt = s.rfind('>');
-    for (i, c) in s.char_indices() {
-        match c {
-            // Only enter tag mode if this `<` actually closes somewhere;
-            // otherwise it's stray text and should pass through literally
-            // instead of swallowing everything after it.
-            '<' if !in_tag => {
-                if last_gt.is_some_and(|g| g > i) {
-                    in_tag = true;
-                } else {
-                    out.push(c);
+    // A '<' only opens a tag if *its own* '>' arrives before any other '<'
+    // and the content looks like a tag ("<b>", "</a>", "<a href=...>") —
+    // plain text like "1 < 2 > 3" or "<3" must pass through literally.
+    // Each candidate span is consumed at most once, so this stays O(n)
+    // even on hostile input (this is an unauthenticated D-Bus endpoint).
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        let c = rest.chars().next().expect("i is on a char boundary");
+        if c == '<' {
+            if let Some(rel) = rest[1..].find(['<', '>']) {
+                let inner = &rest[1..1 + rel];
+                if rest.as_bytes()[1 + rel] == b'>'
+                    && inner.starts_with(|c: char| c.is_ascii_alphabetic() || c == '/')
+                {
+                    i += 1 + rel + 1; // skip the whole tag
+                    continue;
                 }
             }
-            '>' if in_tag => in_tag = false,
-            c if !in_tag => out.push(c),
-            _ => {}
         }
+        out.push(c);
+        i += c.len_utf8();
     }
     for (ent, ch) in [
         ("&lt;", "<"),
@@ -336,6 +338,16 @@ mod tests {
     fn stray_lt_without_gt_passes_through() {
         assert_eq!(strip_markup("1 < 2"), "1 < 2");
         assert_eq!(strip_markup("<b>x</b> then 1 < 2"), "x then 1 < 2");
+    }
+
+    #[test]
+    fn plain_text_angle_brackets_survive() {
+        // A literal '<' followed by a later literal '>' is not a tag unless
+        // the span between them actually looks like one.
+        assert_eq!(strip_markup("1 < 2 > 3"), "1 < 2 > 3");
+        assert_eq!(strip_markup("see a<3 b>4 lol"), "see a<3 b>4 lol");
+        assert_eq!(strip_markup("x <- y -> z"), "x <- y -> z");
+        assert_eq!(strip_markup("<b>1<2</b>"), "1<2");
     }
 
     #[test]

@@ -130,8 +130,10 @@ pub const BTN_SPACING: i32 = 4;
 /// must match `BtnKind`'s variants — `min_split_w` derives from it.
 pub const N_SPLIT_BTNS: i32 = 3;
 /// Vertical nudge (down = positive) applied to titlebar buttons, to fine-tune
-/// their alignment within the bitmap titlebar.
-pub const BTN_Y_OFFSET: i32 = 3;
+/// their alignment within the bitmap titlebar. Folds in a 2px correction
+/// against the naive titlebar-midpoint calculation (`tb_h / 2`), which sits
+/// a couple of pixels low of the button row's true visual centre.
+pub const BTN_Y_OFFSET: i32 = 1;
 
 pub const fn min_split_w() -> i32 {
     N_SPLIT_BTNS * BTN_SIZE + (N_SPLIT_BTNS - 1) * BTN_SPACING

@@ -14,7 +14,7 @@ use x11rb::CURRENT_TIME;
 
 use super::clients::WM_STATE_WITHDRAWN;
 use super::types::{
-    rect_contains, Action, BtnKind, Drag, EdgeDrag, FloatDrag, FrameRect, Wm, MOD4, R,
+    clamp_dim, rect_contains, Action, BtnKind, Drag, EdgeDrag, FloatDrag, FrameRect, Wm, MOD4, R,
 };
 use crate::theme;
 use crate::tree::{Boundary, Dir, NodeId, Rect, Win};
@@ -345,19 +345,25 @@ impl Wm {
                 &ConfigureWindowAux::new()
                     .x(x)
                     .y(y)
-                    .width(u32::try_from(w).unwrap_or(1))
-                    .height(u32::try_from(h).unwrap_or(1)),
+                    .width(clamp_dim(w))
+                    .height(clamp_dim(h)),
             )?;
             self.conn.configure_window(
                 frame,
                 &ConfigureWindowAux::new()
                     .x(x - bw)
                     .y(y - tb)
-                    .width(u32::try_from(w + 2 * bw).unwrap_or(1))
-                    .height(u32::try_from(h + tb + bw).unwrap_or(1)),
+                    .width(clamp_dim(w + 2 * bw))
+                    .height(clamp_dim(h + tb + bw)),
             )?;
             self.paint_float_frame(frame)?;
             return Ok(());
+        }
+        // The dock's geometry is ours (set once in manage_dock and reasserted
+        // by every place_dock): granting its request would let it drift for
+        // one frame and then snap back. Deny + echo, like tiled clients.
+        if self.dock.win == Some(e.window) {
+            return self.send_synthetic_configure(e.window);
         }
         let aux = ConfigureWindowAux::from_configure_request(e);
         self.conn.configure_window(e.window, &aux)?;
@@ -412,8 +418,8 @@ impl Wm {
             &ConfigureWindowAux::new()
                 .x(0)
                 .y(0)
-                .width(u32::try_from(w.max(1)).unwrap_or(1))
-                .height(u32::try_from(h.max(1)).unwrap_or(1)),
+                .width(clamp_dim(w.max(1)))
+                .height(clamp_dim(h.max(1))),
         )?;
         self.set_wallpaper();
         self.update_net_workarea()?;
@@ -498,6 +504,14 @@ impl Wm {
             // ICCCM deiconify request (Iconic -> Normal): bring it into a
             // split rather than blindly mapping it over the layout.
             return self.bring_into_layout(e.window);
+        }
+        // The dock re-requesting a map must not fall through to manage():
+        // matches_dock would see dock.win already set to this same window,
+        // misread it as a second dock, and tile it while place_dock still
+        // manages it — a permanently leaked, geometry-fighting duplicate.
+        if self.dock.win == Some(e.window) {
+            self.conn.map_window(e.window)?;
+            return Ok(());
         }
         self.manage(e.window, false)?;
         Ok(())
@@ -769,6 +783,13 @@ impl Wm {
         // (`hit_test`) resolves the target; `hover_cursor` consumes the same
         // ordering, so click dispatch and cursor feedback stay in lockstep.
         if e.event == self.underlay && (e.detail == 1 || e.detail == 3) {
+            // Hit regions are computed from the *final* layout, but a
+            // layout animation may still be drawing chrome mid-slide (the
+            // event loop only cuts it after this batch). Snap it now so the
+            // click lands on what the user sees.
+            if self.anim.is_some() {
+                self.step_animation(true)?;
+            }
             let (mx, my) = (i32::from(e.event_x), i32::from(e.event_y));
             let hit = self.hit_test(mx, my);
             // Split-control buttons take left and right click (right picks

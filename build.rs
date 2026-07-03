@@ -14,26 +14,26 @@ use std::path::{Path, PathBuf};
 
 use pixel_graphics::{Palette, Sprite};
 
-const PALETTE_PNG: &str = "na16-1x.png";
+const PALETTE_PNG: &str = "assets/na16-1x.png";
 
 const SPRITES: &[&str] = &[
-    "bubble.png",
-    "close.png",
-    "cursor_disabled.png",
-    "cursor_hand.png",
-    "cursor_pointer.png",
-    "close_disabled.png",
-    "hsplit.png",
-    "hsplit_disabled.png",
-    "minimize.png",
-    "minimize_disabled.png",
-    "minimize_h.png",
-    "minimize_h_disabled.png",
-    "vsplit.png",
-    "vsplit_disabled.png",
-    "winborder.png",
-    "winmin.png",
-    "winmin_h.png",
+    "assets/bubble.png",
+    "assets/close.png",
+    "assets/cursor_disabled.png",
+    "assets/cursor_hand.png",
+    "assets/cursor_pointer.png",
+    "assets/close_disabled.png",
+    "assets/hsplit.png",
+    "assets/hsplit_disabled.png",
+    "assets/minimize.png",
+    "assets/minimize_disabled.png",
+    "assets/minimize_h.png",
+    "assets/minimize_h_disabled.png",
+    "assets/vsplit.png",
+    "assets/vsplit_disabled.png",
+    "assets/winborder.png",
+    "assets/winmin.png",
+    "assets/winmin_h.png",
 ];
 
 fn main() {
@@ -43,7 +43,8 @@ fn main() {
     }
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let palette = Palette::load(PALETTE_PNG).unwrap();
+    let palette = Palette::load(PALETTE_PNG)
+        .unwrap_or_else(|e| panic!("failed to load palette {PALETTE_PNG}: {e}"));
     let mut out = String::new();
 
     let palette_bytes: Vec<u8> = (0..palette.len())
@@ -66,7 +67,9 @@ fn main() {
 }
 
 fn bake_sprite(path: &Path, palette: &Palette, out_dir: &Path, out: &mut String) {
-    let sprite = Sprite::load_native(path.to_str().unwrap(), palette).unwrap();
+    let path_str = path.to_str().unwrap();
+    let sprite = Sprite::load_native(path_str, palette)
+        .unwrap_or_else(|e| panic!("failed to load sprite {path_str}: {e}"));
     let name = path.file_stem().unwrap().to_str().unwrap();
 
     let sprite = &sprite;

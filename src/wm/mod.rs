@@ -176,7 +176,6 @@ fn claim_manager_selection(
     Ok(sel_owner)
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn run(replace: bool) -> R<()> {
     let (conn, screen_num) = x11rb::connect(None)?;
     let screen = conn.setup().roots[screen_num].clone();
@@ -184,165 +183,12 @@ pub fn run(replace: bool) -> R<()> {
 
     let sel_owner = claim_manager_selection(&conn, screen_num, root, &screen, replace)?;
 
-    // Become the window manager. STRUCTURE_NOTIFY is included so the root's
-    // own ConfigureNotify reports screen (RandR) resizes.
-    let mask = EventMask::SUBSTRUCTURE_REDIRECT
-        | EventMask::SUBSTRUCTURE_NOTIFY
-        | EventMask::STRUCTURE_NOTIFY
-        | EventMask::BUTTON_PRESS;
-    let change = ChangeWindowAttributesAux::new().event_mask(mask);
-    conn.change_window_attributes(root, &change)?
-        .check()
-        .map_err(|_| "another window manager is already running")?;
+    grab_substructure_redirect(&conn, root)?;
 
     let atoms = Atoms::intern(&conn)?;
-    // Minimal EWMH presence: announce what we support, and point
-    // _NET_SUPPORTING_WM_CHECK at the (never-mapped) selection-owner window
-    // so pagers/panels recognise a live EWMH WM.
-    conn.change_property32(
-        PropMode::REPLACE,
-        root,
-        atoms.net_supported,
-        AtomEnum::ATOM,
-        &[
-            atoms.net_supported,
-            atoms.net_client_list,
-            atoms.net_active_window,
-            atoms.net_supporting_wm_check,
-            atoms.net_wm_name,
-            atoms.net_wm_icon,
-            atoms.net_wm_window_type,
-            atoms.net_wm_window_type_notification,
-            atoms.net_wm_window_type_dialog,
-            atoms.net_wm_state,
-            atoms.net_wm_state_fullscreen,
-            atoms.net_workarea,
-            atoms.net_number_of_desktops,
-            atoms.net_current_desktop,
-        ],
-    )?;
-    // Single-desktop EWMH bookkeeping: pagers/taskbars that consult these
-    // misbehave (or guess) when they're absent entirely.
-    conn.change_property32(
-        PropMode::REPLACE,
-        root,
-        atoms.net_number_of_desktops,
-        AtomEnum::CARDINAL,
-        &[1],
-    )?;
-    conn.change_property32(
-        PropMode::REPLACE,
-        root,
-        atoms.net_current_desktop,
-        AtomEnum::CARDINAL,
-        &[0],
-    )?;
-    conn.change_property32(
-        PropMode::REPLACE,
-        root,
-        atoms.net_supporting_wm_check,
-        AtomEnum::WINDOW,
-        &[sel_owner],
-    )?;
-    // Present-but-empty until the first client is managed.
-    conn.change_property32(
-        PropMode::REPLACE,
-        root,
-        atoms.net_client_list,
-        AtomEnum::WINDOW,
-        &[],
-    )?;
-    conn.change_property32(
-        PropMode::REPLACE,
-        sel_owner,
-        atoms.net_supporting_wm_check,
-        AtomEnum::WINDOW,
-        &[sel_owner],
-    )?;
-    conn.change_property8(
-        PropMode::REPLACE,
-        sel_owner,
-        atoms.net_wm_name,
-        atoms.utf8_string,
-        b"splitwm",
-    )?;
+    publish_ewmh(&conn, root, &atoms, sel_owner)?;
 
-    // Black root background + a normal left-pointer cursor. Without setting a
-    // root cursor the pointer is invisible over the root and the underlay
-    // (which inherits the root's cursor). The arrow/hand/disabled cursors are
-    // the hand-drawn `cursor_*` sprites, built as ARGB cursors via RENDER;
-    // the core "cursor" font supplies the resize arrows (no drawn art) and
-    // the fallbacks when the server lacks RENDER cursors (glyph 68 =
-    // XC_left_ptr, 108 = XC_sb_h_double_arrow, 116 = XC_sb_v_double_arrow,
-    // 60 = XC_hand2, 0 = XC_X_cursor; a glyph's mask is always the next
-    // glyph).
-    let cursor_font = conn.generate_id()?;
-    conn.open_font(cursor_font, b"cursor")?;
-    let make_cursor = |glyph: u16| -> R<u32> {
-        let c = conn.generate_id()?;
-        conn.create_glyph_cursor(
-            c,
-            cursor_font,
-            cursor_font,
-            glyph,
-            glyph + 1,
-            0,
-            0,
-            0,
-            0xffff,
-            0xffff,
-            0xffff,
-        )?;
-        Ok(c)
-    };
-    let mut cursors = Cursors {
-        arrow: make_cursor(68)?,
-        h_resize: make_cursor(108)?,
-        v_resize: make_cursor(116)?,
-        disabled: make_cursor(0)?,
-        hand: make_cursor(60)?,
-        current: 0,
-    };
-    conn.close_font(cursor_font)?;
-    if let Some(argb32) = render_argb32_format(&conn)? {
-        let palette = crate::assets::palette();
-        // The glyph fallbacks being replaced are dead server resources
-        // otherwise — free them as they're superseded.
-        for old in [cursors.arrow, cursors.hand, cursors.disabled] {
-            conn.free_cursor(old)?;
-        }
-        // Hotspots: arrow tip, fingertip, circle center.
-        cursors.arrow = sprite_cursor(
-            &conn,
-            root,
-            argb32,
-            &crate::assets::cursor_pointer(),
-            &palette,
-            (4, 0),
-        )?;
-        cursors.hand = sprite_cursor(
-            &conn,
-            root,
-            argb32,
-            &crate::assets::cursor_hand(),
-            &palette,
-            (11, 0),
-        )?;
-        cursors.disabled = sprite_cursor(
-            &conn,
-            root,
-            argb32,
-            &crate::assets::cursor_disabled(),
-            &palette,
-            (12, 12),
-        )?;
-    }
-    let cursor = cursors.arrow;
-    let cw = ChangeWindowAttributesAux::new()
-        .background_pixel(screen.black_pixel)
-        .cursor(cursor);
-    conn.change_window_attributes(root, &cw)?;
-    conn.clear_area(false, root, 0, 0, 0, 0)?;
+    let cursors = setup_cursors_and_root_style(&conn, &screen, root)?;
 
     // Conservative cap for chunking PutImage (X core caps near 256 KiB).
     let max_req_bytes = 200_000usize;
@@ -352,107 +198,8 @@ pub fn run(replace: bool) -> R<()> {
     let gc = conn.generate_id()?;
     conn.create_gc(gc, root, &CreateGCAux::new())?;
 
-    // Single full-screen underlay window: wallpaper + all leaf chrome + drag
-    // handles + "+" buttons are composited onto it, below every client.
-    let geo = conn.get_geometry(root)?.reply()?;
-    let workarea = Rect {
-        x: 0,
-        y: 0,
-        w: i32::from(geo.width),
-        h: i32::from(geo.height),
-    };
-    let underlay = conn.generate_id()?;
-    conn.create_window(
-        screen.root_depth,
-        underlay,
-        root,
-        0,
-        0,
-        geo.width,
-        geo.height,
-        0,
-        WindowClass::INPUT_OUTPUT,
-        screen.root_visual,
-        &CreateWindowAux::new()
-            .background_pixel(screen.black_pixel)
-            .event_mask(
-                EventMask::EXPOSURE
-                    | EventMask::BUTTON_PRESS
-                    | EventMask::BUTTON_RELEASE
-                    | EventMask::BUTTON1_MOTION
-                    // Hover motion drives the resize/disabled cursor feedback
-                    // over drag handles and titlebar buttons.
-                    | EventMask::POINTER_MOTION,
-            ),
-    )?;
-    conn.map_window(underlay)?;
-    // Keep the underlay pinned at the bottom of the stack.
-    conn.configure_window(
-        underlay,
-        &ConfigureWindowAux::new().stack_mode(StackMode::BELOW),
-    )?;
-    // Deliver button1 (and the drag's motion/release) even over the underlay.
-    conn.grab_button(
-        true,
-        underlay,
-        EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::BUTTON1_MOTION,
-        GrabMode::ASYNC,
-        GrabMode::ASYNC,
-        x11rb::NONE,
-        x11rb::NONE,
-        ButtonIndex::M1,
-        ModMask::ANY,
-    )?;
-
-    // Override-redirect popup windows for the app launcher menu (main column +
-    // one submenu). Created hidden; mapped/moved on demand. POINTER_MOTION
-    // drives hover, BUTTON_PRESS selection, EXPOSURE repaints.
-    let menu_mask = EventMask::EXPOSURE
-        | EventMask::BUTTON_PRESS
-        | EventMask::POINTER_MOTION
-        | EventMask::LEAVE_WINDOW;
-    let (menu_main, menu_sub) = (conn.generate_id()?, conn.generate_id()?);
-    for mw in [menu_main, menu_sub] {
-        conn.create_window(
-            screen.root_depth,
-            mw,
-            root,
-            0,
-            0,
-            1,
-            1,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            screen.root_visual,
-            &CreateWindowAux::new()
-                .override_redirect(1)
-                .background_pixel(screen.black_pixel)
-                // Every menu row is clickable, so the hand covers the menu.
-                .cursor(cursors.hand)
-                .event_mask(menu_mask),
-        )?;
-    }
-    let menu = MenuUi {
-        tree: crate::menu::build(),
-        main_win: menu_main,
-        sub_win: menu_sub,
-        open: false,
-        main: FrameRect {
-            x: 0,
-            y: 0,
-            w: 1,
-            h: 1,
-        },
-        main_cw: 0,
-        main_hi: None,
-        open_cat: None,
-        sub_cw: 0,
-        sub_hi: None,
-        target_leaf: crate::tree::NodeId::default(),
-        icon_cache: HashMap::new(),
-        main_icons: Vec::new(),
-        sub_icons: Vec::new(),
-    };
+    let (underlay, workarea) = create_underlay(&conn, &screen, root)?;
+    let menu = create_menu_windows(&conn, &screen, root, &cursors)?;
 
     let debug_scroll = std::env::var_os("SPLITWM_DEBUG_SCROLL").is_some();
 
@@ -525,6 +272,323 @@ pub fn run(replace: bool) -> R<()> {
         root,
     };
 
+    startup_adopt_and_arrange(&mut wm, root)?;
+
+    // Run the loop with a panic guard: layout hiding uses plain unmaps, and
+    // exiting without remapping strands taskbar'd windows invisible for the
+    // next WM (which only adopts viewable windows). Restore on *every* exit
+    // path — clean quit, handling error, or panic. When the connection
+    // itself died the restore fails too, but then the server is resetting
+    // client state anyway.
+    let looped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| event_loop(&mut wm)));
+    let restored = wm.restore_clients();
+    match looped {
+        Err(payload) => std::panic::resume_unwind(payload),
+        Ok(Err(e)) => Err(e),
+        Ok(Ok(())) => restored,
+    }
+}
+
+/// Become the window manager. STRUCTURE_NOTIFY is included so the root's
+/// own ConfigureNotify reports screen (RandR) resizes.
+fn grab_substructure_redirect(conn: &x11rb::rust_connection::RustConnection, root: Window) -> R<()> {
+    let mask = EventMask::SUBSTRUCTURE_REDIRECT
+        | EventMask::SUBSTRUCTURE_NOTIFY
+        | EventMask::STRUCTURE_NOTIFY
+        | EventMask::BUTTON_PRESS;
+    let change = ChangeWindowAttributesAux::new().event_mask(mask);
+    conn.change_window_attributes(root, &change)?
+        .check()
+        .map_err(|_| "another window manager is already running".into())
+}
+
+/// Minimal EWMH presence: announce what we support, and point
+/// _NET_SUPPORTING_WM_CHECK at the (never-mapped) selection-owner window
+/// so pagers/panels recognise a live EWMH WM.
+fn publish_ewmh(
+    conn: &x11rb::rust_connection::RustConnection,
+    root: Window,
+    atoms: &Atoms,
+    sel_owner: Window,
+) -> R<()> {
+    conn.change_property32(
+        PropMode::REPLACE,
+        root,
+        atoms.net_supported,
+        AtomEnum::ATOM,
+        &[
+            atoms.net_supported,
+            atoms.net_client_list,
+            atoms.net_active_window,
+            atoms.net_supporting_wm_check,
+            atoms.net_wm_name,
+            atoms.net_wm_icon,
+            atoms.net_wm_window_type,
+            atoms.net_wm_window_type_notification,
+            atoms.net_wm_window_type_dialog,
+            atoms.net_wm_state,
+            atoms.net_wm_state_fullscreen,
+            atoms.net_workarea,
+            atoms.net_number_of_desktops,
+            atoms.net_current_desktop,
+        ],
+    )?;
+    // Single-desktop EWMH bookkeeping: pagers/taskbars that consult these
+    // misbehave (or guess) when they're absent entirely.
+    conn.change_property32(
+        PropMode::REPLACE,
+        root,
+        atoms.net_number_of_desktops,
+        AtomEnum::CARDINAL,
+        &[1],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        root,
+        atoms.net_current_desktop,
+        AtomEnum::CARDINAL,
+        &[0],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        root,
+        atoms.net_supporting_wm_check,
+        AtomEnum::WINDOW,
+        &[sel_owner],
+    )?;
+    // Present-but-empty until the first client is managed.
+    conn.change_property32(
+        PropMode::REPLACE,
+        root,
+        atoms.net_client_list,
+        AtomEnum::WINDOW,
+        &[],
+    )?;
+    conn.change_property32(
+        PropMode::REPLACE,
+        sel_owner,
+        atoms.net_supporting_wm_check,
+        AtomEnum::WINDOW,
+        &[sel_owner],
+    )?;
+    conn.change_property8(
+        PropMode::REPLACE,
+        sel_owner,
+        atoms.net_wm_name,
+        atoms.utf8_string,
+        b"splitwm",
+    )?;
+    Ok(())
+}
+
+/// Build the cursor set and apply the root's background/cursor. Black root
+/// background + a normal left-pointer cursor: without setting a root cursor
+/// the pointer is invisible over the root and the underlay (which inherits
+/// the root's cursor). The arrow/hand/disabled cursors are the hand-drawn
+/// `cursor_*` sprites, built as ARGB cursors via RENDER; the core "cursor"
+/// font supplies the resize arrows (no drawn art) and the fallbacks when the
+/// server lacks RENDER cursors (glyph 68 = XC_left_ptr, 108 =
+/// XC_sb_h_double_arrow, 116 = XC_sb_v_double_arrow, 60 = XC_hand2, 0 =
+/// XC_X_cursor; a glyph's mask is always the next glyph).
+fn setup_cursors_and_root_style(
+    conn: &x11rb::rust_connection::RustConnection,
+    screen: &x11rb::protocol::xproto::Screen,
+    root: Window,
+) -> R<Cursors> {
+    let cursor_font = conn.generate_id()?;
+    conn.open_font(cursor_font, b"cursor")?;
+    let make_cursor = |glyph: u16| -> R<u32> {
+        let c = conn.generate_id()?;
+        conn.create_glyph_cursor(
+            c,
+            cursor_font,
+            cursor_font,
+            glyph,
+            glyph + 1,
+            0,
+            0,
+            0,
+            0xffff,
+            0xffff,
+            0xffff,
+        )?;
+        Ok(c)
+    };
+    let mut cursors = Cursors {
+        arrow: make_cursor(68)?,
+        h_resize: make_cursor(108)?,
+        v_resize: make_cursor(116)?,
+        disabled: make_cursor(0)?,
+        hand: make_cursor(60)?,
+        current: 0,
+    };
+    conn.close_font(cursor_font)?;
+    if let Some(argb32) = render_argb32_format(conn)? {
+        let palette = crate::assets::palette();
+        // The glyph fallbacks being replaced are dead server resources
+        // otherwise — free them as they're superseded.
+        for old in [cursors.arrow, cursors.hand, cursors.disabled] {
+            conn.free_cursor(old)?;
+        }
+        // Hotspots: arrow tip, fingertip, circle center.
+        cursors.arrow = sprite_cursor(
+            conn,
+            root,
+            argb32,
+            &crate::assets::cursor_pointer(),
+            &palette,
+            (4, 0),
+        )?;
+        cursors.hand = sprite_cursor(
+            conn,
+            root,
+            argb32,
+            &crate::assets::cursor_hand(),
+            &palette,
+            (11, 0),
+        )?;
+        cursors.disabled = sprite_cursor(
+            conn,
+            root,
+            argb32,
+            &crate::assets::cursor_disabled(),
+            &palette,
+            (12, 12),
+        )?;
+    }
+    let cursor = cursors.arrow;
+    let cw = ChangeWindowAttributesAux::new()
+        .background_pixel(screen.black_pixel)
+        .cursor(cursor);
+    conn.change_window_attributes(root, &cw)?;
+    conn.clear_area(false, root, 0, 0, 0, 0)?;
+    Ok(cursors)
+}
+
+/// Create the single full-screen underlay window: wallpaper + all leaf
+/// chrome + drag handles + "+" buttons are composited onto it, below every
+/// client. Returns the window id and the root's current geometry as the
+/// initial workarea.
+fn create_underlay(
+    conn: &x11rb::rust_connection::RustConnection,
+    screen: &x11rb::protocol::xproto::Screen,
+    root: Window,
+) -> R<(Window, Rect)> {
+    let geo = conn.get_geometry(root)?.reply()?;
+    let workarea = Rect {
+        x: 0,
+        y: 0,
+        w: i32::from(geo.width),
+        h: i32::from(geo.height),
+    };
+    let underlay = conn.generate_id()?;
+    conn.create_window(
+        screen.root_depth,
+        underlay,
+        root,
+        0,
+        0,
+        geo.width,
+        geo.height,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        screen.root_visual,
+        &CreateWindowAux::new()
+            .background_pixel(screen.black_pixel)
+            .event_mask(
+                EventMask::EXPOSURE
+                    | EventMask::BUTTON_PRESS
+                    | EventMask::BUTTON_RELEASE
+                    | EventMask::BUTTON1_MOTION
+                    // Hover motion drives the resize/disabled cursor feedback
+                    // over drag handles and titlebar buttons.
+                    | EventMask::POINTER_MOTION,
+            ),
+    )?;
+    conn.map_window(underlay)?;
+    // Keep the underlay pinned at the bottom of the stack.
+    conn.configure_window(
+        underlay,
+        &ConfigureWindowAux::new().stack_mode(StackMode::BELOW),
+    )?;
+    // Deliver button1 (and the drag's motion/release) even over the underlay.
+    conn.grab_button(
+        true,
+        underlay,
+        EventMask::BUTTON_PRESS | EventMask::BUTTON_RELEASE | EventMask::BUTTON1_MOTION,
+        GrabMode::ASYNC,
+        GrabMode::ASYNC,
+        x11rb::NONE,
+        x11rb::NONE,
+        ButtonIndex::M1,
+        ModMask::ANY,
+    )?;
+    Ok((underlay, workarea))
+}
+
+/// Create the override-redirect popup windows for the app launcher menu
+/// (main column + one submenu) and the `MenuUi` state that tracks them.
+/// Created hidden; mapped/moved on demand. POINTER_MOTION drives hover,
+/// BUTTON_PRESS selection, EXPOSURE repaints.
+fn create_menu_windows(
+    conn: &x11rb::rust_connection::RustConnection,
+    screen: &x11rb::protocol::xproto::Screen,
+    root: Window,
+    cursors: &Cursors,
+) -> R<MenuUi> {
+    let menu_mask = EventMask::EXPOSURE
+        | EventMask::BUTTON_PRESS
+        | EventMask::POINTER_MOTION
+        | EventMask::LEAVE_WINDOW;
+    let (menu_main, menu_sub) = (conn.generate_id()?, conn.generate_id()?);
+    for mw in [menu_main, menu_sub] {
+        conn.create_window(
+            screen.root_depth,
+            mw,
+            root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            screen.root_visual,
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .background_pixel(screen.black_pixel)
+                // Every menu row is clickable, so the hand covers the menu.
+                .cursor(cursors.hand)
+                .event_mask(menu_mask),
+        )?;
+    }
+    Ok(MenuUi {
+        tree: crate::menu::build(),
+        main_win: menu_main,
+        sub_win: menu_sub,
+        open: false,
+        main: FrameRect {
+            x: 0,
+            y: 0,
+            w: 1,
+            h: 1,
+        },
+        main_cw: 0,
+        main_hi: None,
+        open_cat: None,
+        sub_cw: 0,
+        sub_hi: None,
+        target_leaf: crate::tree::NodeId::default(),
+        icon_cache: HashMap::new(),
+        main_icons: Vec::new(),
+        sub_icons: Vec::new(),
+    })
+}
+
+/// Finish startup once `wm` is fully constructed: wire up keybindings,
+/// EWMH workarea/wallpaper, XInput2 (best-effort), adopt any windows a
+/// previous WM left on screen, autostart the dock, and run the first
+/// arrange.
+fn startup_adopt_and_arrange(wm: &mut Wm, root: Window) -> R<()> {
     wm.build_keymap()?;
     wm.grab_keys()?;
     wm.update_net_workarea()?;
@@ -562,21 +626,7 @@ pub fn run(replace: bool) -> R<()> {
     }
 
     wm.conn.flush()?;
-    wm.arrange()?;
-
-    // Run the loop with a panic guard: layout hiding uses plain unmaps, and
-    // exiting without remapping strands taskbar'd windows invisible for the
-    // next WM (which only adopts viewable windows). Restore on *every* exit
-    // path — clean quit, handling error, or panic. When the connection
-    // itself died the restore fails too, but then the server is resetting
-    // client state anyway.
-    let looped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| event_loop(&mut wm)));
-    let restored = wm.restore_clients();
-    match looped {
-        Err(payload) => std::panic::resume_unwind(payload),
-        Ok(Err(e)) => Err(e),
-        Ok(Ok(())) => restored,
-    }
+    wm.arrange()
 }
 
 /// Events that cut a layout animation short: input so 280 ms of keypresses
@@ -873,6 +923,15 @@ impl Wm {
 /// an x11rb error (a `format!`-context string, a future typed error) must
 /// not silently demote a dead socket to "log and retry" — that would spin
 /// the event loop forever on a connection that can never deliver again.
+/// Whether `e` (or anything in its `source()` chain) indicates the X11
+/// connection itself died, as opposed to an ordinary per-request error.
+///
+/// This walks `Error::source()` to find the chain, so callers that box up
+/// errors for fatal-connection detection to work here must propagate them
+/// as boxed `dyn Error` (preserving the chain) rather than flattening them
+/// through `format!("{e}")`/`.to_string()` into a fresh `String`-based
+/// error — that severs the chain and this function will never see the
+/// underlying `ConnectionError`/`ReplyError`/`ReplyOrIdError`.
 fn is_connection_error(mut e: &(dyn std::error::Error + 'static)) -> bool {
     loop {
         if e.is::<x11rb::errors::ConnectionError>()

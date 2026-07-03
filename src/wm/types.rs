@@ -357,9 +357,7 @@ pub struct Widgets {
 }
 
 impl Widgets {
-    /// Drop every region from the previous layout; `taskbar_plus` is
-    /// unconditionally overwritten by `compute_taskbar`, so it needs no
-    /// reset here.
+    /// Drop every region (and stale rect) from the previous layout.
     pub fn clear(&mut self) {
         self.handle_regions.clear();
         self.plus_regions.clear();
@@ -367,6 +365,7 @@ impl Widgets {
         self.btn_regions.clear();
         self.taskbar_regions.clear();
         self.edge_handle_regions.clear();
+        self.taskbar_plus = FrameRect::default();
     }
 }
 
@@ -528,6 +527,15 @@ pub fn ease_out_back(t: f32) -> f32 {
     (t * t).mul_add(inner, 1.0)
 }
 
+/// Clamp a signed window dimension (width/height) to the `u32` X11 wire
+/// type, floored at 1px (X rejects zero-size windows). A negative input
+/// indicates a layout bug upstream; in debug builds that fails loudly via
+/// the assertion instead of silently producing a 1px sliver.
+pub fn clamp_dim(v: i32) -> u32 {
+    debug_assert!(v > 0, "clamp_dim: non-positive dimension {v}");
+    v.max(1) as u32
+}
+
 pub const fn rect_contains(r: FrameRect, x: i32, y: i32) -> bool {
     x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
 }
@@ -579,7 +587,11 @@ pub struct ShmSeg {
 }
 
 impl ShmSeg {
-    pub fn new(seg: u32, ptr: *mut u8, len: usize) -> Self {
+    /// # Safety
+    /// `ptr` must be the start of a live `MAP_SHARED` mapping of at least
+    /// `len` bytes that this `ShmSeg` uniquely owns: `slice()` will hand out
+    /// `&mut [u8]` views of it and `Drop` will `munmap(ptr, len)`.
+    pub unsafe fn new(seg: u32, ptr: *mut u8, len: usize) -> Self {
         Self { seg, ptr, len }
     }
 

@@ -124,7 +124,7 @@ impl Wm {
         }
         let bsz = theme::BTN_SIZE;
         let bsp = theme::BTN_SPACING;
-        let bcy = p.target.y + tb_h / 2 - 2 + theme::BTN_Y_OFFSET;
+        let bcy = p.target.y + tb_h / 2 + theme::BTN_Y_OFFSET;
         if p.target.w >= theme::min_split_w() {
             let right = p.target.x + p.target.w - bw - 4;
             for (i, kind) in [BtnKind::Close, BtnKind::Split, BtnKind::Minimize]

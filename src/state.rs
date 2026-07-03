@@ -258,9 +258,19 @@ impl State {
         // colour stays with the content; child_b gets a fresh colour.
         // `leaf` should always resolve (it came from `focused_leaf_valid`),
         // but a dangling id degrades to an empty leaf rather than panicking.
-        let child_a = self
-            .tree
-            .insert_node(Node::Leaf(self.tree.leaf(leaf).cloned().unwrap_or_default()));
+        let child_a = self.tree.insert_node(Node::Leaf(
+            self.tree.leaf(leaf).cloned().unwrap_or_else(|| {
+                debug_assert!(
+                    false,
+                    "split_focused: focused_leaf_valid() returned a dangling id {leaf:?}"
+                );
+                eprintln!(
+                    "split_focused: focused leaf {leaf:?} not found in tree; \
+                     falling back to an empty leaf"
+                );
+                Default::default()
+            }),
+        ));
         let child_b = self.tree.make_leaf();
         // Insert a branch in place of `leaf`, with child_a carrying the window.
         self.split_node(leaf, dir, child_a, child_b);
@@ -269,14 +279,10 @@ impl State {
         self.focused_leaf = child_a;
     }
 
-    /// Close the focused leaf. Its window moves into the adjacent sibling if
-    /// that split is empty, otherwise down to the taskbar.
-    pub fn close_focused(&mut self) -> bool {
-        let leaf = self.focused_leaf_valid();
-        let Some((parent, idx)) = self.tree.find_parent(leaf) else {
-            return false; // root leaf: nothing to close
-        };
-
+    /// Relocate `leaf`'s window: into the adjacent sibling's first leaf if it
+    /// is empty, otherwise onto the taskbar. `idx` is `leaf`'s index among
+    /// `parent`'s children.
+    fn relocate_closed_window(&mut self, parent: NodeId, idx: usize, leaf: NodeId) -> bool {
         // Relocate this leaf's window: into the adjacent sibling's first leaf
         // if it is empty, otherwise onto the taskbar.
         let client = self.tree.leaf(leaf).and_then(|l| l.client);
@@ -313,6 +319,81 @@ impl State {
                 self.push_taskbar(c);
             }
         }
+        true
+    }
+
+    /// n-ary close path: remove `leaf` (at index `idx` of `parent`'s
+    /// children), redistributing its ratio among the survivors, and refocus
+    /// the nearest surviving neighbour.
+    fn close_focused_nary(&mut self, parent: NodeId, idx: usize, leaf: NodeId) {
+        // n-ary: remove this child, redistribute its ratio.
+        if let Some(Node::Branch {
+            children, ratios, ..
+        }) = self.tree.get_mut(parent)
+        {
+            let removed = ratios[idx];
+            children.remove(idx);
+            ratios.remove(idx);
+            let remaining: f64 = ratios.iter().sum();
+            if remaining > 0.0 {
+                for r in ratios.iter_mut() {
+                    *r += removed * *r / remaining;
+                }
+            }
+        }
+        self.tree.remove_node(leaf);
+        let children = match self.tree.get(parent) {
+            Some(Node::Branch { children, .. }) => children.clone(),
+            _ => unreachable!(),
+        };
+        let fb = idx.min(children.len() - 1);
+        self.focused_leaf = self.tree.first_leaf(children[fb]);
+    }
+
+    /// Binary close path: collapse `parent`, the surviving sibling (at index
+    /// `idx`'s opposite) takes its place, and same-direction branches are
+    /// flattened back into the grandparent.
+    fn close_focused_binary(&mut self, parent: NodeId, idx: usize, leaf: NodeId) -> bool {
+        // binary: collapse parent, sibling takes its place.
+        let sibling = match self.tree.get(parent) {
+            Some(Node::Branch { children, .. }) => children[usize::from(idx == 0)],
+            _ => return false,
+        };
+        self.tree.remove_node(leaf);
+        // Resolve focus before any flattening: the sibling *node* may
+        // be dissolved into the grandparent below, but its leaves
+        // survive.
+        let new_focus = self.tree.first_leaf(sibling);
+        if parent == self.tree.root {
+            self.tree.root = sibling;
+            self.tree.remove_node(parent);
+        } else if let Some((grand, pidx)) = self.tree.find_parent(parent) {
+            if let Some(Node::Branch { children, .. }) = self.tree.get_mut(grand) {
+                children[pidx] = sibling;
+            }
+            self.tree.remove_node(parent);
+            // The spliced-in sibling can be a branch in the
+            // grandparent's own direction; dissolve it so same-dir
+            // splits stay one flat n-ary branch.
+            self.tree.flatten_same_dir(grand, pidx);
+        } else {
+            self.tree.remove_node(parent);
+        }
+        self.focused_leaf = new_focus;
+        true
+    }
+
+    /// Close the focused leaf. Its window moves into the adjacent sibling if
+    /// that split is empty, otherwise down to the taskbar.
+    pub fn close_focused(&mut self) -> bool {
+        let leaf = self.focused_leaf_valid();
+        let Some((parent, idx)) = self.tree.find_parent(leaf) else {
+            return false; // root leaf: nothing to close
+        };
+
+        if !self.relocate_closed_window(parent, idx, leaf) {
+            return false;
+        }
 
         let nchildren = match self.tree.get(parent) {
             Some(Node::Branch { children, .. }) => children.len(),
@@ -323,57 +404,11 @@ impl State {
         // leaf *was* the focused one (node ids are never reused, so it can't
         // still be found anywhere in the tree after removal).
         if nchildren > 2 {
-            // n-ary: remove this child, redistribute its ratio.
-            if let Some(Node::Branch {
-                children, ratios, ..
-            }) = self.tree.get_mut(parent)
-            {
-                let removed = ratios[idx];
-                children.remove(idx);
-                ratios.remove(idx);
-                let remaining: f64 = ratios.iter().sum();
-                if remaining > 0.0 {
-                    for r in ratios.iter_mut() {
-                        *r += removed * *r / remaining;
-                    }
-                }
-            }
-            self.tree.remove_node(leaf);
-            let children = match self.tree.get(parent) {
-                Some(Node::Branch { children, .. }) => children.clone(),
-                _ => unreachable!(),
-            };
-            let fb = idx.min(children.len() - 1);
-            self.focused_leaf = self.tree.first_leaf(children[fb]);
+            self.close_focused_nary(parent, idx, leaf);
+            true
         } else {
-            // binary: collapse parent, sibling takes its place.
-            let sibling = match self.tree.get(parent) {
-                Some(Node::Branch { children, .. }) => children[usize::from(idx == 0)],
-                _ => return false,
-            };
-            self.tree.remove_node(leaf);
-            // Resolve focus before any flattening: the sibling *node* may
-            // be dissolved into the grandparent below, but its leaves
-            // survive.
-            let new_focus = self.tree.first_leaf(sibling);
-            if parent == self.tree.root {
-                self.tree.root = sibling;
-                self.tree.remove_node(parent);
-            } else if let Some((grand, pidx)) = self.tree.find_parent(parent) {
-                if let Some(Node::Branch { children, .. }) = self.tree.get_mut(grand) {
-                    children[pidx] = sibling;
-                }
-                self.tree.remove_node(parent);
-                // The spliced-in sibling can be a branch in the
-                // grandparent's own direction; dissolve it so same-dir
-                // splits stay one flat n-ary branch.
-                self.tree.flatten_same_dir(grand, pidx);
-            } else {
-                self.tree.remove_node(parent);
-            }
-            self.focused_leaf = new_focus;
+            self.close_focused_binary(parent, idx, leaf)
         }
-        true
     }
 
     // --- resize ---
@@ -483,27 +518,19 @@ impl State {
     /// column's canvas-space x right by `delta`. The caller (`Wm::on_motion`)
     /// nudges `scroll_x`/`scroll_target` by the same `delta` so those
     /// columns stay put on screen and only the dragged edge visibly moves.
-    pub fn resize_edge(&mut self, wa: Rect, left: bool, target_w: i32) -> i32 {
-        let root = self.tree.root;
-        let gap = theme::GAP;
-        let canvas_w = self.canvas_w.unwrap_or(wa.w);
-        let Some(mut widths) = self.tree.root_h_sizes(canvas_w - 2 * gap, gap) else {
-            return 0;
-        };
-        let idx = if left { 0 } else { widths.len() - 1 };
-        // Which root children are minimized leaves: their pixel width is
-        // pinned to `gap` regardless of ratio (see `child_sizes`), so their
-        // stored ratios must survive the rewrite below untouched — deriving
-        // a ratio from the pinned width would crush the share they restore
-        // to. And the end column itself being minimized makes the whole
-        // drag meaningless (old_w is the pinned gap, not a real width).
-        // Built strictly parallel to `widths`: per root H-child, or a single
-        // `false` for the one-column cases (lone leaf, V-branch root, where
-        // `root_h_sizes` returns one full-width span). Matching on any
-        // branch here used to index a V-root's *stacked children* with a
-        // column index — correct only by coincidence of the len-1 guards
-        // below.
-        let minimized: Vec<bool> = match self.tree.get(root) {
+    /// Which root children are minimized leaves: their pixel width is
+    /// pinned to `gap` regardless of ratio (see `child_sizes`), so their
+    /// stored ratios must survive the rewrite in `redistribute_column_widths`
+    /// untouched — deriving a ratio from the pinned width would crush the
+    /// share they restore to.
+    /// Built strictly parallel to `widths`: per root H-child, or a single
+    /// `false` for the one-column cases (lone leaf, V-branch root, where
+    /// `root_h_sizes` returns one full-width span). Matching on any
+    /// branch here used to index a V-root's *stacked children* with a
+    /// column index — correct only by coincidence of the len-1 guards
+    /// around its callers.
+    fn root_column_minimized(&self, root: NodeId, widths_len: usize) -> Vec<bool> {
+        match self.tree.get(root) {
             Some(Node::Branch {
                 dir: Dir::H,
                 children,
@@ -512,9 +539,63 @@ impl State {
                 .iter()
                 .map(|&c| self.tree.leaf(c).is_some_and(|l| l.minimized))
                 .collect(),
-            _ => vec![false; widths.len()],
+            _ => vec![false; widths_len],
+        }
+    }
+
+    /// Multi-column case of `resize_edge`: rewrite `root`'s ratios so that
+    /// column `idx` becomes `new_w` pixels wide, every other *normal*
+    /// (non-minimized) column keeps its relative share, and minimized
+    /// columns' ratios are left untouched. Returns `false` if the rewrite
+    /// isn't possible (e.g. every other column is minimized).
+    fn redistribute_column_widths(
+        &mut self,
+        root: NodeId,
+        idx: usize,
+        new_w: i32,
+        mut widths: Vec<i32>,
+        minimized: &[bool],
+    ) -> bool {
+        widths[idx] = new_w;
+        let total: i32 = widths
+            .iter()
+            .zip(minimized)
+            .filter_map(|(&w, &m)| (!m).then_some(w))
+            .sum();
+        if total <= 0 {
+            return false;
+        }
+        if let Some(Node::Branch {
+            dir: Dir::H,
+            ratios,
+            ..
+        }) = self.tree.get_mut(root)
+        {
+            // Only normal children's ratios matter to the layout
+            // (`child_sizes` normalises over them alone), so rewriting
+            // just those reproduces the pixel widths exactly.
+            for ((r, &w), &m) in ratios.iter_mut().zip(widths.iter()).zip(minimized) {
+                if !m {
+                    *r = f64::from(w) / f64::from(total);
+                }
+            }
+        }
+        true
+    }
+
+    pub fn resize_edge(&mut self, wa: Rect, left: bool, target_w: i32) -> i32 {
+        let root = self.tree.root;
+        let gap = theme::GAP;
+        let canvas_w = self.canvas_w.unwrap_or(wa.w);
+        let Some(widths) = self.tree.root_h_sizes(canvas_w - 2 * gap, gap) else {
+            return 0;
         };
+        let idx = if left { 0 } else { widths.len() - 1 };
+        let minimized = self.root_column_minimized(root, widths.len());
+        debug_assert_eq!(widths.len(), minimized.len());
         if widths.len() > 1 && minimized[idx] {
+            // The end column itself being minimized makes the whole drag
+            // meaningless (old_w is the pinned gap, not a real width).
             return 0;
         }
         let old_w = widths[idx];
@@ -524,31 +605,10 @@ impl State {
         if delta == 0 {
             return 0;
         }
-        if widths.len() > 1 {
-            widths[idx] = new_w;
-            let total: i32 = widths
-                .iter()
-                .zip(&minimized)
-                .filter_map(|(&w, &m)| (!m).then_some(w))
-                .sum();
-            if total <= 0 {
-                return 0;
-            }
-            if let Some(Node::Branch {
-                dir: Dir::H,
-                ratios,
-                ..
-            }) = self.tree.get_mut(root)
-            {
-                // Only normal children's ratios matter to the layout
-                // (`child_sizes` normalises over them alone), so rewriting
-                // just those reproduces the pixel widths exactly.
-                for ((r, &w), &m) in ratios.iter_mut().zip(widths.iter()).zip(&minimized) {
-                    if !m {
-                        *r = f64::from(w) / f64::from(total);
-                    }
-                }
-            }
+        if widths.len() > 1
+            && !self.redistribute_column_widths(root, idx, new_w, widths, &minimized)
+        {
+            return 0;
         }
         self.canvas_w_extra += delta;
         delta
