@@ -10,8 +10,8 @@ use x11rb::protocol::xproto::{
 
 use super::clients::WmState;
 use super::types::{
-    clamp_dim, ease_out_back, lerp_rect, BtnKind, Dock, FrameRect, LayoutAnim, LeafMeta,
-    Placement, ShmSeg, ShmState, Wm, R,
+    clamp_dim, ease_out_back, lerp_rect, BtnKind, Dock, FrameRect, LayoutAnim, LeafMeta, Placement,
+    ShmSeg, ShmState, Wm, R,
 };
 use crate::render::{LeafView, TabInfo, TaskItem};
 use crate::theme;

@@ -151,7 +151,11 @@ struct ThemeDir {
 /// the ~36px taskbar tile), then the largest smaller size (the mildest
 /// upscale).
 fn dir_rank(d: &ThemeDir) -> (bool, i32) {
-    let size_rank = if d.size >= 48 { d.size - 48 } else { 10_000 - d.size };
+    let size_rank = if d.size >= 48 {
+        d.size - 48
+    } else {
+        10_000 - d.size
+    };
     (d.scale != 1, size_rank)
 }
 
@@ -242,14 +246,16 @@ fn theme_search_dirs() -> &'static [std::path::PathBuf] {
                 if !seen.insert(theme.clone()) {
                     continue;
                 }
-                let Some(index) = data
-                    .iter()
-                    .find_map(|d| std::fs::read_to_string(d.join("icons").join(&theme).join("index.theme")).ok())
-                else {
+                let Some(index) = data.iter().find_map(|d| {
+                    std::fs::read_to_string(d.join("icons").join(&theme).join("index.theme")).ok()
+                }) else {
                     continue;
                 };
                 let (dirs, inherits) = parse_index_theme(&index);
-                out.extend(dirs.into_iter().map(|d| std::path::Path::new(&theme).join(d.path)));
+                out.extend(
+                    dirs.into_iter()
+                        .map(|d| std::path::Path::new(&theme).join(d.path)),
+                );
                 queue.extend(inherits);
             }
             // hicolor is the spec's implicit final fallback; visit it even

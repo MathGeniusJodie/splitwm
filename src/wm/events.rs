@@ -124,15 +124,14 @@ impl Wm {
             }
         }
         let p = self.conn.query_pointer(self.root)?.reply()?;
-        let allowed =
-            if p.child == x11rb::NONE
-                || p.child == self.underlay
-                || self.dock.docked.is_some_and(|d| d.win == p.child)
-            {
-                true
-            } else {
-                u16::from(p.mask) & MOD4 != 0
-            };
+        let allowed = if p.child == x11rb::NONE
+            || p.child == self.underlay
+            || self.dock.docked.is_some_and(|d| d.win == p.child)
+        {
+            true
+        } else {
+            u16::from(p.mask) & MOD4 != 0
+        };
         if self.debug_scroll {
             eprintln!(
                 "splitwm: hscroll_allowed child={} underlay={} mask={:?} -> {}",
@@ -1231,4 +1230,3 @@ pub(super) fn contain(r: R<()>, what: &str) -> R<()> {
         other => other,
     }
 }
-

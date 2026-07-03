@@ -70,11 +70,6 @@ pub struct Renderer {
     /// so the whole map is cleared once it exceeds `ICON_CACHE_CAP`.
     /// `Rc` payloads so a cache hit is a refcount bump, not a buffer copy.
     icon_idx_cache: IconCache<u8>,
-    /// The taskbar highlight's pre-dilated outline ring (`(size+6)²`,
-    /// Chebyshev radius 3 around the icon's silhouette, minus the icon's
-    /// own footprint), cached the same way — recomputing the dilation would
-    /// cost ~50 stores per opaque icon pixel per frame.
-    icon_ring_cache: IconCache<bool>,
 }
 
 /// A per-(icon id, size) render cache; `Rc` payloads make a hit a refcount
@@ -363,7 +358,6 @@ impl Renderer {
             ],
             palette,
             icon_idx_cache: RefCell::new(HashMap::new()),
-            icon_ring_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -688,10 +682,10 @@ impl Renderer {
         font.draw_text_clipped(fb, s, x as isize, y as usize, color, 0, fb.width);
     }
 
-    /// Draw one taskbar entry: a dithered background tile with the app icon
-    /// (or letter-glyph fallback) centred in it. Windows currently shown in a
-    /// split (`highlight`) get a 3px accent outline traced around the icon's
-    /// own silhouette instead of a box.
+    /// Draw one taskbar entry: the app icon (or letter-glyph fallback) with
+    /// a drop shadow, centred in its slot directly on the bar background.
+    /// Windows currently shown in a split (`highlight`) get an
+    /// accent-coloured rounded-rect box traced around the icon.
     pub fn draw_taskbar_item(
         &self,
         fb: &mut Framebuffer,
@@ -701,65 +695,59 @@ impl Renderer {
         accent: Index,
         highlight: bool,
     ) {
-        // Pixel-art rounded tile: full-height middle plus 2px-notched sides.
-        fill_paint(fb, r.x + 2, r.y, r.w - 4, r.h, CHROME_BG);
-        fill_paint(fb, r.x, r.y + 2, 2, r.h - 4, CHROME_BG);
-        fill_paint(fb, r.x + r.w - 2, r.y + 2, 2, r.h - 4, CHROME_BG);
-
         let cx = r.x + r.w / 2;
         let cy = r.y + r.h / 2;
         let isz = r.h.min(r.w) - 6;
+        let (dx, dy) = (cx - isz / 2, cy - isz / 2);
         if let Some(img) = icon {
-            let (dx, dy) = (cx - isz / 2, cy - isz / 2);
-            if highlight {
-                self.draw_icon_outline(fb, img, dx, dy, isz, accent);
-            }
+            self.draw_icon_shadow(fb, img, dx, dy, isz);
+        } else {
+            self.draw_glyph(
+                fb,
+                label,
+                cx + SHADOW_OFFSET,
+                cy + SHADOW_OFFSET,
+                SHADOW_COLOR,
+            );
+        }
+        if highlight {
+            let bx = dx - ICON_BOX_PAD;
+            let by = dy - ICON_BOX_PAD;
+            let bsz = isz + 2 * ICON_BOX_PAD;
+            draw_rounded_box(fb, bx, by, bsz, bsz, accent);
+        }
+        if let Some(img) = icon {
             self.draw_icon(fb, img, dx, dy, isz);
         } else {
-            if highlight {
-                // Silhouette-outline the fallback glyph the same way. The
-                // 48 restrikes per frame are accepted: this path only runs
-                // for highlighted windows that provide no icon at all, and a
-                // single glyph is a few dozen pixels.
-                for oy in -3i32..=3 {
-                    for ox in -3i32..=3 {
-                        if ox == 0 && oy == 0 {
-                            continue;
-                        }
-                        self.draw_glyph(fb, label, cx + ox, cy + oy, accent);
-                    }
-                }
-            }
             self.draw_glyph(fb, label, cx, cy, self.fg);
         }
     }
 
-    /// Trace a 3px outline in `accent` around `img`'s opaque silhouette,
-    /// from the cached pre-dilated ring (see `cached_ring`): one store per
-    /// ring pixel per frame instead of re-running the dilation.
-    fn draw_icon_outline(
-        &self,
-        fb: &mut Framebuffer,
-        img: &Icon,
-        dx: i32,
-        dy: i32,
-        size: i32,
-        accent: Index,
-    ) {
-        let Some(ring) = self.cached_ring(img, size) else {
+    /// Draw a solid drop shadow behind `img`: its own opaque silhouette,
+    /// offset by `SHADOW_OFFSET` and flattened to `SHADOW_COLOR`, reusing
+    /// the cached per-pixel index buffer (`cached_icon_indices`) so this
+    /// costs one extra store per opaque icon pixel instead of a second scale
+    /// pass.
+    fn draw_icon_shadow(&self, fb: &mut Framebuffer, img: &Icon, dx: i32, dy: i32, size: i32) {
+        if img.w == 0 || img.h == 0 || size < 1 {
             return;
-        };
-        let rsz = (size + 6) as usize;
-        for ty in 0..rsz {
-            for tx in 0..rsz {
-                if !ring[ty * rsz + tx] {
+        }
+        let sz = size as usize;
+        let idx = self.cached_icon_indices(img, size);
+        for ty in 0..size {
+            let py = dy + SHADOW_OFFSET + ty;
+            if py < 0 {
+                continue;
+            }
+            for tx in 0..size {
+                let px = dx + SHADOW_OFFSET + tx;
+                if px < 0 {
                     continue;
                 }
-                let px = dx - 3 + tx as i32;
-                let py = dy - 3 + ty as i32;
-                if px >= 0 && py >= 0 {
-                    fb.set_pixel(px as usize, py as usize, accent);
+                if idx[ty as usize * sz + tx as usize] == TRANSPARENT_INDEX {
+                    continue;
                 }
+                fb.set_pixel(px as usize, py as usize, SHADOW_COLOR);
             }
         }
     }
@@ -849,57 +837,6 @@ impl Renderer {
         );
         idx
     }
-
-    /// The `(size+6)²` dilated outline ring for `img`'s silhouette (every
-    /// pixel within Chebyshev distance 3 of an opaque icon pixel, minus the
-    /// icon's own footprint — the icon is drawn over it anyway), cached the
-    /// same way as `cached_icon_indices`; `None` for empty inputs.
-    fn cached_ring(&self, img: &Icon, size: i32) -> Option<Rc<[bool]>> {
-        if img.w == 0 || img.h == 0 || size < 1 {
-            return None;
-        }
-        let key = (img.id(), size);
-        if let Some(v) = self.icon_ring_cache.borrow().get(&key) {
-            return Some(Rc::clone(v));
-        }
-        // The mask is exactly the cached index buffer's opacity: deriving it
-        // there keeps one sampling loop (and one alpha threshold) instead of
-        // a second scaler that could drift.
-        let idx = self.cached_icon_indices(img, size);
-        let mask: Vec<bool> = idx.iter().map(|&i| i != TRANSPARENT_INDEX).collect();
-        let sz = size as usize;
-        let rsz = sz + 6;
-        let mut ring = vec![false; rsz * rsz];
-        for ty in 0..sz {
-            for tx in 0..sz {
-                if !mask[ty * sz + tx] {
-                    continue;
-                }
-                for oy in 0..7 {
-                    for ox in 0..7 {
-                        ring[(ty + oy) * rsz + tx + ox] = true;
-                    }
-                }
-            }
-        }
-        // Punch the icon's own footprint back out: only the visible ring
-        // remains, so drawing it never repaints under-icon pixels.
-        for ty in 0..sz {
-            for tx in 0..sz {
-                if mask[ty * sz + tx] {
-                    ring[(ty + 3) * rsz + tx + 3] = false;
-                }
-            }
-        }
-        let ring: Rc<[bool]> = ring.into();
-        insert_capped(
-            &mut self.icon_ring_cache.borrow_mut(),
-            ICON_CACHE_CAP,
-            key,
-            Rc::clone(&ring),
-        );
-        Some(ring)
-    }
 }
 
 /// Palette index is a valid `Index` for every real colour, so a distinct
@@ -939,6 +876,33 @@ pub struct TaskItem {
     pub y: i32,
     pub w: i32,
     pub h: i32,
+}
+
+/// Pixel offset (down and right) of a taskbar icon's drop shadow from the
+/// icon itself.
+const SHADOW_OFFSET: i32 = 2;
+
+/// Flat colour a taskbar icon's drop shadow silhouette is drawn in.
+const SHADOW_COLOR: Index = palette_color::BLACK;
+
+/// Gap between a highlighted taskbar icon's own footprint and the
+/// rounded-rect box traced around it.
+const ICON_BOX_PAD: i32 = 3;
+
+/// Thickness in pixels of the highlighted taskbar icon's rounded-rect box
+/// stroke.
+const ICON_BOX_THICKNESS: i32 = 2;
+
+/// Stroke an accent-coloured rounded-rect box: a `w`x`h` outline with
+/// 2px-notched corners, matching the pixel-art rounding used elsewhere in
+/// the chrome. Used to mark a taskbar icon as currently shown in a split.
+fn draw_rounded_box(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, color: Index) {
+    let t = ICON_BOX_THICKNESS;
+    let paint = PgPaint::Solid(color);
+    fill_paint(fb, x + 2, y, w - 4, t, paint); // top
+    fill_paint(fb, x + 2, y + h - t, w - 4, t, paint); // bottom
+    fill_paint(fb, x, y + 2, t, h - 4, paint); // left
+    fill_paint(fb, x + w - t, y + 2, t, h - 4, paint); // right
 }
 
 /// Half-length of each "+" arm as a percentage of the icon's overall size

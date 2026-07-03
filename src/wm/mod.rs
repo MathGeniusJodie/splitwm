@@ -85,7 +85,11 @@ fn mask_term_signals(block: bool) {
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGTERM);
         libc::sigaddset(&mut set, libc::SIGINT);
-        let how = if block { libc::SIG_BLOCK } else { libc::SIG_UNBLOCK };
+        let how = if block {
+            libc::SIG_BLOCK
+        } else {
+            libc::SIG_UNBLOCK
+        };
         libc::pthread_sigmask(how, &set, std::ptr::null_mut());
     }
 }
