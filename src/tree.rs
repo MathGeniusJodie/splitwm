@@ -384,6 +384,53 @@ impl Tree {
     }
 }
 
+#[cfg(test)]
+mod child_sizes_tests {
+    use super::child_sizes;
+
+    #[test]
+    fn sizes_fill_usable_exactly() {
+        // Rounding must never leave the last child short or long.
+        let kids = [(false, 0.3), (false, 0.3), (false, 0.4)];
+        let sizes = child_sizes(&kids, 997, 20);
+        assert_eq!(sizes.iter().sum::<i32>(), 997);
+        assert!(sizes.iter().all(|&s| s >= 1));
+    }
+
+    #[test]
+    fn minimized_children_get_min_size() {
+        let kids = [(true, 0.5), (false, 0.25), (false, 0.25)];
+        let sizes = child_sizes(&kids, 1000, 20);
+        assert_eq!(sizes[0], 20);
+        assert_eq!(sizes[1] + sizes[2], 980);
+        // Equal ratios split the remainder evenly.
+        assert_eq!(sizes[1], 490);
+    }
+
+    #[test]
+    fn all_minimized_does_not_panic_or_go_negative() {
+        let kids = [(true, 0.5), (true, 0.5)];
+        let sizes = child_sizes(&kids, 100, 20);
+        assert_eq!(sizes, vec![20, 20]);
+    }
+
+    #[test]
+    fn zero_ratio_sum_falls_back() {
+        // Degenerate ratios must not divide by zero.
+        let kids = [(false, 0.0), (false, 0.0)];
+        let sizes = child_sizes(&kids, 100, 20);
+        assert_eq!(sizes.iter().sum::<i32>(), 100);
+    }
+
+    #[test]
+    fn usable_smaller_than_min_total_clamps() {
+        let kids = [(true, 0.5), (false, 0.5)];
+        let sizes = child_sizes(&kids, 10, 20);
+        assert_eq!(sizes[0], 20);
+        assert_eq!(sizes[1], 1, "normal child bottoms out at 1, not negative");
+    }
+}
+
 /// A gap between two adjacent children of a branch: the place a drag handle
 /// (and, at root level, a "+" button) sits. Coordinates are canvas-space.
 /// `dir` is the parent branch's direction: `H` is a vertical gap dragged
@@ -400,6 +447,12 @@ pub struct Boundary {
     pub cross: i32,     // strip start on the cross axis
     pub cross_len: i32, // strip extent on the cross axis
     pub root: bool,     // whether `parent` is the tree root (insert eligible)
+    /// Whether dragging this gap can actually resize its neighbours: false
+    /// when either adjacent child is a minimized leaf — its pixel size is
+    /// pinned to `gap` regardless of ratio, so the drag's pixel-space
+    /// fraction wouldn't correspond to the ratio-space one `resize_boundary`
+    /// applies (the handle would not track the pointer).
+    pub resizable: bool,
 }
 
 impl Tree {
@@ -439,6 +492,7 @@ impl Tree {
                         cross: at.y,
                         cross_len: at.h,
                         root: node == self.root,
+                        resizable: !meta[i].0 && !meta[i + 1].0,
                     });
                 }
                 self.boundaries_inner(c, Rect { x: cx, w: cw, ..at }, gap, out);
@@ -462,6 +516,7 @@ impl Tree {
                         cross: at.x,
                         cross_len: at.w,
                         root: node == self.root,
+                        resizable: !meta[i].0 && !meta[i + 1].0,
                     });
                 }
                 self.boundaries_inner(c, Rect { y: cy, h: ch, ..at }, gap, out);

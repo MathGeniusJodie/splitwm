@@ -83,8 +83,16 @@ impl Wm {
         self.place_clients(&placed)?;
         self.place_dock(wa, canvas_w)?;
         // place_clients/place_dock raise their windows to the top; keep
-        // notifications above them, and an open launcher menu above
-        // everything (an arrange can be triggered while it's open).
+        // floats above tiled clients, notifications above those, and an open
+        // launcher menu above everything (an arrange can be triggered while
+        // it's open).
+        self.raise_floats()?;
+        // Fullscreen covers floats too; only notifications and the menu stay
+        // above it.
+        if let Some(fs) = self.fullscreen.filter(|w| self.clients.contains_key(w)) {
+            self.conn
+                .configure_window(fs, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        }
         self.raise_notifications()?;
         self.raise_menu()?;
 
@@ -110,7 +118,7 @@ impl Wm {
                 self.renderer.draw_leaf(m, p.target.x, p.target.y, &view);
             }
             if widgets {
-                for (r, _) in &self.plus_regions {
+                for (r, _) in &self.widgets.plus_regions {
                     crate::render::draw_plus(m, r.x + r.w / 2, r.y + r.h / 2, r.w);
                 }
                 // Split-control buttons. Look each leaf's final frame up so the
@@ -119,7 +127,7 @@ impl Wm {
                 // minimize); parent lookups come from one `parent_map` walk
                 // rather than a full-arena `find_parent` scan per leaf.
                 let metas = self.leaf_metas(placed);
-                for (r, leaf, kind) in &self.btn_regions {
+                for (r, leaf, kind) in &self.widgets.btn_regions {
                     let Some(&meta) = metas.get(leaf) else {
                         continue;
                     };
@@ -160,7 +168,7 @@ impl Wm {
             // Bottom bar: one tile per managed window; split-visible windows
             // get an accent highlight box, and every tile carries a corner
             // close badge.
-            for t in &self.taskbar_regions {
+            for t in &self.widgets.taskbar_regions {
                 let icon = self.icon_for(t.win);
                 self.renderer.draw_taskbar_item(
                     m,
@@ -178,7 +186,7 @@ impl Wm {
                 crate::render::draw_close_badge(m, t.close.x, t.close.y, t.close.w);
             }
             // Launcher "+" at the right end of the bar.
-            let pr = self.taskbar_plus;
+            let pr = self.widgets.taskbar_plus;
             crate::render::draw_plus(m, pr.x + pr.w / 2, pr.y + pr.h / 2, pr.w);
         }
         let mut buf = std::mem::take(&mut self.bgrx);
@@ -289,15 +297,22 @@ impl Wm {
         let tb_h = theme::tb_h();
         let bw = theme::BORDER_LEFT;
         let mut visible: std::collections::HashSet<Win> = std::collections::HashSet::new();
+        let fullscreen = self.fullscreen.filter(|w| self.clients.contains_key(w));
         for p in placed {
             let minimized = self.state.tree.leaf(p.leaf).is_some_and(|l| l.minimized);
             if let Some(c) = p.active_client {
-                if minimized {
+                if minimized || Some(c) == fullscreen {
+                    // The fullscreen client is configured below, over the
+                    // whole workarea; don't fight it with split geometry.
                     continue;
                 }
                 let r = p.target;
-                let cw = (r.w - 2 * bw).max(1);
-                let ch = (r.h - tb_h - bw).max(1);
+                // Never configure a client below its WM_NORMAL_HINTS
+                // minimum: the split shows it at min size (clipped by the
+                // chrome) rather than handing it geometry it can't honour.
+                let (min_w, min_h) = self.clients.get(&c).map_or((1, 1), |cl| cl.min_size);
+                let cw = (r.w - 2 * bw).max(min_w).max(1);
+                let ch = (r.h - tb_h - bw).max(min_h).max(1);
                 self.conn.configure_window(
                     c,
                     &ConfigureWindowAux::new()
@@ -317,6 +332,32 @@ impl Wm {
                 if newly_mapped {
                     self.set_wm_state(c, WM_STATE_NORMAL)?;
                 }
+            }
+        }
+        // The fullscreen client covers the whole workarea above every tiled
+        // client, regardless of where (or whether) its split is on screen —
+        // marked visible before `to_hide` is computed so it can't be
+        // mapped-then-hidden in the same pass.
+        if let Some(fs) = fullscreen {
+            let full = self.wa();
+            self.conn.configure_window(
+                fs,
+                &ConfigureWindowAux::new()
+                    .x(full.x)
+                    .y(full.y)
+                    .width(u32::try_from(full.w.max(1)).unwrap_or(1))
+                    .height(u32::try_from(full.h.max(1)).unwrap_or(1))
+                    .border_width(0)
+                    .stack_mode(StackMode::ABOVE),
+            )?;
+            self.conn.map_window(fs)?;
+            visible.insert(fs);
+            let newly_mapped = self
+                .clients
+                .get_mut(&fs)
+                .is_some_and(|cl| !std::mem::replace(&mut cl.mapped, true));
+            if newly_mapped {
+                self.set_wm_state(fs, WM_STATE_NORMAL)?;
             }
         }
         let to_hide: Vec<Win> = self
@@ -420,9 +461,37 @@ impl Wm {
             })
             .collect();
         let start = Instant::now();
+        let mut cut_short = false;
         loop {
             let frame_start = Instant::now();
-            let t = (start.elapsed().as_secs_f32() / DURATION.as_secs_f32()).min(1.0);
+            // Drain whatever arrived while the last frame rendered: a
+            // keypress or click cuts the animation short (snap to the final
+            // frame) instead of queueing 280 ms of input behind it. Every
+            // drained event is stashed for the main loop to process next.
+            while let Some(ev) = self.conn.poll_for_event()? {
+                // Any input or structural event cuts the animation short:
+                // input so 280 ms of keypresses don't queue behind eye candy,
+                // structural (map/unmap/destroy/configure/client-message) so
+                // a window appearing or dying mid-animation is handled
+                // promptly instead of waiting out the transition.
+                use x11rb::protocol::Event as E;
+                cut_short |= matches!(
+                    ev,
+                    E::KeyPress(_)
+                        | E::ButtonPress(_)
+                        | E::MapRequest(_)
+                        | E::UnmapNotify(_)
+                        | E::DestroyNotify(_)
+                        | E::ConfigureRequest(_)
+                        | E::ClientMessage(_)
+                );
+                self.pending_events.push(ev);
+            }
+            let t = if cut_short {
+                1.0
+            } else {
+                (start.elapsed().as_secs_f32() / DURATION.as_secs_f32()).min(1.0)
+            };
             let e = ease_out_back(t);
             let interp: Vec<Placement> = placed
                 .iter()

@@ -208,6 +208,9 @@ pub fn run(replace: bool) -> R<()> {
             atoms.net_wm_icon,
             atoms.net_wm_window_type,
             atoms.net_wm_window_type_notification,
+            atoms.net_wm_window_type_dialog,
+            atoms.net_wm_state,
+            atoms.net_wm_state_fullscreen,
         ],
     )?;
     conn.change_property32(
@@ -279,6 +282,11 @@ pub fn run(replace: bool) -> R<()> {
     conn.close_font(cursor_font)?;
     if let Some(argb32) = render_argb32_format(&conn)? {
         let palette = crate::assets::palette();
+        // The glyph fallbacks being replaced are dead server resources
+        // otherwise — free them as they're superseded.
+        for old in [cursors.arrow, cursors.hand, cursors.disabled] {
+            conn.free_cursor(old)?;
+        }
         // Hotspots: arrow tip, fingertip, circle center.
         cursors.arrow =
             sprite_cursor(&conn, root, argb32, &crate::assets::cursor_pointer(), &palette, (4, 0))?;
@@ -426,6 +434,10 @@ pub fn run(replace: bool) -> R<()> {
         renderer: Renderer::new(),
         state: State::new(),
         clients: HashMap::new(),
+        floats: Vec::new(),
+        focused_float: None,
+        last_event_time: 0,
+        pending_events: Vec::new(),
         bar_order: Vec::new(),
         docked: None,
         docked_w: 0,
@@ -447,20 +459,10 @@ pub fn run(replace: bool) -> R<()> {
         debug_scroll,
         animate: false,
         prev_frame_rect: HashMap::new(),
-        handle_regions: Vec::new(),
-        plus_regions: Vec::new(),
-        taskbar_plus: FrameRect {
-            x: 0,
-            y: 0,
-            w: 0,
-            h: 0,
-        },
-        tab_regions: Vec::new(),
-        taskbar_regions: Vec::new(),
-        btn_regions: Vec::new(),
+        widgets: Widgets::default(),
         menu,
         drag: None,
-        edge_handle_regions: Vec::new(),
+        float_drag: None,
         edge_drag: None,
         cursors,
         bgrx: Vec::new(),
@@ -470,6 +472,7 @@ pub fn run(replace: bool) -> R<()> {
             true,
         ),
         ignore_unmaps: HashMap::new(),
+        fullscreen: None,
         conn,
         root,
     };
@@ -477,6 +480,10 @@ pub fn run(replace: bool) -> R<()> {
     wm.build_keymap()?;
     wm.grab_keys()?;
     wm.set_wallpaper();
+    // Warm the cached systemd-run probe now: it's a synchronous D-Bus round
+    // trip, and paying for it lazily would block the event loop on the
+    // session's first app launch.
+    let _ = Wm::have_systemd_run();
     // Two-finger trackpad swipes (and any other horizontal-scroll-capable
     // device) report a smooth XInput2 scroll valuator; listen for its raw
     // motion globally so panning tracks the swipe instead of jumping in
@@ -533,7 +540,12 @@ pub fn run(replace: bool) -> R<()> {
         // Collect a whole batch: block for one event, then drain everything the
         // server already has queued. Motion events that arrive faster than we
         // can render are coalesced (see handle_batch) so renders never pile up.
-        let mut batch = vec![wm.conn.wait_for_event()?];
+        // Events drained mid-animation (see `run_layout_animation`) were
+        // stashed in `pending_events` and are consumed before blocking.
+        let mut batch = std::mem::take(&mut wm.pending_events);
+        if batch.is_empty() {
+            batch.push(wm.conn.wait_for_event()?);
+        }
         while let Some(ev) = wm.conn.poll_for_event()? {
             batch.push(ev);
         }
@@ -565,7 +577,12 @@ pub fn run(replace: bool) -> R<()> {
         let debug_scroll = scroll_delta != 0.0 && wm.debug_scroll;
         let batch_len = batch.len();
         let t0 = std::time::Instant::now();
-        wm.handle_batch(batch)?;
+        // A handling error (e.g. a reply from a window that raced us and
+        // died) must not take down the whole session; connection-level
+        // failures resurface at the next flush/wait and end the loop there.
+        if let Err(e) = wm.handle_batch(batch) {
+            eprintln!("splitwm: error handling event batch: {e}");
+        }
         if debug_scroll {
             eprintln!(
                 "splitwm: batch of {batch_len} events (scroll delta {scroll_delta:.3}) took {:?}",

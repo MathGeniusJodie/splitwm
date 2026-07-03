@@ -11,6 +11,8 @@
     clippy::many_single_char_names
 )]
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use pixel_fonts::{BitmapFont, FUSION_PIXEL_12_SPEC};
@@ -55,6 +57,17 @@ pub struct Renderer {
     /// time. `Minimize`/`MinimizeH` are two separate slots (not
     /// enabled/disabled of the same button) — see `BtnIcon::MinimizeH`.
     buttons: [ButtonArt; BtnIcon::COUNT],
+    /// `draw_icon`'s per-pixel `nearest_index` lookups are wasted work every
+    /// frame — icons are already quantized to exact palette colours, so the
+    /// resulting index buffer never changes for a given icon+size. Keyed by
+    /// (`Icon::id`, size) — ids are process-unique, so a dropped icon's
+    /// entry can never be served for a new one (a pointer key could, via
+    /// allocator address reuse). Entries for dropped icons are dead weight,
+    /// so the whole map is cleared once it exceeds `ICON_CACHE_CAP`.
+    icon_idx_cache: RefCell<HashMap<(u64, i32), Vec<u8>>>,
+    /// Same idea for `scaled_mask`'s coverage mask, used by the taskbar's
+    /// highlight outline.
+    icon_mask_cache: RefCell<HashMap<(u64, i32), Vec<bool>>>,
 }
 
 /// One titlebar button's art: the normal and dedicated disabled sprite.
@@ -188,6 +201,19 @@ impl NineSlice {
     ) {
         let (l, t, r, b) = (self.l, self.t, self.r, self.b);
         let (sw, sh) = (self.sprite.width, self.sprite.height);
+        // The sprite must cover its own configured insets or `sw - lu - ru`
+        // (etc.) below underflows mid-frame; a mismatched border asset
+        // should fail loudly in debug builds rather than panic on that
+        // subtraction.
+        debug_assert!(
+            sw >= l as usize + r as usize && sh >= t as usize + b as usize,
+            "NineSlice sprite ({sw}x{sh}) too small for insets l={l} t={t} r={r} b={b}"
+        );
+        if sw < l as usize + r as usize || sh < t as usize + b as usize {
+            // Release-build fallback: nothing sane to draw, skip rather than
+            // underflow.
+            return;
+        }
         let (lu, tu, ru, bu) = (l as usize, t as usize, r as usize, b as usize);
         let edge_x = Self::EDGE_SAMPLE_X0;
         let edge_w = Self::EDGE_SAMPLE_X1 - Self::EDGE_SAMPLE_X0;
@@ -306,6 +332,8 @@ impl Renderer {
                 },
             ],
             palette,
+            icon_idx_cache: RefCell::new(HashMap::new()),
+            icon_mask_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -325,6 +353,11 @@ impl Renderer {
 
     fn load_wallpaper(&self, path: &str, w: i32, h: i32) -> Option<Framebuffer> {
         let (sw, sh, pixels) = Self::decode_image(path)?;
+        // Belt-and-braces: a malformed/truncated wallpaper file must never
+        // reach the sampling loop below, which indexes `pixels` unchecked.
+        if sw == 0 || sh == 0 || pixels.len() < sw * sh {
+            return None;
+        }
         let (dw, dh) = (w.max(1) as usize, h.max(1) as usize);
         // Scale-to-cover with nearest-neighbour sampling, then quantize to
         // the palette with serpentine Floyd-Steinberg error diffusion so the
@@ -378,9 +411,7 @@ impl Renderer {
                 }
             }
             std::mem::swap(&mut err_cur, &mut err_next);
-            for e in &mut err_next {
-                *e = [0.0; 3];
-            }
+            err_next.fill([0.0; 3]);
         }
         Some(fb)
     }
@@ -396,8 +427,17 @@ impl Renderer {
         let mut dec = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&bytes));
         let data = dec.decode().ok()?;
         let (w, h) = dec.dimensions()?;
+        // Guard against a degenerate/truncated decode: zero dimensions or a
+        // pixel buffer shorter than w*h would panic downstream (indexing,
+        // slicing) if allowed through.
+        if w == 0 || h == 0 {
+            return None;
+        }
         // Grayscale JPEGs decode to 1 byte/pixel, colour to 3 (RGB).
         let comps = data.len().checked_div(w * h).filter(|&c| c == 1 || c == 3)?;
+        if data.len() < w * h * comps {
+            return None;
+        }
         let pixels = data
             .chunks_exact(comps)
             .map(|px| Rgba {
@@ -572,7 +612,7 @@ impl Renderer {
         size: i32,
         accent: Index,
     ) {
-        let Some(mask) = scaled_mask(img, size) else {
+        let Some(mask) = self.cached_mask(img, size) else {
             return;
         };
         let sz = size as usize;
@@ -607,32 +647,91 @@ impl Renderer {
         if img.w == 0 || img.h == 0 || size < 1 {
             return;
         }
+        let sz = size as usize;
+        let idx = self.cached_icon_indices(img, size);
         for ty in 0..size {
-            let sy = (ty as u32 * img.h / size as u32).min(img.h - 1);
             let py = dy + ty;
             if py < 0 {
                 continue;
             }
             for tx in 0..size {
-                let sx = (tx as u32 * img.w / size as u32).min(img.w - 1);
                 let px = dx + tx;
                 if px < 0 {
                     continue;
                 }
+                let i = idx[ty as usize * sz + tx as usize];
+                if i == TRANSPARENT_INDEX {
+                    continue;
+                }
+                fb.set_pixel(px as usize, py as usize, i);
+            }
+        }
+    }
+
+    /// The `size`x`size` nearest-scaled palette-index buffer for `img`
+    /// (`TRANSPARENT_INDEX` where alpha < 50%), computed once per
+    /// icon+size and reused every frame after.
+    fn cached_icon_indices(&self, img: &Icon, size: i32) -> Vec<u8> {
+        let key = (img.id(), size);
+        if let Some(v) = self.icon_idx_cache.borrow().get(&key) {
+            return v.clone();
+        }
+        let sz = size as usize;
+        let mut idx = vec![TRANSPARENT_INDEX; sz * sz];
+        for ty in 0..size {
+            let sy = (ty as u32 * img.h / size as u32).min(img.h - 1);
+            for tx in 0..size {
+                let sx = (tx as u32 * img.w / size as u32).min(img.w - 1);
                 let s = img.argb[(sy * img.w + sx) as usize];
                 if (s >> 24) & 0xff < 128 {
                     continue;
                 }
-                let index = self.palette.nearest_index(PgRgb {
+                idx[ty as usize * sz + tx as usize] = self.palette.nearest_index(PgRgb {
                     r: ((s >> 16) & 0xff) as u8,
                     g: ((s >> 8) & 0xff) as u8,
                     b: (s & 0xff) as u8,
                 });
-                fb.set_pixel(px as usize, py as usize, index);
             }
         }
+        let mut cache = self.icon_idx_cache.borrow_mut();
+        if cache.len() >= ICON_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, idx.clone());
+        idx
+    }
+
+    /// The `size`x`size` nearest-scaled opacity mask of `img` (alpha >= 50%),
+    /// row-major, cached the same way as `cached_icon_indices`; `None` for
+    /// empty inputs.
+    fn cached_mask(&self, img: &Icon, size: i32) -> Option<Vec<bool>> {
+        if img.w == 0 || img.h == 0 || size < 1 {
+            return None;
+        }
+        let key = (img.id(), size);
+        if let Some(v) = self.icon_mask_cache.borrow().get(&key) {
+            return Some(v.clone());
+        }
+        let mask = scaled_mask(img, size)?;
+        let mut cache = self.icon_mask_cache.borrow_mut();
+        if cache.len() >= ICON_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(key, mask.clone());
+        Some(mask)
     }
 }
+
+/// Palette index is a valid `Index` for every real colour, so a distinct
+/// out-of-band value marks "no pixel here" in the icon index cache.
+const TRANSPARENT_INDEX: Index = Index::MAX;
+
+/// Entry cap on the icon render caches. Entries for dropped icons are never
+/// individually evicted (nothing tracks icon lifetimes here), so the maps
+/// are wholesale-cleared at this size — icon churn (e.g. repeated
+/// `_NET_WM_ICON` updates) then costs an occasional re-render instead of
+/// unbounded growth. Live icons repopulate on the next frame.
+const ICON_CACHE_CAP: usize = 256;
 
 /// The `size`x`size` nearest-scaled opacity mask of `img` (alpha >= 50%),
 /// row-major; `None` for empty inputs.

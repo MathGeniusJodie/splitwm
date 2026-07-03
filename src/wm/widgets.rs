@@ -6,12 +6,7 @@ use crate::tree::{Dir, Rect};
 
 impl Wm {
     pub(crate) fn compute_widgets(&mut self, wa: Rect, placed: &[Placement]) {
-        self.handle_regions.clear();
-        self.plus_regions.clear();
-        self.tab_regions.clear();
-        self.btn_regions.clear();
-        self.taskbar_regions.clear();
-        self.edge_handle_regions.clear();
+        self.widgets.clear();
 
         self.compute_leaf_widgets(placed);
         self.compute_boundary_widgets(wa);
@@ -63,9 +58,9 @@ impl Wm {
             });
             x += isz + gap;
         }
-        self.taskbar_regions = tiles;
+        self.widgets.taskbar_regions = tiles;
         // Launcher "+" immediately after the last tile (clamped on-screen).
-        self.taskbar_plus = FrameRect {
+        self.widgets.taskbar_plus = FrameRect {
             x: x.min(right - isz),
             y,
             w: isz,
@@ -82,7 +77,7 @@ impl Wm {
             let has_client = leaf.is_some_and(|l| l.client.is_some());
             let minimized = leaf.is_some_and(|l| l.minimized);
             if has_client && !minimized {
-                self.tab_regions.push((
+                self.widgets.tab_regions.push((
                     FrameRect {
                         x: p.target.x + bw,
                         y: p.target.y,
@@ -107,7 +102,7 @@ impl Wm {
         minimized: bool,
     ) {
         if minimized {
-            self.btn_regions.push((p.target, p.leaf, BtnKind::Minimize));
+            self.widgets.btn_regions.push((p.target, p.leaf, BtnKind::Minimize));
             return;
         }
         let bsz = theme::BTN_SIZE;
@@ -120,7 +115,7 @@ impl Wm {
                 .enumerate()
             {
                 let bcx = right - bsz / 2 - i32::try_from(i).unwrap_or(0) * (bsz + bsp);
-                self.btn_regions.push((
+                self.widgets.btn_regions.push((
                     FrameRect {
                         x: bcx - bsz / 2,
                         y: bcy - bsz / 2,
@@ -133,7 +128,7 @@ impl Wm {
             }
         } else {
             let bcx = p.target.x + p.target.w / 2;
-            self.btn_regions.push((
+            self.widgets.btn_regions.push((
                 FrameRect {
                     x: bcx - bsz / 2,
                     y: bcy - bsz / 2,
@@ -180,10 +175,10 @@ impl Wm {
                     h: hw,
                 }
             };
-            self.handle_regions.push((rect, b));
+            self.widgets.handle_regions.push((rect, b));
             if b.root && b.dir == Dir::H {
                 let py = b.cross + (b.cross_len - Self::PLUS_SZ) / 2;
-                self.plus_regions
+                self.widgets.plus_regions
                     .push((Self::plus_rect(b.pos - scroll_x, py), b.idx + 1));
             }
         }
@@ -214,7 +209,7 @@ impl Wm {
             if x + gap <= wa.x || x >= wa.x + wa.w {
                 continue;
             }
-            self.edge_handle_regions.push((
+            self.widgets.edge_handle_regions.push((
                 FrameRect {
                     x,
                     y: wa.y + gap,
@@ -244,7 +239,7 @@ impl Wm {
             if vis_x < wa.x || vis_x > wa.x + wa.w {
                 continue;
             }
-            self.plus_regions
+            self.widgets.plus_regions
                 .push((Self::plus_rect(vis_x, edge_cy), at));
         }
     }

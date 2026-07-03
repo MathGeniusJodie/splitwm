@@ -1,5 +1,6 @@
-//! Per-tag layout state plus every mutation of the split tree / tab stacks.
-//! Combines splitwm core.lua + ops.lua + scroll bookkeeping for one tag.
+//! Layout state plus every mutation of the split tree / tab stacks —
+//! there is exactly one layout (no workspaces/tags).
+//! Combines splitwm core.lua + ops.lua + scroll bookkeeping.
 
 use crate::theme;
 use crate::tree::{Boundary, Dir, Node, NodeId, Rect, Tree, Win};
@@ -283,6 +284,11 @@ impl State {
                 Some(Node::Branch { children, .. }) => children.clone(),
                 _ => return false,
             };
+            if children.len() < 2 {
+                // Degenerate single-child branch: no sibling to fall back
+                // to (and `children[1]` below would be out of bounds).
+                return false;
+            }
             let dest_idx = if idx > 0 { idx - 1 } else { 1 };
             self.tree.first_leaf(children[dest_idx])
         };
@@ -370,12 +376,21 @@ impl State {
                 return false;
             }
             let other = if idx + 1 < n { idx + 1 } else { idx - 1 };
-            let min_r = 0.01;
+            let min_r = theme::MIN_SPLIT_FRAC;
             let cur = ratios[idx];
             let cur_other = ratios[other];
-            let new_cur = (cur + delta).max(min_r);
-            ratios[idx] = new_cur;
-            ratios[other] = (cur_other - (new_cur - cur)).max(min_r);
+            // Cap the transfer at what each side can actually give, so the
+            // pair's sum is exactly conserved — clamping both ends
+            // independently let the total ratio mass drift upward once the
+            // neighbour bottomed out, silently shrinking every *other*
+            // sibling via renormalisation.
+            let (lo, hi) = ((min_r - cur).min(0.0), (cur_other - min_r).max(0.0));
+            let delta = delta.clamp(lo, hi);
+            if delta == 0.0 {
+                return false;
+            }
+            ratios[idx] = cur + delta;
+            ratios[other] = cur_other - delta;
             true
         } else {
             false
@@ -491,7 +506,7 @@ impl State {
         if let Some(Node::Branch { ratios, .. }) = self.tree.get_mut(parent) {
             if idx + 1 < ratios.len() {
                 let combined = ratios[idx] + ratios[idx + 1];
-                let f = frac.clamp(0.05, 0.95);
+                let f = frac.clamp(theme::MIN_SPLIT_FRAC, 1.0 - theme::MIN_SPLIT_FRAC);
                 ratios[idx] = combined * f;
                 ratios[idx + 1] = combined * (1.0 - f);
             }
@@ -838,6 +853,50 @@ mod tests {
         s.unpin_client(2); // prev was consumed; 1 stays in the taskbar
         assert_eq!(s.focused_client(), None);
         assert_eq!(s.taskbar, vec![1]);
+    }
+
+    /// A degenerate single-child branch must not panic `close_focused`
+    /// (`children[1]` when there is no sibling).
+    #[test]
+    fn close_focused_survives_single_child_branch() {
+        let mut s = State::new();
+        let leaf = s.tree.first_leaf(s.tree.root);
+        let branch = s.tree.insert_node(Node::Branch {
+            dir: Dir::H,
+            children: vec![leaf],
+            ratios: vec![1.0],
+        });
+        s.tree.root = branch;
+        s.focused_leaf = leaf;
+        assert!(!s.close_focused());
+    }
+
+    /// Repeated growing must stop once the neighbour bottoms out at
+    /// `MIN_SPLIT_FRAC`, conserving the pair's ratio sum exactly — clamping
+    /// both sides independently used to let total ratio mass drift upward,
+    /// silently shrinking every other sibling via renormalisation.
+    #[test]
+    fn resize_focused_conserves_ratio_sum() {
+        let mut s = State::new();
+        s.split_focused(Dir::H);
+        s.insert_at_root(2); // three columns
+        s.focused_leaf = s.tree.collect_leaves()[0];
+        let sum_before: f64 = match s.tree.get(s.tree.root) {
+            Some(Node::Branch { ratios, .. }) => ratios.iter().sum(),
+            _ => panic!(),
+        };
+        for _ in 0..100 {
+            s.resize_focused(theme::RESIZE_STEP);
+        }
+        let ratios = match s.tree.get(s.tree.root) {
+            Some(Node::Branch { ratios, .. }) => ratios.clone(),
+            _ => panic!(),
+        };
+        let sum_after: f64 = ratios.iter().sum();
+        assert!((sum_after - sum_before).abs() < 1e-9, "sum drifted");
+        assert!(ratios.iter().all(|&r| r >= theme::MIN_SPLIT_FRAC - 1e-9));
+        // Once the neighbour is at its floor, further growth is refused.
+        assert!(!s.resize_focused(theme::RESIZE_STEP));
     }
 
     /// A degenerate single-child branch must not panic `resize_focused`

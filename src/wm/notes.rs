@@ -15,6 +15,12 @@ use super::types::{NotePopup, Wm, R};
 use crate::notify::{Note, NoteMsg};
 use crate::theme;
 
+/// Cap on live popup windows; kept coherent with `notify::MAX_NOTES` (the
+/// daemon thread's own outstanding-notification cap) — the daemon evicts its
+/// oldest tracked id at the same threshold, so this is mostly a backstop for
+/// popups that reached us before an eviction round-trips.
+const MAX_NOTE_POPUPS: usize = 8;
+
 impl Wm {
     /// The daemon thread's ClientMessage wakeup: drain the channel and
     /// bring the popup pile up to date.
@@ -77,10 +83,17 @@ impl Wm {
                 )?;
                 self.note_popups.push(NotePopup { win, note, w, h });
                 self.conn.map_window(win)?;
+                // Cap live popups: the daemon caps outstanding notifications
+                // too (see `notify::MAX_NOTES`), but a burst can still land
+                // more `Show`s here before an eviction round-trips back —
+                // drop our own oldest rather than let the pile grow.
+                if self.note_popups.len() > MAX_NOTE_POPUPS {
+                    self.conn.destroy_window(self.note_popups.remove(0).win)?;
+                }
                 win
             }
         };
-        self.shape_note(win, &fb)?;
+        self.shape_to_opaque(win, &fb)?;
         self.paint_note(win, &fb)?;
         Ok(())
     }
@@ -101,10 +114,11 @@ impl Wm {
         self.put_image(win, fb.width as u16, fb.height as u16, &self.bgrx)
     }
 
-    /// Shape the window to the bubble: one 1-px-tall rectangle per opaque
-    /// row span, so the rounded corners and the tail's surroundings are
+    /// Shape a window to a framebuffer's opaque pixels: one 1-px-tall
+    /// rectangle per opaque row span, so transparent areas (bubble corners,
+    /// the tail's surroundings, float-frame border corners) are
     /// click-through and show whatever is beneath.
-    fn shape_note(&self, win: Window, fb: &Framebuffer) -> R<()> {
+    pub(crate) fn shape_to_opaque(&self, win: Window, fb: &Framebuffer) -> R<()> {
         let mut rects = Vec::new();
         for y in 0..fb.height {
             let row = fb.row(y);

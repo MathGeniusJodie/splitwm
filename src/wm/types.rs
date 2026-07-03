@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use x11rb::protocol::xproto::{Atom, ConnectionExt, Gcontext, Window};
+use x11rb::protocol::xproto::{Atom, ConnectionExt, Gcontext, Pixmap, Window};
 use x11rb::rust_connection::RustConnection;
 
 use crate::icon::Icon;
@@ -77,6 +77,10 @@ pub struct Atoms {
     pub net_wm_name: Atom,
     pub net_wm_window_type: Atom,
     pub net_wm_window_type_notification: Atom,
+    pub net_wm_window_type_dialog: Atom,
+    pub net_wm_state: Atom,
+    pub net_wm_state_fullscreen: Atom,
+    pub wm_take_focus: Atom,
     pub utf8_string: Atom,
     /// Wakeup ClientMessage type from the notification-daemon thread (see
     /// `crate::notify`): "drain the note channel and update popups".
@@ -87,7 +91,7 @@ impl Atoms {
     pub fn intern(conn: &RustConnection) -> R<Self> {
         // Send every InternAtom before reading any reply, so interning costs
         // one round trip instead of ten.
-        let names: [&[u8]; 13] = [
+        let names: [&[u8]; 17] = [
             b"WM_PROTOCOLS",
             b"WM_DELETE_WINDOW",
             b"WM_STATE",
@@ -99,15 +103,19 @@ impl Atoms {
             b"_NET_WM_NAME",
             b"_NET_WM_WINDOW_TYPE",
             b"_NET_WM_WINDOW_TYPE_NOTIFICATION",
+            b"_NET_WM_WINDOW_TYPE_DIALOG",
+            b"_NET_WM_STATE",
+            b"_NET_WM_STATE_FULLSCREEN",
+            b"WM_TAKE_FOCUS",
             b"UTF8_STRING",
             crate::notify::PING_ATOM.as_bytes(),
         ];
         let cookies = names.map(|n| conn.intern_atom(false, n));
-        let mut atoms = [0 as Atom; 13];
+        let mut atoms = [0 as Atom; 17];
         for (slot, cookie) in atoms.iter_mut().zip(cookies) {
             *slot = cookie?.reply()?.atom;
         }
-        let [wm_protocols, wm_delete_window, wm_state, net_wm_icon, net_supported, net_client_list, net_active_window, net_supporting_wm_check, net_wm_name, net_wm_window_type, net_wm_window_type_notification, utf8_string, splitwm_note] =
+        let [wm_protocols, wm_delete_window, wm_state, net_wm_icon, net_supported, net_client_list, net_active_window, net_supporting_wm_check, net_wm_name, net_wm_window_type, net_wm_window_type_notification, net_wm_window_type_dialog, net_wm_state, net_wm_state_fullscreen, wm_take_focus, utf8_string, splitwm_note] =
             atoms;
         Ok(Self {
             wm_protocols,
@@ -121,6 +129,10 @@ impl Atoms {
             net_wm_name,
             net_wm_window_type,
             net_wm_window_type_notification,
+            net_wm_window_type_dialog,
+            net_wm_state,
+            net_wm_state_fullscreen,
+            wm_take_focus,
             utf8_string,
             splitwm_note,
         })
@@ -147,6 +159,52 @@ pub struct Client {
     /// self-inflicted-unmap bookkeeping (`Wm::ignore_unmaps`) that lets a
     /// client's own withdraw be told apart from our layout hiding it.
     pub mapped: bool,
+    /// `WM_NORMAL_HINTS` minimum size, read at manage time. Tiling never
+    /// configures the window below it (the split clips instead), so apps
+    /// with a hard minimum aren't handed geometry they can't honour.
+    pub min_size: (i32, i32),
+    /// ICCCM focus model, read from `WM_HINTS.input` / `WM_TAKE_FOCUS` in
+    /// `WM_PROTOCOLS` at manage time (see `Wm::give_focus`).
+    pub focus: FocusModel,
+}
+
+/// How a window wants keyboard focus delivered (ICCCM 4.1.7): whether
+/// `SetInputFocus` applies (`WM_HINTS.input`, default true) and whether the
+/// client wants a `WM_TAKE_FOCUS` handshake.
+#[derive(Clone, Copy)]
+pub struct FocusModel {
+    pub input: bool,
+    pub take_focus: bool,
+}
+
+/// A floating window: a dialog/transient (`WM_TRANSIENT_FOR` or
+/// `_NET_WM_WINDOW_TYPE_DIALOG`) or a fixed-size client (min == max in
+/// `WM_NORMAL_HINTS`). Never in `clients`/the split tree/taskbar: shown at
+/// its requested size, centered over its parent's split (or the workarea),
+/// stacked above every tiled client, focused on map and click but not part
+/// of Mod4+Tab cycling.
+pub struct FloatWin {
+    pub win: Win,
+    /// Our own chrome window stacked just below `win`: the split border art
+    /// (border + titlebar, no control buttons), draggable to move the float.
+    pub frame: Window,
+    /// `WM_TRANSIENT_FOR` target, used for centering and for handing focus
+    /// back when the float goes away.
+    pub parent: Option<Win>,
+    pub focus: FocusModel,
+    /// Client-window screen geometry (the frame extends `BORDER_LEFT` /
+    /// `tb_h` around it), tracked so drags and repaints don't need a
+    /// `GetGeometry` round trip.
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+    /// Accent palette index for the chrome — the transient parent's split
+    /// colour when it has one, so the dialog visibly belongs to it.
+    pub accent: crate::Index,
+    /// Titlebar app icon/label, resolved once at manage time.
+    pub icon: Option<Rc<Icon>>,
+    pub label: char,
 }
 
 pub struct Wm {
@@ -155,6 +213,22 @@ pub struct Wm {
     pub depth: u8,
     pub state: State,
     pub clients: HashMap<Win, Client>,
+    /// Floating dialogs/transients/fixed-size windows, in mapping order
+    /// (see `FloatWin`). Kept above tiled clients by every arrange.
+    pub floats: Vec<FloatWin>,
+    /// The float that last took focus, if it still has it — keyboard
+    /// actions that target "the focused window" (close) act on this before
+    /// falling back to the focused split's client. Cleared whenever focus
+    /// moves back into the tree.
+    pub focused_float: Option<Win>,
+    /// Timestamp of the last user input event, used instead of
+    /// `CURRENT_TIME` for `SetInputFocus`/`WM_TAKE_FOCUS` (ICCCM wants real
+    /// timestamps so a slow client can't steal focus back across a race).
+    pub last_event_time: u32,
+    /// Events drained mid-animation (`run_layout_animation` polls so a
+    /// keypress/click can cut the animation short); the main loop consumes
+    /// these before blocking for new ones.
+    pub pending_events: Vec<x11rb::protocol::Event>,
     /// Stable insertion order of managed windows, for the bottom bar.
     pub bar_order: Vec<Win>,
     /// The window pinned past the right end of the scrolling canvas, only
@@ -173,8 +247,10 @@ pub struct Wm {
     /// order. Like `docked`, they live outside `clients`/the split
     /// tree/`bar_order`: no chrome, no taskbar entry, no focus cycling.
     /// They stack above everything at the bottom-right of the screen
-    /// (see `Wm::place_notifications`), at whatever size they requested.
-    pub notifications: Vec<Win>,
+    /// (see `Wm::place_notifications`), at whatever size they requested —
+    /// tracked here (updated on ConfigureRequest) so restacking the pile
+    /// doesn't cost a `GetGeometry` round trip per window.
+    pub notifications: Vec<ForeignNote>,
     /// Speech-bubble popups for notifications *we* serve as the session's
     /// `org.freedesktop.Notifications` daemon (see `crate::notify` and
     /// `Wm::on_note_ping`). Own override-redirect windows, drawn by the
@@ -189,7 +265,7 @@ pub struct Wm {
     /// Server-side pixmap holding the underlay's composited image, set as the
     /// underlay's `background_pixmap` so the server repaints exposed regions
     /// itself (no black flash while a shaped client moves over it).
-    pub underlay_pix: Window,
+    pub underlay_pix: Pixmap,
     /// Current size of `underlay_pix`; recreated by `compose` on mismatch
     /// (RandR resize).
     pub underlay_pix_size: (u16, u16),
@@ -216,19 +292,14 @@ pub struct Wm {
     pub debug_scroll: bool,
     pub animate: bool,
     pub prev_frame_rect: HashMap<NodeId, FrameRect>,
-    pub handle_regions: Vec<(FrameRect, Boundary)>,
-    pub plus_regions: Vec<(FrameRect, usize)>,
-    /// The launcher "+" button at the right end of the bottom taskbar.
-    pub taskbar_plus: FrameRect,
-    pub tab_regions: Vec<(FrameRect, NodeId)>,
-    pub taskbar_regions: Vec<TaskTile>,
-    pub btn_regions: Vec<(FrameRect, NodeId, BtnKind)>,
+    /// Every hit-testable widget rect for the current layout, rebuilt as one
+    /// unit by `compute_widgets` each arrange (see `Widgets`).
+    pub widgets: Widgets,
     pub menu: MenuUi,
     pub drag: Option<Drag>,
-    /// Hit-regions for the outer canvas-edge resize handles (see
-    /// `Wm::compute_edge_handle_widgets`); the bool is `true` for the left
-    /// edge, `false` for the right.
-    pub edge_handle_regions: Vec<(FrameRect, bool)>,
+    /// An in-progress float move, started by pressing button 1 on a float's
+    /// frame window.
+    pub float_drag: Option<FloatDrag>,
     pub edge_drag: Option<EdgeDrag>,
     /// Startup-created pointer cursors + the one currently on the underlay.
     pub cursors: Cursors,
@@ -246,6 +317,55 @@ pub struct Wm {
     /// hiding a client) and must swallow; any unmap beyond the count is the
     /// client withdrawing itself (ICCCM) and unmanages it.
     pub ignore_unmaps: HashMap<Win, u32>,
+    /// The managed client currently in EWMH fullscreen
+    /// (`_NET_WM_STATE_FULLSCREEN`), if any: covers the whole workarea above
+    /// every tiled client and float. Its split slot is kept, so leaving
+    /// fullscreen drops it straight back into the layout.
+    pub fullscreen: Option<Win>,
+}
+
+/// Every hit-testable widget rect computed for the current layout: gap drag
+/// handles, "+" insert buttons, tab titles, split-control buttons, taskbar
+/// tiles, the launcher "+", and the canvas-edge resize handles. Grouped so
+/// the whole set is rebuilt (and cleared) as one unit by
+/// `Wm::compute_widgets` — the caches must always describe the same arrange.
+#[derive(Default)]
+pub struct Widgets {
+    pub handle_regions: Vec<(FrameRect, Boundary)>,
+    pub plus_regions: Vec<(FrameRect, usize)>,
+    /// The launcher "+" button at the right end of the bottom taskbar.
+    pub taskbar_plus: FrameRect,
+    pub tab_regions: Vec<(FrameRect, NodeId)>,
+    pub taskbar_regions: Vec<TaskTile>,
+    pub btn_regions: Vec<(FrameRect, NodeId, BtnKind)>,
+    /// Hit-regions for the outer canvas-edge resize handles (see
+    /// `Wm::compute_edge_handle_widgets`); the bool is `true` for the left
+    /// edge, `false` for the right.
+    pub edge_handle_regions: Vec<(FrameRect, bool)>,
+}
+
+impl Widgets {
+    /// Drop every region from the previous layout; `taskbar_plus` is
+    /// unconditionally overwritten by `compute_taskbar`, so it needs no
+    /// reset here.
+    pub fn clear(&mut self) {
+        self.handle_regions.clear();
+        self.plus_regions.clear();
+        self.tab_regions.clear();
+        self.btn_regions.clear();
+        self.taskbar_regions.clear();
+        self.edge_handle_regions.clear();
+    }
+}
+
+/// A foreign notification window (`_NET_WM_WINDOW_TYPE_NOTIFICATION`) and
+/// its last-known size, so the bottom-right pile can be restacked without
+/// re-querying geometry.
+#[derive(Clone, Copy)]
+pub struct ForeignNote {
+    pub win: Win,
+    pub w: i32,
+    pub h: i32,
 }
 
 /// One on-screen speech-bubble notification popup and the note it shows.
@@ -263,6 +383,16 @@ pub struct HScroll {
     pub dev: u16,
     pub valuator: u16,
     pub incr: f64,
+}
+
+/// An in-progress float move: dragging a float's frame repositions the
+/// frame + client pair. `dx`/`dy` are the pointer's offset from the client
+/// window's origin at press time, so the window tracks the grab point.
+#[derive(Clone, Copy)]
+pub struct FloatDrag {
+    pub win: Win,
+    pub dx: i32,
+    pub dy: i32,
 }
 
 /// An in-progress gap resize started by dragging a handle.
@@ -342,7 +472,7 @@ pub enum BtnKind {
     Close,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct FrameRect {
     pub x: i32,
     pub y: i32,

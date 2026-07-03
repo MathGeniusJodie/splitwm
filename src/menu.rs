@@ -4,6 +4,8 @@
 //! submenus). Pure data + layout; the X windows and rendering live in `wm`.
 
 use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 /// One launchable application.
 #[derive(Clone)]
@@ -193,6 +195,20 @@ const ICON_SIZES: &[&str] = &[
 /// `pixmaps` (a deliberately minimal cut of the freedesktop icon-theme
 /// lookup — no theme inheritance, PNG only).
 pub fn find_icon_file(icon: &str) -> Option<std::path::PathBuf> {
+    // Repeated menu rows/redraws re-resolve the same icon names; the
+    // filesystem scan below is pure per-process (nothing installs/uninstalls
+    // themes while we run), so cache results keyed by the raw `icon` string.
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<std::path::PathBuf>>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(hit) = cache.lock().unwrap().get(icon) {
+        return hit.clone();
+    }
+    let found = find_icon_file_uncached(icon);
+    cache.lock().unwrap().insert(icon.to_string(), found.clone());
+    found
+}
+
+fn find_icon_file_uncached(icon: &str) -> Option<std::path::PathBuf> {
     if icon.starts_with('/') {
         let p = std::path::PathBuf::from(icon);
         return (p.extension().is_some_and(|x| x == "png") && p.is_file()).then_some(p);
@@ -276,7 +292,12 @@ pub fn desktop_entry_cmd(id: &str) -> Option<String> {
     }
     let exec = exec.filter(|e| !e.is_empty())?;
     Some(match path {
-        Some(p) if !p.is_empty() => format!("cd '{p}' && {exec}"),
+        Some(p) if !p.is_empty() => {
+            // Single-quote the Path= value for the shell: close the quote,
+            // emit an escaped literal quote, reopen it.
+            let escaped = p.replace('\'', "'\\''");
+            format!("cd '{escaped}' && {exec}")
+        }
         _ => exec,
     })
 }
@@ -364,4 +385,49 @@ pub fn build() -> MenuTree {
     }
 
     MenuTree { main, subs }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clean_exec, first_main_category, parse_desktop};
+
+    #[test]
+    fn clean_exec_strips_field_codes() {
+        assert_eq!(clean_exec("firefox %u"), "firefox");
+        assert_eq!(clean_exec("app --flag %F --other"), "app --flag  --other");
+        assert_eq!(clean_exec("echo 100%% done"), "echo 100% done");
+    }
+
+    #[test]
+    fn parses_a_normal_application() {
+        let text = "[Desktop Entry]\nType=Application\nName=Foo\nExec=foo %U\nIcon=foo\nCategories=Network;WebBrowser;\n";
+        let (name, exec, cat, icon) = parse_desktop(text).unwrap();
+        assert_eq!(name, "Foo");
+        assert_eq!(exec, "foo");
+        assert_eq!(cat, "Network");
+        assert_eq!(icon.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn hidden_nodisplay_and_non_apps_are_skipped() {
+        for extra in ["NoDisplay=true", "Hidden=true", "Type=Link"] {
+            let text =
+                format!("[Desktop Entry]\nType=Application\nName=X\nExec=x\n{extra}\n");
+            assert!(parse_desktop(&text).is_none(), "{extra} should filter");
+        }
+    }
+
+    #[test]
+    fn keys_outside_desktop_entry_group_are_ignored() {
+        let text = "[Desktop Action new]\nExec=evil\n[Desktop Entry]\nType=Application\nName=A\nExec=good\n";
+        let (_, exec, _, _) = parse_desktop(text).unwrap();
+        assert_eq!(exec, "good");
+    }
+
+    #[test]
+    fn unknown_categories_fall_back_to_other() {
+        assert_eq!(first_main_category("X-Weird;Foo;"), "Other");
+        assert_eq!(first_main_category(""), "Other");
+        assert_eq!(first_main_category("WebBrowser;Network;"), "Network");
+    }
 }

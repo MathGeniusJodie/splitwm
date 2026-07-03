@@ -13,6 +13,28 @@ pub struct Icon {
     pub w: u32,
     pub h: u32,
     pub argb: Vec<u32>,
+    /// Process-unique id, used as a render-cache key. A raw pointer is not
+    /// usable for that: icons are dropped and reallocated (e.g. every
+    /// `_NET_WM_ICON` refresh), and the allocator can hand a new icon the
+    /// old address, silently serving the dead icon's cached pixels.
+    id: u64,
+}
+
+impl Icon {
+    pub fn new(w: u32, h: u32, argb: Vec<u32>) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self {
+            w,
+            h,
+            argb,
+            id: NEXT.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    pub fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 /// Decode a PNG file (e.g. a launcher icon resolved from the icon theme)
@@ -31,11 +53,7 @@ pub fn load_png(path: &std::path::Path) -> Option<Icon> {
                 | u32::from(p.b)
         })
         .collect();
-    Some(Icon {
-        w: w as u32,
-        h: h as u32,
-        argb,
-    })
+    Some(Icon::new(w as u32, h as u32, argb))
 }
 
 /// Snap every non-transparent pixel in `icon` to the nearest na16 palette
@@ -54,11 +72,7 @@ pub fn rotate(palette: &Palette, icon: &Icon, deg: f32) -> Icon {
 }
 
 fn map_argb(icon: &Icon, f: impl Fn(u32) -> u32) -> Icon {
-    Icon {
-        w: icon.w,
-        h: icon.h,
-        argb: icon.argb.iter().map(|&px| f(px)).collect(),
-    }
+    Icon::new(icon.w, icon.h, icon.argb.iter().map(|&px| f(px)).collect())
 }
 
 fn quantize_argb(palette: &Palette, px: u32) -> u32 {

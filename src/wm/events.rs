@@ -3,8 +3,9 @@
 
 use x11rb::protocol::xinput;
 use x11rb::protocol::xproto::{
-    Allow, ButtonPressEvent, ButtonReleaseEvent, ChangeWindowAttributesAux, ConfigureNotifyEvent,
-    ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, ExposeEvent, InputFocus,
+    Allow, ButtonPressEvent, ButtonReleaseEvent, ChangeWindowAttributesAux, ConfigWindow,
+    ConfigureNotifyEvent, ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, ExposeEvent,
+    InputFocus,
     KeyPressEvent, MapRequestEvent,
     Mapping, MappingNotifyEvent, ModMask, MotionNotifyEvent, UnmapNotifyEvent,
 };
@@ -13,7 +14,9 @@ use x11rb::protocol::Event;
 use x11rb::CURRENT_TIME;
 
 use super::clients::WM_STATE_WITHDRAWN;
-use super::types::{rect_contains, Action, BtnKind, Drag, EdgeDrag, FrameRect, Wm, MOD4, R};
+use super::types::{
+    rect_contains, Action, BtnKind, Drag, EdgeDrag, FloatDrag, FrameRect, Wm, MOD4, R,
+};
 use crate::theme;
 use crate::tree::{Dir, NodeId, Rect};
 
@@ -117,7 +120,17 @@ impl Wm {
     /// and the dragged boundary keeps sliding after the pointer has stopped.
     /// We only ever render the latest pointer position per batch.
     pub(crate) fn handle_batch(&mut self, batch: Vec<Event>) -> R<()> {
-        let mut pending_motion: Option<MotionNotifyEvent> = None;
+        // Coalesced per *window*, not one global slot: a batch can span a
+        // window crossing (e.g. menu -> underlay), and keeping only the very
+        // last motion would drop the final hover update on the window left
+        // behind. One pointer means this stays at most 2-3 entries.
+        let mut pending_motion: Vec<MotionNotifyEvent> = Vec::new();
+        let coalesce = |pending: &mut Vec<MotionNotifyEvent>, e: MotionNotifyEvent| {
+            match pending.iter_mut().find(|p| p.event == e.event) {
+                Some(slot) => *slot = e,
+                None => pending.push(e),
+            }
+        };
         // Raw scroll deltas from one batch are summed and applied as a single
         // scroll + arrange, for the same reason motion is coalesced: a swipe
         // reports far faster than we can recomposite the whole screen.
@@ -125,7 +138,7 @@ impl Wm {
         for ev in batch {
             match ev {
                 Event::MotionNotify(e) => {
-                    pending_motion = Some(e);
+                    coalesce(&mut pending_motion, e);
                     continue;
                 }
                 Event::XinputRawMotion(ref e) => {
@@ -147,7 +160,7 @@ impl Wm {
             }
             // Flush pending motion/scroll before any other event so ordering
             // (e.g. a button release ending a drag) is preserved.
-            if let Some(m) = pending_motion.take() {
+            for m in pending_motion.drain(..) {
                 self.on_motion(&m)?;
             }
             if pending_hscroll != 0.0 {
@@ -158,7 +171,7 @@ impl Wm {
             }
             self.handle_event(&ev)?;
         }
-        if let Some(m) = pending_motion.take() {
+        for m in pending_motion {
             self.on_motion(&m)?;
         }
         if pending_hscroll != 0.0 {
@@ -168,6 +181,15 @@ impl Wm {
     }
 
     fn handle_event(&mut self, ev: &Event) -> R<()> {
+        // Track the last real input timestamp for ICCCM focus handoffs
+        // (`Wm::give_focus` wants a real time, not CURRENT_TIME).
+        match ev {
+            Event::KeyPress(e) => self.last_event_time = e.time,
+            Event::ButtonPress(e) => self.last_event_time = e.time,
+            Event::ButtonRelease(e) => self.last_event_time = e.time,
+            Event::MotionNotify(e) => self.last_event_time = e.time,
+            _ => {}
+        }
         match ev {
             Event::MapRequest(e) => self.on_map_request(*e)?,
             Event::UnmapNotify(e) => self.on_unmap(e)?,
@@ -193,6 +215,24 @@ impl Wm {
             Event::ClientMessage(e) if e.type_ == self.atoms.splitwm_note => {
                 self.on_note_ping()?;
             }
+            // EWMH fullscreen request (data32: [action, prop1, prop2, ..]).
+            Event::ClientMessage(e) if e.type_ == self.atoms.net_wm_state => {
+                let d = e.data.as_data32();
+                let fs = self.atoms.net_wm_state_fullscreen;
+                if d[1] == fs || d[2] == fs {
+                    // 0 = remove, 1 = add, 2 = toggle.
+                    let on = match d[0] {
+                        0 => false,
+                        1 => true,
+                        _ => self.fullscreen != Some(e.window),
+                    };
+                    self.set_fullscreen(e.window, on)?;
+                }
+            }
+            // A pager/panel asks to activate a window.
+            Event::ClientMessage(e) if e.type_ == self.atoms.net_active_window => {
+                self.on_activate_request(e.window)?;
+            }
             // Another WM took over the manager selection (e.g. its own
             // `--replace`); quit gracefully so it can grab the redirect.
             Event::SelectionClear(e) if e.owner == self.sel_owner => self.running = false,
@@ -204,17 +244,54 @@ impl Wm {
         Ok(())
     }
 
-    fn on_configure_request(&self, e: &ConfigureRequestEvent) -> R<()> {
+    fn on_configure_request(&mut self, e: &ConfigureRequestEvent) -> R<()> {
         // Honour requests for windows we don't (yet) manage; managed clients
         // are positioned by arrange().
         if self.clients.contains_key(&e.window) {
             return Ok(());
         }
+        // A float resizing itself keeps its new size but our position (the
+        // frame is the move handle); resize + repaint the frame to match.
+        if let Some(i) = self.floats.iter().position(|f| f.win == e.window) {
+            let f = &mut self.floats[i];
+            if u16::from(e.value_mask) & u16::from(ConfigWindow::WIDTH) != 0 {
+                f.w = i32::from(e.width).max(1);
+            }
+            if u16::from(e.value_mask) & u16::from(ConfigWindow::HEIGHT) != 0 {
+                f.h = i32::from(e.height).max(1);
+            }
+            let (bw, tb) = Self::float_insets();
+            let (frame, w, h, x, y) = (f.frame, f.w, f.h, f.x, f.y);
+            self.conn.configure_window(
+                e.window,
+                &ConfigureWindowAux::new()
+                    .x(x)
+                    .y(y)
+                    .width(u32::try_from(w).unwrap_or(1))
+                    .height(u32::try_from(h).unwrap_or(1)),
+            )?;
+            self.conn.configure_window(
+                frame,
+                &ConfigureWindowAux::new()
+                    .x(x - bw)
+                    .y(y - tb)
+                    .width(u32::try_from(w + 2 * bw).unwrap_or(1))
+                    .height(u32::try_from(h + tb + bw).unwrap_or(1)),
+            )?;
+            self.paint_float_frame(frame)?;
+            return Ok(());
+        }
         let aux = ConfigureWindowAux::from_configure_request(e);
         self.conn.configure_window(e.window, &aux)?;
         // A notification resizing itself keeps its new size, but position
-        // stays ours: re-stack the bottom-right pile around it.
-        if self.notifications.contains(&e.window) {
+        // stays ours: record the size and re-stack the bottom-right pile.
+        if let Some(n) = self.notifications.iter_mut().find(|n| n.win == e.window) {
+            if u16::from(e.value_mask) & u16::from(ConfigWindow::WIDTH) != 0 {
+                n.w = i32::from(e.width).max(1);
+            }
+            if u16::from(e.value_mask) & u16::from(ConfigWindow::HEIGHT) != 0 {
+                n.h = i32::from(e.height).max(1);
+            }
             self.place_notifications()?;
         }
         Ok(())
@@ -255,7 +332,45 @@ impl Wm {
         Ok(())
     }
 
+    /// Shared epilogue for every layout-mutating action: keep the focused
+    /// split in view, land the scroll, re-arrange, and focus the focused
+    /// split's client.
+    pub(crate) fn commit_layout(&mut self) -> R<()> {
+        let wa = self.la();
+        self.state.ensure_in_view(wa);
+        self.state.scroll_x = self.state.scroll_target;
+        self.arrange()?;
+        let f = self.state.focused_client();
+        self.focus(f)
+    }
+
+    /// `_NET_ACTIVE_WINDOW` ClientMessage: bring the window into view and
+    /// focus it — into its split if it has one, otherwise into the focused
+    /// split (same policy as a deiconify MapRequest); floats just take focus.
+    fn on_activate_request(&mut self, win: u32) -> R<()> {
+        if self.clients.contains_key(&win) {
+            if !self.state.activate_client(win) {
+                let leaf = self.state.focused_leaf_valid();
+                self.state.assign_to_leaf(win, leaf);
+            }
+            return self.commit_layout();
+        }
+        if self.floats.iter().any(|f| f.win == win) {
+            self.focus_float(win)?;
+            self.raise_notifications()?;
+        }
+        Ok(())
+    }
+
     fn on_map_request(&mut self, e: MapRequestEvent) -> R<()> {
+        // A float re-requesting a map (some toolkits unmap/remap on hide)
+        // must not be managed again: just show and re-focus it.
+        if self.floats.iter().any(|f| f.win == e.window) {
+            self.conn.map_window(e.window)?;
+            self.focus_float(e.window)?;
+            self.raise_notifications()?;
+            return Ok(());
+        }
         if self.clients.contains_key(&e.window) {
             // A map request for a window we manage but have hidden is the
             // ICCCM deiconify request (Iconic -> Normal): bring it into a
@@ -264,12 +379,7 @@ impl Wm {
                 let leaf = self.state.focused_leaf_valid();
                 self.state.assign_to_leaf(e.window, leaf);
             }
-            let wa = self.la();
-            self.state.ensure_in_view(wa);
-            self.state.scroll_x = self.state.scroll_target;
-            self.arrange()?;
-            self.focus(Some(e.window))?;
-            return Ok(());
+            return self.commit_layout();
         }
         self.manage(e.window, false)?;
         Ok(())
@@ -300,8 +410,12 @@ impl Wm {
             self.docked_w = 0;
             return self.arrange();
         }
-        if self.notifications.contains(&win) {
+        if self.notifications.iter().any(|n| n.win == win) {
             return self.forget_notification(win);
+        }
+        if self.floats.iter().any(|f| f.win == win) {
+            self.set_wm_state(win, WM_STATE_WITHDRAWN)?;
+            return self.forget_float(win);
         }
         if self.clients.contains_key(&win) {
             self.set_wm_state(win, WM_STATE_WITHDRAWN)?;
@@ -316,8 +430,11 @@ impl Wm {
             self.docked_w = 0;
             return self.arrange();
         }
-        if self.notifications.contains(&win) {
+        if self.notifications.iter().any(|n| n.win == win) {
             return self.forget_notification(win);
+        }
+        if self.floats.iter().any(|f| f.win == win) {
+            return self.forget_float(win);
         }
         self.forget_client(win)?;
         Ok(())
@@ -340,7 +457,6 @@ impl Wm {
             }
             _ => {}
         }
-        let wa = self.la();
         // Layout-changing actions get an animated transition.
         self.animate = matches!(
             action,
@@ -394,7 +510,9 @@ impl Wm {
                 self.state.resize_focused(-theme::RESIZE_STEP);
             }
             Action::CloseWindow => {
-                if let Some(c) = self.state.focused_client() {
+                // A focused float (dialog) is the keyboard target before the
+                // focused split's client.
+                if let Some(c) = self.focused_float.or_else(|| self.state.focused_client()) {
                     self.close_client(c)?;
                 }
             }
@@ -408,12 +526,7 @@ impl Wm {
             self.prev_frame_rect
                 .insert(self.state.focused_leaf_valid(), rect);
         }
-        self.state.ensure_in_view(wa);
-        self.state.scroll_x = self.state.scroll_target;
-        self.arrange()?;
-        let f = self.state.focused_client();
-        self.focus(f)?;
-        Ok(())
+        self.commit_layout()
     }
 
     /// Act on a split-control button click. `secondary` is a right-click,
@@ -471,12 +584,7 @@ impl Wm {
                 self.animate = true;
             }
         }
-        self.state.ensure_in_view(wa);
-        self.state.scroll_x = self.state.scroll_target;
-        self.arrange()?;
-        let f = self.state.focused_client();
-        self.focus(f)?;
-        Ok(())
+        self.commit_layout()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -486,6 +594,20 @@ impl Wm {
             return Ok(());
         }
         let wa = self.la();
+        // Button 1 on a float's frame: focus the float and start moving it.
+        if e.detail == 1 {
+            if let Some(f) = self.floats.iter().find(|f| f.frame == e.event) {
+                let (win, fx, fy) = (f.win, f.x, f.y);
+                self.float_drag = Some(FloatDrag {
+                    win,
+                    dx: i32::from(e.root_x) - fx,
+                    dy: i32::from(e.root_y) - fy,
+                });
+                self.focus_float(win)?;
+                self.raise_notifications()?;
+                return Ok(());
+            }
+        }
         // Clicks inside the launcher menu select an item; clicks elsewhere
         // dismiss it before falling through to normal handling.
         if self.menu.open {
@@ -500,7 +622,7 @@ impl Wm {
         // Split-control buttons (left = primary, right = opposite split dir).
         if (e.detail == 1 || e.detail == 3) && e.event == self.underlay {
             let (mx, my) = (i32::from(e.event_x), i32::from(e.event_y));
-            if let Some((leaf, kind)) = self
+            if let Some((leaf, kind)) = self.widgets
                 .btn_regions
                 .iter()
                 .find(|(r, _, _)| rect_contains(*r, mx, my))
@@ -514,7 +636,7 @@ impl Wm {
             let (mx, my) = (i32::from(e.event_x), i32::from(e.event_y));
             // The corner "x" badge on a bottom-bar tile: politely close that
             // window (checked before the tile itself so the badge wins).
-            if let Some(win) = self
+            if let Some(win) = self.widgets
                 .taskbar_regions
                 .iter()
                 .find(|t| rect_contains(t.close, mx, my))
@@ -524,7 +646,7 @@ impl Wm {
             }
             // A bottom-bar icon: focus its split if already on-screen,
             // otherwise bring that window into the focused split.
-            if let Some(win) = self
+            if let Some(win) = self.widgets
                 .taskbar_regions
                 .iter()
                 .find(|t| rect_contains(t.rect, mx, my))
@@ -544,31 +666,29 @@ impl Wm {
                 return Ok(());
             }
             // Taskbar "+" opens the app launcher into the focused split.
-            if rect_contains(self.taskbar_plus, mx, my) {
+            if rect_contains(self.widgets.taskbar_plus, mx, my) {
                 let leaf = self.state.focused_leaf_valid();
-                let pr = self.taskbar_plus;
+                let pr = self.widgets.taskbar_plus;
                 return self.open_menu(leaf, pr.x + pr.w, pr.y);
             }
-            // Click the title (tab) to focus it.
-            if let Some(leaf) = self
+            // Click the title (tab) to focus it — an empty leaf's tab
+            // focuses the leaf too, matching a click on its body.
+            if let Some(leaf) = self.widgets
                 .tab_regions
                 .iter()
                 .find(|(r, _)| rect_contains(*r, mx, my))
                 .map(|(_, l)| *l)
             {
-                let client = self.state.tree.leaf(leaf).and_then(|l| l.client);
-                if let Some(c) = client {
-                    self.state.focused_leaf = leaf;
-                    self.arrange()?;
-                    self.focus(Some(c))?;
-                }
+                self.state.focused_leaf = leaf;
+                self.arrange()?;
+                self.focus(self.state.focused_client())?;
                 return Ok(());
             }
             // The boundary "+" button sits centred inside its drag handle's
             // hit region (the handle spans the full boundary height so it's
             // easy to grab; "+" is a small target in its middle) — check the
             // narrower "+" rect first so it isn't shadowed by the handle.
-            if let Some(at) = self
+            if let Some(at) = self.widgets
                 .plus_regions
                 .iter()
                 .find(|(r, _)| rect_contains(*r, mx, my))
@@ -576,17 +696,12 @@ impl Wm {
             {
                 self.state.insert_at_root(at);
                 self.animate = true;
-                self.state.ensure_in_view(wa);
-                self.state.scroll_x = self.state.scroll_target;
-                self.arrange()?;
-                let f = self.state.focused_client();
-                self.focus(f)?;
-                return Ok(());
+                return self.commit_layout();
             }
-            if let Some(b) = self
+            if let Some(b) = self.widgets
                 .handle_regions
                 .iter()
-                .find(|(r, _)| rect_contains(*r, mx, my))
+                .find(|(r, b)| b.resizable && rect_contains(*r, mx, my))
                 .map(|(_, b)| *b)
             {
                 self.drag = Some(Drag {
@@ -602,7 +717,7 @@ impl Wm {
             // Outer canvas-edge resize handles: the screen-space x of
             // whichever end of the leftmost/rightmost column isn't being
             // dragged stays fixed for the whole gesture (see `EdgeDrag`).
-            if let Some(&(_, left)) = self
+            if let Some(&(_, left)) = self.widgets
                 .edge_handle_regions
                 .iter()
                 .find(|(r, _)| rect_contains(*r, mx, my))
@@ -634,15 +749,19 @@ impl Wm {
                 self.state.activate_client(e.event);
                 self.arrange()?;
                 self.focus(Some(e.event))?;
+            } else if self.floats.iter().any(|f| f.win == e.event) {
+                self.focus_float(e.event)?;
+                self.raise_notifications()?;
             } else if self.docked == Some(e.event) {
                 // Outside the tree/`clients`, so `focus()` (which only knows
                 // tiled windows) can't take it; set input focus directly.
                 self.conn
                     .set_input_focus(InputFocus::POINTER_ROOT, e.event, CURRENT_TIME)?;
             }
-            // Replay so the click reaches the app.
-            self.conn
-                .allow_events(Allow::REPLAY_POINTER, CURRENT_TIME)?;
+            // Replay so the click reaches the app. Use the grab event's own
+            // timestamp, not CURRENT_TIME — under latency CURRENT_TIME can
+            // release a *later* grab than the one this press froze.
+            self.conn.allow_events(Allow::REPLAY_POINTER, e.time)?;
         }
         Ok(())
     }
@@ -650,6 +769,15 @@ impl Wm {
     fn on_motion(&mut self, e: &MotionNotifyEvent) -> R<()> {
         if self.menu.open && (e.event == self.menu.main_win || e.event == self.menu.sub_win) {
             return self.on_menu_motion(e.event, i32::from(e.event_y));
+        }
+        if let Some(fd) = self.float_drag {
+            self.move_float(
+                fd.win,
+                i32::from(e.root_x) - fd.dx,
+                i32::from(e.root_y) - fd.dy,
+            )?;
+            self.conn.flush()?;
+            return Ok(());
         }
         if let Some(ed) = self.edge_drag {
             let wa = self.la();
@@ -705,7 +833,7 @@ impl Wm {
     /// the plain arrow otherwise.
     fn hover_cursor(&self, mx: i32, my: i32) -> u32 {
         let c = self.cursors;
-        if let Some((leaf, kind)) = self
+        if let Some((leaf, kind)) = self.widgets
             .btn_regions
             .iter()
             .find(|(r, _, _)| rect_contains(*r, mx, my))
@@ -729,16 +857,16 @@ impl Wm {
         }
         // Taskbar tiles (and their close badges), the launcher "+", and the
         // tab titles are plain click targets, mirroring `on_button`.
-        if self
+        if self.widgets
             .taskbar_regions
             .iter()
             .any(|t| rect_contains(t.rect, mx, my) || rect_contains(t.close, mx, my))
-            || rect_contains(self.taskbar_plus, mx, my)
-            || self.tab_regions.iter().any(|(r, _)| rect_contains(*r, mx, my))
+            || rect_contains(self.widgets.taskbar_plus, mx, my)
+            || self.widgets.tab_regions.iter().any(|(r, _)| rect_contains(*r, mx, my))
         {
             return c.hand;
         }
-        if let Some((_, b)) = self
+        if let Some((_, b)) = self.widgets
             .handle_regions
             .iter()
             .find(|(r, _)| rect_contains(*r, mx, my))
@@ -746,8 +874,13 @@ impl Wm {
             // The boundary "+" button sits inside the handle's hit region;
             // it's clickable, so the hand wins, matching the click hit-test
             // order.
-            if b.root && self.plus_regions.iter().any(|(r, _)| rect_contains(*r, mx, my)) {
+            if b.root && self.widgets.plus_regions.iter().any(|(r, _)| rect_contains(*r, mx, my)) {
                 return c.hand;
+            }
+            // A gap next to a minimized leaf can't be dragged (its size is
+            // pinned); don't advertise a resize that won't happen.
+            if !b.resizable {
+                return c.arrow;
             }
             return if b.dir == Dir::V {
                 c.v_resize
@@ -755,7 +888,7 @@ impl Wm {
                 c.h_resize
             };
         }
-        if self
+        if self.widgets
             .edge_handle_regions
             .iter()
             .any(|(r, _)| rect_contains(*r, mx, my))
@@ -778,7 +911,13 @@ impl Wm {
         Ok(())
     }
 
-    fn on_button_release(&mut self, _e: &ButtonReleaseEvent) -> R<()> {
+    fn on_button_release(&mut self, e: &ButtonReleaseEvent) -> R<()> {
+        // Drags are button-1 gestures; a stray right/middle release mid-drag
+        // must not end them.
+        if e.detail != 1 {
+            return Ok(());
+        }
+        self.float_drag = None;
         let dragged = self.drag.take().is_some();
         let edge_dragged = self.edge_drag.take().is_some();
         if dragged || edge_dragged {
@@ -794,6 +933,8 @@ impl Wm {
             self.paint_menu_main()?;
         } else if self.menu.open && e.window == self.menu.sub_win {
             self.paint_menu_sub()?;
+        } else if self.floats.iter().any(|f| f.frame == e.window) {
+            self.paint_float_frame(e.window)?;
         } else {
             self.paint_note_win(e.window)?;
         }

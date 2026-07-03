@@ -35,6 +35,10 @@ pub const PING_ATOM: &str = "SPLITWM_NOTE";
 /// `expire_timeout: -1` ("server decides") becomes this.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Cap on outstanding notifications; matches `wm::notes`'s popup cap, which
+/// this daemon's `Show`/`Close` traffic ultimately drives.
+const MAX_NOTES: usize = 8;
+
 pub struct Note {
     pub id: u32,
     pub summary: String,
@@ -88,12 +92,17 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
 
     let mut next_id: u32 = 1;
     let mut expiries: HashMap<u32, Instant> = HashMap::new();
+    // FIFO of currently-outstanding ids, oldest first; used only to enforce
+    // `MAX_NOTES` by evicting the oldest popup once a new one would exceed
+    // it.
+    let mut order: Vec<u32> = Vec::new();
 
     loop {
         // Popups the WM closed on click: emit the spec's "dismissed by the
         // user" close reason.
         while let Ok(id) = dismissed.try_recv() {
             expiries.remove(&id);
+            order.retain(|&o| o != id);
             emit_closed(conn.channel(), id, 2)?;
         }
 
@@ -105,6 +114,7 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
             .collect();
         for id in expired {
             expiries.remove(&id);
+            order.retain(|&o| o != id);
             to_wm
                 .send(NoteMsg::Close(id))
                 .map_err(|_| "wm channel closed")?;
@@ -134,6 +144,12 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
                     continue;
                 };
                 let id = note.id;
+                // A `replaces_id` re-show must not inherit the replaced
+                // note's deadline: clear it unconditionally, then re-arm
+                // below only if the *new* notification wants a timeout
+                // (a critical/never-expire replacement previously kept the
+                // old expiry and got auto-closed by it).
+                expiries.remove(&id);
                 // 0 means never expire; so does critical urgency per spec.
                 match timeout {
                     _ if note.urgency >= 2 => None,
@@ -142,6 +158,20 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
                     _ => Some(DEFAULT_TIMEOUT),
                 }
                 .map(|d| expiries.insert(id, Instant::now() + d));
+                order.retain(|&o| o != id); // a `replaces_id` re-show moves to newest
+                order.push(id);
+                // Cap outstanding notifications: evict the oldest rather
+                // than let the popup pile grow without bound.
+                if order.len() > MAX_NOTES {
+                    let evict = order.remove(0);
+                    expiries.remove(&evict);
+                    to_wm
+                        .send(NoteMsg::Close(evict))
+                        .map_err(|_| "wm channel closed")?;
+                    // No spec reason fits "evicted for space" exactly;
+                    // 4 = "undefined/reserved" is the closest fit.
+                    emit_closed(conn.channel(), evict, 4)?;
+                }
                 to_wm
                     .send(NoteMsg::Show(note))
                     .map_err(|_| "wm channel closed")?;
@@ -150,12 +180,18 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
             }
             Some("CloseNotification") => {
                 if let Ok(id) = msg.read1::<u32>() {
-                    expiries.remove(&id);
-                    to_wm
-                        .send(NoteMsg::Close(id))
-                        .map_err(|_| "wm channel closed")?;
-                    emit_closed(conn.channel(), id, 3)?; // 3 = closed by call
-                    ping(())?;
+                    // Only act/signal for ids that are actually still
+                    // outstanding — closing an already-gone id shouldn't
+                    // emit a spurious NotificationClosed.
+                    if order.contains(&id) {
+                        expiries.remove(&id);
+                        order.retain(|&o| o != id);
+                        to_wm
+                            .send(NoteMsg::Close(id))
+                            .map_err(|_| "wm channel closed")?;
+                        emit_closed(conn.channel(), id, 3)?; // 3 = closed by call
+                        ping(())?;
+                    }
                 }
                 reply(conn.channel(), msg.method_return())?;
             }
@@ -226,10 +262,24 @@ fn reply(ch: &Channel, msg: Message) -> R<()> {
 fn strip_markup(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut in_tag = false;
-    for c in s.chars() {
+    // Byte index of the last '>' — a '<' only opens a tag if a '>' follows
+    // it somewhere. Precomputed once: scanning the remainder per '<' would
+    // be O(n²) on hostile input, and this is an unauthenticated D-Bus
+    // endpoint.
+    let last_gt = s.rfind('>');
+    for (i, c) in s.char_indices() {
         match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
+            // Only enter tag mode if this `<` actually closes somewhere;
+            // otherwise it's stray text and should pass through literally
+            // instead of swallowing everything after it.
+            '<' if !in_tag => {
+                if last_gt.is_some_and(|g| g > i) {
+                    in_tag = true;
+                } else {
+                    out.push(c);
+                }
+            }
+            '>' if in_tag => in_tag = false,
             c if !in_tag => out.push(c),
             _ => {}
         }
@@ -244,4 +294,38 @@ fn strip_markup(s: &str) -> String {
         out = out.replace(ent, ch);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_markup;
+
+    #[test]
+    fn strips_tags_and_decodes_entities() {
+        assert_eq!(strip_markup("<b>bold</b> &amp; <i>x</i>"), "bold & x");
+        assert_eq!(strip_markup("a &lt;tag&gt; b"), "a <tag> b");
+    }
+
+    #[test]
+    fn amp_decoded_last_avoids_double_decode() {
+        assert_eq!(strip_markup("&amp;lt;"), "&lt;");
+    }
+
+    #[test]
+    fn stray_lt_without_gt_passes_through() {
+        assert_eq!(strip_markup("1 < 2"), "1 < 2");
+        assert_eq!(strip_markup("<b>x</b> then 1 < 2"), "x then 1 < 2");
+    }
+
+    #[test]
+    fn multibyte_text_survives() {
+        assert_eq!(strip_markup("héllo <em>wörld</em> ✓"), "héllo wörld ✓");
+    }
+
+    #[test]
+    fn pathological_lt_run_is_fast() {
+        // O(n²) would take minutes on this; O(n) is instant.
+        let s = "<".repeat(200_000) + ">";
+        let _ = strip_markup(&s);
+    }
 }

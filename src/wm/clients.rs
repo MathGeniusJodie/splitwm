@@ -7,13 +7,13 @@ use std::rc::Rc;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
     AtomEnum, ButtonIndex, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux,
-    ConnectionExt, EventMask, GrabMode, InputFocus, MapState, ModMask, PropMode, StackMode,
-    WindowClass,
+    ConnectionExt, CreateWindowAux, EventMask, GrabMode, InputFocus, MapState, ModMask, PropMode,
+    StackMode, WindowClass,
 };
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::CURRENT_TIME;
 
-use super::types::{Client, Wm, R};
+use super::types::{Client, FloatWin, FocusModel, Wm, R};
 use crate::icon::{self, Icon};
 use crate::theme;
 use crate::tree::Win;
@@ -47,7 +47,13 @@ impl Wm {
             {
                 continue;
             }
-            self.manage(win, true)?;
+            // A window destroyed between query_tree and managing it (easy to
+            // race during a --replace handover) must not abort the whole
+            // startup — log and adopt the rest, matching the main loop's
+            // per-event error containment.
+            if let Err(e) = self.manage(win, true) {
+                eprintln!("splitwm: failed to adopt existing window {win:#x}: {e}");
+            }
         }
         Ok(())
     }
@@ -58,6 +64,9 @@ impl Wm {
     pub(crate) fn manage(&mut self, win: Win, already_mapped: bool) -> R<()> {
         if self.is_notification(win) {
             return self.manage_notification(win);
+        }
+        if self.wants_float(win) {
+            return self.manage_float(win);
         }
         let title = self.client_title(win);
         if title.as_ref() == self.dock_title {
@@ -111,6 +120,11 @@ impl Wm {
                 class: class.clone(),
                 icon_slot,
                 mapped: already_mapped,
+                min_size: self
+                    .size_hints(win)
+                    .and_then(|h| h.min_size)
+                    .map_or((1, 1), |(w, h)| (w.max(1), h.max(1))),
+                focus: self.focus_model(win),
             },
         );
         self.refresh_icon_rotations(&class);
@@ -176,9 +190,315 @@ impl Wm {
         Ok(())
     }
 
+    /// Whether `win` should float instead of tiling: a transient
+    /// (`WM_TRANSIENT_FOR`), a declared dialog
+    /// (`_NET_WM_WINDOW_TYPE_DIALOG`), or a fixed-size window
+    /// (`WM_NORMAL_HINTS` min == max — it can't be resized, so stretching
+    /// it into a split only produces gravel).
+    fn wants_float(&self, win: Win) -> bool {
+        if self.transient_for(win).is_some() || self.is_window_type(win, self.atoms.net_wm_window_type_dialog) {
+            return true;
+        }
+        self.size_hints(win).is_some_and(|h| {
+            matches!((h.min_size, h.max_size),
+                (Some((minw, minh)), Some((maxw, maxh)))
+                    if minw == maxw && minh == maxh && minw > 0 && minh > 0)
+        })
+    }
+
+    /// `WM_TRANSIENT_FOR`'s target window, if set (and not the root, which
+    /// some toolkits use to mean "transient for the whole session").
+    fn transient_for(&self, win: Win) -> Option<Win> {
+        let r = self
+            .conn
+            .get_property(false, win, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, 0, 1)
+            .ok()?
+            .reply()
+            .ok()?;
+        let parent = r.value32()?.next()?;
+        (parent != x11rb::NONE && parent != self.root).then_some(parent)
+    }
+
+    fn size_hints(&self, win: Win) -> Option<x11rb::properties::WmSizeHints> {
+        x11rb::properties::WmSizeHints::get_normal_hints(&self.conn, win)
+            .ok()?
+            .reply()
+            .ok()?
+    }
+
+    /// ICCCM focus model from `WM_HINTS.input` (defaults to true when unset,
+    /// per ICCCM) and `WM_TAKE_FOCUS` membership in `WM_PROTOCOLS`.
+    fn focus_model(&self, win: Win) -> FocusModel {
+        let input = x11rb::properties::WmHints::get(&self.conn, win)
+            .ok()
+            .and_then(|c| c.reply().ok().flatten())
+            .and_then(|h| h.input)
+            .unwrap_or(true);
+        let take_focus = self
+            .conn
+            .get_property(false, win, self.atoms.wm_protocols, AtomEnum::ATOM, 0, 32)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .and_then(|r| Some(r.value32()?.any(|a| a == self.atoms.wm_take_focus)))
+            .unwrap_or(false);
+        FocusModel { input, take_focus }
+    }
+
+    /// Frame insets around a float's client window: the same border art the
+    /// splits use — `tb_h` above (the titlebar strip), `BORDER_LEFT` on the
+    /// other three sides, matching `place_clients`'s insets.
+    pub(crate) const fn float_insets() -> (i32, i32) {
+        (theme::BORDER_LEFT, theme::tb_h())
+    }
+
+    /// Float `win` (see `FloatWin`): show it at its requested size,
+    /// centered over its transient parent's split frame when that parent is
+    /// a tiled client currently on screen, otherwise centered in the
+    /// workarea. A chrome frame window (split border + titlebar, no control
+    /// buttons) is stacked just below it; dragging the frame moves the pair.
+    /// It takes focus immediately (a dialog exists to be answered).
+    fn manage_float(&mut self, win: Win) -> R<()> {
+        let parent = self.transient_for(win);
+        let geo = self
+            .conn
+            .get_geometry(win)
+            .ok()
+            .and_then(|c| c.reply().ok());
+        let (mut w, mut h) = geo.map_or((400, 300), |g| (i32::from(g.width).max(1), i32::from(g.height).max(1)));
+        // An adopted window a previous WM stretched into a split can be
+        // bigger than its own maximum; snap it back to the size it wants.
+        if let Some((maxw, maxh)) = self.size_hints(win).and_then(|hints| hints.max_size) {
+            (w, h) = (w.min(maxw.max(1)), h.min(maxh.max(1)));
+        }
+        // Center over the parent's frame when we know it, else the workarea.
+        let around = parent
+            .and_then(|p| self.state.tree.find_leaf_for_client(p))
+            .and_then(|l| self.prev_frame_rect.get(&l).copied())
+            .map_or(self.la(), |f| crate::tree::Rect { x: f.x, y: f.y, w: f.w, h: f.h });
+        let wa = self.la();
+        let x = (around.x + (around.w - w) / 2).clamp(wa.x, (wa.x + wa.w - w).max(wa.x));
+        let y = (around.y + (around.h - h) / 2).clamp(wa.y, (wa.y + wa.h - h).max(wa.y));
+
+        // The dialog inherits its transient parent's split accent so the
+        // chrome visibly ties them together.
+        let accent = parent
+            .and_then(|p| self.state.tree.find_leaf_for_client(p))
+            .map_or(theme::FALLBACK_ACCENT_INDEX, |l| self.leaf_color_index(l));
+        let class = self.client_identity(win);
+        let label = class.chars().next().map_or('?', |c| c.to_ascii_uppercase());
+        let icon = self.fetch_icon(win).or_else(|| self.theme_icon(&class));
+
+        self.conn.change_window_attributes(
+            win,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+        )?;
+        // Same click-to-focus passive grab as tiled clients.
+        self.conn.grab_button(
+            true,
+            win,
+            EventMask::BUTTON_PRESS,
+            GrabMode::SYNC,
+            GrabMode::ASYNC,
+            x11rb::NONE,
+            x11rb::NONE,
+            ButtonIndex::M1,
+            ModMask::ANY,
+        )?;
+        // The chrome frame: our own override-redirect window, painted with
+        // the split border art and shaped so its rounded corners are
+        // click-through. Button events on it start a move drag.
+        let (bw, tb) = Self::float_insets();
+        let frame = self.conn.generate_id()?;
+        self.conn.create_window(
+            self.depth,
+            frame,
+            self.root,
+            i16::try_from(x - bw).unwrap_or(0),
+            i16::try_from(y - tb).unwrap_or(0),
+            u16::try_from(w + 2 * bw).unwrap_or(1),
+            u16::try_from(h + tb + bw).unwrap_or(1),
+            0,
+            WindowClass::INPUT_OUTPUT,
+            0, // CopyFromParent
+            &CreateWindowAux::new()
+                .override_redirect(1)
+                .cursor(self.cursors.hand)
+                .event_mask(
+                    EventMask::EXPOSURE
+                        | EventMask::BUTTON_PRESS
+                        | EventMask::BUTTON_RELEASE
+                        | EventMask::BUTTON1_MOTION,
+                ),
+        )?;
+        self.conn.configure_window(
+            win,
+            &ConfigureWindowAux::new()
+                .x(x)
+                .y(y)
+                .width(u32::try_from(w).unwrap_or(1))
+                .height(u32::try_from(h).unwrap_or(1))
+                .border_width(0),
+        )?;
+        let focus = self.focus_model(win);
+        self.floats.push(FloatWin {
+            win,
+            frame,
+            parent,
+            focus,
+            x,
+            y,
+            w,
+            h,
+            accent,
+            icon,
+            label,
+        });
+        self.conn.map_window(frame)?;
+        self.conn.map_window(win)?;
+        self.update_client_list()?;
+        self.restack_float(win)?;
+        self.paint_float_frame(frame)?;
+        self.set_wm_state(win, WM_STATE_NORMAL)?;
+        self.focus_float(win)?;
+        self.raise_notifications()?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Raise a float as a unit: frame to the top, client just above it.
+    fn restack_float(&self, win: Win) -> R<()> {
+        let Some(f) = self.floats.iter().find(|f| f.win == win) else {
+            return Ok(());
+        };
+        self.conn
+            .configure_window(f.frame, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        self.conn.configure_window(
+            win,
+            &ConfigureWindowAux::new()
+                .sibling(f.frame)
+                .stack_mode(StackMode::ABOVE),
+        )?;
+        Ok(())
+    }
+
+    /// Render a float's chrome into its frame window: the split border +
+    /// titlebar icon via `draw_leaf` (control buttons are drawn separately
+    /// for splits, so none appear here), shaped to the opaque pixels.
+    pub(crate) fn paint_float_frame(&mut self, frame: Win) -> R<()> {
+        let Some(f) = self.floats.iter().find(|f| f.frame == frame) else {
+            return Ok(());
+        };
+        let (bw, tb) = Self::float_insets();
+        let (fw, fh) = (f.w + 2 * bw, f.h + tb + bw);
+        let view = crate::render::LeafView {
+            w: fw,
+            h: fh,
+            tb_h: tb,
+            bw,
+            accent_index: f.accent,
+            tab: Some(crate::render::TabInfo {
+                label: f.label,
+                icon: f.icon.clone(),
+            }),
+            minimized: false,
+        };
+        let mut fb = pixel_graphics::Framebuffer::new(
+            fw.max(1) as usize,
+            fh.max(1) as usize,
+            pixel_graphics::TRANSPARENT,
+        );
+        self.renderer.draw_leaf(&mut fb, 0, 0, &view);
+        self.shape_to_opaque(frame, &fb)?;
+        let mut buf = std::mem::take(&mut self.bgrx);
+        self.renderer.present(&fb, &mut buf);
+        self.bgrx = buf;
+        self.put_image(frame, fw.max(1) as u16, fh.max(1) as u16, &self.bgrx)
+    }
+
+    /// Move a float (client + frame) so its client origin lands at (x, y),
+    /// keeping at least a grabbable strip on screen.
+    pub(crate) fn move_float(&mut self, win: Win, x: i32, y: i32) -> R<()> {
+        let (bw, tb) = Self::float_insets();
+        let wa = self.wa();
+        let Some(f) = self.floats.iter_mut().find(|f| f.win == win) else {
+            return Ok(());
+        };
+        // Clamp so the titlebar can't leave the screen (the frame is the
+        // only handle there is to drag it back with).
+        let x = x.clamp(wa.x - f.w + theme::tb_h(), wa.x + wa.w - theme::tb_h());
+        let y = y.clamp(wa.y + tb, wa.y + wa.h - theme::tb_h());
+        (f.x, f.y) = (x, y);
+        let frame = f.frame;
+        self.conn.configure_window(
+            frame,
+            &ConfigureWindowAux::new().x(x - bw).y(y - tb),
+        )?;
+        self.conn
+            .configure_window(win, &ConfigureWindowAux::new().x(x).y(y))?;
+        Ok(())
+    }
+
+    /// Give input focus to a float and remember it as the keyboard target.
+    pub(crate) fn focus_float(&mut self, win: Win) -> R<()> {
+        let Some(f) = self.floats.iter().find(|f| f.win == win) else {
+            return Ok(());
+        };
+        self.give_focus(win, f.focus)?;
+        self.focused_float = Some(win);
+        self.restack_float(win)?;
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms.net_active_window,
+            AtomEnum::WINDOW,
+            &[win],
+        )?;
+        Ok(())
+    }
+
+    /// A float went away: drop it and hand focus back to its transient
+    /// parent (if tiled and visible) or the focused split.
+    pub(crate) fn forget_float(&mut self, win: Win) -> R<()> {
+        let Some(idx) = self.floats.iter().position(|f| f.win == win) else {
+            return Ok(());
+        };
+        let gone = self.floats.remove(idx);
+        self.conn.destroy_window(gone.frame)?;
+        self.update_client_list()?;
+        if self.float_drag.is_some_and(|d| d.win == win) {
+            self.float_drag = None;
+        }
+        let parent = gone.parent;
+        if self.focused_float == Some(win) {
+            self.focused_float = None;
+            let back = parent
+                .filter(|p| self.state.tree.find_leaf_for_client(*p).is_some())
+                .or_else(|| self.state.focused_client());
+            if let Some(b) = back {
+                self.state.activate_client(b);
+            }
+            self.focus(back)?;
+        }
+        Ok(())
+    }
+
+    /// Restack every float (frame + client pair) above the tiled clients
+    /// (arrange raises tiled windows; floats must stay above them, below
+    /// notifications).
+    pub(crate) fn raise_floats(&self) -> R<()> {
+        for f in &self.floats {
+            self.restack_float(f.win)?;
+        }
+        Ok(())
+    }
+
     /// Whether `win` declares `_NET_WM_WINDOW_TYPE_NOTIFICATION` (the type
     /// property is a preference-ordered list; any entry counts).
     fn is_notification(&self, win: Win) -> bool {
+        self.is_window_type(win, self.atoms.net_wm_window_type_notification)
+    }
+
+    fn is_window_type(&self, win: Win, wanted: u32) -> bool {
         self.conn
             .get_property(
                 false,
@@ -190,12 +510,7 @@ impl Wm {
             )
             .ok()
             .and_then(|c| c.reply().ok())
-            .and_then(|r| {
-                Some(
-                    r.value32()?
-                        .any(|a| a == self.atoms.net_wm_window_type_notification),
-                )
-            })
+            .and_then(|r| Some(r.value32()?.any(|a| a == wanted)))
             .unwrap_or(false)
     }
 
@@ -210,8 +525,16 @@ impl Wm {
         )?;
         self.conn
             .configure_window(win, &ConfigureWindowAux::new().border_width(0))?;
-        if !self.notifications.contains(&win) {
-            self.notifications.push(win);
+        if !self.notifications.iter().any(|n| n.win == win) {
+            // One geometry query at manage time; size updates thereafter
+            // come from the window's own ConfigureRequests.
+            let (w, h) = self
+                .conn
+                .get_geometry(win)
+                .ok()
+                .and_then(|c| c.reply().ok())
+                .map_or((1, 1), |g| (i32::from(g.width), i32::from(g.height)));
+            self.notifications.push(super::types::ForeignNote { win, w, h });
         }
         self.place_notifications()?;
         self.conn.map_window(win)?;
@@ -226,21 +549,12 @@ impl Wm {
         let wa = self.wa();
         let gap = theme::GAP;
         let mut bottom = wa.y + wa.h - Self::taskbar_h();
-        for &win in &self.notifications {
-            let Some(g) = self
-                .conn
-                .get_geometry(win)
-                .ok()
-                .and_then(|c| c.reply().ok())
-            else {
-                continue;
-            };
-            let (w, h) = (i32::from(g.width), i32::from(g.height));
-            bottom -= gap + h;
+        for n in &self.notifications {
+            bottom -= gap + n.h;
             self.conn.configure_window(
-                win,
+                n.win,
                 &ConfigureWindowAux::new()
-                    .x(wa.x + wa.w - gap - w)
+                    .x(wa.x + wa.w - gap - n.w)
                     .y(bottom)
                     .stack_mode(StackMode::ABOVE),
             )?;
@@ -252,9 +566,9 @@ impl Wm {
     /// order — arrange()/focus() raise tiled clients, so notifications must
     /// be re-raised afterwards to stay on top of everything.
     pub(crate) fn raise_notifications(&self) -> R<()> {
-        for &win in &self.notifications {
+        for n in &self.notifications {
             self.conn
-                .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+                .configure_window(n.win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
         }
         for p in &self.note_popups {
             self.conn
@@ -265,7 +579,7 @@ impl Wm {
 
     /// Stop tracking a closed notification and re-stack the survivors.
     pub(crate) fn forget_notification(&mut self, win: Win) -> R<()> {
-        self.notifications.retain(|&w| w != win);
+        self.notifications.retain(|n| n.win != win);
         self.place_notifications()?;
         Ok(())
     }
@@ -275,6 +589,9 @@ impl Wm {
     pub(crate) fn forget_client(&mut self, win: Win) -> R<()> {
         if self.clients.remove(&win).is_none() {
             return Ok(());
+        }
+        if self.fullscreen == Some(win) {
+            self.fullscreen = None;
         }
         self.bar_order.retain(|&w| w != win);
         self.ignore_unmaps.remove(&win);
@@ -325,6 +642,9 @@ impl Wm {
         if let Some(dock) = self.docked {
             self.conn.map_window(dock)?;
         }
+        for f in &self.floats {
+            self.conn.map_window(f.win)?;
+        }
         // A plain flush is not enough right before process exit: the server
         // can notice the connection hang up before draining what we just
         // wrote and drop it. A round trip proves everything was processed.
@@ -347,15 +667,69 @@ impl Wm {
         Ok(())
     }
 
-    /// Refresh `_NET_CLIENT_LIST` on the root (managed windows in
-    /// `bar_order`, i.e. mapping order), for panels/pagers.
+    /// Refresh `_NET_CLIENT_LIST` on the root: managed tiled windows in
+    /// `bar_order` (mapping order) plus the floats — they're managed client
+    /// windows too, and panels/pagers should see them.
     pub(crate) fn update_client_list(&self) -> R<()> {
+        let mut list = self.bar_order.clone();
+        list.extend(self.floats.iter().map(|f| f.win));
         self.conn.change_property32(
             PropMode::REPLACE,
             self.root,
             self.atoms.net_client_list,
             AtomEnum::WINDOW,
-            &self.bar_order,
+            &list,
+        )?;
+        Ok(())
+    }
+
+    // --- EWMH fullscreen ---
+
+    /// Apply an `_NET_WM_STATE_FULLSCREEN` change for a managed tiled client:
+    /// track it, mirror the state onto the window's `_NET_WM_STATE` property,
+    /// and re-arrange (which positions/stacks the fullscreen window). Only
+    /// one window is fullscreen at a time; a second request replaces the
+    /// first (its property is cleared so it doesn't believe it's still
+    /// fullscreen).
+    pub(crate) fn set_fullscreen(&mut self, win: Win, on: bool) -> R<()> {
+        if !self.clients.contains_key(&win) {
+            return Ok(());
+        }
+        if on {
+            if let Some(prev) = self.fullscreen.replace(win) {
+                if prev != win {
+                    self.set_net_wm_state_fullscreen(prev, false)?;
+                }
+            }
+            self.set_net_wm_state_fullscreen(win, true)?;
+        } else {
+            if self.fullscreen != Some(win) {
+                return Ok(());
+            }
+            self.fullscreen = None;
+            self.set_net_wm_state_fullscreen(win, false)?;
+        }
+        self.state.activate_client(win);
+        self.arrange()?;
+        self.focus(Some(win))?;
+        Ok(())
+    }
+
+    /// Mirror our fullscreen bookkeeping onto the client's `_NET_WM_STATE`
+    /// property (the whole list is just this one state — we support no
+    /// others).
+    fn set_net_wm_state_fullscreen(&self, win: Win, on: bool) -> R<()> {
+        let states: &[u32] = if on {
+            &[self.atoms.net_wm_state_fullscreen]
+        } else {
+            &[]
+        };
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            win,
+            self.atoms.net_wm_state,
+            AtomEnum::ATOM,
+            states,
         )?;
         Ok(())
     }
@@ -382,15 +756,23 @@ impl Wm {
         Rc::from(String::from_utf8_lossy(name).as_ref())
     }
 
-    /// `WM_NAME`, used to identify windows that never set `WM_CLASS` (e.g.
-    /// the `Wm::dock_title` sidebar).
+    /// The window's title — `_NET_WM_NAME` (UTF-8) with a latin-1 `WM_NAME`
+    /// fallback, so toolkits that only set the EWMH property still match.
+    /// Used to identify windows that never set `WM_CLASS` (e.g. the
+    /// `Wm::dock_title` sidebar).
     fn client_title(&self, win: Win) -> Rc<str> {
-        let name = self
-            .conn
-            .get_property(false, win, AtomEnum::WM_NAME, AtomEnum::STRING, 0, 256)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .map(|r| r.value)
+        let read = |atom: u32, ty: u32| -> Option<Vec<u8>> {
+            let v = self
+                .conn
+                .get_property(false, win, atom, ty, 0, 256)
+                .ok()?
+                .reply()
+                .ok()?
+                .value;
+            (!v.is_empty()).then_some(v)
+        };
+        let name = read(self.atoms.net_wm_name, self.atoms.utf8_string)
+            .or_else(|| read(u32::from(AtomEnum::WM_NAME), u32::from(AtomEnum::STRING)))
             .unwrap_or_default();
         Rc::from(String::from_utf8_lossy(&name).as_ref())
     }
@@ -507,7 +889,7 @@ impl Wm {
         }
         let (w, h, start) = best?;
         let argb = vals[start..start + (w * h) as usize].to_vec();
-        let icon = Icon { w, h, argb };
+        let icon = Icon::new(w, h, argb);
         // Quantize to the na16 chrome palette so app icons render as flat
         // pixel art matching the rest of the UI, and so the (rotate + snap)
         // hue-rotation for same-app disambiguation stays crisp.
@@ -542,13 +924,41 @@ impl Wm {
 
     // --- focus & spawning ---
 
-    pub(crate) fn focus(&self, win: Option<Win>) -> R<()> {
+    /// Deliver input focus per the ICCCM model: `SetInputFocus` only when
+    /// `WM_HINTS.input` allows it, plus a `WM_TAKE_FOCUS` handshake for
+    /// clients that asked for one — with the last real input timestamp, not
+    /// `CURRENT_TIME`, so a slow client can't steal focus back across a race.
+    fn give_focus(&self, win: Win, model: FocusModel) -> R<()> {
+        let time = if self.last_event_time == 0 {
+            CURRENT_TIME
+        } else {
+            self.last_event_time
+        };
+        if model.input {
+            self.conn
+                .set_input_focus(InputFocus::POINTER_ROOT, win, time)?;
+        }
+        if model.take_focus {
+            let msg = ClientMessageEvent::new(
+                32,
+                win,
+                self.atoms.wm_protocols,
+                [self.atoms.wm_take_focus, time, 0, 0, 0],
+            );
+            self.conn.send_event(false, win, EventMask::NO_EVENT, msg)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn focus(&mut self, win: Option<Win>) -> R<()> {
         match win {
             Some(w) if self.clients.contains_key(&w) => {
-                self.conn
-                    .set_input_focus(InputFocus::POINTER_ROOT, w, CURRENT_TIME)?;
+                self.focused_float = None;
+                let model = self.clients[&w].focus;
+                self.give_focus(w, model)?;
                 self.conn
                     .configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+                self.raise_floats()?;
                 self.raise_notifications()?;
                 self.conn.change_property32(
                     PropMode::REPLACE,
@@ -559,6 +969,7 @@ impl Wm {
                 )?;
             }
             _ => {
+                self.focused_float = None;
                 self.conn
                     .set_input_focus(InputFocus::POINTER_ROOT, self.root, CURRENT_TIME)?;
                 self.conn.change_property32(
@@ -582,11 +993,24 @@ impl Wm {
     /// command to init immediately; waiting on the short-lived `sh` itself
     /// (it exits as soon as it has forked) is what actually prevents a
     /// zombie per launch — dropping the `Child` would leave it unreaped.
+    ///
+    /// When systemd-run is available the command is placed in its own
+    /// transient scope under app.slice, like a desktop-environment launcher
+    /// would; Chromium/Electron apps otherwise try to move themselves out of
+    /// the shared session scope and log a spurious UnitExists error.
     #[allow(clippy::unused_self)]
     pub(crate) fn spawn(&self, cmd: &str) {
+        let line = if Self::have_systemd_run() {
+            format!(
+                "systemd-run --user --scope --slice=app.slice --collect --quiet -- /bin/sh -c {} &",
+                shell_quote(cmd)
+            )
+        } else {
+            format!("{cmd} &")
+        };
         match std::process::Command::new("/bin/sh")
             .arg("-c")
-            .arg(format!("{cmd} &"))
+            .arg(line)
             .spawn()
         {
             Ok(mut sh) => {
@@ -595,4 +1019,25 @@ impl Wm {
             Err(e) => eprintln!("splitwm: failed to spawn '{cmd}': {e}"),
         }
     }
+
+    /// Whether `systemd-run` exists and a user manager is reachable.
+    /// Checked once and cached; false on non-systemd setups or bare X
+    /// sessions. The probe is a synchronous D-Bus round trip, so `run`
+    /// warms it at startup rather than letting the first launch pay for it
+    /// inside the event loop.
+    pub(crate) fn have_systemd_run() -> bool {
+        use std::sync::OnceLock;
+        static HAVE: OnceLock<bool> = OnceLock::new();
+        *HAVE.get_or_init(|| {
+            std::process::Command::new("systemd-run")
+                .args(["--user", "--scope", "--collect", "--quiet", "--", "true"])
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    }
+}
+
+/// Single-quote `s` for use as one `sh` word.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }

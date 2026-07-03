@@ -117,6 +117,9 @@ pub const DOCK_OVERLAP: i32 = 310;
 
 pub const SPLIT_RATIO: f64 = 0.618;
 pub const RESIZE_STEP: f64 = 0.05;
+/// Smallest fraction of a branch a child can be resized down to, shared by
+/// keyboard resizing and boundary drags so both stop at the same point.
+pub const MIN_SPLIT_FRAC: f64 = 0.05;
 pub const SCROLL_STEP: i32 = 100;
 
 // Split-control button geometry: native pixel size of the close/minimize/
