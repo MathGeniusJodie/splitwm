@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-x11rb = { version = "0.13", features = ["xinput", "render"] }
+x11rb = { version = "0.13", features = ["xinput", "render", "shape"] }
+# Session-bus server for org.freedesktop.Notifications (the WM doubles as the
+# notification daemon); binds the system libdbus, driven from its own thread.
+dbus = "0.9"
 # Chrome art is baked by build.rs; png-loading stays on for decoding user
 # wallpaper PNGs at runtime.
 pixel-graphics = { path = "../pixel-graphics" }

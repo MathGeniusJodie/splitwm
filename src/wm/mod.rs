@@ -13,6 +13,7 @@ mod arrange;
 mod clients;
 mod events;
 mod menu;
+mod notes;
 mod types;
 mod widgets;
 
@@ -410,6 +411,13 @@ pub fn run(replace: bool) -> R<()> {
     };
 
     let debug_scroll = std::env::var_os("SPLITWM_DEBUG_SCROLL").is_some();
+
+    // Become the session's notification daemon: the thread owns the D-Bus
+    // connection and wakes our event loop with a `splitwm_note` ClientMessage
+    // whenever the channel has something for us.
+    let (note_tx, note_rx) = std::sync::mpsc::channel();
+    let note_dismiss = crate::notify::spawn(note_tx);
+
     let mut wm = Wm {
         depth: screen.root_depth,
         gc,
@@ -424,6 +432,9 @@ pub fn run(replace: bool) -> R<()> {
         dock_title: std::env::var("SPLITWM_DOCK_TITLE")
             .unwrap_or_else(|_| theme::DOCK_TITLE.to_string()),
         notifications: Vec::new(),
+        note_popups: Vec::new(),
+        note_rx,
+        note_dismiss,
         underlay,
         underlay_pix: 0,
         underlay_pix_size: (0, 0),
@@ -647,6 +658,8 @@ impl Wm {
             (MOD4, ks::MINUS, Action::Shrink),
             (MOD4 | shift, ks::Q, Action::Quit),
             (MOD4 | shift, ks::C, Action::CloseWindow),
+            (0, ks::XF86_MON_BRIGHTNESS_UP, Action::BrightnessUp),
+            (0, ks::XF86_MON_BRIGHTNESS_DOWN, Action::BrightnessDown),
         ];
         // Also grab with Lock (CapsLock) and Mod2 (NumLock) variants.
         let extra = [

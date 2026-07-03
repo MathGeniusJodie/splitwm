@@ -36,6 +36,8 @@ pub mod ks {
     pub const L: u32 = 0x6c;
     pub const C: u32 = 0x63;
     pub const SPACE: u32 = 0x20;
+    pub const XF86_MON_BRIGHTNESS_UP: u32 = 0x1008_ff02;
+    pub const XF86_MON_BRIGHTNESS_DOWN: u32 = 0x1008_ff03;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -58,6 +60,8 @@ pub enum Action {
     /// Ask the focused window to close via `WM_DELETE_WINDOW`, falling back
     /// to disconnecting its client if it doesn't speak the protocol.
     CloseWindow,
+    BrightnessUp,
+    BrightnessDown,
 }
 
 /// Interned atoms used for ICCCM/EWMH interop, fetched once at startup.
@@ -74,13 +78,16 @@ pub struct Atoms {
     pub net_wm_window_type: Atom,
     pub net_wm_window_type_notification: Atom,
     pub utf8_string: Atom,
+    /// Wakeup ClientMessage type from the notification-daemon thread (see
+    /// `crate::notify`): "drain the note channel and update popups".
+    pub splitwm_note: Atom,
 }
 
 impl Atoms {
     pub fn intern(conn: &RustConnection) -> R<Self> {
         // Send every InternAtom before reading any reply, so interning costs
         // one round trip instead of ten.
-        let names: [&[u8]; 12] = [
+        let names: [&[u8]; 13] = [
             b"WM_PROTOCOLS",
             b"WM_DELETE_WINDOW",
             b"WM_STATE",
@@ -93,13 +100,14 @@ impl Atoms {
             b"_NET_WM_WINDOW_TYPE",
             b"_NET_WM_WINDOW_TYPE_NOTIFICATION",
             b"UTF8_STRING",
+            crate::notify::PING_ATOM.as_bytes(),
         ];
         let cookies = names.map(|n| conn.intern_atom(false, n));
-        let mut atoms = [0 as Atom; 12];
+        let mut atoms = [0 as Atom; 13];
         for (slot, cookie) in atoms.iter_mut().zip(cookies) {
             *slot = cookie?.reply()?.atom;
         }
-        let [wm_protocols, wm_delete_window, wm_state, net_wm_icon, net_supported, net_client_list, net_active_window, net_supporting_wm_check, net_wm_name, net_wm_window_type, net_wm_window_type_notification, utf8_string] =
+        let [wm_protocols, wm_delete_window, wm_state, net_wm_icon, net_supported, net_client_list, net_active_window, net_supporting_wm_check, net_wm_name, net_wm_window_type, net_wm_window_type_notification, utf8_string, splitwm_note] =
             atoms;
         Ok(Self {
             wm_protocols,
@@ -114,6 +122,7 @@ impl Atoms {
             net_wm_window_type,
             net_wm_window_type_notification,
             utf8_string,
+            splitwm_note,
         })
     }
 }
@@ -166,6 +175,16 @@ pub struct Wm {
     /// They stack above everything at the bottom-right of the screen
     /// (see `Wm::place_notifications`), at whatever size they requested.
     pub notifications: Vec<Win>,
+    /// Speech-bubble popups for notifications *we* serve as the session's
+    /// `org.freedesktop.Notifications` daemon (see `crate::notify` and
+    /// `Wm::on_note_ping`). Own override-redirect windows, drawn by the
+    /// renderer, stacked bottom-right above the `notifications` pile.
+    pub note_popups: Vec<NotePopup>,
+    /// Incoming notification events from the daemon thread.
+    pub note_rx: std::sync::mpsc::Receiver<crate::notify::NoteMsg>,
+    /// Ids of popups the user click-dismissed, reported back to the daemon
+    /// thread so it emits the matching `NotificationClosed` signal.
+    pub note_dismiss: std::sync::mpsc::Sender<u32>,
     pub underlay: Window,
     /// Server-side pixmap holding the underlay's composited image, set as the
     /// underlay's `background_pixmap` so the server repaints exposed regions
@@ -227,6 +246,14 @@ pub struct Wm {
     /// hiding a client) and must swallow; any unmap beyond the count is the
     /// client withdrawing itself (ICCCM) and unmanages it.
     pub ignore_unmaps: HashMap<Win, u32>,
+}
+
+/// One on-screen speech-bubble notification popup and the note it shows.
+pub struct NotePopup {
+    pub win: Window,
+    pub note: crate::notify::Note,
+    pub w: i32,
+    pub h: i32,
 }
 
 /// A device's horizontal scroll axis: which valuator carries it and how many

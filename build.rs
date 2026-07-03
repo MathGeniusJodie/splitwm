@@ -17,6 +17,7 @@ use pixel_graphics::{Palette, Sprite};
 const PALETTE_PNG: &str = "na16-1x.png";
 
 const SPRITES: &[&str] = &[
+    "bubble.png",
     "close.png",
     "cursor_disabled.png",
     "cursor_hand.png",

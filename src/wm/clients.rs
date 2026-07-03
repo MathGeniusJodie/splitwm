@@ -256,6 +256,10 @@ impl Wm {
             self.conn
                 .configure_window(win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
         }
+        for p in &self.note_popups {
+            self.conn
+                .configure_window(p.win, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+        }
         Ok(())
     }
 

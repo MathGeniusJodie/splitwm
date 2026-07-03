@@ -189,6 +189,10 @@ impl Wm {
             Event::MappingNotify(e) => self.on_mapping(e)?,
             // Device hotplug: rebuild the horizontal-scroll device map.
             Event::XinputHierarchy(_) => self.build_hscroll_map()?,
+            // The notification-daemon thread pinged us: drain its channel.
+            Event::ClientMessage(e) if e.type_ == self.atoms.splitwm_note => {
+                self.on_note_ping()?;
+            }
             // Another WM took over the manager selection (e.g. its own
             // `--replace`); quit gracefully so it can grab the redirect.
             Event::SelectionClear(e) if e.owner == self.sel_owner => self.running = false,
@@ -323,6 +327,19 @@ impl Wm {
         let Some(action) = self.lookup_action(e.state.into(), e.detail) else {
             return Ok(());
         };
+        // Media-style keys don't touch the layout; handle them before the
+        // animate/arrange bookkeeping below.
+        match action {
+            Action::BrightnessUp => {
+                adjust_brightness(5);
+                return Ok(());
+            }
+            Action::BrightnessDown => {
+                adjust_brightness(-5);
+                return Ok(());
+            }
+            _ => {}
+        }
         let wa = self.la();
         // Layout-changing actions get an animated transition.
         self.animate = matches!(
@@ -385,6 +402,7 @@ impl Wm {
                 self.running = false;
                 return Ok(());
             }
+            Action::BrightnessUp | Action::BrightnessDown => unreachable!("handled above"),
         }
         if let Some(rect) = pre_split {
             self.prev_frame_rect
@@ -463,6 +481,10 @@ impl Wm {
 
     #[allow(clippy::too_many_lines)]
     fn on_button(&mut self, e: ButtonPressEvent) -> R<()> {
+        // Any click on a notification bubble dismisses it.
+        if self.dismiss_note(e.event)? {
+            return Ok(());
+        }
         let wa = self.la();
         // Clicks inside the launcher menu select an item; clicks elsewhere
         // dismiss it before falling through to normal handling.
@@ -772,7 +794,35 @@ impl Wm {
             self.paint_menu_main()?;
         } else if self.menu.open && e.window == self.menu.sub_win {
             self.paint_menu_sub()?;
+        } else {
+            self.paint_note_win(e.window)?;
         }
         Ok(())
+    }
+}
+
+/// Step every `/sys/class/backlight` device by `pct` percent of its maximum,
+/// clamped to `[1, max]` so the panel never turns fully off. Writing the
+/// sysfs file needs group write access (udev rule + `video` group).
+fn adjust_brightness(pct: i64) {
+    let Ok(entries) = std::fs::read_dir("/sys/class/backlight") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let read = |name: &str| -> Option<i64> {
+            std::fs::read_to_string(dir.join(name))
+                .ok()?
+                .trim()
+                .parse()
+                .ok()
+        };
+        let (Some(cur), Some(max)) = (read("brightness"), read("max_brightness")) else {
+            continue;
+        };
+        let new = (cur + max * pct / 100).clamp(1, max);
+        if let Err(e) = std::fs::write(dir.join("brightness"), new.to_string()) {
+            eprintln!("splitwm: brightness write to {} failed: {e}", dir.display());
+        }
     }
 }
