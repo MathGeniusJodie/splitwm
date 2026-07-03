@@ -92,12 +92,17 @@ impl Wm {
             return Ok(());
         }
         let wa = self.la();
-        let px = (delta * f64::from(theme::SCROLL_STEP)) as i32;
+        // Carry the sub-pixel remainder between batches: a slow continuous
+        // swipe can deliver less than a pixel per batch, and truncating each
+        // batch independently would discard the entire gesture.
+        let px_f = delta.mul_add(f64::from(theme::SCROLL_STEP), self.hscroll_frac);
+        let px = px_f as i32;
+        self.hscroll_frac = px_f - f64::from(px);
         if px == 0 {
             return Ok(());
         }
         self.state.scroll_delta(wa, px);
-        self.state.scroll_x = self.state.scroll_target;
+        self.state.land_scroll();
         if self.debug_scroll {
             let t0 = std::time::Instant::now();
             self.arrange()?;
@@ -176,11 +181,12 @@ impl Wm {
                 // Legacy wheel-click compatibility events (buttons 4-7):
                 // libinput synthesizes one of these alongside every smooth
                 // XI2 scroll report, for X clients that only understand the
-                // old discrete-click protocol. We scroll from the raw axis
-                // instead, so these carry no information for us — but until
-                // ignored here, each one forced a flush of the accumulated
-                // scroll delta, defeating the coalescing above: a burst of
-                // N scroll reports means N clicks means N full recomposites.
+                // discrete-click protocol. We scroll from the raw axis
+                // instead, so these carry no information for us — leaving
+                // them unhandled here would force a flush of the accumulated
+                // scroll delta per event, defeating the coalescing above: a
+                // burst of N scroll reports would mean N clicks means N full
+                // recomposites.
                 //
                 // Exception: on a server with no smooth-scroll devices at all
                 // (`hscroll` empty — XI2 missing or too old, e.g. some Xvfb/
@@ -435,7 +441,7 @@ impl Wm {
             let wa = self.la();
             let full = self.wa();
             let canvas_w = self.state.canvas_w(wa);
-            let x = wa.x + canvas_w - self.dock_overlap() - self.state.scroll_x;
+            let x = wa.x + canvas_w - self.dock_overlap() - self.state.scroll_x();
             return Some((x, full.y, self.dock.w.max(1), full.h.max(1)));
         }
         if self.fullscreen == Some(win) {
@@ -443,12 +449,17 @@ impl Wm {
             return Some((full.x, full.y, full.w.max(1), full.h.max(1)));
         }
         let leaf = self.state.tree.find_leaf_for_client(win)?;
-        if self.state.tree.leaf(leaf).is_some_and(|l| l.minimized) {
-            return None; // its window is hidden, not configured to the slot
+        // A hidden window (minimized, or its split scrolled off-screen) was
+        // never configured to its slot; answer from the server instead.
+        let client = self.clients.get(&win);
+        if self.state.tree.leaf(leaf).is_some_and(|l| l.minimized)
+            || !client.is_some_and(|c| c.mapped)
+        {
+            return None;
         }
         let r = self.prev_frame_rect.get(&leaf)?;
         let (bw, tb) = (theme::BORDER_LEFT, theme::tb_h());
-        let (min_w, min_h) = self.clients.get(&win).map_or((1, 1), |c| c.min_size);
+        let (min_w, min_h) = client.map_or((1, 1), |c| c.min_size);
         Some((
             r.x + bw,
             r.y + tb,
@@ -506,7 +517,7 @@ impl Wm {
         self.drags.edge = None;
         let wa = self.la();
         self.state.ensure_in_view(wa);
-        self.state.scroll_x = self.state.scroll_target;
+        self.state.land_scroll();
         self.arrange()?;
         // A focused dialog keeps the keyboard across pure layout changes
         // (split/resize/insert): re-assert its focus instead of handing it
@@ -578,8 +589,8 @@ impl Wm {
 
     /// A window was unmapped. Layout hiding accounts for its own unmaps in
     /// `ignore_unmaps`; anything beyond that is the client withdrawing
-    /// itself (ICCCM), which unmanages it — the old no-op here meant a
-    /// withdrawn window got forcibly re-mapped by the next arrange.
+    /// itself (ICCCM), so it must be unmanaged here — otherwise the next
+    /// arrange would forcibly re-map a withdrawn window.
     fn on_unmap(&mut self, e: &UnmapNotifyEvent) -> R<()> {
         // Each unmap of a client is delivered twice: once via the root's
         // SubstructureNotify and once via the client's own StructureNotify
@@ -962,7 +973,7 @@ impl Wm {
                 Hit::Edge(left) => {
                     if let Some((start_x, w)) = self.state.edge_span(wa, left) {
                         let canvas_anchor = if left { start_x + w } else { start_x };
-                        let anchor_x = canvas_anchor - self.state.scroll_x;
+                        let anchor_x = canvas_anchor - self.state.scroll_x();
                         self.drags.edge = Some(EdgeDrag { left, anchor_x });
                     }
                 }
@@ -1031,8 +1042,7 @@ impl Wm {
             // same amount so they stay put on screen and only the dragged
             // edge visibly moves.
             if ed.left && applied != 0 {
-                self.state.scroll_x += applied;
-                self.state.scroll_target += applied;
+                self.state.shift_scroll(applied);
             }
             self.arrange()?;
             return Ok(());
@@ -1052,7 +1062,7 @@ impl Wm {
         let canvas_pos = if d.vertical {
             i32::from(e.root_y)
         } else {
-            i32::from(e.root_x) + self.state.scroll_x
+            i32::from(e.root_x) + self.state.scroll_x()
         };
         let new_first = canvas_pos - d.start - d.gap / 2;
         let frac = f64::from(new_first) / f64::from(d.combined);

@@ -170,7 +170,7 @@ impl Wm {
     pub(crate) fn compute_boundary_widgets(&mut self, wa: Rect) {
         let gap = theme::GAP;
         let hw = (gap - Self::HANDLE_INSET).max(4);
-        let scroll_x = self.state.scroll_x;
+        let scroll_x = self.state.scroll_x();
         let canvas_w = self.state.canvas_w(wa);
         for b in self.state.boundaries(wa) {
             let rect = if b.dir == Dir::H {
@@ -219,7 +219,7 @@ impl Wm {
     /// `State::edge_span`); nothing to grab otherwise.
     pub(crate) fn compute_edge_handle_widgets(&mut self, wa: Rect) {
         let gap = theme::GAP;
-        let scroll_x = self.state.scroll_x;
+        let scroll_x = self.state.scroll_x();
         let span_h = (wa.h - 2 * gap).max(1);
         for left in [true, false] {
             let Some((start_x, w)) = self.state.edge_span(wa, left) else {

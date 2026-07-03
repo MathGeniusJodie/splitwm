@@ -55,12 +55,57 @@ impl Wm {
                 eprintln!("splitwm: failed to adopt existing window {win:#x}: {e}");
             }
         }
+        // `manage` defers per-window layout work during adoption
+        // (`already_mapped`): one arrange/focus/client-list pass here covers
+        // the whole batch instead of one full recomposite per window.
+        self.update_client_list()?;
+        self.arrange()?;
+        let f = self.state.focused_client();
+        self.focus(f)?;
+        let adopted: Vec<Win> = self.clients.keys().copied().collect();
+        for win in adopted {
+            let mapped = self.clients.get(&win).is_some_and(|c| c.mapped);
+            self.set_wm_state(
+                win,
+                if mapped {
+                    WM_STATE_NORMAL
+                } else {
+                    WM_STATE_ICONIC
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Shared adoption prologue: select the events we need from `win`, strip
+    /// its core border (chrome is ours), and optionally install the
+    /// click-to-focus passive button-1 grab.
+    fn select_and_grab(&self, win: Win, mask: EventMask, grab: bool) -> R<()> {
+        self.conn
+            .change_window_attributes(win, &ChangeWindowAttributesAux::new().event_mask(mask))?;
+        if grab {
+            self.conn.grab_button(
+                true,
+                win,
+                EventMask::BUTTON_PRESS,
+                GrabMode::SYNC,
+                GrabMode::ASYNC,
+                x11rb::NONE,
+                x11rb::NONE,
+                ButtonIndex::M1,
+                ModMask::ANY,
+            )?;
+        }
+        self.conn
+            .configure_window(win, &ConfigureWindowAux::new().border_width(0))?;
         Ok(())
     }
 
     /// Start managing `win`. `already_mapped` distinguishes adopted
     /// already-viewable windows (whose next unmap by us must be counted in
-    /// `ignore_unmaps`) from fresh `MapRequest`s that are not yet mapped.
+    /// `ignore_unmaps`, and whose arrange/focus work is batched by
+    /// `manage_existing_windows`) from fresh `MapRequest`s that are not yet
+    /// mapped.
     pub(crate) fn manage(&mut self, win: Win, already_mapped: bool) -> R<()> {
         if self.is_notification(win) {
             return self.manage_notification(win);
@@ -89,26 +134,11 @@ impl Wm {
         // Place the client into the focused split (displacing any occupant).
         self.state.pin_client(win);
 
-        self.conn.change_window_attributes(
+        self.select_and_grab(
             win,
-            &ChangeWindowAttributesAux::new()
-                .event_mask(EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY),
-        )?;
-        // Click-to-focus passive grab.
-        self.conn.grab_button(
+            EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY,
             true,
-            win,
-            EventMask::BUTTON_PRESS,
-            GrabMode::SYNC,
-            GrabMode::ASYNC,
-            x11rb::NONE,
-            x11rb::NONE,
-            ButtonIndex::M1,
-            ModMask::ANY,
         )?;
-        // No border; the chrome (border + tab bar) is drawn on the underlay.
-        self.conn
-            .configure_window(win, &ConfigureWindowAux::new().border_width(0))?;
 
         self.clients.insert(
             win,
@@ -130,20 +160,26 @@ impl Wm {
         if !self.bar_order.contains(&win) {
             self.bar_order.push(win);
         }
-        self.update_client_list()?;
         self.state.activate_client(win);
-        self.arrange()?;
-        self.focus(Some(win))?;
-        // arrange() has mapped it (or left it hidden); record the ICCCM state.
-        let mapped = self.clients.get(&win).is_some_and(|c| c.mapped);
-        self.set_wm_state(
-            win,
-            if mapped {
-                WM_STATE_NORMAL
-            } else {
-                WM_STATE_ICONIC
-            },
-        )?;
+        // During startup adoption (`already_mapped`) the arrange/focus/
+        // client-list/WM_STATE work is batched by `manage_existing_windows`
+        // after the loop — once for all adopted windows.
+        if !already_mapped {
+            self.update_client_list()?;
+            self.arrange()?;
+            self.focus(Some(win))?;
+            // arrange() has mapped it (or left it hidden); record the ICCCM
+            // state.
+            let mapped = self.clients.get(&win).is_some_and(|c| c.mapped);
+            self.set_wm_state(
+                win,
+                if mapped {
+                    WM_STATE_NORMAL
+                } else {
+                    WM_STATE_ICONIC
+                },
+            )?;
+        }
         // EWMH allows requesting fullscreen by setting the property before
         // mapping; the ClientMessage path only covers later requests.
         if self.wants_fullscreen(win) {
@@ -169,23 +205,7 @@ impl Wm {
         self.dock.win = Some(win);
         self.dock.w = width.max(1);
 
-        self.conn.change_window_attributes(
-            win,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
-        )?;
-        self.conn.grab_button(
-            true,
-            win,
-            EventMask::BUTTON_PRESS,
-            GrabMode::SYNC,
-            GrabMode::ASYNC,
-            x11rb::NONE,
-            x11rb::NONE,
-            ButtonIndex::M1,
-            ModMask::ANY,
-        )?;
-        self.conn
-            .configure_window(win, &ConfigureWindowAux::new().border_width(0))?;
+        self.select_and_grab(win, EventMask::STRUCTURE_NOTIFY, true)?;
 
         // arrange() calls place_dock() with the freshly computed workarea
         // and canvas width, so no separate initial placement is needed here.
@@ -328,22 +348,7 @@ impl Wm {
         let label = class.chars().next().map_or('?', |c| c.to_ascii_uppercase());
         let icon = self.fetch_icon(win).or_else(|| self.theme_icon(&class));
 
-        self.conn.change_window_attributes(
-            win,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
-        )?;
-        // Same click-to-focus passive grab as tiled clients.
-        self.conn.grab_button(
-            true,
-            win,
-            EventMask::BUTTON_PRESS,
-            GrabMode::SYNC,
-            GrabMode::ASYNC,
-            x11rb::NONE,
-            x11rb::NONE,
-            ButtonIndex::M1,
-            ModMask::ANY,
-        )?;
+        self.select_and_grab(win, EventMask::STRUCTURE_NOTIFY, true)?;
         // The chrome frame: our own override-redirect window, painted with
         // the split border art and shaped so its rounded corners are
         // click-through. Button events on it start a move drag.
@@ -555,12 +560,7 @@ impl Wm {
     /// taskbar strip), at whatever size it requested. Newer notifications
     /// stack upward above older ones.
     fn manage_notification(&mut self, win: Win) -> R<()> {
-        self.conn.change_window_attributes(
-            win,
-            &ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
-        )?;
-        self.conn
-            .configure_window(win, &ConfigureWindowAux::new().border_width(0))?;
+        self.select_and_grab(win, EventMask::STRUCTURE_NOTIFY, false)?;
         if !self.notes.foreign.iter().any(|n| n.win == win) {
             // One geometry query at manage time; size updates thereafter
             // come from the window's own ConfigureRequests.
@@ -580,31 +580,16 @@ impl Wm {
         Ok(())
     }
 
-    /// Position every notification: right-aligned to the screen edge (split
-    /// gap margin), stacked bottom-up starting just above the taskbar, each
-    /// raised to the top of the stacking order (oldest at the bottom). Our
-    /// own served-notification popups continue the same pile upward (see
-    /// `place_note_popups`), so both kinds share one stack instead of
-    /// overlapping — which is also why a foreign-pile change must re-place
-    /// the popups.
+    /// Position every notification: stacked bottom-up starting just above
+    /// the taskbar (oldest at the bottom; see `stack_note_pile` for the
+    /// shared geometry). Our own served-notification popups continue the
+    /// same pile upward (see `place_note_popups`), so both kinds share one
+    /// stack instead of overlapping — which is also why a foreign-pile
+    /// change must re-place the popups.
     pub(crate) fn place_notifications(&self) -> R<()> {
         let wa = self.wa();
-        let gap = theme::GAP;
-        let mut bottom = wa.y + wa.h - Self::taskbar_h();
-        for n in &self.notes.foreign {
-            // Clamp to the top of the workarea: a deep enough pile would
-            // otherwise place the overflow at negative y — visible nowhere
-            // and (click-to-dismiss being the only dismissal) undismissable.
-            // Overflowing bubbles overlap at the top edge instead.
-            bottom = (bottom - gap - n.h).max(wa.y);
-            self.conn.configure_window(
-                n.win,
-                &ConfigureWindowAux::new()
-                    .x(wa.x + wa.w - gap - n.w)
-                    .y(bottom)
-                    .stack_mode(StackMode::ABOVE),
-            )?;
-        }
+        let bottom = wa.y + wa.h - Self::taskbar_h();
+        self.stack_note_pile(self.notes.foreign.iter().map(|n| (n.win, n.w, n.h)), bottom)?;
         self.place_note_popups()
     }
 
@@ -1174,6 +1159,10 @@ impl Wm {
                 )?;
             }
         }
+        // Raising the focused client puts it above everything, including an
+        // open launcher menu; the menu must stay on top (`arrange` does the
+        // same after its raises).
+        self.raise_menu()?;
         Ok(())
     }
 
@@ -1195,8 +1184,8 @@ impl Wm {
     pub(crate) fn spawn(&self, cmd: &str) {
         // Both paths hand `cmd` to `/bin/sh -c` as one quoted word, so a
         // command line containing `;`/`&&` behaves identically whether or
-        // not systemd-run is available (the old bare `{cmd} &` fallback
-        // backgrounded only the last statement of a compound command).
+        // not systemd-run is available (a bare `{cmd} &` fallback would
+        // background only the last statement of a compound command).
         let line = if Self::have_systemd_run() {
             format!(
                 "systemd-run --user --scope --slice=app.slice --collect --quiet -- /bin/sh -c {} &",
@@ -1246,8 +1235,10 @@ fn shell_quote(s: &str) -> String {
 
 /// Walk a `_NET_WM_ICON` value (a list of `width, height, w*h ARGB pixels`
 /// blocks packed as 32-bit CARDINALs) and pick the block whose size best
-/// matches `want`: the smallest that still covers it, otherwise the largest
-/// available. Returns `(w, h, pixel_start)`; `None` when no valid block
+/// matches `want`: the smallest whose *smaller dimension* still covers it,
+/// otherwise the largest available — judging by `min(w, h)` so a degenerate
+/// wide-but-short block can't beat a square one that actually covers the
+/// target box. Returns `(w, h, pixel_start)`; `None` when no valid block
 /// exists (empty, zero-sized, or truncated property).
 fn best_icon_block(vals: &[u32], want: u32) -> Option<(u32, u32, usize)> {
     let mut i = 0;
@@ -1259,9 +1250,13 @@ fn best_icon_block(vals: &[u32], want: u32) -> Option<(u32, u32, usize)> {
         if w == 0 || h == 0 || start + count > vals.len() {
             break;
         }
+        let m = w.min(h);
         let better = match best {
             None => true,
-            Some((bw, _, _)) => (w >= want && (bw < want || w < bw)) || (bw < want && w > bw),
+            Some((bw, bh, _)) => {
+                let bm = bw.min(bh);
+                (m >= want && (bm < want || m < bm)) || (bm < want && m > bm)
+            }
         };
         if better {
             best = Some((w, h, start));

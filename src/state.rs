@@ -8,8 +8,11 @@ use crate::tree::{Boundary, Dir, Node, NodeId, Rect, Tree, Win};
 pub struct State {
     pub tree: Tree,
     pub focused_leaf: NodeId,
-    pub scroll_x: i32,
-    pub scroll_target: i32,
+    /// Current and target scroll offsets. Private so every mutation goes
+    /// through the clamping/landing methods below — `update_canvas`
+    /// re-clamps both whenever the scroll range changes.
+    scroll_x: i32,
+    scroll_target: i32,
     /// Canvas width, derived by `update_canvas` (0 until the first call;
     /// read through `canvas_w()`, which falls back to the viewport width).
     canvas_w: i32,
@@ -80,7 +83,9 @@ impl State {
     }
 
     /// Put `c` into leaf `dst`, displacing the existing occupant to the taskbar.
-    /// `c` is first detached from its previous home.
+    /// `c` is first detached from its previous home. The destination is
+    /// un-minimized: showing a window in a leaf means the user wants to see
+    /// it, and a minimized leaf's window is never mapped.
     pub fn assign_to_leaf(&mut self, c: Win, dst: NodeId) {
         if !self.tree.is_leaf(dst) {
             return;
@@ -95,6 +100,7 @@ impl State {
         }
         if let Some(l) = self.tree.leaf_mut(dst) {
             l.client = Some(c);
+            l.minimized = false;
             if displaced.is_some() {
                 l.prev = displaced;
             }
@@ -133,9 +139,15 @@ impl State {
         }
     }
 
-    /// Focus whatever split currently shows `c`.
+    /// Focus whatever split currently shows `c`, un-minimizing it —
+    /// activation means the user (or a pager) wants the window visible, and
+    /// a minimized leaf's window is never mapped, so focusing one without
+    /// restoring it would target an unviewable window.
     pub fn activate_client(&mut self, c: Win) -> bool {
         if let Some(lid) = self.tree.find_leaf_for_client(c) {
+            if let Some(l) = self.tree.leaf_mut(lid) {
+                l.minimized = false;
+            }
             self.focused_leaf = lid;
             return true;
         }
@@ -276,7 +288,7 @@ impl State {
         let child_b = self.tree.make_leaf();
         // Insert a branch in place of `leaf`, with child_a carrying the window.
         self.split_node(leaf, dir, child_a, child_b);
-        // The old leaf node is now detached; drop it.
+        // `leaf` is now detached from the tree; drop it.
         self.tree.remove_node(leaf);
         self.focused_leaf = child_a;
     }
@@ -437,8 +449,8 @@ impl State {
             let cur_other = ratios[other];
             // Cap the transfer at what each side can actually give, so the
             // pair's sum is exactly conserved — clamping both ends
-            // independently let the total ratio mass drift upward once the
-            // neighbour bottomed out, silently shrinking every *other*
+            // independently would let the total ratio mass drift upward once
+            // the neighbour bottoms out, silently shrinking every *other*
             // sibling via renormalisation.
             let (lo, hi) = ((min_r - cur).min(0.0), (cur_other - min_r).max(0.0));
             let delta = delta.clamp(lo, hi);
@@ -491,6 +503,25 @@ impl State {
     }
 
     // --- scroll ---
+
+    pub fn scroll_x(&self) -> i32 {
+        self.scroll_x
+    }
+
+    /// Land the scroll: snap the current offset to the target.
+    pub fn land_scroll(&mut self) {
+        self.scroll_x = self.scroll_target;
+    }
+
+    /// Shift both offsets by `delta` without clamping — used by the
+    /// edge-resize drag to keep on-screen columns stationary while the
+    /// canvas width changes underneath. The caller's follow-up arrange runs
+    /// `update_canvas`, which re-clamps against the *new* canvas width;
+    /// clamping here against the stale one would cancel part of the shift.
+    pub fn shift_scroll(&mut self, delta: i32) {
+        self.scroll_x += delta;
+        self.scroll_target += delta;
+    }
 
     pub fn max_scroll(&self, wa: Rect) -> i32 {
         (self.canvas_w(wa) + self.dock_extra - wa.w).max(0)
@@ -766,9 +797,9 @@ mod tests {
     }
 
     /// Wrapping a lone leaf must keep the *existing* content on the larger
-    /// `SPLIT_RATIO` share regardless of which side the new column lands
-    /// (regression: `at == 0` swapped children but not ratios, so a
-    /// left-edge insert handed the empty column the bigger share).
+    /// `SPLIT_RATIO` share regardless of which side the new column lands:
+    /// swapping the children without also swapping the ratios would hand
+    /// the empty column the bigger share on a left-edge insert.
     #[test]
     fn insert_at_root_keeps_existing_content_share_on_both_sides() {
         for (at, existing_idx) in [(0usize, 1usize), (usize::MAX, 0usize)] {
@@ -963,9 +994,10 @@ mod tests {
     }
 
     /// Backward taskbar cycling must walk the whole list in reverse, not
-    /// flip-flop between the shown window and the last taskbar entry
-    /// (regression: `assign_to_leaf` pushes the displaced window to the
-    /// back, which is exactly where the next backward pop looked).
+    /// flip-flop between the shown window and the last taskbar entry:
+    /// `assign_to_leaf` pushes the displaced window to the back, which is
+    /// exactly where the next backward pop looks, so the displaced window
+    /// must be moved to the front.
     #[test]
     fn cycle_taskbar_prev_visits_every_window() {
         let mut s = State::new();
@@ -1037,6 +1069,25 @@ mod tests {
         assert_eq!(s.taskbar, vec![1]);
     }
 
+    /// Activating a client whose leaf is minimized must restore the leaf:
+    /// its window is unmapped while minimized, so focusing without
+    /// restoring would target an unviewable window (`SetInputFocus` on one
+    /// is a BadMatch). Assignment into a minimized leaf restores it too.
+    #[test]
+    fn activation_unminimizes_the_leaf() {
+        let mut s = State::new();
+        s.pin_client(1);
+        s.split_focused(Dir::H);
+        let leaf = s.tree.find_leaf_for_client(1).unwrap();
+        s.toggle_minimize(leaf);
+        assert!(s.activate_client(1));
+        assert!(!s.tree.leaf(leaf).unwrap().minimized);
+
+        s.toggle_minimize(leaf);
+        s.assign_to_leaf(2, leaf);
+        assert!(!s.tree.leaf(leaf).unwrap().minimized);
+    }
+
     /// A degenerate single-child branch must not panic `close_focused`
     /// (`children[1]` when there is no sibling).
     #[test]
@@ -1055,7 +1106,7 @@ mod tests {
 
     /// Repeated growing must stop once the neighbour bottoms out at
     /// `MIN_SPLIT_FRAC`, conserving the pair's ratio sum exactly — clamping
-    /// both sides independently used to let total ratio mass drift upward,
+    /// both sides independently would let total ratio mass drift upward,
     /// silently shrinking every other sibling via renormalisation.
     #[test]
     fn resize_focused_conserves_ratio_sum() {
@@ -1191,9 +1242,9 @@ mod tests {
     }
 
     /// An edge resize must not rewrite a minimized column's ratio from its
-    /// pinned pixel width (regression: un-minimizing after an edge drag
-    /// restored the column as a sliver of its former share), and dragging
-    /// an end column that is itself minimized is refused outright.
+    /// pinned pixel width, or un-minimizing after an edge drag would restore
+    /// the column as a sliver of its former share; dragging an end column
+    /// that is itself minimized is refused outright.
     #[test]
     fn resize_edge_leaves_minimized_ratio_alone() {
         let mut s = State::new();

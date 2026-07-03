@@ -32,8 +32,8 @@ pub mod palette_color {
 /// Deliberately a fixed, hand-editable table rather than something computed
 /// from RGB distance, so each pairing can be retuned by eye. Rows are
 /// `(accent, darker, lighter)` and are looked up by matching the accent, so
-/// row order doesn't matter (the old pair of parallel arrays indexed by
-/// palette position silently desynced if either was reordered).
+/// row order doesn't matter (a pair of parallel arrays indexed by palette
+/// position would desync silently if either were reordered).
 const SHADES: [(Index, Index, Index); 16] = [
     (palette_color::LAVENDER, palette_color::GUNMETAL, palette_color::CREAM),
     (palette_color::GUNMETAL, palette_color::PLUM, palette_color::LAVENDER),

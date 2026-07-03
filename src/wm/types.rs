@@ -18,7 +18,96 @@ use crate::render::Renderer;
 use crate::state::State;
 use crate::tree::{Boundary, Dir, NodeId, Rect, Win};
 
-pub type R<T> = Result<T, Box<dyn std::error::Error>>;
+pub type R<T> = Result<T, WmError>;
+
+/// The `wm` error type, split at construction time into "the X connection
+/// itself is gone" versus everything else. Classifying at the `?` site —
+/// via the `From` impls below, before any wrapping can happen — is what
+/// lets the event loop decide fatality with a plain `match` instead of
+/// walking `source()` chains and hoping no intermediate layer flattened the
+/// original error into a string.
+#[derive(Debug)]
+pub enum WmError {
+    /// The X connection is dead (socket closed, server gone): the event
+    /// loop must exit — retrying would spin forever on a socket that can
+    /// never deliver again.
+    Fatal(x11rb::errors::ConnectionError),
+    /// An ordinary per-request failure (e.g. a reply from a window that
+    /// raced us and died): contained and logged, the session continues.
+    Other(Box<dyn std::error::Error>),
+}
+
+impl std::fmt::Display for WmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fatal(e) => write!(f, "X connection lost: {e}"),
+            Self::Other(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for WmError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Fatal(e) => Some(e),
+            Self::Other(e) => Some(e.as_ref()),
+        }
+    }
+}
+
+impl WmError {
+    pub const fn is_fatal(&self) -> bool {
+        matches!(self, Self::Fatal(_))
+    }
+}
+
+impl From<x11rb::errors::ConnectionError> for WmError {
+    fn from(e: x11rb::errors::ConnectionError) -> Self {
+        Self::Fatal(e)
+    }
+}
+
+impl From<x11rb::errors::ReplyError> for WmError {
+    fn from(e: x11rb::errors::ReplyError) -> Self {
+        match e {
+            x11rb::errors::ReplyError::ConnectionError(c) => Self::Fatal(c),
+            other => Self::Other(other.into()),
+        }
+    }
+}
+
+impl From<x11rb::errors::ReplyOrIdError> for WmError {
+    fn from(e: x11rb::errors::ReplyOrIdError) -> Self {
+        match e {
+            x11rb::errors::ReplyOrIdError::ConnectionError(c) => Self::Fatal(c),
+            other => Self::Other(other.into()),
+        }
+    }
+}
+
+impl From<x11rb::errors::ConnectError> for WmError {
+    fn from(e: x11rb::errors::ConnectError) -> Self {
+        Self::Other(e.into())
+    }
+}
+
+impl From<std::io::Error> for WmError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Other(e.into())
+    }
+}
+
+impl From<String> for WmError {
+    fn from(e: String) -> Self {
+        Self::Other(e.into())
+    }
+}
+
+impl From<&str> for WmError {
+    fn from(e: &str) -> Self {
+        Self::Other(e.into())
+    }
+}
 
 // Keyboard configuration (keysyms, actions, the binding table) lives in
 // `theme` with the rest of the user-tunable config; re-exported here so the
@@ -27,8 +116,9 @@ pub use crate::theme::{Action, MOD4};
 
 /// Declare the `Atoms` struct and its `intern`: each field is written next
 /// to the atom name it holds, so the pairing is checked by construction —
-/// the old positional array + destructuring pattern compiled fine when the
-/// two lists drifted out of order, silently binding fields to wrong atoms.
+/// a positional array + destructuring pattern would compile fine even if
+/// the two lists drifted out of order, silently binding fields to wrong
+/// atoms.
 macro_rules! atoms {
     ($($(#[$doc:meta])* $field:ident => $name:expr,)+) => {
         /// Interned atoms used for ICCCM/EWMH interop, fetched once at startup.
@@ -237,6 +327,9 @@ pub struct Wm {
     /// Slave devices with a horizontal scroll valuator (trackpads, scroll
     /// wheels with tilt), rebuilt whenever the device hierarchy changes.
     pub hscroll: Vec<HScroll>,
+    /// Sub-pixel scroll remainder carried between batches, so slow swipes
+    /// whose per-batch delta rounds to zero pixels still accumulate.
+    pub hscroll_frac: f64,
     /// Cached result of the last "is scrolling allowed here" pointer query
     /// and when it was taken, so a fast scroll burst doesn't force a
     /// `QueryPointer` round trip for every single event. `None` until the

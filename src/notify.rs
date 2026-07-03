@@ -160,7 +160,7 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
         while let Ok((id, reason)) = dismissed.try_recv() {
             expiries.remove(&id);
             order.retain(|&o| o != id);
-            emit_closed(conn.channel(), id, reason)?;
+            emit_closed(conn.channel(), id, reason);
         }
 
         let now = Instant::now();
@@ -175,7 +175,7 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
             to_wm
                 .send(NoteMsg::Close(id))
                 .map_err(|_| "wm channel closed")?;
-            emit_closed(conn.channel(), id, 1)?; // 1 = expired
+            emit_closed(conn.channel(), id, 1); // 1 = expired
             ping(())?;
         }
 
@@ -239,7 +239,7 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
                         .map_err(|_| "wm channel closed")?;
                     // No spec reason fits "evicted for space" exactly;
                     // 4 = "undefined/reserved" is the closest fit.
-                    emit_closed(conn.channel(), evict, 4)?;
+                    emit_closed(conn.channel(), evict, 4);
                 }
                 to_wm
                     .send(NoteMsg::Show(note))
@@ -258,7 +258,7 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
                         to_wm
                             .send(NoteMsg::Close(id))
                             .map_err(|_| "wm channel closed")?;
-                        emit_closed(conn.channel(), id, 3)?; // 3 = closed by call
+                        emit_closed(conn.channel(), id, 3); // 3 = closed by call
                         ping(())?;
                     }
                 }
@@ -340,11 +340,16 @@ fn parse_notify(
     ))
 }
 
-fn emit_closed(ch: &Channel, id: u32, reason: u32) -> R<()> {
-    let sig = Message::new_signal(PATH, IFACE, "NotificationClosed")
-        .map_err(|e| format!("bad signal: {e}"))?
-        .append2(id, reason);
-    reply(ch, sig)
+/// Emit `NotificationClosed(id, reason)`, best-effort: a failed signal send
+/// only logs — one bus hiccup must not kill notifications for the whole
+/// session (a truly dead bus surfaces at the next `blocking_pop_message`).
+fn emit_closed(ch: &Channel, id: u32, reason: u32) {
+    let sent = Message::new_signal(PATH, IFACE, "NotificationClosed")
+        .map_err(|e| format!("bad signal: {e}").into())
+        .and_then(|sig| reply(ch, sig.append2(id, reason)));
+    if let Err(e) = sent {
+        eprintln!("splitwm: failed to emit NotificationClosed({id}): {e}");
+    }
 }
 
 fn reply(ch: &Channel, msg: Message) -> R<()> {
@@ -379,14 +384,56 @@ fn strip_markup(s: &str) -> String {
         out.push(c);
         i += c.len_utf8();
     }
-    for (ent, ch) in [
-        ("&lt;", "<"),
-        ("&gt;", ">"),
-        ("&quot;", "\""),
-        ("&apos;", "'"),
-        ("&amp;", "&"), // last, so `&amp;lt;` doesn't double-decode
-    ] {
-        out = out.replace(ent, ch);
+    decode_entities(&out)
+}
+
+/// The character a spec entity name (between `&` and `;`) stands for: the
+/// five named XML entities plus numeric `#NNN` / `#xHH` references. `None`
+/// for anything else, which then passes through literally.
+fn entity_char(name: &str) -> Option<char> {
+    match name {
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        "amp" => Some('&'),
+        _ => {
+            let digits = name.strip_prefix('#')?;
+            let code = match digits.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => digits.parse().ok()?,
+            };
+            char::from_u32(code)
+        }
+    }
+}
+
+/// Decode entities in one left-to-right pass: each `&...;` span is consumed
+/// exactly once, so `&amp;lt;` yields the literal `&lt;` (no re-scan of
+/// decoded output) and hostile input stays O(n) — the `;` search per `&` is
+/// bounded to the longest plausible entity.
+fn decode_entities(s: &str) -> String {
+    const MAX_ENTITY_LEN: usize = 10; // "&#x10FFFF;"
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        let c = rest.chars().next().expect("i is on a char boundary");
+        if c == '&' {
+            // Byte scan: '&' and ';' are ASCII, so byte indices here are
+            // always char boundaries even in multibyte text.
+            let semi = rest.as_bytes()[1..]
+                .iter()
+                .take(MAX_ENTITY_LEN - 1)
+                .position(|&b| b == b';');
+            if let Some(ch) = semi.and_then(|e| entity_char(&rest[1..1 + e])) {
+                out.push(ch);
+                i += 1 + semi.expect("checked by and_then") + 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += c.len_utf8();
     }
     out
 }
@@ -404,6 +451,13 @@ mod tests {
     #[test]
     fn amp_decoded_last_avoids_double_decode() {
         assert_eq!(strip_markup("&amp;lt;"), "&lt;");
+    }
+
+    #[test]
+    fn numeric_entities_decode() {
+        assert_eq!(strip_markup("&#64;&#x41;&#X61;"), "@Aa");
+        // Malformed or out-of-range references pass through literally.
+        assert_eq!(strip_markup("&#xZZ; &#1114112; &nope; &"), "&#xZZ; &#1114112; &nope; &");
     }
 
     #[test]

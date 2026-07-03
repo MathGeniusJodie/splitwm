@@ -388,45 +388,62 @@ impl Tree {
         }
     }
 
-    fn compute_inner(&self, node: NodeId, at: Rect, gap: i32, geos: &mut HashMap<NodeId, Rect>) {
-        match self.nodes.get(&node) {
-            Some(Node::Leaf(_)) => {
-                geos.insert(node, at);
-            }
-            Some(Node::Branch {
-                dir,
-                children,
-                ratios,
-            }) => {
-                let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
-                let meta = self.child_meta(children, ratios);
-                // A minimized child collapses to `gap` in the split dimension
-                // (both directions): it's the same size already reserved as
-                // breathing room between normal children, so it stays
-                // visually consistent with the layout's spacing rather than
-                // needing a size of its own.
-                let minimized_size = gap;
-                if *dir == Dir::H {
-                    let usable = (at.w - gap * (n - 1)).max(0);
-                    let sizes = child_sizes(&meta, usable, minimized_size);
-                    let mut cx = at.x;
-                    for (i, &c) in children.iter().enumerate() {
-                        let cw = sizes[i];
-                        self.compute_inner(c, Rect { x: cx, w: cw, ..at }, gap, geos);
-                        cx += cw + gap;
-                    }
+    /// Lay out `node`'s children within `at`: per-child rects (in layout
+    /// order) plus the sizes and (minimized, ratio) metadata they were built
+    /// from — the shared geometry behind `compute_inner` and
+    /// `boundaries_inner`, so leaf placement and boundary handles can never
+    /// disagree. `None` when `node` isn't a branch. A minimized child
+    /// collapses to `gap` in the split dimension (both directions): it's the
+    /// same size already reserved as breathing room between normal children,
+    /// so it stays visually consistent with the layout's spacing rather than
+    /// needing a size of its own.
+    #[allow(clippy::type_complexity)]
+    fn layout_children(
+        &self,
+        node: NodeId,
+        at: Rect,
+        gap: i32,
+    ) -> Option<(Dir, Vec<(NodeId, Rect)>, Vec<i32>, Vec<(bool, f64)>)> {
+        let Some(Node::Branch {
+            dir,
+            children,
+            ratios,
+        }) = self.nodes.get(&node)
+        else {
+            return None;
+        };
+        let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
+        let meta = self.child_meta(children, ratios);
+        let span = if *dir == Dir::H { at.w } else { at.h };
+        let usable = (span - gap * (n - 1)).max(0);
+        let sizes = child_sizes(&meta, usable, gap);
+        let mut pos = if *dir == Dir::H { at.x } else { at.y };
+        let rects = children
+            .iter()
+            .zip(&sizes)
+            .map(|(&c, &sz)| {
+                let r = if *dir == Dir::H {
+                    Rect { x: pos, w: sz, ..at }
                 } else {
-                    let usable = (at.h - gap * (n - 1)).max(0);
-                    let sizes = child_sizes(&meta, usable, minimized_size);
-                    let mut cy = at.y;
-                    for (i, &c) in children.iter().enumerate() {
-                        let ch = sizes[i];
-                        self.compute_inner(c, Rect { y: cy, h: ch, ..at }, gap, geos);
-                        cy += ch + gap;
-                    }
-                }
-            }
-            None => {}
+                    Rect { y: pos, h: sz, ..at }
+                };
+                pos += sz + gap;
+                (c, r)
+            })
+            .collect();
+        Some((*dir, rects, sizes, meta))
+    }
+
+    fn compute_inner(&self, node: NodeId, at: Rect, gap: i32, geos: &mut HashMap<NodeId, Rect>) {
+        if self.is_leaf(node) {
+            geos.insert(node, at);
+            return;
+        }
+        let Some((_, rects, _, _)) = self.layout_children(node, at, gap) else {
+            return;
+        };
+        for (c, r) in rects {
+            self.compute_inner(c, r, gap, geos);
         }
     }
 }
@@ -511,64 +528,31 @@ impl Tree {
     }
 
     fn boundaries_inner(&self, node: NodeId, at: Rect, gap: i32, out: &mut Vec<Boundary>) {
-        let Some(Node::Branch {
-            dir,
-            children,
-            ratios,
-        }) = self.nodes.get(&node)
-        else {
+        let Some((dir, rects, sizes, meta)) = self.layout_children(node, at, gap) else {
             return;
         };
-        let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
-        let meta = self.child_meta(children, ratios);
-        if *dir == Dir::H {
-            let usable = (at.w - gap * (n - 1)).max(0);
-            let sizes = child_sizes(&meta, usable, gap);
-            let mut cx = at.x;
-            for (i, &c) in children.iter().enumerate() {
-                let cw = sizes[i];
-                if i + 1 < children.len() {
-                    out.push(Boundary {
-                        parent: node,
-                        idx: i,
-                        dir: Dir::H,
-                        pos: cx + cw + gap / 2,
-                        start: cx,
-                        first: cw,
-                        second: sizes[i + 1],
-                        cross: at.y,
-                        cross_len: at.h,
-                        root: node == self.root,
-                        resizable: !meta[i].0 && !meta[i + 1].0,
-                    });
-                }
-                self.boundaries_inner(c, Rect { x: cx, w: cw, ..at }, gap, out);
-                cx += cw + gap;
+        for (i, &(c, r)) in rects.iter().enumerate() {
+            if i + 1 < rects.len() {
+                let (drag_start, drag_size, cross, cross_len) = if dir == Dir::H {
+                    (r.x, r.w, at.y, at.h)
+                } else {
+                    (r.y, r.h, at.x, at.w)
+                };
+                out.push(Boundary {
+                    parent: node,
+                    idx: i,
+                    dir,
+                    pos: drag_start + drag_size + gap / 2,
+                    start: drag_start,
+                    first: drag_size,
+                    second: sizes[i + 1],
+                    cross,
+                    cross_len,
+                    root: node == self.root,
+                    resizable: !meta[i].0 && !meta[i + 1].0,
+                });
             }
-        } else {
-            let usable = (at.h - gap * (n - 1)).max(0);
-            let sizes = child_sizes(&meta, usable, gap);
-            let mut cy = at.y;
-            for (i, &c) in children.iter().enumerate() {
-                let ch = sizes[i];
-                if i + 1 < children.len() {
-                    out.push(Boundary {
-                        parent: node,
-                        idx: i,
-                        dir: Dir::V,
-                        pos: cy + ch + gap / 2,
-                        start: cy,
-                        first: ch,
-                        second: sizes[i + 1],
-                        cross: at.x,
-                        cross_len: at.w,
-                        root: node == self.root,
-                        resizable: !meta[i].0 && !meta[i + 1].0,
-                    });
-                }
-                self.boundaries_inner(c, Rect { y: cy, h: ch, ..at }, gap, out);
-                cy += ch + gap;
-            }
+            self.boundaries_inner(c, r, gap, out);
         }
     }
 }

@@ -26,8 +26,8 @@ use crate::theme::{self, palette_color};
 use crate::Index;
 
 /// Dithered "translucent" chrome background: a checker of black and gunmetal
-/// stands in for the old 50%-alpha black fills, keeping everything on the
-/// 16-colour palette.
+/// stands in for a 50%-alpha black fill, keeping everything on the 16-colour
+/// palette.
 const CHROME_BG: PgPaint = PgPaint::Checker(palette_color::BLACK, palette_color::GUNMETAL);
 
 pub struct Renderer {
@@ -72,8 +72,8 @@ pub struct Renderer {
     icon_idx_cache: IconCache<u8>,
     /// The taskbar highlight's pre-dilated outline ring (`(size+6)²`,
     /// Chebyshev radius 3 around the icon's silhouette, minus the icon's
-    /// own footprint), cached the same way — recomputing the dilation was
-    /// ~50 stores per opaque icon pixel per frame.
+    /// own footprint), cached the same way — recomputing the dilation would
+    /// cost ~50 stores per opaque icon pixel per frame.
     icon_ring_cache: IconCache<bool>,
 }
 

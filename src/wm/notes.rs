@@ -171,6 +171,33 @@ impl Wm {
         Ok(())
     }
 
+    /// Stack a pile of `(window, w, h)` bottom-up from `bottom`,
+    /// right-aligned to the screen edge (split-gap margin), each raised to
+    /// the top of the stacking order. Clamped to the top of the workarea: a
+    /// deep enough pile would otherwise place the overflow at negative y —
+    /// visible nowhere and (click-to-dismiss being the only dismissal)
+    /// undismissable; overflowing bubbles overlap at the top edge instead.
+    /// Returns the pile's new top edge.
+    pub(crate) fn stack_note_pile(
+        &self,
+        items: impl Iterator<Item = (Window, i32, i32)>,
+        mut bottom: i32,
+    ) -> R<i32> {
+        let wa = self.wa();
+        let gap = theme::GAP;
+        for (win, w, h) in items {
+            bottom = (bottom - gap - h).max(wa.y);
+            self.conn.configure_window(
+                win,
+                &ConfigureWindowAux::new()
+                    .x(wa.x + wa.w - gap - w)
+                    .y(bottom)
+                    .stack_mode(StackMode::ABOVE),
+            )?;
+        }
+        Ok(bottom)
+    }
+
     /// Stack the popups bottom-right, oldest nearest the corner, continuing
     /// upward from wherever the foreign-notification pile ends (see
     /// `place_notifications`) so the two kinds never overlap.
@@ -178,19 +205,8 @@ impl Wm {
         let wa = self.wa();
         let gap = theme::GAP;
         let foreign_h: i32 = self.notes.foreign.iter().map(|n| gap + n.h).sum();
-        let mut bottom = wa.y + wa.h - Self::taskbar_h() - foreign_h;
-        for p in &self.notes.popups {
-            // Same top-of-workarea clamp as `place_notifications`: a deep
-            // pile overlaps at the top edge instead of leaving the screen.
-            bottom = (bottom - gap - p.h).max(wa.y);
-            self.conn.configure_window(
-                p.win,
-                &ConfigureWindowAux::new()
-                    .x(wa.x + wa.w - gap - p.w)
-                    .y(bottom)
-                    .stack_mode(StackMode::ABOVE),
-            )?;
-        }
+        let bottom = wa.y + wa.h - Self::taskbar_h() - foreign_h;
+        self.stack_note_pile(self.notes.popups.iter().map(|p| (p.win, p.w, p.h)), bottom)?;
         Ok(())
     }
 

@@ -36,11 +36,14 @@ impl Wm {
 
         let leaves = self.state.tree.collect_leaves();
         let geos = self.state.compute(wa);
-        let scroll_x = self.state.scroll_x;
+        let scroll_x = self.state.scroll_x();
         let focused = self.state.focused_leaf_valid();
 
-        // Screen-space chrome rect for every on-screen leaf.
+        // Screen-space chrome rect for every on-screen leaf. `frame_rects`
+        // keeps every leaf's rect, on-screen or not, so a leaf scrolled out
+        // of view keeps a sane animation start / hit rect when it returns.
         let mut placed: Vec<Placement> = Vec::new();
+        let mut frame_rects: HashMap<NodeId, FrameRect> = HashMap::new();
         for &leaf in &leaves {
             let Some(geo) = geos.get(&leaf).copied() else {
                 continue;
@@ -51,6 +54,7 @@ impl Wm {
                 w: geo.w.max(1),
                 h: geo.h.max(1),
             };
+            frame_rects.insert(leaf, target);
             if target.x + target.w <= wa.x || target.x >= wa.x + wa.w {
                 continue;
             }
@@ -74,13 +78,13 @@ impl Wm {
 
         // Layout-changing actions animate: capture start rects and hand the
         // transition to the main event loop (`step_animation`), which steps
-        // one frame per iteration so events keep flowing — the old blocking
-        // in-arrange render loop had to drain and stash events itself, a
-        // re-entrancy hazard. Client windows are still configured at their
-        // final rects right away (below), so focus delivered right after
-        // this arrange targets a mapped window; only the composited chrome
-        // interpolates. A non-animated arrange cancels any transition in
-        // flight (it describes a newer layout).
+        // one frame per iteration so events keep flowing — animating inside
+        // `arrange` with a blocking render loop would require draining and
+        // stashing events itself, a re-entrancy hazard. Client windows are
+        // still configured at their final rects right away (below), so focus
+        // delivered right after this arrange targets a mapped window; only
+        // the composited chrome interpolates. A non-animated arrange cancels
+        // any transition in flight (it describes a newer layout).
         if std::mem::take(&mut self.animate) {
             let starts: Vec<FrameRect> = placed
                 .iter()
@@ -103,7 +107,7 @@ impl Wm {
                 starts,
                 placed: placed.clone(),
             });
-            // First frame from the old rects so content visibly slides.
+            // First frame from the pre-transition rects so content visibly slides.
             self.anim_frame(0.0)?;
         } else {
             self.anim = None;
@@ -143,7 +147,7 @@ impl Wm {
         self.raise_menu()?;
 
         // Cache final rects as the start point for the next transition.
-        self.prev_frame_rect = placed.iter().map(|p| (p.leaf, p.target)).collect();
+        self.prev_frame_rect = frame_rects;
         self.conn.flush()?;
         Ok(())
     }
@@ -450,7 +454,7 @@ impl Wm {
         // bottom taskbar) — the dock spans the entire screen, overlapping
         // the taskbar strip in its column.
         let full = self.wa();
-        let x = wa.x + canvas_w - self.dock_overlap() - self.state.scroll_x;
+        let x = wa.x + canvas_w - self.dock_overlap() - self.state.scroll_x();
         self.conn.configure_window(
             win,
             &ConfigureWindowAux::new()
@@ -543,12 +547,13 @@ impl Wm {
     /// zero-copy `ShmPutImage`. The segment holds two frame-sized halves
     /// used alternately: the put goes out unchecked (errors surface as
     /// `Event::Error` like every other unchecked request), and reuse of a
-    /// half is serialised by one round trip *before overwriting it* — by
-    /// then its put is two frames old and long processed, so the reply is
-    /// already on the socket and the wait is effectively free, unlike the
-    /// old per-blit `.check()` which stalled the event loop for a full
-    /// round trip on every frame. Without MIT-SHM, present into the staging
-    /// buffer and fall back to chunked core-protocol `PutImage`.
+    /// half is serialised by a round trip before overwriting it while a put
+    /// reading it may still be in flight. In steady state that costs one
+    /// round trip every other blit, and (X being FIFO) the reply queues
+    /// behind the immediately preceding put — an intentional pacing point:
+    /// rendering never gets more than one full frame ahead of the server.
+    /// Without MIT-SHM, present into the staging buffer and fall back to
+    /// chunked core-protocol `PutImage`.
     pub(crate) fn blit_fb(
         &mut self,
         drawable: Window,

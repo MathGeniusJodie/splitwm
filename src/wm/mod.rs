@@ -313,6 +313,7 @@ pub fn run(replace: bool) -> R<()> {
         cursors,
         bgrx: Vec::new(),
         hscroll: Vec::new(),
+        hscroll_frac: 0.0,
         hscroll_gate: None,
         ignore_unmaps: HashMap::new(),
         fullscreen: None,
@@ -757,9 +758,9 @@ fn event_loop(wm: &mut Wm) -> R<()> {
         // A handling error (e.g. a reply from a window that raced us and
         // died) must not take down the whole session — but a broken
         // connection must: retrying the loop on one would just spin on the
-        // dead socket, so tell the two apart instead of logging both.
+        // dead socket. `WmError` classifies the two at construction time.
         if let Err(e) = wm.handle_batch(batch) {
-            if is_connection_error(e.as_ref()) {
+            if e.is_fatal() {
                 return Err(e);
             }
             eprintln!("splitwm: error handling event batch: {e}");
@@ -773,7 +774,7 @@ fn event_loop(wm: &mut Wm) -> R<()> {
         if wm.anim.is_some() {
             let cut = cut && wm.anim.as_ref().map(|a| a.seq) == pre_seq;
             if let Err(e) = wm.step_animation(cut) {
-                if is_connection_error(e.as_ref()) {
+                if e.is_fatal() {
                     return Err(e);
                 }
                 eprintln!("splitwm: error stepping layout animation: {e}");
@@ -977,42 +978,6 @@ impl Wm {
             );
         }
         Ok(())
-    }
-}
-
-/// Whether a batch-handling error means the X connection itself is gone
-/// (socket closed, server shut down) rather than one failed request. Walks
-/// the whole `source()` chain, not just the top error: anything that wraps
-/// an x11rb error (a `format!`-context string, a future typed error) must
-/// not silently demote a dead socket to "log and retry" — that would spin
-/// the event loop forever on a connection that can never deliver again.
-/// Whether `e` (or anything in its `source()` chain) indicates the X11
-/// connection itself died, as opposed to an ordinary per-request error.
-///
-/// This walks `Error::source()` to find the chain, so callers that box up
-/// errors for fatal-connection detection to work here must propagate them
-/// as boxed `dyn Error` (preserving the chain) rather than flattening them
-/// through `format!("{e}")`/`.to_string()` into a fresh `String`-based
-/// error — that severs the chain and this function will never see the
-/// underlying `ConnectionError`/`ReplyError`/`ReplyOrIdError`.
-fn is_connection_error(mut e: &(dyn std::error::Error + 'static)) -> bool {
-    loop {
-        if e.is::<x11rb::errors::ConnectionError>()
-            || matches!(
-                e.downcast_ref::<x11rb::errors::ReplyError>(),
-                Some(x11rb::errors::ReplyError::ConnectionError(_))
-            )
-            || matches!(
-                e.downcast_ref::<x11rb::errors::ReplyOrIdError>(),
-                Some(x11rb::errors::ReplyOrIdError::ConnectionError(_))
-            )
-        {
-            return true;
-        }
-        match e.source() {
-            Some(src) => e = src,
-            None => return false,
-        }
     }
 }
 
