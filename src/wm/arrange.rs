@@ -482,7 +482,7 @@ impl Wm {
 
     // --- gap drag handles & "+" insert buttons (composited on the underlay) ---
 
-    pub(crate) const PLUS_SZ: i32 = 22;
+    pub(crate) const PLUS_SZ: i32 = theme::GAP - 4;
     /// Total px trimmed off the gap to get the drag-handle pill width.
     pub(crate) const HANDLE_INSET: i32 = 10;
 
