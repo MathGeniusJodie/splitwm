@@ -714,10 +714,10 @@ impl Wm {
                 self.state.cycle_taskbar(false);
             }
             Action::MoveTabNext => {
-                self.animate &= self.state.move_tab_to_direction(true).is_some();
+                self.animate &= self.state.move_window_to_direction(true).is_some();
             }
             Action::MoveTabPrev => {
-                self.animate &= self.state.move_tab_to_direction(false).is_some();
+                self.animate &= self.state.move_window_to_direction(false).is_some();
             }
             Action::Grow => self.animate &= self.state.resize_focused(theme::RESIZE_STEP),
             Action::Shrink => self.animate &= self.state.resize_focused(-theme::RESIZE_STEP),

@@ -686,7 +686,7 @@ impl Wm {
         // before its X requests); clean the layout up regardless, or the
         // split shows a phantom occupant forever.
         let in_layout = self.state.tree.find_leaf_for_client(win).is_some()
-            || self.state.taskbar.contains(&win);
+            || self.state.taskbar().contains(&win);
         if !known && !in_layout {
             return Ok(());
         }

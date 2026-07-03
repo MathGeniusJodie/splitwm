@@ -23,14 +23,19 @@ pub struct State {
     /// sidebar (see `Wm::manage_dock`), so scrolling all the way right
     /// reveals it even though it sits outside the split tree and doesn't
     /// affect `compute`'s leaf geometry. Zero when nothing is docked.
-    pub dock_extra: i32,
+    /// Private so the only write is `update_canvas`, which re-clamps the
+    /// scroll offsets against the widened range in the same breath.
+    dock_extra: i32,
     /// Cumulative manual adjustment to `canvas_w` from dragging an
-    /// edge-of-canvas resize handle (see `resize_edge`), layered on top of
-    /// `update_canvas`'s column-count-driven heuristic every recompute so a
-    /// manual resize isn't immediately overwritten by it.
-    pub canvas_w_extra: i32,
+    /// edge-of-canvas resize handle, layered on top of `update_canvas`'s
+    /// column-count-driven heuristic every recompute so a manual resize
+    /// isn't immediately overwritten by it. Private so the only write is
+    /// `resize_edge`, whose per-column `min_split_w` clamp keeps it sane.
+    canvas_w_extra: i32,
     /// Windows not currently shown in any split, in the bottom taskbar.
-    pub taskbar: Vec<Win>,
+    /// Private so every insert goes through `push_taskbar`, which owns the
+    /// no-duplicates invariant; read through `taskbar()`.
+    taskbar: Vec<Win>,
 }
 
 /// How a collapsing branch hangs in the tree: it is the root, or child
@@ -77,11 +82,23 @@ impl State {
 
     // --- window placement helpers ---
 
+    /// Windows not currently shown in any split, in taskbar (queue) order.
+    pub fn taskbar(&self) -> &[Win] {
+        &self.taskbar
+    }
+
     /// Drop a client into the bottom taskbar (deduplicated).
     fn push_taskbar(&mut self, c: Win) {
         if !self.taskbar.contains(&c) {
             self.taskbar.push(c);
         }
+    }
+
+    /// Pull `w` out of the taskbar; whether it was there.
+    fn take_from_taskbar(&mut self, w: Win) -> bool {
+        let len = self.taskbar.len();
+        self.taskbar.retain(|&x| x != w);
+        self.taskbar.len() < len
     }
 
     /// Detach `c` from wherever it lives (a split or the taskbar).
@@ -91,7 +108,7 @@ impl State {
                 l.client = None;
             }
         }
-        self.taskbar.retain(|&w| w != c);
+        self.take_from_taskbar(c);
     }
 
     /// Place a new client into the focused leaf, bumping any current occupant
@@ -138,8 +155,7 @@ impl State {
         if let Some(lid) = lid {
             let prev = self.tree.leaf(lid).and_then(|l| l.prev);
             if let Some(p) = prev {
-                if self.taskbar.contains(&p) {
-                    self.taskbar.retain(|&w| w != p);
+                if self.take_from_taskbar(p) {
                     if let Some(l) = self.tree.leaf_mut(lid) {
                         l.show(p);
                     }
@@ -207,7 +223,7 @@ impl State {
         // inverse rotations of the same queue.
         if !forward {
             if let Some(d) = displaced {
-                self.taskbar.retain(|&w| w != d);
+                self.take_from_taskbar(d);
                 self.taskbar.insert(0, d);
             }
         }
@@ -242,7 +258,7 @@ impl State {
 
     /// Move the focused window to the adjacent split (displacing its occupant
     /// to the taskbar). Returns the moved client.
-    pub fn move_tab_to_direction(&mut self, next: bool) -> Option<Win> {
+    pub fn move_window_to_direction(&mut self, next: bool) -> Option<Win> {
         let src = self.focused_leaf_valid();
         let dst = self.adjacent_leaf(src, next)?;
         let c = self.tree.leaf(src)?.client?;
@@ -309,25 +325,14 @@ impl State {
     /// focused) and `child_b` starts empty.
     pub fn split_focused(&mut self, dir: Dir) {
         let leaf = self.focused_leaf_valid();
+        // `focused_leaf_valid` only hands out live leaves, so this always
+        // resolves; a dangling id makes the split a no-op rather than a panic.
+        let Some(leaf_data) = self.tree.leaf(leaf).cloned() else {
+            return;
+        };
         // child_a keeps the original split's window *and* its accent colour, so
         // colour stays with the content; child_b gets a fresh colour.
-        // `leaf` should always resolve (it came from `focused_leaf_valid`),
-        // but a dangling id degrades to an empty leaf rather than panicking.
-        let child_a =
-            self.tree
-                .insert_node(Node::Leaf(self.tree.leaf(leaf).cloned().unwrap_or_else(
-                    || {
-                        debug_assert!(
-                            false,
-                            "split_focused: focused_leaf_valid() returned a dangling id {leaf:?}"
-                        );
-                        eprintln!(
-                            "split_focused: focused leaf {leaf:?} not found in tree; \
-                     falling back to an empty leaf"
-                        );
-                        Default::default()
-                    },
-                )));
+        let child_a = self.tree.insert_node(Node::Leaf(leaf_data));
         let child_b = self.tree.make_leaf();
         // Insert a branch in place of `leaf`, with child_a carrying the window.
         self.split_node(leaf, dir, child_a, child_b);
@@ -379,19 +384,21 @@ impl State {
     /// children), redistributing its ratio among the survivors, and refocus
     /// the nearest surviving neighbour.
     fn close_focused_nary(&mut self, parent: NodeId, idx: usize, leaf: NodeId) {
-        // n-ary: remove this child, redistribute its ratio.
-        let mut new_focus = self.focused_leaf;
-        if let Some(b) = self.tree.branch_mut(parent) {
-            let removed = b.remove(idx).ratio;
-            let remaining: f64 = b.children().iter().map(|c| c.ratio).sum();
-            if remaining > 0.0 {
-                for c in b.children_mut() {
-                    c.ratio += removed * c.ratio / remaining;
-                }
+        // n-ary: remove this child, redistribute its ratio. Resolving the
+        // branch up front keeps a bad `parent` a no-op — focus must never
+        // land on the removed leaf.
+        let Some(b) = self.tree.branch_mut(parent) else {
+            return;
+        };
+        let removed = b.remove(idx).ratio;
+        let remaining: f64 = b.children().iter().map(|c| c.ratio).sum();
+        if remaining > 0.0 {
+            for c in b.children_mut() {
+                c.ratio += removed * c.ratio / remaining;
             }
-            let fb = idx.min(b.children().len() - 1);
-            new_focus = b.children()[fb].node;
         }
+        let fb = idx.min(b.children().len() - 1);
+        let new_focus = b.children()[fb].node;
         self.tree.remove_node(leaf);
         self.focused_leaf = self.tree.first_leaf(new_focus);
     }
@@ -588,18 +595,23 @@ impl State {
         self.scroll_to(wa, t);
     }
 
+    /// The viewport rect widened to the scrollable canvas — the area every
+    /// layout query is answered against.
+    fn canvas_rect(&self, wa: Rect) -> Rect {
+        Rect {
+            w: self.canvas_w(wa),
+            ..wa
+        }
+    }
+
     /// Geometry of every leaf in canvas coordinates.
     pub fn compute(&self, wa: Rect) -> std::collections::HashMap<NodeId, Rect> {
-        let gap = theme::GAP;
-        let canvas_w = self.canvas_w(wa);
-        self.tree.compute(Rect { w: canvas_w, ..wa }, gap)
+        self.tree.compute(self.canvas_rect(wa), theme::GAP)
     }
 
     /// Gaps between adjacent splits, for drag handles / insert buttons.
     pub fn boundaries(&self, wa: Rect) -> Vec<Boundary> {
-        let gap = theme::GAP;
-        let canvas_w = self.canvas_w(wa);
-        self.tree.boundaries(Rect { w: canvas_w, ..wa }, gap)
+        self.tree.boundaries(self.canvas_rect(wa), theme::GAP)
     }
 
     /// Canvas-space x-span `(start_x, width)` of the leftmost/rightmost
@@ -620,45 +632,6 @@ impl State {
             let before: i32 = sizes[..n - 1].iter().sum();
             let gaps_before = gap * i32::try_from(n - 1).unwrap_or(0);
             Some((start_x + before + gaps_before, sizes[n - 1]))
-        }
-    }
-
-    /// Resize the leftmost or rightmost root-level column to `target_w`
-    /// pixels: the column absorbs the whole delta, every sibling keeps its
-    /// exact current pixel width, and `canvas_w` grows/shrinks by that same
-    /// delta (via `canvas_w_extra`, layered on top of `update_canvas`'s
-    /// heuristic each frame) — the canvas itself tracks the resize, the
-    /// same way it grows when a new column is inserted. `theme::GAP` (the
-    /// margin) never changes. A single leaf (or a vertical-branch root) has
-    /// no sibling ratios to redistribute — it's the whole row already, so
-    /// only `canvas_w_extra` moves.
-    ///
-    /// For the left edge specifically, the column's *start* is what's
-    /// meant to track the mouse (growing toward the screen edge), but
-    /// `Tree::compute` always lays children out left-to-right from a fixed
-    /// origin — so growing column 0 there necessarily shifts every later
-    /// column's canvas-space x right by `delta`. The caller (`Wm::on_motion`)
-    /// nudges `scroll_x`/`scroll_target` by the same `delta` so those
-    /// columns stay put on screen and only the dragged edge visibly moves.
-    /// Which root children are minimized leaves: their pixel width is
-    /// pinned to `gap` regardless of ratio (see `child_sizes`), so their
-    /// stored ratios must survive the rewrite in `redistribute_column_widths`
-    /// untouched — deriving a ratio from the pinned width would crush the
-    /// share they restore to.
-    /// Built strictly parallel to `widths`: per root H-child, or a single
-    /// `false` for the one-column cases (lone leaf, V-branch root, where
-    /// `root_h_sizes` returns one full-width span). Indexing a V-root's
-    /// *stacked children* with a column index here would be wrong in
-    /// general — it's only safe as a fallback because of the len-1
-    /// guards around its callers.
-    fn root_column_minimized(&self, root: NodeId, widths_len: usize) -> Vec<bool> {
-        match self.tree.branch(root) {
-            Some(b) if b.dir == Dir::H => b
-                .children()
-                .iter()
-                .map(|c| self.tree.leaf(c.node).is_some_and(|l| l.minimized))
-                .collect(),
-            _ => vec![false; widths_len],
         }
     }
 
@@ -689,7 +662,11 @@ impl State {
                 // Only normal children's ratios matter to the layout
                 // (`child_sizes` normalises over them alone), so rewriting
                 // just those reproduces the pixel widths exactly.
-                for ((c, &w), &m) in b.children_mut().iter_mut().zip(widths.iter()).zip(minimized)
+                for ((c, &w), &m) in b
+                    .children_mut()
+                    .iter_mut()
+                    .zip(widths.iter())
+                    .zip(minimized)
                 {
                     if !m {
                         c.ratio = f64::from(w) / f64::from(total);
@@ -700,6 +677,23 @@ impl State {
         true
     }
 
+    /// Resize the leftmost or rightmost root-level column to `target_w`
+    /// pixels: the column absorbs the whole delta, every sibling keeps its
+    /// exact current pixel width, and `canvas_w` grows/shrinks by that same
+    /// delta (via `canvas_w_extra`, layered on top of `update_canvas`'s
+    /// heuristic each frame) — the canvas itself tracks the resize, the
+    /// same way it grows when a new column is inserted. `theme::GAP` (the
+    /// margin) never changes. A single leaf (or a vertical-branch root) has
+    /// no sibling ratios to redistribute — it's the whole row already, so
+    /// only `canvas_w_extra` moves.
+    ///
+    /// For the left edge specifically, the column's *start* is what's
+    /// meant to track the mouse (growing toward the screen edge), but
+    /// `Tree::compute` always lays children out left-to-right from a fixed
+    /// origin — so growing column 0 there necessarily shifts every later
+    /// column's canvas-space x right by `delta`. The caller (`Wm::on_motion`)
+    /// nudges `scroll_x`/`scroll_target` by the same `delta` so those
+    /// columns stay put on screen and only the dragged edge visibly moves.
     pub fn resize_edge(&mut self, wa: Rect, left: bool, target_w: i32) -> i32 {
         let root = self.tree.root;
         let gap = theme::GAP;
@@ -708,24 +702,37 @@ impl State {
             return 0;
         };
         let idx = if left { 0 } else { widths.len() - 1 };
-        let minimized = self.root_column_minimized(root, widths.len());
-        debug_assert_eq!(widths.len(), minimized.len());
-        if widths.len() > 1 && minimized[idx] {
-            // The end column itself being minimized makes the whole drag
-            // meaningless (old_w is the pinned gap, not a real width).
-            return 0;
-        }
         let old_w = widths[idx];
-        let min_w = theme::min_split_w();
-        let new_w = target_w.max(min_w);
+        let new_w = target_w.max(theme::min_split_w());
         let delta = new_w - old_w;
         if delta == 0 {
             return 0;
         }
-        if widths.len() > 1
-            && !self.redistribute_column_widths(root, idx, new_w, widths, &minimized)
-        {
-            return 0;
+        if widths.len() > 1 {
+            // A multi-column root is necessarily an H-branch (`root_h_sizes`
+            // returns a single full-width span for a lone leaf or V-branch
+            // root), so per-column minimized flags index `widths` one-to-one.
+            // A minimized column's pixel width is pinned to `gap` regardless
+            // of ratio (see `child_sizes`), so its stored ratio must survive
+            // the rewrite in `redistribute_column_widths` untouched —
+            // deriving a ratio from the pinned width would crush the share
+            // it restores to.
+            let minimized: Vec<bool> = match self.tree.branch(root) {
+                Some(b) if b.dir == Dir::H => b
+                    .children()
+                    .iter()
+                    .map(|c| self.tree.leaf(c.node).is_some_and(|l| l.minimized))
+                    .collect(),
+                _ => return 0,
+            };
+            if minimized[idx] {
+                // The end column itself being minimized makes the whole drag
+                // meaningless (old_w is the pinned gap, not a real width).
+                return 0;
+            }
+            if !self.redistribute_column_widths(root, idx, new_w, widths, &minimized) {
+                return 0;
+            }
         }
         self.canvas_w_extra += delta;
         delta
@@ -757,7 +764,13 @@ impl State {
                 let n = b.children().len();
                 let avg = b.children().iter().map(|c| c.ratio).sum::<f64>() / n as f64;
                 let i = at.min(n);
-                b.insert(i, Child { node: new, ratio: avg });
+                b.insert(
+                    i,
+                    Child {
+                        node: new,
+                        ratio: avg,
+                    },
+                );
                 let s: f64 = b.children().iter().map(|c| c.ratio).sum();
                 for c in b.children_mut() {
                     c.ratio /= s;

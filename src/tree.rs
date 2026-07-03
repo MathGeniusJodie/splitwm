@@ -1,14 +1,19 @@
 //! Pure split-tree math.
 //!
 //! Splits form an n-ary tree (horizontal branches are n-ary, vertical too).
-//! Each leaf owns a tab stack of client windows. Nodes live in an arena keyed
+//! Each leaf shows at most one client window. Nodes live in an arena keyed
 //! by `NodeId`; branches reference children by id so parent lookup and
 //! mutation avoid Rust's aliasing headaches.
 
 use std::collections::HashMap;
 
 pub type Win = u32;
-pub type NodeId = u32;
+
+/// Arena key for a tree node. A newtype rather than a second bare `u32`
+/// alias so a node id and a `Win` can never be swapped at a call site —
+/// only this module mints them (`Tree::gen_id`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct NodeId(u32);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dir {
@@ -137,7 +142,7 @@ pub enum Node {
 
 pub struct Tree {
     nodes: HashMap<NodeId, Node>,
-    next_id: NodeId,
+    next_id: u32,
     pub root: NodeId,
 }
 
@@ -145,7 +150,7 @@ impl Tree {
     pub fn new() -> Self {
         let mut nodes = HashMap::new();
         nodes.insert(
-            1,
+            NodeId(1),
             Node::Leaf(Leaf {
                 color: crate::theme::leaf_color_index(1),
                 ..Leaf::default()
@@ -154,7 +159,7 @@ impl Tree {
         Self {
             nodes,
             next_id: 2,
-            root: 1,
+            root: NodeId(1),
         }
     }
 
@@ -166,7 +171,7 @@ impl Tree {
         self.next_id = id
             .checked_add(1)
             .unwrap_or_else(|| panic!("Tree::gen_id: NodeId space exhausted (next_id={id})"));
-        id
+        NodeId(id)
     }
 
     pub fn make_leaf(&mut self) -> NodeId {
@@ -194,7 +199,7 @@ impl Tree {
         crate::theme::LEAF_PALETTE
             .into_iter()
             .find(|c| !used.contains(c))
-            .unwrap_or_else(|| crate::theme::leaf_color_index(id))
+            .unwrap_or_else(|| crate::theme::leaf_color_index(id.0))
     }
 
     pub fn make_branch(&mut self, dir: Dir, ratio: f64, a: NodeId, b: NodeId) -> NodeId {
@@ -461,11 +466,7 @@ impl Tree {
     /// `compute`'s `w - 2 * gap`).
     pub fn root_h_sizes(&self, usable_w: i32, gap: i32) -> Option<Vec<i32>> {
         match self.get(self.root)? {
-            Node::Leaf(_)
-            | Node::Branch(Branch {
-                dir: Dir::V,
-                ..
-            }) => Some(vec![usable_w.max(0)]),
+            Node::Leaf(_) | Node::Branch(Branch { dir: Dir::V, .. }) => Some(vec![usable_w.max(0)]),
             Node::Branch(b) => {
                 let n = i32::try_from(b.children().len()).unwrap_or(i32::MAX);
                 let meta = self.child_meta(b.children());
