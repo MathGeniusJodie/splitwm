@@ -561,6 +561,22 @@ pub fn run(replace: bool) -> R<()> {
     wm.conn.flush()?;
     wm.arrange()?;
 
+    // Run the loop with a panic guard: layout hiding uses plain unmaps, and
+    // exiting without remapping strands taskbar'd windows invisible for the
+    // next WM (which only adopts viewable windows). Restore on *every* exit
+    // path — clean quit, handling error, or panic. When the connection
+    // itself died the restore fails too, but then the server is resetting
+    // client state anyway.
+    let looped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| event_loop(&mut wm)));
+    let restored = wm.restore_clients();
+    match looped {
+        Err(payload) => std::panic::resume_unwind(payload),
+        Ok(Err(e)) => Err(e),
+        Ok(Ok(())) => restored,
+    }
+}
+
+fn event_loop(wm: &mut Wm) -> R<()> {
     while wm.running {
         wm.conn.flush()?;
         // Collect a whole batch: block for one event, then drain everything the
@@ -586,21 +602,21 @@ pub fn run(replace: bool) -> R<()> {
         // Gate on an actual scroll *delta*, not the mere presence of raw
         // motion: RAW_MOTION fires for every plain pointer movement too, and
         // sleeping on those would add 8 ms of input latency (and constant
-        // wakeups) whenever the mouse moves.
-        let scroll_delta: f64 = batch
-            .iter()
-            .filter_map(|e| match e {
-                Event::XinputRawMotion(e) => Some(wm.hscroll_delta(e)),
-                _ => None,
-            })
-            .sum();
-        if scroll_delta != 0.0 {
+        // wakeups) whenever the mouse moves. Also gate on the pointer-
+        // position check (`hscroll_allowed`): a swipe inside a client window
+        // without Mod4 held is ignored by `apply_hscroll`, and sleeping for
+        // it would add latency to input the WM won't act on.
+        let has_scroll = batch.iter().any(|e| match e {
+            Event::XinputRawMotion(e) => wm.hscroll_delta(e) != 0.0,
+            _ => false,
+        });
+        if has_scroll && wm.hscroll_allowed().unwrap_or(false) {
             std::thread::sleep(std::time::Duration::from_millis(8));
             while let Some(ev) = wm.conn.poll_for_event()? {
                 batch.push(ev);
             }
         }
-        let debug_scroll = scroll_delta != 0.0 && wm.debug_scroll;
+        let debug_scroll = has_scroll && wm.debug_scroll;
         let batch_len = batch.len();
         let t0 = std::time::Instant::now();
         // A handling error (e.g. a reply from a window that raced us and
@@ -615,16 +631,11 @@ pub fn run(replace: bool) -> R<()> {
         }
         if debug_scroll {
             eprintln!(
-                "splitwm: batch of {batch_len} events (scroll delta {scroll_delta:.3}) took {:?}",
+                "splitwm: scroll-bearing batch of {batch_len} events took {:?}",
                 t0.elapsed()
             );
         }
     }
-
-    // Layout hiding uses plain unmaps; remap everything on the way out so
-    // taskbar'd windows aren't stranded invisible for the next WM (which
-    // only adopts viewable windows).
-    wm.restore_clients()?;
     Ok(())
 }
 
@@ -844,6 +855,9 @@ fn is_connection_error(e: &(dyn std::error::Error + 'static)) -> bool {
     matches!(
         e.downcast_ref::<x11rb::errors::ReplyError>(),
         Some(x11rb::errors::ReplyError::ConnectionError(_))
+    ) || matches!(
+        e.downcast_ref::<x11rb::errors::ReplyOrIdError>(),
+        Some(x11rb::errors::ReplyOrIdError::ConnectionError(_))
     )
 }
 
@@ -931,4 +945,52 @@ fn sprite_cursor(
     conn.free_gc(gc)?;
     conn.free_pixmap(pixmap)?;
     Ok(cursor)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valuator_value;
+    use x11rb::protocol::xinput::Fp3232;
+
+    const fn fp(i: i32) -> Fp3232 {
+        Fp3232 { integral: i, frac: 0 }
+    }
+
+    /// `axisvalues` holds one entry per set mask bit, in bit order — the
+    /// lookup must count only *earlier* set bits.
+    #[test]
+    fn picks_the_right_axisvalue_for_sparse_masks() {
+        let mask = [0b1010u32]; // valuators 1 and 3
+        let vals = [fp(10), fp(30)];
+        assert_eq!(valuator_value(&mask, &vals, 1), Some(10.0));
+        assert_eq!(valuator_value(&mask, &vals, 3), Some(30.0));
+        assert_eq!(valuator_value(&mask, &vals, 0), None);
+        assert_eq!(valuator_value(&mask, &vals, 2), None);
+    }
+
+    /// The mask spans as many u32 words as needed; bit counting must cross
+    /// word boundaries.
+    #[test]
+    fn spans_multiple_mask_words() {
+        let mask = [0b1u32, 0b10u32]; // valuators 0 and 33
+        let vals = [fp(1), fp(2)];
+        assert_eq!(valuator_value(&mask, &vals, 0), Some(1.0));
+        assert_eq!(valuator_value(&mask, &vals, 33), Some(2.0));
+    }
+
+    /// Out-of-range valuators and a truncated axisvalues list must return
+    /// None, not panic.
+    #[test]
+    fn out_of_range_or_short_axisvalues_is_none() {
+        assert_eq!(valuator_value(&[], &[], 5), None);
+        let mask = [0b11u32];
+        assert_eq!(valuator_value(&mask, &[fp(1)], 1), None);
+    }
+
+    /// The fractional part is a 32-bit binary fraction.
+    #[test]
+    fn fp3232_fraction_converts() {
+        let half = Fp3232 { integral: 2, frac: 0x8000_0000 };
+        assert_eq!(valuator_value(&[0b1], &[half], 0), Some(2.5));
+    }
 }

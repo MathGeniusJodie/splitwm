@@ -203,11 +203,15 @@ pub fn find_icon_file(icon: &str) -> Option<std::path::PathBuf> {
     // themes while we run), so cache results keyed by the raw `icon` string.
     static CACHE: OnceLock<Mutex<HashMap<String, Option<std::path::PathBuf>>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = cache.lock().unwrap().get(icon) {
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner).get(icon) {
         return hit.clone();
     }
     let found = find_icon_file_uncached(icon);
-    let mut cache = cache.lock().unwrap();
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Same wholesale-clear-at-cap policy as the renderer's icon caches:
     // bounded in practice, but nothing here should grow without a lid.
     if cache.len() >= 1024 {

@@ -17,7 +17,34 @@ use super::types::{
     rect_contains, Action, BtnKind, Drag, EdgeDrag, FloatDrag, FrameRect, Wm, MOD4, R,
 };
 use crate::theme;
-use crate::tree::{Dir, NodeId, Rect};
+use crate::tree::{Boundary, Dir, NodeId, Rect, Win};
+
+/// Everything clickable on the underlay, resolved by one priority-ordered
+/// hit-test (`Wm::hit_test`) shared by `on_button` (dispatch) and
+/// `hover_cursor` (cursor feedback) — a single ordering both consume, so
+/// click handling and hover feedback can never drift apart.
+#[derive(Clone, Copy)]
+enum Hit {
+    /// A split-control titlebar button (close/split/minimize).
+    Btn(NodeId, BtnKind),
+    /// The corner "x" badge on a taskbar tile.
+    TaskbarClose(Win),
+    /// A taskbar tile body.
+    TaskbarTile(Win),
+    /// The launcher "+" at the right end of the taskbar.
+    TaskbarPlus,
+    /// A leaf's titlebar tab.
+    Tab(NodeId),
+    /// A boundary/edge "+" insert button (root-children insert index).
+    Plus(usize),
+    /// A gap drag handle.
+    Handle(Boundary),
+    /// An outer canvas-edge resize handle (`true` = left edge).
+    Edge(bool),
+    /// An empty split's body (no client window catches the click there).
+    LeafBody(NodeId),
+    Miss,
+}
 
 impl Wm {
     pub(crate) fn lookup_action(&self, modmask: u16, keycode: u8) -> Option<Action> {
@@ -87,7 +114,7 @@ impl Wm {
     /// the answer is cached for a short window — long enough to absorb a
     /// whole burst, short enough that moving the pointer under/off a window
     /// mid-swipe is still honoured almost immediately.
-    fn hscroll_allowed(&mut self) -> R<bool> {
+    pub(crate) fn hscroll_allowed(&mut self) -> R<bool> {
         let (last, allowed) = self.hscroll_gate;
         if last.elapsed() < std::time::Duration::from_millis(30) {
             return Ok(allowed);
@@ -399,6 +426,17 @@ impl Wm {
         self.state.ensure_in_view(wa);
         self.state.scroll_x = self.state.scroll_target;
         self.arrange()?;
+        // A focused dialog keeps the keyboard across pure layout changes
+        // (split/resize/insert): re-assert its focus instead of handing it
+        // to the focused split's client, so Mod4+Shift+C still closes the
+        // dialog the user is looking at. Deliberate focus-moving actions
+        // (`on_key`, activation requests) clear `focused_float` first.
+        if let Some(fw) = self.focused_float {
+            if self.floats.iter().any(|f| f.win == fw) {
+                return self.focus_float(fw);
+            }
+            self.focused_float = None;
+        }
         let f = self.state.focused_client();
         self.focus(f)
     }
@@ -408,6 +446,9 @@ impl Wm {
     /// split (same policy as a deiconify MapRequest); floats just take focus.
     fn on_activate_request(&mut self, win: u32) -> R<()> {
         if self.clients.contains_key(&win) {
+            // An explicit activation targets the tiled window; a focused
+            // dialog yields the keyboard.
+            self.focused_float = None;
             if !self.state.activate_client(win) {
                 let leaf = self.state.focused_leaf_valid();
                 self.state.assign_to_leaf(win, leaf);
@@ -433,7 +474,9 @@ impl Wm {
         if self.clients.contains_key(&e.window) {
             // A map request for a window we manage but have hidden is the
             // ICCCM deiconify request (Iconic -> Normal): bring it into a
-            // split rather than blindly mapping it over the layout.
+            // split rather than blindly mapping it over the layout. It
+            // takes focus, so a focused dialog yields the keyboard.
+            self.focused_float = None;
             if !self.state.activate_client(e.window) {
                 let leaf = self.state.focused_leaf_valid();
                 self.state.assign_to_leaf(e.window, leaf);
@@ -529,6 +572,20 @@ impl Wm {
                 return Ok(());
             }
             self.last_layout_key = Some((e.detail, now));
+        }
+        // Deliberate focus movement returns the keyboard to the tree: it
+        // must also clear a focused dialog's keyboard-target bookkeeping,
+        // or `commit_layout` would hand focus straight back to it.
+        if matches!(
+            action,
+            Action::FocusNext
+                | Action::FocusPrev
+                | Action::NextTab
+                | Action::PrevTab
+                | Action::MoveTabNext
+                | Action::MoveTabPrev
+        ) {
+            self.focused_float = None;
         }
         // Layout-changing actions get an animated transition.
         self.animate = matches!(
@@ -692,138 +749,82 @@ impl Wm {
             }
             self.close_menu()?;
         }
-        // Split-control buttons (left = primary, right = opposite split dir).
-        if (e.detail == 1 || e.detail == 3) && e.event == self.underlay {
+        // Clicks on the underlay: one shared, priority-ordered hit-test
+        // (`hit_test`) resolves the target; `hover_cursor` consumes the same
+        // ordering, so click dispatch and cursor feedback stay in lockstep.
+        if e.event == self.underlay && (e.detail == 1 || e.detail == 3) {
             let (mx, my) = (i32::from(e.event_x), i32::from(e.event_y));
-            if let Some((leaf, kind)) = self
-                .widgets
-                .btn_regions
-                .iter()
-                .find(|(r, _, _)| rect_contains(*r, mx, my))
-                .map(|(_, l, k)| (*l, *k))
-            {
+            let hit = self.hit_test(mx, my);
+            // Split-control buttons take left and right click (right picks
+            // the opposite split direction); everything else is left only.
+            if let Hit::Btn(leaf, kind) = hit {
                 return self.click_split_button(leaf, kind, e.detail == 3);
             }
-        }
-        // Clicks on the underlay (gaps): hit-test drag handles and "+" buttons.
-        if e.detail == 1 && e.event == self.underlay {
-            let (mx, my) = (i32::from(e.event_x), i32::from(e.event_y));
-            // The corner "x" badge on a bottom-bar tile: politely close that
-            // window (checked before the tile itself so the badge wins).
-            // Reverse iteration matches draw order: compressed tiles overlap
-            // left-to-right, so the topmost (rightmost) one takes the click.
-            if let Some(win) = self
-                .widgets
-                .taskbar_regions
-                .iter()
-                .rev()
-                .find(|t| rect_contains(t.close, mx, my))
-                .map(|t| t.win)
-            {
-                return self.close_client(win);
+            if e.detail != 1 {
+                return Ok(());
             }
-            // A bottom-bar icon: focus its split if already on-screen,
-            // otherwise bring that window into the focused split.
-            if let Some(win) = self
-                .widgets
-                .taskbar_regions
-                .iter()
-                .rev()
-                .find(|t| rect_contains(t.rect, mx, my))
-                .map(|t| t.win)
-            {
-                if self.state.activate_client(win) {
+            match hit {
+                Hit::Btn(..) => {} // handled above
+                // The corner "x" badge on a bottom-bar tile: politely close
+                // that window.
+                Hit::TaskbarClose(win) => return self.close_client(win),
+                // A bottom-bar icon: focus its split if already on-screen,
+                // otherwise bring that window into the focused split.
+                Hit::TaskbarTile(win) => {
+                    if self.state.activate_client(win) {
+                        self.arrange()?;
+                        self.focus(Some(win))?;
+                        return Ok(());
+                    }
+                    let leaf = self.state.focused_leaf_valid();
+                    self.state.assign_to_leaf(win, leaf);
+                    self.animate = true;
                     self.arrange()?;
-                    self.focus(Some(win))?;
-                    return Ok(());
+                    let f = self.state.focused_client();
+                    self.focus(f)?;
                 }
-                let leaf = self.state.focused_leaf_valid();
-                self.state.assign_to_leaf(win, leaf);
-                self.animate = true;
-                self.arrange()?;
-                let f = self.state.focused_client();
-                self.focus(f)?;
-                return Ok(());
-            }
-            // Taskbar "+" opens the app launcher into the focused split.
-            if rect_contains(self.widgets.taskbar_plus, mx, my) {
-                let leaf = self.state.focused_leaf_valid();
-                let pr = self.widgets.taskbar_plus;
-                return self.open_menu(leaf, pr.x + pr.w, pr.y);
-            }
-            // Click the title (tab) to focus it — an empty leaf's tab
-            // focuses the leaf too, matching a click on its body.
-            if let Some(leaf) = self
-                .widgets
-                .tab_regions
-                .iter()
-                .find(|(r, _)| rect_contains(*r, mx, my))
-                .map(|(_, l)| *l)
-            {
-                self.state.focused_leaf = leaf;
-                self.arrange()?;
-                self.focus(self.state.focused_client())?;
-                return Ok(());
-            }
-            // The boundary "+" button sits centred inside its drag handle's
-            // hit region (the handle spans the full boundary height so it's
-            // easy to grab; "+" is a small target in its middle) — check the
-            // narrower "+" rect first so it isn't shadowed by the handle.
-            if let Some(at) = self
-                .widgets
-                .plus_regions
-                .iter()
-                .find(|(r, _)| rect_contains(*r, mx, my))
-                .map(|(_, at)| *at)
-            {
-                self.state.insert_at_root(at);
-                self.animate = true;
-                return self.commit_layout();
-            }
-            if let Some(b) = self
-                .widgets
-                .handle_regions
-                .iter()
-                .find(|(r, b)| b.resizable && rect_contains(*r, mx, my))
-                .map(|(_, b)| *b)
-            {
-                self.drags.split = Some(Drag {
-                    parent: b.parent,
-                    idx: b.idx,
-                    vertical: b.dir == Dir::V,
-                    start: b.start,
-                    combined: b.first + b.second,
-                    gap: theme::GAP,
-                });
-                return Ok(());
-            }
-            // Outer canvas-edge resize handles: the screen-space x of
-            // whichever end of the leftmost/rightmost column isn't being
-            // dragged stays fixed for the whole gesture (see `EdgeDrag`).
-            if let Some(&(_, left)) = self
-                .widgets
-                .edge_handle_regions
-                .iter()
-                .find(|(r, _)| rect_contains(*r, mx, my))
-            {
-                if let Some((start_x, w)) = self.state.edge_span(wa, left) {
-                    let canvas_anchor = if left { start_x + w } else { start_x };
-                    let anchor_x = canvas_anchor - self.state.scroll_x;
-                    self.drags.edge = Some(EdgeDrag { left, anchor_x });
+                // Taskbar "+" opens the app launcher into the focused split.
+                Hit::TaskbarPlus => {
+                    let leaf = self.state.focused_leaf_valid();
+                    let pr = self.widgets.taskbar_plus;
+                    return self.open_menu(leaf, pr.x + pr.w, pr.y);
                 }
-                return Ok(());
-            }
-            // Clicking an empty split's body (no client window catches it):
-            // focus that leaf.
-            if let Some(leaf) = self
-                .prev_frame_rect
-                .iter()
-                .find(|(l, r)| self.state.tree.is_leaf(**l) && rect_contains(**r, mx, my))
-                .map(|(l, _)| *l)
-            {
-                self.state.focused_leaf = leaf;
-                self.arrange()?;
-                self.focus(self.state.focused_client())?;
+                // Click a title (tab) or an empty split's body to focus it.
+                Hit::Tab(leaf) | Hit::LeafBody(leaf) => {
+                    self.state.focused_leaf = leaf;
+                    self.arrange()?;
+                    self.focus(self.state.focused_client())?;
+                }
+                Hit::Plus(at) => {
+                    self.state.insert_at_root(at);
+                    self.animate = true;
+                    return self.commit_layout();
+                }
+                Hit::Handle(b) => {
+                    // A gap next to a minimized leaf can't be dragged (its
+                    // pixel size is pinned); ignore the press.
+                    if b.resizable {
+                        self.drags.split = Some(Drag {
+                            parent: b.parent,
+                            idx: b.idx,
+                            vertical: b.dir == Dir::V,
+                            start: b.start,
+                            combined: b.first + b.second,
+                            gap: theme::GAP,
+                        });
+                    }
+                }
+                // Outer canvas-edge resize handles: the screen-space x of
+                // whichever end of the leftmost/rightmost column isn't being
+                // dragged stays fixed for the whole gesture (see `EdgeDrag`).
+                Hit::Edge(left) => {
+                    if let Some((start_x, w)) = self.state.edge_span(wa, left) {
+                        let canvas_anchor = if left { start_x + w } else { start_x };
+                        let anchor_x = canvas_anchor - self.state.scroll_x;
+                        self.drags.edge = Some(EdgeDrag { left, anchor_x });
+                    }
+                }
+                Hit::Miss => {}
             }
             return Ok(());
         }
@@ -911,12 +912,9 @@ impl Wm {
         Ok(())
     }
 
-    /// Pick the pointer cursor for a hover position on the underlay:
-    /// resize arrows over gap/edge drag handles, the hand over clickable
-    /// buttons, the "disabled" cursor over a disabled titlebar button, and
-    /// the plain arrow otherwise.
-    fn hover_cursor(&self, mx: i32, my: i32) -> u32 {
-        let c = self.cursors;
+    /// Priority-ordered hit-test of everything clickable on the underlay,
+    /// shared by `on_button` (dispatch) and `hover_cursor` (feedback).
+    fn hit_test(&self, mx: i32, my: i32) -> Hit {
         if let Some((leaf, kind)) = self
             .widgets
             .btn_regions
@@ -924,76 +922,128 @@ impl Wm {
             .find(|(r, _, _)| rect_contains(*r, mx, my))
             .map(|(_, l, k)| (*l, *k))
         {
-            // Mirror `compose`'s enabled/disabled choice for the button art
-            // (a minimized leaf's whole-frame region is always a live
-            // restore button).
-            if let Some(&frame) = self.prev_frame_rect.get(&leaf) {
-                let meta = self.leaf_meta(leaf, frame);
-                let disabled = !meta.minimized
-                    && match kind {
-                        BtnKind::Close | BtnKind::Minimize => meta.parent_dir.is_none(),
-                        BtnKind::Split => !meta.can_split,
-                    };
-                if disabled {
-                    return c.disabled;
-                }
-            }
-            return c.hand;
+            return Hit::Btn(leaf, kind);
         }
-        // Taskbar tiles (and their close badges), the launcher "+", and the
-        // tab titles are plain click targets, mirroring `on_button`.
-        if self
+        // Compressed taskbar tiles overlap like fanned cards, rightmost on
+        // top; reverse iteration matches draw order so the topmost tile
+        // wins. The corner "x" badge is checked before the tile bodies so
+        // the badge wins the click.
+        if let Some(win) = self
             .widgets
             .taskbar_regions
             .iter()
-            .any(|t| rect_contains(t.rect, mx, my) || rect_contains(t.close, mx, my))
-            || rect_contains(self.widgets.taskbar_plus, mx, my)
-            || self
-                .widgets
-                .tab_regions
-                .iter()
-                .any(|(r, _)| rect_contains(*r, mx, my))
+            .rev()
+            .find(|t| rect_contains(t.close, mx, my))
+            .map(|t| t.win)
         {
-            return c.hand;
+            return Hit::TaskbarClose(win);
         }
-        if let Some((_, b)) = self
+        if let Some(win) = self
+            .widgets
+            .taskbar_regions
+            .iter()
+            .rev()
+            .find(|t| rect_contains(t.rect, mx, my))
+            .map(|t| t.win)
+        {
+            return Hit::TaskbarTile(win);
+        }
+        if rect_contains(self.widgets.taskbar_plus, mx, my) {
+            return Hit::TaskbarPlus;
+        }
+        if let Some(leaf) = self
+            .widgets
+            .tab_regions
+            .iter()
+            .find(|(r, _)| rect_contains(*r, mx, my))
+            .map(|(_, l)| *l)
+        {
+            return Hit::Tab(leaf);
+        }
+        // "+" buttons sit centred inside their drag handle's (or the edge
+        // handle's) larger hit region — check the narrower "+" rects first
+        // so they aren't shadowed by the handles.
+        if let Some(at) = self
+            .widgets
+            .plus_regions
+            .iter()
+            .find(|(r, _)| rect_contains(*r, mx, my))
+            .map(|(_, at)| *at)
+        {
+            return Hit::Plus(at);
+        }
+        if let Some(b) = self
             .widgets
             .handle_regions
             .iter()
             .find(|(r, _)| rect_contains(*r, mx, my))
+            .map(|(_, b)| *b)
         {
-            // The boundary "+" button sits inside the handle's hit region;
-            // it's clickable, so the hand wins, matching the click hit-test
-            // order.
-            if b.root
-                && self
-                    .widgets
-                    .plus_regions
-                    .iter()
-                    .any(|(r, _)| rect_contains(*r, mx, my))
-            {
-                return c.hand;
-            }
-            // A gap next to a minimized leaf can't be dragged (its size is
-            // pinned); don't advertise a resize that won't happen.
-            if !b.resizable {
-                return c.arrow;
-            }
-            return if b.dir == Dir::V {
-                c.v_resize
-            } else {
-                c.h_resize
-            };
+            return Hit::Handle(b);
         }
-        if self
+        if let Some(&(_, left)) = self
             .widgets
             .edge_handle_regions
             .iter()
-            .any(|(r, _)| rect_contains(*r, mx, my))
+            .find(|(r, _)| rect_contains(*r, mx, my))
         {
-            return c.h_resize;
+            return Hit::Edge(left);
         }
-        c.arrow
+        if let Some(leaf) = self
+            .prev_frame_rect
+            .iter()
+            .find(|(l, r)| self.state.tree.is_leaf(**l) && rect_contains(**r, mx, my))
+            .map(|(l, _)| *l)
+        {
+            return Hit::LeafBody(leaf);
+        }
+        Hit::Miss
+    }
+
+    /// Pick the pointer cursor for a hover position on the underlay:
+    /// resize arrows over gap/edge drag handles, the hand over clickable
+    /// buttons, the "disabled" cursor over a disabled titlebar button, and
+    /// the plain arrow otherwise. Consumes the same `hit_test` ordering as
+    /// `on_button`, so the advertised cursor always matches the click.
+    fn hover_cursor(&self, mx: i32, my: i32) -> u32 {
+        let c = self.cursors;
+        match self.hit_test(mx, my) {
+            Hit::Btn(leaf, kind) => {
+                // Mirror `compose`'s enabled/disabled choice for the button
+                // art (a minimized leaf's whole-frame region is always a
+                // live restore button).
+                if let Some(&frame) = self.prev_frame_rect.get(&leaf) {
+                    let meta = self.leaf_meta(leaf, frame);
+                    let disabled = !meta.minimized
+                        && match kind {
+                            BtnKind::Close | BtnKind::Minimize => meta.parent_dir.is_none(),
+                            BtnKind::Split => !meta.can_split,
+                        };
+                    if disabled {
+                        return c.disabled;
+                    }
+                }
+                c.hand
+            }
+            Hit::TaskbarClose(_)
+            | Hit::TaskbarTile(_)
+            | Hit::TaskbarPlus
+            | Hit::Tab(_)
+            | Hit::Plus(_) => c.hand,
+            Hit::Handle(b) => {
+                // A gap next to a minimized leaf can't be dragged (its size
+                // is pinned); don't advertise a resize that won't happen.
+                if !b.resizable {
+                    c.arrow
+                } else if b.dir == Dir::V {
+                    c.v_resize
+                } else {
+                    c.h_resize
+                }
+            }
+            Hit::Edge(_) => c.h_resize,
+            Hit::LeafBody(_) | Hit::Miss => c.arrow,
+        }
     }
 
     /// Set the underlay's cursor, skipping the request when unchanged.

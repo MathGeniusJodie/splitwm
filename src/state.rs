@@ -298,8 +298,15 @@ impl State {
                 .leaf(dest_child)
                 .is_some_and(|l| l.client.is_none());
             if dest_free {
+                // Carry the closed leaf's displaced-window memory
+                // (`Leaf::prev`) along with its window, so popup-restore
+                // still works after the split it happened in is closed.
+                let prev = self.tree.leaf(leaf).and_then(|l| l.prev);
                 if let Some(d) = self.tree.leaf_mut(dest_child) {
                     d.client = Some(c);
+                    if d.prev.is_none() {
+                        d.prev = prev;
+                    }
                 }
             } else {
                 self.push_taskbar(c);
@@ -344,15 +351,26 @@ impl State {
                 _ => return false,
             };
             self.tree.remove_node(leaf);
+            // Resolve focus before any flattening: the sibling *node* may
+            // be dissolved into the grandparent below, but its leaves
+            // survive.
+            let new_focus = self.tree.first_leaf(sibling);
             if parent == self.tree.root {
                 self.tree.root = sibling;
+                self.tree.remove_node(parent);
             } else if let Some((grand, pidx)) = self.tree.find_parent(parent) {
                 if let Some(Node::Branch { children, .. }) = self.tree.get_mut(grand) {
                     children[pidx] = sibling;
                 }
+                self.tree.remove_node(parent);
+                // The spliced-in sibling can be a branch in the
+                // grandparent's own direction; dissolve it so same-dir
+                // splits stay one flat n-ary branch.
+                self.tree.flatten_same_dir(grand, pidx);
+            } else {
+                self.tree.remove_node(parent);
             }
-            self.tree.remove_node(parent);
-            self.focused_leaf = self.tree.first_leaf(sibling);
+            self.focused_leaf = new_focus;
         }
         true
     }
@@ -913,6 +931,58 @@ mod tests {
         s.tree.root = branch;
         s.focused_leaf = leaf;
         assert!(!s.resize_focused(0.1));
+    }
+
+    /// Collapsing a binary branch must dissolve a same-direction sibling
+    /// branch into the grandparent (`Tree::flatten_same_dir`): nested
+    /// same-dir branches demote their gaps from root-level boundaries,
+    /// losing the "+" insert buttons between visually root-level columns.
+    #[test]
+    fn collapse_flattens_same_dir_branches() {
+        let mut s = State::new();
+        s.split_focused(Dir::H); // root H[a, b]
+        s.split_focused(Dir::V); // a -> V[a1, a2]
+        s.split_focused(Dir::H); // a1 -> H[x1, x2]
+        let leaves = s.tree.collect_leaves(); // x1, x2, a2, b
+        assert_eq!(leaves.len(), 4);
+        s.focused_leaf = leaves[2]; // a2
+        assert!(s.close_focused());
+        // The V-branch collapses; H[x1, x2] splices into the root H-branch
+        // and must flatten into it: one H-branch, three leaf children.
+        match s.tree.get(s.tree.root) {
+            Some(Node::Branch {
+                dir: Dir::H,
+                children,
+                ratios,
+            }) => {
+                assert_eq!(children.len(), 3, "nested same-dir branch survived");
+                assert!((ratios.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+                for &c in children {
+                    assert!(s.tree.is_leaf(c));
+                }
+            }
+            _ => panic!("root not an H-branch"),
+        }
+        // Focus landed on a surviving leaf, and every root-level gap is
+        // insert-eligible again.
+        assert!(s.tree.is_leaf(s.focused_leaf));
+        s.canvas_w = Some(WA.w);
+        assert!(s.boundaries(WA).iter().all(|b| b.root));
+    }
+
+    /// Closing a split whose window moves into an empty sibling must carry
+    /// the displaced-window memory (`Leaf::prev`) with it, so popup-restore
+    /// survives the collapse.
+    #[test]
+    fn close_focused_carries_prev_to_sibling() {
+        let mut s = State::new();
+        s.pin_client(1);
+        s.split_focused(Dir::H); // window 1 stays in the focused child
+        s.pin_client(2); // displaces 1 -> taskbar, prev = 1
+        assert!(s.close_focused()); // 2 moves into the empty sibling
+        assert_eq!(s.focused_client(), Some(2));
+        s.unpin_client(2); // popup dies: 1 must come back
+        assert_eq!(s.focused_client(), Some(1), "prev restore survives collapse");
     }
 
     /// Closing a middle column moves focus to a surviving neighbour.

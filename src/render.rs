@@ -695,6 +695,13 @@ impl Renderer {
     /// (`TRANSPARENT_INDEX` where alpha < 50%), computed once per
     /// icon+size and reused every frame after.
     fn cached_icon_indices(&self, img: &Icon, size: i32) -> Rc<[u8]> {
+        // Callers (`draw_icon`) pre-check dims; the `img.h - 1` /
+        // `img.w - 1` below would wrap to u32::MAX on a zero-sized icon,
+        // and the cast lints that would flag it are allowed module-wide.
+        debug_assert!(
+            img.w > 0 && img.h > 0 && size >= 1,
+            "cached_icon_indices needs non-empty icon and positive size"
+        );
         let key = (img.id(), size);
         if let Some(v) = self.icon_idx_cache.borrow().get(&key) {
             return Rc::clone(v);

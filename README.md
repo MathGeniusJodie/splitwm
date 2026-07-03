@@ -20,13 +20,16 @@ terminal-multiplexer-style tiling layout where:
 
 - **[x11rb](https://crates.io/crates/x11rb)** — pure-Rust X11/XCB binding
   (`xinput` feature for smooth trackpad scrolling).
-- **[tiny-skia](https://crates.io/crates/tiny-skia)** — pure-Rust 2D
-  rasteriser for the underlay compositing (blitted via `PutImage`).
-- **[fontdue](https://crates.io/crates/fontdue)** — glyph rasterising for
-  labels (a system TTF/OTF is loaded at runtime; labels degrade to nothing
-  if none is found).
-- **pixel-graphics** (vendored) — palette-indexed sprite drawing and the
-  palette-swap machinery behind the per-split accent colours.
+- **pixel-graphics** (vendored) — palette-indexed software rasteriser,
+  sprite drawing, and the palette-swap machinery behind the per-split
+  accent colours; the underlay is composited into its framebuffers and
+  blitted via `PutImage`.
+- **pixel-fonts** (vendored) — baked bitmap pixel font for labels (text
+  degrades to nothing if the font atlas can't be loaded).
+- **[zune-jpeg](https://crates.io/crates/zune-jpeg)** + pixel-graphics PNG
+  decoding — user wallpapers.
+- **dbus** — the WM doubles as the session's
+  `org.freedesktop.Notifications` daemon on its own thread.
 
 ## Architecture
 

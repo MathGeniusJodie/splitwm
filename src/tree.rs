@@ -162,6 +162,41 @@ impl Tree {
         self.nodes.remove(&id);
     }
 
+    /// If `parent.children[idx]` is a branch in the same direction as
+    /// `parent`, splice its children (ratios scaled by the slot's ratio)
+    /// into `parent` in its place and drop the dissolved branch node.
+    /// `State::split_node` maintains the no-nested-same-dir invariant on
+    /// the way in; this is the counterpart for collapse paths
+    /// (`State::close_focused`), which can splice a same-dir branch into a
+    /// grandparent — leaving it nested would demote its gaps from
+    /// root-level boundaries, silently losing their "+" insert buttons.
+    pub fn flatten_same_dir(&mut self, parent: NodeId, idx: usize) {
+        let (pdir, child, slot_r) = match self.get(parent) {
+            Some(Node::Branch {
+                dir,
+                children,
+                ratios,
+            }) if idx < children.len() => (*dir, children[idx], ratios[idx]),
+            _ => return,
+        };
+        let (sub_children, sub_ratios) = match self.get(child) {
+            Some(Node::Branch {
+                dir,
+                children,
+                ratios,
+            }) if *dir == pdir => (children.clone(), ratios.clone()),
+            _ => return,
+        };
+        if let Some(Node::Branch {
+            children, ratios, ..
+        }) = self.get_mut(parent)
+        {
+            children.splice(idx..=idx, sub_children);
+            ratios.splice(idx..=idx, sub_ratios.into_iter().map(|r| r * slot_r));
+        }
+        self.remove_node(child);
+    }
+
     /// Depth-first leaf ids in layout order.
     pub fn collect_leaves(&self) -> Vec<NodeId> {
         let mut out = Vec::new();

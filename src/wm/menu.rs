@@ -133,10 +133,15 @@ impl Wm {
         let Some(cat) = self.menu.open_cat else {
             return Ok(());
         };
-        let Item::Submenu(idx) = self.menu.tree.main.items[cat] else {
+        // `.get`, not indexing: `open_cat` and the tree are only coupled by
+        // convention, and a stale index (e.g. after a future menu rescan)
+        // must degrade to a no-op rather than a panic.
+        let Some(&Item::Submenu(idx)) = self.menu.tree.main.items.get(cat) else {
             return Ok(());
         };
-        let sub = &self.menu.tree.subs[idx];
+        let Some(sub) = self.menu.tree.subs.get(idx) else {
+            return Ok(());
+        };
         let seps = vec![false; sub.labels.len()];
         let fb = self.renderer.draw_menu(
             &sub.labels,
@@ -160,11 +165,14 @@ impl Wm {
 
     /// Open the submenu for main row `cat` to the right of that row.
     pub(crate) fn open_submenu(&mut self, cat: usize) -> R<()> {
-        let Item::Submenu(idx) = self.menu.tree.main.items[cat] else {
+        let Some(&Item::Submenu(idx)) = self.menu.tree.main.items.get(cat) else {
             return Ok(());
         };
-        let labels = self.menu.tree.subs[idx].labels.clone();
-        let icon_names = self.menu.tree.subs[idx].icons.clone();
+        let Some(sub) = self.menu.tree.subs.get(idx) else {
+            return Ok(());
+        };
+        let labels = sub.labels.clone();
+        let icon_names = sub.icons.clone();
         self.menu.sub_icons = self.resolve_menu_icons(&icon_names);
         let any_icon = self.menu.sub_icons.iter().any(Option::is_some);
         let cw = self.renderer.menu_content_w(&labels, false, any_icon);
@@ -213,19 +221,21 @@ impl Wm {
         if win == self.menu.main_win {
             let n = self.menu.tree.main.labels.len();
             let row = Self::menu_row_at(ly, n)
-                .filter(|&r| !matches!(self.menu.tree.main.items[r], Item::Separator));
+                .filter(|&r| !matches!(self.menu.tree.main.items.get(r), Some(Item::Separator)));
             if row != self.menu.main_hi {
                 self.menu.main_hi = row;
                 self.paint_menu_main()?;
             }
             // Hovering a category opens its submenu; hovering anything else closes it.
-            match row.map(|r| &self.menu.tree.main.items[r]) {
-                Some(Item::Submenu(_)) => {
-                    if self.menu.open_cat != row {
-                        self.open_submenu(row.unwrap())?;
+            let hovered_cat =
+                row.filter(|&r| matches!(self.menu.tree.main.items.get(r), Some(Item::Submenu(_))));
+            match hovered_cat {
+                Some(r) => {
+                    if self.menu.open_cat != Some(r) {
+                        self.open_submenu(r)?;
                     }
                 }
-                _ => {
+                None => {
                     if self.menu.open_cat.is_some() {
                         self.menu.open_cat = None;
                         self.conn.unmap_window(self.menu.sub_win)?;
@@ -234,8 +244,8 @@ impl Wm {
             }
         } else if win == self.menu.sub_win {
             if let Some(cat) = self.menu.open_cat {
-                if let Item::Submenu(idx) = self.menu.tree.main.items[cat] {
-                    let n = self.menu.tree.subs[idx].labels.len();
+                if let Some(&Item::Submenu(idx)) = self.menu.tree.main.items.get(cat) {
+                    let n = self.menu.tree.subs.get(idx).map_or(0, |s| s.labels.len());
                     let row = Self::menu_row_at(ly, n);
                     if row != self.menu.sub_hi {
                         self.menu.sub_hi = row;
@@ -270,29 +280,28 @@ impl Wm {
     pub(crate) fn on_menu_click(&mut self, win: Window, ly: i32) -> R<()> {
         let cmd = if win == self.menu.main_win {
             let n = self.menu.tree.main.labels.len();
-            match Self::menu_row_at(ly, n) {
-                Some(r) => match &self.menu.tree.main.items[r] {
-                    Item::Launch(c) => Some(c.clone()),
-                    // Clicking a category just (re)opens its submenu.
-                    Item::Submenu(_) => {
-                        self.open_submenu(r)?;
-                        return Ok(());
-                    }
-                    Item::Separator => return Ok(()),
-                },
-                None => return Ok(()),
+            match Self::menu_row_at(ly, n).and_then(|r| self.menu.tree.main.items.get(r).zip(Some(r)))
+            {
+                Some((Item::Launch(c), _)) => Some(c.clone()),
+                // Clicking a category just (re)opens its submenu.
+                Some((Item::Submenu(_), r)) => {
+                    self.open_submenu(r)?;
+                    return Ok(());
+                }
+                Some((Item::Separator, _)) | None => return Ok(()),
             }
         } else if win == self.menu.sub_win {
             match self.menu.open_cat {
-                Some(cat) => match self.menu.tree.main.items[cat] {
-                    Item::Submenu(idx) => {
-                        let n = self.menu.tree.subs[idx].labels.len();
-                        match Self::menu_row_at(ly, n) {
-                            Some(r) => match &self.menu.tree.subs[idx].items[r] {
-                                Item::Launch(c) => Some(c.clone()),
-                                _ => return Ok(()),
-                            },
-                            None => return Ok(()),
+                Some(cat) => match self.menu.tree.main.items.get(cat) {
+                    Some(&Item::Submenu(idx)) => {
+                        let Some(sub) = self.menu.tree.subs.get(idx) else {
+                            return Ok(());
+                        };
+                        match Self::menu_row_at(ly, sub.labels.len())
+                            .and_then(|r| sub.items.get(r))
+                        {
+                            Some(Item::Launch(c)) => Some(c.clone()),
+                            _ => return Ok(()),
                         }
                     }
                     _ => return Ok(()),
@@ -312,5 +321,23 @@ impl Wm {
             self.close_menu()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::menu::{MENU_BORDER, MENU_ROW_H};
+
+    /// Row hit-testing must respect the border padding and the row count.
+    #[test]
+    fn row_hit_testing_matches_geometry() {
+        assert_eq!(Wm::menu_row_at(-3, 5), None);
+        assert_eq!(Wm::menu_row_at(MENU_BORDER - 1, 5), None);
+        assert_eq!(Wm::menu_row_at(MENU_BORDER, 5), Some(0));
+        assert_eq!(Wm::menu_row_at(MENU_BORDER + MENU_ROW_H - 1, 5), Some(0));
+        assert_eq!(Wm::menu_row_at(MENU_BORDER + MENU_ROW_H, 5), Some(1));
+        assert_eq!(Wm::menu_row_at(MENU_BORDER + 5 * MENU_ROW_H, 5), None);
+        assert_eq!(Wm::menu_row_at(MENU_BORDER, 0), None);
     }
 }

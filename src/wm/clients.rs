@@ -974,29 +974,7 @@ impl Wm {
             .ok()?;
         let vals: Vec<u32> = reply.value32()?.collect();
         let want = theme::tb_h() as u32;
-        let mut i = 0;
-        let mut best: Option<(u32, u32, usize)> = None; // (w, h, pixel_start)
-        while i + 2 <= vals.len() {
-            let (w, h) = (vals[i], vals[i + 1]);
-            let start = i + 2;
-            let count = (w as usize).checked_mul(h as usize)?;
-            if w == 0 || h == 0 || start + count > vals.len() {
-                break;
-            }
-            let better = match best {
-                None => true,
-                Some((bw, _, _)) => {
-                    // Prefer the smallest size that still covers `want`,
-                    // otherwise the largest available.
-                    (w >= want && (bw < want || w < bw)) || (bw < want && w > bw)
-                }
-            };
-            if better {
-                best = Some((w, h, start));
-            }
-            i = start + count;
-        }
-        let (w, h, start) = best?;
+        let (w, h, start) = best_icon_block(&vals, want)?;
         let argb = vals[start..start + (w * h) as usize].to_vec();
         let icon = Icon::new(w, h, argb);
         // Quantize to the na16 chrome palette so app icons render as flat
@@ -1156,7 +1134,12 @@ impl Wm {
             .spawn()
         {
             Ok(mut sh) => {
-                let _ = sh.wait();
+                // Reap the short-lived `sh` off-thread: it exits as soon as
+                // it has forked, but even that wait doesn't belong on the
+                // event loop.
+                std::thread::spawn(move || {
+                    let _ = sh.wait();
+                });
             }
             Err(e) => eprintln!("splitwm: failed to spawn '{cmd}': {e}"),
         }
@@ -1182,4 +1165,74 @@ impl Wm {
 /// Single-quote `s` for use as one `sh` word.
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Walk a `_NET_WM_ICON` value (a list of `width, height, w*h ARGB pixels`
+/// blocks packed as 32-bit CARDINALs) and pick the block whose size best
+/// matches `want`: the smallest that still covers it, otherwise the largest
+/// available. Returns `(w, h, pixel_start)`; `None` when no valid block
+/// exists (empty, zero-sized, or truncated property).
+fn best_icon_block(vals: &[u32], want: u32) -> Option<(u32, u32, usize)> {
+    let mut i = 0;
+    let mut best: Option<(u32, u32, usize)> = None;
+    while i + 2 <= vals.len() {
+        let (w, h) = (vals[i], vals[i + 1]);
+        let start = i + 2;
+        let count = (w as usize).checked_mul(h as usize)?;
+        if w == 0 || h == 0 || start + count > vals.len() {
+            break;
+        }
+        let better = match best {
+            None => true,
+            Some((bw, _, _)) => (w >= want && (bw < want || w < bw)) || (bw < want && w > bw),
+        };
+        if better {
+            best = Some((w, h, start));
+        }
+        i = start + count;
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::best_icon_block;
+
+    fn block(w: u32, h: u32) -> Vec<u32> {
+        let mut v = vec![w, h];
+        v.extend(std::iter::repeat_n(0, (w * h) as usize));
+        v
+    }
+
+    #[test]
+    fn prefers_smallest_size_covering_want() {
+        let mut vals = block(16, 16);
+        vals.extend(block(64, 64));
+        vals.extend(block(32, 32));
+        assert_eq!(best_icon_block(&vals, 27).map(|b| b.0), Some(32));
+    }
+
+    #[test]
+    fn falls_back_to_largest_when_none_cover() {
+        let mut vals = block(16, 16);
+        vals.extend(block(24, 24));
+        assert_eq!(best_icon_block(&vals, 48).map(|b| b.0), Some(24));
+    }
+
+    #[test]
+    fn truncated_or_zero_blocks_stop_cleanly() {
+        // Header claims 16x16 but the pixels are missing.
+        assert_eq!(best_icon_block(&[16, 16, 0, 0], 16), None);
+        assert_eq!(best_icon_block(&[0, 0], 16), None);
+        assert_eq!(best_icon_block(&[], 16), None);
+        // A huge w*h that would overflow the block walk must not panic.
+        assert_eq!(best_icon_block(&[u32::MAX, u32::MAX, 0], 16), None);
+    }
+
+    #[test]
+    fn valid_leading_block_survives_trailing_garbage() {
+        let mut vals = block(16, 16);
+        vals.extend([32, 32, 0]); // truncated second block
+        assert_eq!(best_icon_block(&vals, 16).map(|b| b.0), Some(16));
+    }
 }
