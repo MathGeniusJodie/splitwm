@@ -685,11 +685,24 @@ impl Wm {
         if ptr == libc::MAP_FAILED {
             return Err(std::io::Error::last_os_error().into());
         }
+        // Owns the mapping until ShmSeg takes over: the error paths below
+        // (`generate_id`, a refused attach) must munmap it, not leak it.
+        struct MapGuard(*mut libc::c_void, usize);
+        impl Drop for MapGuard {
+            fn drop(&mut self) {
+                // SAFETY: mapping was created by mmap with this exact ptr/len.
+                unsafe {
+                    libc::munmap(self.0, self.1);
+                }
+            }
+        }
+        let guard = MapGuard(ptr, len);
         let seg = self.conn.generate_id()?;
         // Checked: an attach refusal (e.g. an SSH-forwarded display) must
         // surface here, where the caller can fall back, not as a later
         // async error on the first blit.
         self.conn.shm_attach_fd(seg, fd, false)?.check()?;
+        std::mem::forget(guard);
         // SAFETY: ptr is a fresh MAP_SHARED mapping of exactly `len` bytes,
         // owned solely by the returned ShmSeg (the fd was moved into the
         // server attach; only the mapping remains on our side).

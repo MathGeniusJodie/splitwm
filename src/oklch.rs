@@ -63,6 +63,11 @@ pub fn rotate_hue_argb(argb: u32, degrees: f32) -> u32 {
     let h = ob.atan2(oa) + degrees.to_radians();
     let (na, nb) = (c * h.cos(), c * h.sin());
     let (nr, ng, nb2) = oklab_to_linear(l, na, nb);
+    // Per-channel clamping is not gamut mapping: a rotated colour that lands
+    // outside sRGB has each channel saturate independently, which shifts its
+    // hue/chroma rather than scaling chroma down. Acceptable here because
+    // every output is immediately snapped onto the 16-colour na16 palette
+    // (`icon::quantize`), whose quantisation error dwarfs the clamp's.
     let enc = |x: f32| (linear_to_srgb(x).clamp(0.0, 1.0) * 255.0).round() as u32;
     (a << 24) | (enc(nr) << 16) | (enc(ng) << 8) | enc(nb2)
 }

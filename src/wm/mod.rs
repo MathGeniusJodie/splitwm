@@ -874,9 +874,22 @@ impl Wm {
         let setup = self.conn.setup();
         let min = setup.min_keycode;
         let max = setup.max_keycode;
-        let count = max - min + 1;
+        // Server-reported values, so degenerate ranges must not wrap the u8
+        // count (min > max, or the full 0..=255 range whose count is 256);
+        // an empty keymap (no key bindings) beats not starting at all.
+        let span = i32::from(max) - i32::from(min) + 1;
+        let Ok(count) = u8::try_from(span) else {
+            eprintln!("splitwm: unusable keycode range {min}..={max}; key bindings disabled");
+            return Ok(());
+        };
         let mapping = self.conn.get_keyboard_mapping(min, count)?.reply()?;
         let per = mapping.keysyms_per_keycode as usize;
+        // chunks() panics on 0, and 0 keysyms per keycode means there is
+        // nothing to map anyway.
+        if per == 0 {
+            eprintln!("splitwm: server reports 0 keysyms per keycode; key bindings disabled");
+            return Ok(());
+        }
         for (i, chunk) in mapping.keysyms.chunks(per).enumerate() {
             let keycode = min + i as u8;
             for &sym in chunk {

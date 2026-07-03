@@ -14,7 +14,16 @@ mod wm;
 pub type Index = pixel_graphics::Index;
 
 fn main() {
-    let replace = std::env::args().skip(1).any(|a| a == "--replace");
+    let mut replace = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--replace" => replace = true,
+            other => {
+                eprintln!("splitwm: unknown argument '{other}'\nusage: splitwm [--replace]");
+                std::process::exit(2);
+            }
+        }
+    }
     if let Err(e) = wm::run(replace) {
         eprintln!("splitwm: fatal: {e:?}");
         std::process::exit(1);
