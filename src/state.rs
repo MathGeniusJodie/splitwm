@@ -67,9 +67,8 @@ impl State {
     }
 
     /// Point focus at `leaf`. Anything that isn't a live leaf is ignored:
-    /// callers can hold stale ids (e.g. the launcher menu's target leaf,
-    /// captured when the menu opened), and focus must never come to rest on
-    /// a node `compute` doesn't lay out.
+    /// callers can hold ids captured before an intervening mutation, and
+    /// focus must never come to rest on a node `compute` doesn't lay out.
     pub fn focus_leaf(&mut self, leaf: NodeId) {
         if self.tree.is_leaf(leaf) {
             self.focused_leaf = leaf;

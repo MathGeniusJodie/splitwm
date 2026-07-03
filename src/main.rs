@@ -1,6 +1,6 @@
 mod assets;
 mod icon;
-mod menu;
+mod launch;
 mod notify;
 mod oklch;
 mod render;

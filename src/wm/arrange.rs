@@ -208,9 +208,29 @@ impl Wm {
                 );
                 crate::render::draw_close_badge(m, t.close.x, t.close.y, t.close.w);
             }
-            // Launcher "+" at the right end of the bar.
-            let pr = self.widgets.taskbar_plus;
-            crate::render::draw_plus(m, pr.x + pr.w / 2, pr.y + pr.h / 2, pr.w);
+            // Quick-launch icons at the right end of the bar, walled off
+            // from the window tiles by the separator pill.
+            if let Some(sep) = self.widgets.taskbar_sep {
+                crate::render::draw_taskbar_sep(m, sep);
+            }
+            for &(r, i) in &self.widgets.quick_regions {
+                let Some(q) = self.quick.get(i) else {
+                    continue;
+                };
+                self.renderer.draw_taskbar_item(
+                    m,
+                    TaskItem {
+                        x: r.x,
+                        y: r.y,
+                        w: r.w,
+                        h: r.h,
+                    },
+                    q.icon.as_deref(),
+                    q.label,
+                    theme::palette_color::CREAM,
+                    false,
+                );
+            }
         }
         // Blit into a pixmap installed as the underlay's background, not the
         // window itself: the server then repaints regions exposed by moving
@@ -397,11 +417,11 @@ impl Wm {
     }
 
     /// Re-raise the fullscreen window (if any) above tiled clients and
-    /// floats; only notifications and the menu stay above it. A fullscreen
-    /// *float* also gets its full-workarea geometry re-pinned here (its
-    /// frame stays unmapped; `raise_floats` may have restacked the pair, so
-    /// the client is re-raised last). Callers raise notifications/menu after
-    /// this, completing the stacking policy `arrange` establishes.
+    /// floats; only notifications stay above it. A fullscreen *float* also
+    /// gets its full-workarea geometry re-pinned here (its frame stays
+    /// unmapped; `raise_floats` may have restacked the pair, so the client
+    /// is re-raised last). Callers raise notifications after this,
+    /// completing the stacking policy `arrange` establishes.
     pub(crate) fn raise_fullscreen(&self) -> R<()> {
         let Some(fs) = self.fullscreen else {
             return Ok(());

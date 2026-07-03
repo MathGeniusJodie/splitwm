@@ -325,7 +325,9 @@ pub struct Wm {
     /// Every hit-testable widget rect for the current layout, rebuilt as one
     /// unit by `compute_widgets` each arrange (see `Widgets`).
     pub widgets: Widgets,
-    pub menu: MenuUi,
+    /// The quick-launch entries shown as icons at the right end of the
+    /// taskbar (see `QuickSlot`), resolved once at startup.
+    pub quick: Vec<QuickSlot>,
     /// In-progress gap/float/edge drags (see `DragState`).
     pub drags: DragState,
     /// Startup-created pointer cursors + the one currently on the underlay.
@@ -428,15 +430,19 @@ pub struct DragState {
 
 /// Every hit-testable widget rect computed for the current layout: gap drag
 /// handles, "+" insert buttons, tab titles, split-control buttons, taskbar
-/// tiles, the launcher "+", and the canvas-edge resize handles. Grouped so
-/// the whole set is rebuilt (and cleared) as one unit by
+/// tiles, the quick-launch icons, and the canvas-edge resize handles.
+/// Grouped so the whole set is rebuilt (and cleared) as one unit by
 /// `Wm::compute_widgets` — the caches must always describe the same arrange.
 #[derive(Default)]
 pub struct Widgets {
     pub handle_regions: Vec<(FrameRect, Boundary)>,
     pub plus_regions: Vec<(FrameRect, usize)>,
-    /// The launcher "+" button at the right end of the bottom taskbar.
-    pub taskbar_plus: FrameRect,
+    /// Quick-launch icons at the right end of the bottom taskbar, paired
+    /// with their `Wm::quick` index.
+    pub quick_regions: Vec<(FrameRect, usize)>,
+    /// The pill separating window tiles from the quick-launch icons; only
+    /// present when both groups are (an unpaired separator is just clutter).
+    pub taskbar_sep: Option<FrameRect>,
     pub tab_regions: Vec<(FrameRect, NodeId)>,
     pub taskbar_regions: Vec<TaskTile>,
     pub btn_regions: Vec<(FrameRect, NodeId, BtnKind)>,
@@ -451,11 +457,12 @@ impl Widgets {
     pub fn clear(&mut self) {
         self.handle_regions.clear();
         self.plus_regions.clear();
+        self.quick_regions.clear();
+        self.taskbar_sep = None;
         self.tab_regions.clear();
         self.btn_regions.clear();
         self.taskbar_regions.clear();
         self.edge_handle_regions.clear();
-        self.taskbar_plus = FrameRect::default();
     }
 }
 
@@ -524,7 +531,7 @@ pub struct Cursors {
     /// sprite; `XC_X_cursor` when the server lacks RENDER cursors).
     pub disabled: u32,
     /// Pointing hand over clickable things: live titlebar buttons, boundary
-    /// "+" buttons, and the launcher menu (`XC_hand2` fallback).
+    /// "+" buttons, and the taskbar (`XC_hand2` fallback).
     pub hand: u32,
     pub current: u32,
 }
@@ -541,101 +548,14 @@ pub struct EdgeDrag {
     pub anchor_x: i32,
 }
 
-/// App launcher popup: a main column plus one optional category submenu, each
-/// in its own override-redirect window composited like the underlay.
-pub struct MenuUi {
-    pub tree: crate::menu::MenuTree,
-    pub state: MenuState,
-    pub main: MenuColumn,
-    pub sub: MenuColumn,
-    /// Decoded app icons keyed by the desktop entry's `Icon=` value. Only
-    /// successes are cached; failures retry on the next open so icons
-    /// installed mid-session are picked up (see `Wm::resolve_icon_slot`).
-    pub icon_cache: std::collections::HashMap<String, Rc<crate::icon::Icon>>,
-}
-
-/// The launcher's open state. The target leaf and the open submenu only
-/// exist while the menu is open, so a stale target or a dangling submenu
-/// index on a closed menu is unrepresentable.
-pub enum MenuState {
-    Closed,
-    Open {
-        /// The leaf a launched app's window is routed into.
-        target_leaf: NodeId,
-        /// The open category submenu's row index in the main column.
-        open_cat: Option<usize>,
-    },
-}
-
-impl MenuUi {
-    pub fn is_open(&self) -> bool {
-        matches!(self.state, MenuState::Open { .. })
-    }
-
-    pub fn open_cat(&self) -> Option<usize> {
-        match self.state {
-            MenuState::Open { open_cat, .. } => open_cat,
-            MenuState::Closed => None,
-        }
-    }
-
-    /// Change which category submenu is open; a no-op while the menu is
-    /// closed (there is no open menu for a submenu to attach to).
-    pub fn set_open_cat(&mut self, cat: Option<usize>) {
-        if let MenuState::Open { open_cat, .. } = &mut self.state {
-            *open_cat = cat;
-        }
-    }
-}
-
-/// One menu column (the main menu or the open submenu): its window plus the
-/// per-open view state, shared so the open/paint/hit/scroll logic is written
-/// once for both (see `Wm::paint_column`).
-pub struct MenuColumn {
-    pub win: Window,
-    /// On-screen window rect of the (possibly height-clamped) column.
-    pub rect: FrameRect,
-    /// Inner content width.
-    pub cw: i32,
-    /// Hovered row, in absolute (scroll-independent) row indices.
-    pub hi: Option<usize>,
-    /// Per-row icons, resolved lazily as rows become visible.
-    pub icons: Vec<IconSlot>,
-    /// First visible row; nonzero only when the column has more rows than
-    /// fit on screen and has been wheel-scrolled.
-    pub scroll: usize,
-    /// Total row count of the column's data.
-    pub rows: usize,
-}
-
-impl MenuColumn {
-    pub fn new(win: Window) -> Self {
-        Self {
-            win,
-            rect: FrameRect {
-                x: 0,
-                y: 0,
-                w: 1,
-                h: 1,
-            },
-            cw: 0,
-            hi: None,
-            icons: Vec::new(),
-            scroll: 0,
-            rows: 0,
-        }
-    }
-}
-
-/// A menu row's icon: decoded lazily the first time the row is on screen,
-/// so opening a large column doesn't stat+decode every row's icon up front.
-pub enum IconSlot {
-    /// Not looked up yet; holds the desktop entry's `Icon=` value. Rows
-    /// with no `Icon=` name are born `Ready(None)` — there is nothing to
-    /// resolve for them.
-    Pending(String),
-    /// Looked up (successfully or not) for this open of the column.
-    Ready(Option<Rc<crate::icon::Icon>>),
+/// One taskbar quick-launch entry: the command it spawns and its icon,
+/// resolved once at startup (see `crate::launch::quick_launches`).
+pub struct QuickSlot {
+    pub cmd: String,
+    /// Decoded, palette-quantized icon; `None` falls back to the label glyph.
+    pub icon: Option<Rc<crate::icon::Icon>>,
+    /// First letter of the entry's label, the no-icon fallback glyph.
+    pub label: char,
 }
 
 /// The three split-control buttons on the right of every leaf's tab bar

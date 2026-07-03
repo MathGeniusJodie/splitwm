@@ -12,7 +12,6 @@
 mod arrange;
 mod clients;
 mod events;
-mod menu;
 mod notes;
 mod types;
 mod widgets;
@@ -41,6 +40,55 @@ use crate::theme;
 use crate::tree::Rect;
 
 pub use types::*;
+
+/// Set by the SIGTERM/SIGINT handler. The event loop exits at its next
+/// wakeup so `run` can remap hidden windows before the process ends —
+/// there is no quit keybinding, so a signal (or a `--replace` handover) is
+/// how a session is asked to stop, and a default-action kill would strand
+/// every taskbar'd window unmapped.
+static TERM_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_term_signal(_: libc::c_int) {
+    TERM_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn term_requested() -> bool {
+    TERM_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Route SIGTERM/SIGINT to `on_term_signal`. `SA_RESTART` is deliberately
+/// not set: the signal must interrupt the event loop's blocking `poll(2)`
+/// with `EINTR` so an idle session notices the request immediately.
+fn install_term_handler() {
+    // SAFETY: installs an async-signal-safe handler (a single atomic store)
+    // with a zeroed action struct and an empty mask.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_term_signal as *const () as libc::sighandler_t;
+        libc::sigemptyset(&mut sa.sa_mask);
+        for sig in [libc::SIGTERM, libc::SIGINT] {
+            libc::sigaction(sig, &sa, std::ptr::null_mut());
+        }
+    }
+}
+
+/// Block or unblock SIGTERM/SIGINT for the *calling* thread. Blocked around
+/// the notification-daemon thread's spawn (masks are inherited), so the
+/// signal is always delivered to the main thread — delivery to the daemon
+/// thread would set the flag but interrupt nobody's `poll`, leaving an idle
+/// event loop asleep until the next X event.
+fn mask_term_signals(block: bool) {
+    // SAFETY: builds a two-signal set on the stack and applies it to this
+    // thread only.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        let how = if block { libc::SIG_BLOCK } else { libc::SIG_UNBLOCK };
+        libc::pthread_sigmask(how, &set, std::ptr::null_mut());
+    }
+}
 
 /// Block until the connection has an event or `deadline` passes: the one
 /// wait primitive behind the event loop's frame pacing, `fresh_timestamp`,
@@ -82,6 +130,11 @@ pub(crate) fn wait_event_deadline(
         if r < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::Interrupted {
+                // A termination signal must end even an unbounded wait;
+                // any other interruption just re-enters the poll.
+                if term_requested() {
+                    return Ok(None);
+                }
                 continue;
             }
             return Err(e.into());
@@ -254,22 +307,29 @@ pub fn run(replace: bool) -> R<()> {
     conn.create_gc(gc, root, &CreateGCAux::new())?;
 
     let (underlay, workarea) = create_underlay(&conn, &screen, root)?;
-    let menu = create_menu_windows(&conn, &screen, root, &cursors)?;
 
     let debug_scroll = std::env::var_os("SPLITWM_DEBUG_SCROLL").is_some();
 
+    let renderer = Renderer::new();
+    let quick = quick_slots(&renderer);
+
     // Become the session's notification daemon: the thread owns the D-Bus
     // connection and wakes our event loop with a `splitwm_note` ClientMessage
-    // whenever the channel has something for us.
+    // whenever the channel has something for us. Termination signals are
+    // masked across the spawn (the thread inherits the mask) so they always
+    // land on the main thread, whose poll they must interrupt.
+    install_term_handler();
+    mask_term_signals(true);
     let (note_tx, note_rx) = std::sync::mpsc::channel();
     let note_dismiss = crate::notify::spawn(note_tx);
+    mask_term_signals(false);
 
     let mut wm = Wm {
         depth: screen.root_depth,
         gc,
         keymap: HashMap::new(),
         bindings: Vec::new(),
-        renderer: Renderer::new(),
+        renderer,
         state: State::new(),
         clients: HashMap::new(),
         floats: Vec::new(),
@@ -307,7 +367,7 @@ pub fn run(replace: bool) -> R<()> {
         shm: ShmState::Untried,
         prev_frame_rect: HashMap::new(),
         widgets: Widgets::default(),
-        menu,
+        quick,
         drags: DragState {
             split: None,
             float: None,
@@ -627,48 +687,27 @@ fn create_underlay(
     Ok((underlay, workarea))
 }
 
-/// Create the override-redirect popup windows for the app launcher menu
-/// (main column + one submenu) and the `MenuUi` state that tracks them.
-/// Created hidden; mapped/moved on demand. POINTER_MOTION drives hover,
-/// BUTTON_PRESS selection, EXPOSURE repaints.
-fn create_menu_windows(
-    conn: &x11rb::rust_connection::RustConnection,
-    screen: &x11rb::protocol::xproto::Screen,
-    root: Window,
-    cursors: &Cursors,
-) -> R<MenuUi> {
-    let menu_mask = EventMask::EXPOSURE
-        | EventMask::BUTTON_PRESS
-        | EventMask::POINTER_MOTION
-        | EventMask::LEAVE_WINDOW;
-    let (menu_main, menu_sub) = (conn.generate_id()?, conn.generate_id()?);
-    for mw in [menu_main, menu_sub] {
-        conn.create_window(
-            screen.root_depth,
-            mw,
-            root,
-            0,
-            0,
-            1,
-            1,
-            0,
-            WindowClass::INPUT_OUTPUT,
-            screen.root_visual,
-            &CreateWindowAux::new()
-                .override_redirect(1)
-                .background_pixel(screen.black_pixel)
-                // Every menu row is clickable, so the hand covers the menu.
-                .cursor(cursors.hand)
-                .event_mask(menu_mask),
-        )?;
-    }
-    Ok(MenuUi {
-        tree: crate::menu::build(),
-        state: MenuState::Closed,
-        main: MenuColumn::new(menu_main),
-        sub: MenuColumn::new(menu_sub),
-        icon_cache: HashMap::new(),
-    })
+/// Resolve the taskbar quick-launch entries: each `theme::QUICK` command
+/// plus its icon, decoded and quantized onto the chrome palette once here
+/// (startup) rather than per frame. A missing icon falls back to the
+/// entry's first label letter, like a taskbar tile with no `_NET_WM_ICON`.
+fn quick_slots(renderer: &Renderer) -> Vec<QuickSlot> {
+    crate::launch::quick_launches()
+        .into_iter()
+        .map(|q| {
+            let icon = q
+                .icon
+                .as_deref()
+                .and_then(crate::launch::find_icon_file)
+                .and_then(|p| crate::icon::load_png(&p))
+                .map(|img| std::rc::Rc::new(crate::icon::quantize(renderer.palette(), &img)));
+            QuickSlot {
+                cmd: q.cmd,
+                icon,
+                label: q.label.chars().next().unwrap_or('?'),
+            }
+        })
+        .collect()
 }
 
 /// Finish startup once `wm` is fully constructed: wire up keybindings,
@@ -703,7 +742,7 @@ fn startup_adopt_and_arrange(wm: &mut Wm, root: Window) -> R<()> {
     // id must match the dock title, e.g. cozyui.desktop), unless a previous
     // WM already handed a running one over.
     if wm.dock.docked.is_none() {
-        match crate::menu::desktop_entry_cmd(&wm.dock.title) {
+        match crate::launch::desktop_entry_cmd(&wm.dock.title) {
             Some(cmd) => wm.spawn(&cmd),
             None => eprintln!(
                 "splitwm: no {}.desktop entry found; not autostarting the dock",
@@ -752,7 +791,7 @@ fn event_loop(wm: &mut Wm) -> R<()> {
     // software recomposites), so both scroll bursts and layout animations
     // are paced to this.
     const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
-    while wm.running {
+    while wm.running && !term_requested() {
         wm.conn.flush()?;
         let frame_start = std::time::Instant::now();
         // Collect a whole batch: block for one event, then drain everything the
@@ -766,7 +805,9 @@ fn event_loop(wm: &mut Wm) -> R<()> {
         if batch.is_empty() && wm.anim.is_none() {
             match wait_event_deadline(&wm.conn, None)? {
                 Some(ev) => batch.push(ev),
-                None => unreachable!("no deadline was given"),
+                // Without a deadline, `None` only means a termination
+                // signal arrived; exit so `run` restores hidden windows.
+                None => return Ok(()),
             }
         }
         while let Some(ev) = wm.conn.poll_for_event()? {
@@ -868,8 +909,9 @@ impl Wm {
         self.workarea
     }
 
-    /// Height reserved at the bottom for the window bar. Always present so the
-    /// launcher "+" at its right edge is reachable even with no windows open.
+    /// Height reserved at the bottom for the window bar. Always present so
+    /// the quick-launch icons at its right end are reachable even with no
+    /// windows open.
     pub(crate) const fn taskbar_h() -> i32 {
         theme::TASKBAR_H
     }

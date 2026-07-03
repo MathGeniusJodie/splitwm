@@ -462,58 +462,57 @@ impl Renderer {
         Some(fb)
     }
 
-    /// Decode a wallpaper image — PNG via pixel-graphics, or JPEG — into RGBA
-    /// pixels. Format is sniffed from the file's magic bytes, not its
-    /// extension.
+    /// Decode a wallpaper image into RGBA pixels. PNGs decode natively via
+    /// pixel-graphics; anything else (JPEG, WebP, …) is converted to PNG
+    /// bytes by ImageMagick first, then fed through the same size-checked
+    /// native decode. Format is sniffed from the file's magic bytes, not
+    /// its extension.
     fn decode_image(path: &str) -> Option<(usize, usize, Vec<Rgba>)> {
+        const PNG_SIG: [u8; 4] = [0x89, b'P', b'N', b'G'];
+        let bytes = std::fs::read(path).ok()?;
+        let bytes = if bytes.starts_with(&PNG_SIG) {
+            bytes
+        } else {
+            Self::magick_to_png(path)?
+        };
         // Widest wallpaper dimension worth decoding; a hostile header can
         // otherwise demand a multi-gigabyte allocation (and an O(w*h)
-        // dither pass) before the size is ever looked at.
+        // dither pass) before the size is ever looked at. Checked on the
+        // PNG's declared dimensions, before the decoder allocates.
         const MAX_DIM: usize = 16_384;
-        let bytes = std::fs::read(path).ok()?;
-        if !bytes.starts_with(&[0xff, 0xd8]) {
-            let (dw, dh) = crate::icon::png_declared_dims(&bytes)?;
-            if dw as usize > MAX_DIM || dh as usize > MAX_DIM {
-                return None;
+        let (dw, dh) = crate::icon::png_declared_dims(&bytes)?;
+        if dw as usize > MAX_DIM || dh as usize > MAX_DIM {
+            return None;
+        }
+        decode_png_bytes(&bytes).ok()
+    }
+
+    /// Convert a non-PNG wallpaper to PNG bytes with ImageMagick (`magick`,
+    /// falling back to the IM6 `convert` name), so one native decode path
+    /// handles every format — including its pre-decode declared-size check.
+    /// Runs once at startup/root-resize on a user-chosen file; a missing
+    /// ImageMagick just means no wallpaper, with a hint on stderr.
+    fn magick_to_png(path: &str) -> Option<Vec<u8>> {
+        for prog in ["magick", "convert"] {
+            match std::process::Command::new(prog)
+                .arg(path)
+                .arg("png:-")
+                .output()
+            {
+                Ok(out) if out.status.success() => return Some(out.stdout),
+                Ok(out) => {
+                    eprintln!(
+                        "splitwm: {prog} failed on wallpaper {path}: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    );
+                    return None;
+                }
+                // Not installed under this name; try the next.
+                Err(_) => {}
             }
-            // Decode the bytes already read and size-checked — re-reading
-            // the path would decode whatever the file holds *now*, not what
-            // was validated.
-            return decode_png_bytes(&bytes).ok();
         }
-        let mut dec = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&bytes));
-        // Headers first: reject oversized dimensions before `decode`
-        // allocates the pixel buffer.
-        dec.decode_headers().ok()?;
-        let (w, h) = dec.dimensions()?;
-        if w > MAX_DIM || h > MAX_DIM {
-            return None;
-        }
-        let data = dec.decode().ok()?;
-        // Guard against a degenerate/truncated decode: zero dimensions or a
-        // pixel buffer shorter than w*h would panic downstream (indexing,
-        // slicing) if allowed through.
-        if w == 0 || h == 0 {
-            return None;
-        }
-        // Grayscale JPEGs decode to 1 byte/pixel, colour to 3 (RGB).
-        let comps = data
-            .len()
-            .checked_div(w * h)
-            .filter(|&c| c == 1 || c == 3)?;
-        if data.len() < w * h * comps {
-            return None;
-        }
-        let pixels = data
-            .chunks_exact(comps)
-            .map(|px| Rgba {
-                r: px[0],
-                g: px[comps / 2],
-                b: px[comps - 1],
-                a: 255,
-            })
-            .collect();
-        Some((w, h, pixels))
+        eprintln!("splitwm: non-PNG wallpaper {path} needs ImageMagick (magick/convert) installed");
+        None
     }
 
     /// A screen-sized framebuffer initialised with the wallpaper (or the
@@ -916,7 +915,7 @@ const ICON_CACHE_CAP: usize = 256;
 
 /// Insert into a cache map, wholesale-clearing it first once it reaches
 /// `cap`: the shared "bounded in practice, but nothing should grow without
-/// a lid" policy of every cache here and in `menu` (entries are cheap to
+/// a lid" policy of every cache here and in `launch` (entries are cheap to
 /// recompute, so occasional total eviction beats per-entry bookkeeping).
 /// The clear discards *live* entries along with dead ones, so a working set
 /// hovering at `cap` re-renders everything on the frame after each clear —
@@ -961,6 +960,14 @@ pub fn draw_plus(fb: &mut Framebuffer, cx: i32, cy: i32, sz: i32) {
     let arm = (sz * PLUS_ARM_PCT / 100).max(2);
     fill(fb, cx - arm, cy - 1, 2 * arm, 2, palette_color::CREAM);
     fill(fb, cx - 1, cy - arm, 2, 2 * arm, palette_color::CREAM);
+}
+
+/// Draw the vertical pill separating the taskbar's window tiles from its
+/// quick-launch icons: a cream rounded bar, corners notched pixel-art style
+/// like the tiles around it.
+pub fn draw_taskbar_sep(fb: &mut Framebuffer, r: crate::tree::Rect) {
+    fill(fb, r.x + 1, r.y, r.w - 2, r.h, palette_color::CREAM);
+    fill(fb, r.x, r.y + 2, r.w, r.h - 4, palette_color::CREAM);
 }
 
 /// Inset of the diagonal cross's endpoints from the badge's corners, as a
@@ -1083,140 +1090,6 @@ impl Renderer {
     }
 }
 
-// --- application launcher menu ---
-
-use crate::menu::{frame_size, MENU_BORDER, MENU_ROW_H};
-
-const MENU_PAD_X: i32 = 12;
-const MENU_ARROW_W: i32 = 16;
-const MENU_ICON_SZ: i32 = 16;
-const MENU_ICON_GAP: i32 = 8;
-
-/// One menu column's *visible* row slice, bundled for `draw_menu`.
-pub struct MenuView<'a> {
-    /// The rows to draw (label, action, icon name in one record).
-    pub rows: &'a [crate::menu::Row],
-    /// The rows' *resolved* icons, cut from the same range by the caller
-    /// (`Wm::paint_column`) — per-open view state, so it can't live on the
-    /// rows themselves.
-    pub icons: &'a [Option<Rc<Icon>>],
-    /// Inner content width (shared across a menu + submenu so they line up).
-    pub content_w: i32,
-    /// Hovered row, relative to the visible slice.
-    pub hi: Option<usize>,
-    /// Whether labels share the indented icon column — decided over the
-    /// *whole* column, not the visible slice, so scrolling a column whose
-    /// icons are unevenly distributed doesn't shift its labels sideways.
-    pub icon_col: bool,
-}
-
-impl Renderer {
-    /// Pixel width of a left-aligned string in the UI font. Without a font,
-    /// a rough estimate keeps menu geometry sane.
-    fn text_width(&self, s: &str) -> i32 {
-        match &self.font {
-            Some(font) => font.text_width(s) as i32,
-            None => 8 * s.chars().count() as i32,
-        }
-    }
-
-    /// Inner content width (excludes the black border) for a menu column.
-    /// Any submenu row reserves the trailing arrow column and any icon
-    /// reserves the leading icon column, so labels stay aligned.
-    pub fn menu_content_w(&self, rows: &[crate::menu::Row]) -> i32 {
-        let mut w = 0;
-        for r in rows {
-            w = w.max(self.text_width(&r.label));
-        }
-        let arrow = if rows.iter().any(crate::menu::Row::arrow) {
-            MENU_ARROW_W
-        } else {
-            0
-        };
-        let icon = if rows.iter().any(|r| r.icon.is_some()) {
-            MENU_ICON_SZ + MENU_ICON_GAP
-        } else {
-            0
-        };
-        w + 2 * MENU_PAD_X + arrow + icon
-    }
-
-    /// Render a menu column's visible rows to its own framebuffer.
-    pub fn draw_menu(&self, v: &MenuView) -> Framebuffer {
-        let &MenuView {
-            rows,
-            icons,
-            content_w,
-            hi,
-            icon_col,
-        } = v;
-        let (fw, fh) = frame_size(rows.len() as i32, content_w);
-        let (w, h) = (fw.max(1) as usize, fh.max(1) as usize);
-        let mut fb = Framebuffer::new(w, h, palette_color::BLACK);
-        let b = MENU_BORDER;
-        let cw = content_w;
-        for (i, row) in rows.iter().enumerate() {
-            let ry = b + i as i32 * MENU_ROW_H;
-            if matches!(row.item, crate::menu::Item::Separator) {
-                // Faint divider line centred in the row.
-                fill(
-                    &mut fb,
-                    b + 4,
-                    ry + MENU_ROW_H / 2,
-                    cw - 8,
-                    1,
-                    palette_color::GUNMETAL,
-                );
-                continue;
-            }
-            if Some(i) == hi {
-                // Hover fill with 1px-notched corners.
-                fill(
-                    &mut fb,
-                    b + 3,
-                    ry + 1,
-                    cw - 6,
-                    MENU_ROW_H - 2,
-                    palette_color::GUNMETAL,
-                );
-                fill(
-                    &mut fb,
-                    b + 2,
-                    ry + 2,
-                    cw - 4,
-                    MENU_ROW_H - 4,
-                    palette_color::GUNMETAL,
-                );
-            }
-            if let Some(img) = icons.get(i).and_then(Option::as_ref) {
-                let iy = ry + (MENU_ROW_H - MENU_ICON_SZ) / 2;
-                self.draw_icon(&mut fb, img, b + MENU_PAD_X, iy, MENU_ICON_SZ);
-            }
-            if let Some(font) = &self.font {
-                let tx = b
-                    + MENU_PAD_X
-                    + if icon_col {
-                        MENU_ICON_SZ + MENU_ICON_GAP
-                    } else {
-                        0
-                    };
-                let ty = ry + (MENU_ROW_H - font.cell_h() as i32) / 2;
-                font.draw_text(&mut fb, &row.label, tx as usize, ty.max(0) as usize, self.fg);
-            }
-            if row.arrow() {
-                // Small right-pointing triangle (▸): stacked shrinking rows.
-                let ax = b + cw - MENU_ARROW_W + 4;
-                let ay = ry + MENU_ROW_H / 2;
-                for col in 0..6 {
-                    let ext = (6 - col) * 4 / 6; // half-height tapers 4 -> 0
-                    fill(&mut fb, ax + col, ay - ext, 1, 2 * ext + 1, self.fg);
-                }
-            }
-        }
-        fb
-    }
-}
-
 // --- notification speech bubbles ---
 
 /// 9-slice caps of `bubble.png` (matching cozyui's), measured on the
@@ -1234,6 +1107,15 @@ const NOTE_TEXT_MAX_W: usize = 280;
 const NOTE_MAX_LINES: usize = 8;
 
 impl Renderer {
+    /// Pixel width of a left-aligned string in the UI font. Without a font,
+    /// a rough estimate keeps bubble geometry sane.
+    fn text_width(&self, s: &str) -> i32 {
+        match &self.font {
+            Some(font) => font.text_width(s) as i32,
+            None => 8 * s.chars().count() as i32,
+        }
+    }
+
     /// Render one notification as a speech bubble: summary (bold) then body,
     /// wrapped, on the 9-slice-stretched bubble sprite. The framebuffer is
     /// exactly the popup window's size; pixels outside the bubble stay

@@ -7,7 +7,7 @@ use x11rb::protocol::xproto::{
     Allow, ButtonPressEvent, ButtonReleaseEvent, ChangeWindowAttributesAux, ConfigWindow,
     ConfigureNotifyEvent, ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, EventMask,
     ExposeEvent, InputFocus, KeyPressEvent, MapRequestEvent, Mapping, MappingNotifyEvent, ModMask,
-    MotionNotifyEvent, UnmapNotifyEvent, Window,
+    MotionNotifyEvent, UnmapNotifyEvent,
 };
 use x11rb::protocol::Event;
 
@@ -30,8 +30,9 @@ enum Hit {
     TaskbarClose(Win),
     /// A taskbar tile body.
     TaskbarTile(Win),
-    /// The launcher "+" at the right end of the taskbar.
-    TaskbarPlus,
+    /// A quick-launch icon at the right end of the taskbar (`Wm::quick`
+    /// index).
+    QuickLaunch(usize),
     /// A leaf's titlebar tab.
     Tab(NodeId),
     /// A boundary/edge "+" insert button (root-children insert index).
@@ -155,9 +156,10 @@ impl Wm {
     /// We only ever render the latest pointer position per batch.
     pub(crate) fn handle_batch(&mut self, batch: Vec<Event>) -> R<()> {
         // Coalesced per *window*, not one global slot: a batch can span a
-        // window crossing (e.g. menu -> underlay), and keeping only the very
-        // last motion would drop the final hover update on the window left
-        // behind. One pointer means this stays at most 2-3 entries.
+        // window crossing (e.g. a float frame -> underlay), and keeping only
+        // the very last motion would drop the final hover update on the
+        // window left behind. One pointer means this stays at most 2-3
+        // entries.
         let mut pending_motion: Vec<MotionNotifyEvent> = Vec::new();
         let coalesce = |pending: &mut Vec<MotionNotifyEvent>, e: MotionNotifyEvent| match pending
             .iter_mut()
@@ -170,10 +172,6 @@ impl Wm {
         // scroll + arrange, for the same reason motion is coalesced: a swipe
         // reports far faster than we can recomposite the whole screen.
         let mut pending_hscroll = 0.0f64;
-        // Menu wheel detents, coalesced per column for the same reason:
-        // each application repaints and blits the whole visible column, and
-        // only the batch's final scroll position is ever visible.
-        let mut pending_menu_scroll: Vec<(Window, i32)> = Vec::new();
         for ev in batch {
             match ev {
                 Event::MotionNotify(e) => {
@@ -206,17 +204,6 @@ impl Wm {
                 // receive their own copies (these only reach us over the
                 // underlay/root, never from inside a client window).
                 Event::ButtonPress(e) if (4..=7).contains(&e.detail) => {
-                    // Vertical wheel over an open menu column scrolls its
-                    // rows (a column taller than the screen clamps and
-                    // scrolls; see `on_menu_scroll`).
-                    if self.menu.is_open() && self.is_menu_window(e.event) && matches!(e.detail, 4 | 5) {
-                        let d = if e.detail == 5 { 1 } else { -1 };
-                        match pending_menu_scroll.iter_mut().find(|(w, _)| *w == e.event) {
-                            Some((_, acc)) => *acc += d,
-                            None => pending_menu_scroll.push((e.event, d)),
-                        }
-                        continue;
-                    }
                     if self.hscroll.is_empty() {
                         match e.detail {
                             6 => pending_hscroll -= 1.0,
@@ -230,13 +217,9 @@ impl Wm {
                 _ => {}
             }
             // Flush pending motion/scroll before any other event so ordering
-            // (e.g. a button release ending a drag, or a click whose row hit
-            // depends on the menu's scroll position) is preserved.
+            // (e.g. a button release ending a drag) is preserved.
             for m in pending_motion.drain(..) {
                 contain(self.on_motion(&m), "event")?;
-            }
-            for (win, d) in pending_menu_scroll.drain(..) {
-                contain(self.on_menu_scroll(win, d), "event")?;
             }
             if pending_hscroll != 0.0 {
                 if self.debug_scroll {
@@ -251,9 +234,6 @@ impl Wm {
         }
         for m in pending_motion {
             contain(self.on_motion(&m), "event")?;
-        }
-        for (win, d) in pending_menu_scroll {
-            contain(self.on_menu_scroll(win, d), "event")?;
         }
         if pending_hscroll != 0.0 {
             contain(self.apply_hscroll(pending_hscroll), "event")?;
@@ -310,12 +290,6 @@ impl Wm {
                     || e.atom == u32::from(x11rb::protocol::xproto::AtomEnum::WM_NAME) =>
             {
                 self.on_dock_identity_change(e.window, e.atom)?;
-            }
-            // Pointer left a menu window: retire its hover highlight (the
-            // main column keeps highlighting an open category so the
-            // submenu still reads as attached to its row).
-            Event::LeaveNotify(e) if self.menu.is_open() && self.is_menu_window(e.event) => {
-                self.on_menu_leave(e.event)?;
             }
             // Keyboard layout / modifier mapping changed: rebind everything.
             Event::MappingNotify(e) => self.on_mapping(e)?,
@@ -755,21 +729,6 @@ impl Wm {
                     self.close_client(c)?;
                 }
             }
-            Action::Quit => {
-                self.running = false;
-                return Ok(());
-            }
-            // Media keys touch no layout state: no commit_layout, no
-            // animation. Off-thread, so a wedged backlight device can't
-            // stall input handling.
-            Action::BrightnessUp => {
-                adjust_brightness(5);
-                return Ok(());
-            }
-            Action::BrightnessDown => {
-                adjust_brightness(-5);
-                return Ok(());
-            }
         }
         if let Some(rect) = pre_split {
             self.prev_frame_rect
@@ -893,17 +852,6 @@ impl Wm {
                 return Ok(());
             }
         }
-        // Clicks inside the launcher menu select an item; clicks elsewhere
-        // dismiss it before falling through to normal handling.
-        if self.menu.is_open() {
-            if self.is_menu_window(e.event) {
-                if e.detail == 1 {
-                    self.on_menu_click(e.event, i32::from(e.event_x), i32::from(e.event_y))?;
-                }
-                return Ok(());
-            }
-            self.close_menu()?;
-        }
         // Clicks on the underlay: one shared, priority-ordered hit-test
         // (`hit_test`) resolves the target; `hover_cursor` consumes the same
         // ordering, so click dispatch and cursor feedback stay in lockstep.
@@ -939,11 +887,14 @@ impl Wm {
                     self.animate = true;
                     return self.bring_into_layout(win);
                 }
-                // Taskbar "+" opens the app launcher into the focused split.
-                Hit::TaskbarPlus => {
-                    let leaf = self.state.focused_leaf_valid();
-                    let pr = self.widgets.taskbar_plus;
-                    return self.open_menu(leaf, pr.x + pr.w, pr.y);
+                // A quick-launch icon: spawn its command. The new window
+                // lands wherever a normal map lands (the focused split or
+                // the taskbar).
+                Hit::QuickLaunch(i) => {
+                    if let Some(cmd) = self.quick.get(i).map(|q| q.cmd.clone()) {
+                        self.spawn(&cmd);
+                    }
+                    return Ok(());
                 }
                 // Click a title (tab) or an empty split's body to focus it.
                 Hit::Tab(leaf) | Hit::LeafBody(leaf) => {
@@ -1020,9 +971,6 @@ impl Wm {
     }
 
     fn on_motion(&mut self, e: &MotionNotifyEvent) -> R<()> {
-        if self.menu.is_open() && self.is_menu_window(e.event) {
-            return self.on_menu_motion(e.event, i32::from(e.event_x), i32::from(e.event_y));
-        }
         if let Some(fd) = self.drags.float {
             self.move_float(
                 fd.win,
@@ -1115,8 +1063,14 @@ impl Wm {
         {
             return Hit::TaskbarTile(win);
         }
-        if rect_contains(self.widgets.taskbar_plus, mx, my) {
-            return Hit::TaskbarPlus;
+        if let Some(i) = self
+            .widgets
+            .quick_regions
+            .iter()
+            .find(|(r, _)| rect_contains(*r, mx, my))
+            .map(|(_, i)| *i)
+        {
+            return Hit::QuickLaunch(i);
         }
         if let Some(leaf) = self
             .widgets
@@ -1194,7 +1148,7 @@ impl Wm {
             }
             Hit::TaskbarClose(_)
             | Hit::TaskbarTile(_)
-            | Hit::TaskbarPlus
+            | Hit::QuickLaunch(_)
             | Hit::Tab(_)
             | Hit::Plus(_) => c.hand,
             Hit::Handle(b) => {
@@ -1244,11 +1198,7 @@ impl Wm {
     fn on_expose(&mut self, e: ExposeEvent) -> R<()> {
         // The underlay needs no handling here: its composited image is its
         // `background_pixmap`, so the server repaints exposed areas itself.
-        if self.menu.is_open() && e.window == self.menu.main.win {
-            self.paint_column(false)?;
-        } else if self.menu.is_open() && e.window == self.menu.sub.win {
-            self.paint_column(true)?;
-        } else if self.floats.iter().any(|f| f.frame == e.window) {
+        if self.floats.iter().any(|f| f.frame == e.window) {
             self.paint_float_frame(e.window)?;
         } else {
             self.paint_note_win(e.window)?;
@@ -1272,43 +1222,3 @@ pub(super) fn contain(r: R<()>, what: &str) -> R<()> {
     }
 }
 
-/// Step every `/sys/class/backlight` device by `pct` percent of its maximum,
-/// clamped to `[1, max]` so the panel never turns fully off. Writing the
-/// sysfs file needs group write access (udev rule + `video` group).
-///
-/// Runs on a spawned thread: sysfs reads/writes are synchronous kernel I/O,
-/// and a wedged backlight device would otherwise stall the single event-loop
-/// thread — all input handling — for as long as the driver blocks. One
-/// short-lived thread per keypress; concurrent steps may clobber each
-/// other's read-modify-write, which at worst loses a repeat-step, never the
-/// clamp.
-fn adjust_brightness(pct: i64) {
-    std::thread::spawn(move || adjust_brightness_sync(pct));
-}
-
-fn adjust_brightness_sync(pct: i64) {
-    let Ok(entries) = std::fs::read_dir("/sys/class/backlight") else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let dir = entry.path();
-        let read = |name: &str| -> Option<i64> {
-            std::fs::read_to_string(dir.join(name))
-                .ok()?
-                .trim()
-                .parse()
-                .ok()
-        };
-        let (Some(cur), Some(max)) = (read("brightness"), read("max_brightness")) else {
-            continue;
-        };
-        // Integer percent of a small `max_brightness` rounds to zero; step
-        // by at least one unit so the key always does something.
-        let step = max * pct / 100;
-        let step = if step == 0 { pct.signum() } else { step };
-        let new = (cur + step).clamp(1, max);
-        if let Err(e) = std::fs::write(dir.join("brightness"), new.to_string()) {
-            eprintln!("splitwm: brightness write to {} failed: {e}", dir.display());
-        }
-    }
-}

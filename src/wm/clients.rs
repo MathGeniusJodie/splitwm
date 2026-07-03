@@ -45,7 +45,7 @@ impl Wm {
     pub(crate) fn manage_existing_windows(&mut self) -> R<()> {
         let children = self.conn.query_tree(self.root)?.reply()?.children;
         for win in children {
-            if win == self.underlay || self.is_menu_window(win) {
+            if win == self.underlay {
                 continue;
             }
             let Ok(attrs) = self.conn.get_window_attributes(win)?.reply() else {
@@ -1094,11 +1094,12 @@ impl Wm {
         Some(Rc::new(icon::quantize(self.renderer.palette(), &icon)))
     }
 
-    /// Resolve `class` against the icon theme (the same lookup the launcher
-    /// menu uses), for clients that don't provide `_NET_WM_ICON`.
+    /// Resolve `class` against the icon theme (the same lookup the taskbar
+    /// quick-launch icons use), for clients that don't provide
+    /// `_NET_WM_ICON`.
     fn theme_icon(&self, class: &str) -> Option<Rc<Icon>> {
-        let path = crate::menu::find_icon_file(class)
-            .or_else(|| crate::menu::find_icon_file(&class.to_lowercase()))?;
+        let path = crate::launch::find_icon_file(class)
+            .or_else(|| crate::launch::find_icon_file(&class.to_lowercase()))?;
         let img = icon::load_png(&path)?;
         Some(Rc::new(icon::quantize(self.renderer.palette(), &img)))
     }
@@ -1260,22 +1261,19 @@ impl Wm {
                 self.conn
                     .set_input_focus(InputFocus::POINTER_ROOT, self.root, time)?;
                 self.set_net_active_window(x11rb::NONE)?;
-                self.raise_menu()?;
             }
         }
         Ok(())
     }
 
     /// The stacking order above tiled clients, bottom to top: floats, the
-    /// fullscreen window, notifications, then an open launcher menu.
-    /// `arrange` and `focus` both raise windows to the top and re-apply
-    /// this same sequence afterwards — inserting a new layer means adding
-    /// it here, once.
+    /// fullscreen window, then notifications. `arrange` and `focus` both
+    /// raise windows to the top and re-apply this same sequence afterwards
+    /// — inserting a new layer means adding it here, once.
     pub(crate) fn apply_stacking(&self) -> R<()> {
         self.raise_floats()?;
         self.raise_fullscreen()?;
-        self.raise_notifications()?;
-        self.raise_menu()
+        self.raise_notifications()
     }
 
     /// Advertise `win` (or `x11rb::NONE`) as `_NET_ACTIVE_WINDOW` on the

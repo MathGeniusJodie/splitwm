@@ -277,10 +277,7 @@ pub mod ks {
     pub const Q: u32 = 0x71;
     pub const L: u32 = 0x6c;
     pub const C: u32 = 0x63;
-    pub const E: u32 = 0x65;
     pub const SPACE: u32 = 0x20;
-    pub const XF86_MON_BRIGHTNESS_UP: u32 = 0x1008_ff02;
-    pub const XF86_MON_BRIGHTNESS_DOWN: u32 = 0x1008_ff03;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -299,12 +296,9 @@ pub enum Action {
     SpawnTerminal,
     /// Launch rofi in desktop-application (drun) mode.
     SpawnLauncher,
-    Quit,
     /// Ask the focused window to close via `WM_DELETE_WINDOW`, falling back
     /// to disconnecting its client if it doesn't speak the protocol.
     CloseWindow,
-    BrightnessUp,
-    BrightnessDown,
 }
 
 /// Raw X modifier bits, so this module needs no x11rb dependency.
@@ -314,9 +308,9 @@ pub const SHIFT: u16 = 0x01; // ModMask::SHIFT
 /// The key bindings `Wm::grab_keys` installs: (modifier mask, keysym, action).
 /// Keys are named for the divider the user sees, actions for the branch
 /// direction: Mod4+V draws a Vertical divider, i.e. an H-branch (side-by-side
-/// children), and vice versa. Quit deliberately does *not* share a base key
-/// with Close: one sticky Shift must not turn "close a split" into "end the
-/// session".
+/// children), and vice versa. There is deliberately no quit binding: the WM
+/// ends its session only by being replaced (another WM's `--replace` taking
+/// the manager selection) or killed, never by a stray chord.
 pub const BINDINGS: &[(u16, u32, Action)] = &[
     (MOD4, ks::RETURN, Action::SpawnTerminal),
     (MOD4, ks::SPACE, Action::SpawnLauncher),
@@ -335,10 +329,7 @@ pub const BINDINGS: &[(u16, u32, Action)] = &[
     (MOD4 | SHIFT, ks::L, Action::Shrink),
     (MOD4, ks::EQUAL, Action::Grow),
     (MOD4, ks::MINUS, Action::Shrink),
-    (MOD4 | SHIFT, ks::E, Action::Quit),
     (MOD4 | SHIFT, ks::C, Action::CloseWindow),
-    (0, ks::XF86_MON_BRIGHTNESS_UP, Action::BrightnessUp),
-    (0, ks::XF86_MON_BRIGHTNESS_DOWN, Action::BrightnessDown),
 ];
 
 // --- launcher quick entries ---

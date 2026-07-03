@@ -1,108 +1,25 @@
-//! Application launcher menu: scans freedesktop `.desktop` entries and groups
-//! them by main category, so clicking a leaf's "+" opens a cascading app menu
-//! (quick items + category submenus). Pure data + layout; the X windows and
-//! rendering live in `wm`.
+//! App launching support: resolving the taskbar quick-launch entries
+//! (`theme::QUICK`) to commands and icons, resolving `.desktop` entries to
+//! spawnable commands (the dock autostart), and the minimal freedesktop
+//! icon-file lookup behind both. Pure data; the X windows and rendering
+//! live in `wm`.
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-/// One launchable application.
-#[derive(Clone)]
-pub struct App {
-    pub name: String,
-    pub exec: String,
-    /// `Icon=` value: a themed icon name or an absolute path.
+/// One quick-launch taskbar entry, resolved from `theme::QUICK`.
+pub struct QuickLaunch {
+    pub label: &'static str,
+    /// The command to spawn (the entry's env override or its default).
+    pub cmd: String,
+    /// Icon name/path for `find_icon_file`, when one could be inferred.
     pub icon: Option<String>,
 }
 
-/// What activating a menu row does.
-#[derive(Clone)]
-pub enum Item {
-    /// Spawn this command (appended into the target leaf).
-    Launch(String),
-    /// Open the submenu with this index.
-    Submenu(usize),
-    /// Inert divider row.
-    Separator,
-}
-
-/// One menu row: its label, what activating it does, and its icon. A single
-/// struct rather than parallel per-fact vectors, so a row's facts can't
-/// desync in length or pairing.
-pub struct Row {
-    pub label: String,
-    pub item: Item,
-    /// Icon name/path (from the desktop entry's `Icon=`), resolved and
-    /// decoded lazily by `wm` when the row first becomes visible.
-    pub icon: Option<String>,
-}
-
-impl Row {
-    /// Rows that open a submenu get a trailing ▸ arrow — derived from
-    /// `item` rather than stored, so the two can't disagree.
-    pub fn arrow(&self) -> bool {
-        matches!(self.item, Item::Submenu(_))
-    }
-}
-
-/// A single column of rows (the main menu or one category submenu).
-pub struct Menu {
-    pub rows: Vec<Row>,
-}
-
-impl Menu {
-    fn new() -> Self {
-        Self { rows: Vec::new() }
-    }
-
-    fn push(&mut self, label: String, item: Item, icon: Option<String>) {
-        self.rows.push(Row { label, item, icon });
-    }
-}
-
-// Menu-frame geometry, shared by the renderer (drawing) and `wm` (window
-// placement and row hit-testing).
-pub const MENU_ROW_H: i32 = 26;
-pub const MENU_BORDER: i32 = 8;
-
-/// Outer (window) size of a menu frame holding `rows` rows of `content_w`.
-pub const fn frame_size(rows: i32, content_w: i32) -> (i32, i32) {
-    (
-        content_w + 2 * MENU_BORDER,
-        rows * MENU_ROW_H + 2 * MENU_BORDER,
-    )
-}
-
-/// The whole menu tree: row 0.. of `main` may reference `subs` by index.
-pub struct MenuTree {
-    pub main: Menu,
-    pub subs: Vec<Menu>,
-}
-
-/// freedesktop main-category → display name, in display order.
-const CATEGORIES: &[(&str, &str)] = &[
-    ("AudioVideo", "AudioVideo"),
-    ("Development", "Development"),
-    ("Education", "Education"),
-    ("Game", "Game"),
-    ("Graphics", "Graphics"),
-    ("Network", "Network"),
-    ("Office", "Office"),
-    ("Settings", "Settings"),
-    ("System", "System"),
-    ("Utility", "Utility"),
-];
-
-fn first_main_category(cats: &str) -> String {
-    for c in cats.split(';') {
-        for (key, disp) in CATEGORIES {
-            if c == *key {
-                return (*disp).to_string();
-            }
-        }
-    }
-    "Other".to_string()
+/// A scanned `.desktop` application: just the facts icon inference needs.
+struct App {
+    exec: String,
+    icon: String,
 }
 
 /// Strip desktop-entry field codes (`%f`, `%U`, …) from an Exec line;
@@ -132,11 +49,11 @@ fn clean_exec(exec: &str) -> String {
     out.trim().to_string()
 }
 
-/// Parse one `.desktop` file's `[Desktop Entry]` group. Returns
-/// `(name, exec, category, icon)` when it is a displayable Application.
-fn parse_desktop(text: &str) -> Option<(String, String, String, Option<String>)> {
+/// Parse one `.desktop` file's `[Desktop Entry]` group into `(exec, icon)`
+/// when it is a displayable Application with both set.
+fn parse_desktop(text: &str) -> Option<(String, String)> {
     let mut in_entry = false;
-    let (mut name, mut exec, mut cats, mut icon) = (None, None, String::new(), None);
+    let (mut exec, mut icon): (Option<String>, Option<String>) = (None, None);
     let (mut no_display, mut hidden, mut is_app) = (false, false, true);
     for line in text.lines() {
         let line = line.trim();
@@ -151,9 +68,7 @@ fn parse_desktop(text: &str) -> Option<(String, String, String, Option<String>)>
             continue;
         };
         match k.trim() {
-            "Name" if name.is_none() => name = Some(v.trim().to_string()),
             "Exec" if exec.is_none() => exec = Some(clean_exec(v.trim())),
-            "Categories" => cats = v.trim().to_string(),
             "Icon" if icon.is_none() => icon = Some(v.trim().to_string()),
             "NoDisplay" => no_display = v.trim().eq_ignore_ascii_case("true"),
             "Hidden" => hidden = v.trim().eq_ignore_ascii_case("true"),
@@ -164,16 +79,9 @@ fn parse_desktop(text: &str) -> Option<(String, String, String, Option<String>)>
     if no_display || hidden || !is_app {
         return None;
     }
-    let exec = exec?;
-    if exec.is_empty() {
-        return None;
-    }
-    Some((
-        name?,
-        exec,
-        first_main_category(&cats),
-        icon.filter(|i| !i.is_empty()),
-    ))
+    let exec = exec.filter(|e| !e.is_empty())?;
+    let icon = icon.filter(|i| !i.is_empty())?;
+    Some((exec, icon))
 }
 
 /// Standard XDG data directories (per-user first, so it wins).
@@ -210,22 +118,22 @@ fn app_dirs() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Icon sizes worth loading for 16px menu rows, best first: native 16, then
-/// clean or near-clean downscales.
+/// Icon sizes worth loading for taskbar-tile icons, best (largest useful)
+/// first: the tiles draw the icon at ~36px, so a clean downscale from 48
+/// beats a blocky 16px upscale.
 const ICON_SIZES: &[&str] = &[
-    "16x16", "32x32", "24x24", "22x22", "48x48", "64x64", "128x128", "256x256",
+    "48x48", "64x64", "32x32", "128x128", "256x256", "24x24", "22x22", "16x16",
 ];
 
-/// Resolve a desktop-entry `Icon=` value to a PNG file. Absolute paths are
-/// used as-is; names are looked up in the hicolor theme's `apps` dirs and
-/// `pixmaps` (a deliberately minimal cut of the freedesktop icon-theme
-/// lookup — no theme inheritance, PNG only).
+/// Resolve an `Icon=` value to a PNG file. Absolute paths are used as-is;
+/// names are looked up in the hicolor theme's `apps` dirs and `pixmaps` (a
+/// deliberately minimal cut of the freedesktop icon-theme lookup — no theme
+/// inheritance, PNG only).
 pub fn find_icon_file(icon: &str) -> Option<std::path::PathBuf> {
-    // Repeated menu rows/redraws re-resolve the same icon names, so cache
-    // results keyed by the raw `icon` string. Hits are trusted forever
-    // (nothing uninstalls a theme mid-session), but *misses* expire: an
-    // icon theme installed while we run should start resolving without a
-    // WM restart.
+    // Repeated lookups re-resolve the same icon names, so cache results
+    // keyed by the raw `icon` string. Hits are trusted forever (nothing
+    // uninstalls a theme mid-session), but *misses* expire: an icon theme
+    // installed while we run should start resolving without a WM restart.
     const NEG_TTL: std::time::Duration = std::time::Duration::from_secs(60);
     type Entry = (Option<std::path::PathBuf>, std::time::Instant);
     static CACHE: OnceLock<Mutex<HashMap<String, Entry>>> = OnceLock::new();
@@ -273,9 +181,11 @@ fn find_icon_file_uncached(icon: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Scan every `.desktop` file once, grouped by display category and sorted.
-fn scan() -> BTreeMap<String, Vec<App>> {
-    let mut by_cat: BTreeMap<String, Vec<App>> = BTreeMap::new();
+/// Scan every `.desktop` file once into a flat app list (earlier, more
+/// user-specific dirs win per app id) — the corpus `quick_icon` infers
+/// icons from.
+fn scan() -> Vec<App> {
+    let mut apps = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for dir in app_dirs() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -289,30 +199,24 @@ fn scan() -> BTreeMap<String, Vec<App>> {
             let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            // Earlier (more user-specific) dirs win per app id.
             if !seen.insert(stem.to_string()) {
                 continue;
             }
             if let Ok(text) = std::fs::read_to_string(&p) {
-                if let Some((name, exec, cat, icon)) = parse_desktop(&text) {
-                    by_cat
-                        .entry(cat)
-                        .or_default()
-                        .push(App { name, exec, icon });
+                if let Some((exec, icon)) = parse_desktop(&text) {
+                    apps.push(App { exec, icon });
                 }
             }
         }
     }
-    for apps in by_cat.values_mut() {
-        apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    }
-    by_cat
+    apps
 }
 
 /// Resolve `<id>.desktop` from the standard application dirs into a
 /// spawnable command: its cleaned `Exec` line, prefixed with a `cd` into its
-/// `Path=` working directory when one is set. Unlike the launcher scan this
-/// ignores NoDisplay/Hidden — autostart doesn't care about menu visibility.
+/// `Path=` working directory when one is set. Unlike the quick-launch scan
+/// this ignores NoDisplay/Hidden — autostart doesn't care about launcher
+/// visibility.
 pub fn desktop_entry_cmd(id: &str) -> Option<String> {
     let file = app_dirs()
         .into_iter()
@@ -352,60 +256,39 @@ pub fn desktop_entry_cmd(id: &str) -> Option<String> {
 /// Icon name for a quick-launch command: the icon of the scanned app whose
 /// Exec starts with the same program, else the program's own name (themed
 /// icons are often named after the binary).
-fn quick_icon(by_cat: &BTreeMap<String, Vec<App>>, cmd: &str) -> Option<String> {
+fn quick_icon(apps: &[App], cmd: &str) -> Option<String> {
     let prog = cmd.split_whitespace().next()?;
     let bin = prog.rsplit('/').next()?;
-    for apps in by_cat.values() {
-        for a in apps {
-            let app_prog = a.exec.split_whitespace().next().unwrap_or("");
-            if app_prog.rsplit('/').next() == Some(bin) && a.icon.is_some() {
-                return a.icon.clone();
-            }
+    for a in apps {
+        let app_prog = a.exec.split_whitespace().next().unwrap_or("");
+        if app_prog.rsplit('/').next() == Some(bin) {
+            return Some(a.icon.clone());
         }
     }
     Some(bin.to_string())
 }
 
-/// Build the full menu tree (scans the system once).
-pub fn build() -> MenuTree {
-    let by_cat = scan();
-
-    let mut main = Menu::new();
-    let mut subs = Vec::new();
-    let mut quick_rows = Vec::new();
-    for q in crate::theme::QUICK {
-        let cmd = std::env::var(q.env).unwrap_or_else(|_| q.default.to_string());
-        let icon = quick_icon(&by_cat, &cmd);
-        quick_rows.push((q.label.to_string(), cmd, icon));
-    }
-    // Alphabetical categories with the "Other" catch-all pinned last — the
-    // BTreeMap's lexical order would drop it in the middle of the list.
-    let mut cats: Vec<_> = by_cat.into_iter().collect();
-    cats.sort_by_key(|(cat, _)| cat == "Other"); // stable: alpha order kept
-    for (cat, apps) in cats {
-        if apps.is_empty() {
-            continue;
-        }
-        let mut sub = Menu::new();
-        for a in apps {
-            sub.push(a.name, Item::Launch(a.exec), a.icon);
-        }
-        let idx = subs.len();
-        subs.push(sub);
-        main.push(cat, Item::Submenu(idx), None);
-    }
-
-    main.push(String::new(), Item::Separator, None);
-    for (label, cmd, icon) in quick_rows {
-        main.push(label, Item::Launch(cmd), icon);
-    }
-
-    MenuTree { main, subs }
+/// Resolve every `theme::QUICK` entry (env override or default command, plus
+/// an inferred icon). Scans the system's `.desktop` files once.
+pub fn quick_launches() -> Vec<QuickLaunch> {
+    let apps = scan();
+    crate::theme::QUICK
+        .iter()
+        .map(|q| {
+            let cmd = std::env::var(q.env).unwrap_or_else(|_| q.default.to_string());
+            let icon = quick_icon(&apps, &cmd);
+            QuickLaunch {
+                label: q.label,
+                cmd,
+                icon,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_exec, first_main_category, parse_desktop};
+    use super::{clean_exec, parse_desktop, quick_icon, App};
 
     #[test]
     fn clean_exec_strips_field_codes() {
@@ -425,32 +308,40 @@ mod tests {
     #[test]
     fn parses_a_normal_application() {
         let text = "[Desktop Entry]\nType=Application\nName=Foo\nExec=foo %U\nIcon=foo\nCategories=Network;WebBrowser;\n";
-        let (name, exec, cat, icon) = parse_desktop(text).unwrap();
-        assert_eq!(name, "Foo");
+        let (exec, icon) = parse_desktop(text).unwrap();
         assert_eq!(exec, "foo");
-        assert_eq!(cat, "Network");
-        assert_eq!(icon.as_deref(), Some("foo"));
+        assert_eq!(icon, "foo");
     }
 
     #[test]
     fn hidden_nodisplay_and_non_apps_are_skipped() {
         for extra in ["NoDisplay=true", "Hidden=true", "Type=Link"] {
-            let text = format!("[Desktop Entry]\nType=Application\nName=X\nExec=x\n{extra}\n");
+            let text =
+                format!("[Desktop Entry]\nType=Application\nName=X\nExec=x\nIcon=x\n{extra}\n");
             assert!(parse_desktop(&text).is_none(), "{extra} should filter");
         }
     }
 
     #[test]
     fn keys_outside_desktop_entry_group_are_ignored() {
-        let text = "[Desktop Action new]\nExec=evil\n[Desktop Entry]\nType=Application\nName=A\nExec=good\n";
-        let (_, exec, _, _) = parse_desktop(text).unwrap();
+        let text = "[Desktop Action new]\nExec=evil\n[Desktop Entry]\nType=Application\nName=A\nExec=good\nIcon=a\n";
+        let (exec, _) = parse_desktop(text).unwrap();
         assert_eq!(exec, "good");
     }
 
     #[test]
-    fn unknown_categories_fall_back_to_other() {
-        assert_eq!(first_main_category("X-Weird;Foo;"), "Other");
-        assert_eq!(first_main_category(""), "Other");
-        assert_eq!(first_main_category("WebBrowser;Network;"), "Network");
+    fn quick_icon_matches_by_binary_and_falls_back_to_it() {
+        let apps = vec![App {
+            exec: "/usr/bin/firefox --new-window".into(),
+            icon: "firefox-icon".into(),
+        }];
+        assert_eq!(
+            quick_icon(&apps, "firefox https://x").as_deref(),
+            Some("firefox-icon")
+        );
+        assert_eq!(
+            quick_icon(&apps, "alacritty -e sh").as_deref(),
+            Some("alacritty")
+        );
     }
 }

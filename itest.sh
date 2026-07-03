@@ -115,8 +115,8 @@ spawn_xterm W5 || exit 1 # displaces w4 to the taskbar
 assert_eq "displaced w4 goes Iconic" "$(wm_state "$W4")" "Iconic"
 ICONIC=$W4
 if [ "$(wm_state "$ICONIC")" = "Iconic" ]; then
-    key super+shift+e # Quit
-    wait_for "WM exits on Quit" sh -c "! kill -0 $WM_PID 2>/dev/null" && WM_PID=""
+    kill -TERM "$WM_PID" # graceful shutdown (there is no quit keybinding)
+    wait_for "WM exits on SIGTERM" sh -c "! kill -0 $WM_PID 2>/dev/null" && WM_PID=""
     wait_for "iconic client restored to Normal on WM exit" \
         sh -c "[ \"\$(xprop -display $DPY -id $ICONIC WM_STATE | sed -n 's/.*window state: //p')\" = Normal ]"
 else
