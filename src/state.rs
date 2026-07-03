@@ -2,11 +2,15 @@
 //! scroll bookkeeping — there is exactly one layout (no workspaces/tags).
 
 use crate::theme;
-use crate::tree::{Boundary, Dir, Node, NodeId, Rect, Tree, Win};
+use crate::tree::{Boundary, Child, Dir, Node, NodeId, Rect, Tree, Win};
 
 pub struct State {
     pub tree: Tree,
-    pub focused_leaf: NodeId,
+    /// Private so every write goes through `focus_leaf` (which accepts only
+    /// live leaf ids) and every read through `focused_leaf_valid` (the
+    /// focused leaf can still be *removed* by a later mutation, so reads
+    /// re-validate) — a dangling focus is never handed out.
+    focused_leaf: NodeId,
     /// Current and target scroll offsets. Private so every mutation goes
     /// through the clamping/landing methods below — `update_canvas`
     /// re-clamps both whenever the scroll range changes.
@@ -59,6 +63,16 @@ impl State {
             self.focused_leaf
         } else {
             self.tree.first_leaf(self.tree.root)
+        }
+    }
+
+    /// Point focus at `leaf`. Anything that isn't a live leaf is ignored:
+    /// callers can hold stale ids (e.g. the launcher menu's target leaf,
+    /// captured when the menu opened), and focus must never come to rest on
+    /// a node `compute` doesn't lay out.
+    pub fn focus_leaf(&mut self, leaf: NodeId) {
+        if self.tree.is_leaf(leaf) {
+            self.focused_leaf = leaf;
         }
     }
 
@@ -238,9 +252,20 @@ impl State {
     }
 
     /// Toggle a leaf's minimized flag (the layout collapses it to min size).
-    pub fn toggle_minimize(&mut self, leaf: NodeId) {
-        if let Some(l) = self.tree.leaf_mut(leaf) {
-            l.minimized = !l.minimized;
+    /// Refused for the root leaf: it has no siblings to yield space to, and
+    /// its whole-frame restore button is disabled (`parent_dir.is_none()`),
+    /// so a minimized root would be a full-screen strip with no way back.
+    /// Returns whether the flag changed.
+    pub fn toggle_minimize(&mut self, leaf: NodeId) -> bool {
+        if leaf == self.tree.root {
+            return false;
+        }
+        match self.tree.leaf_mut(leaf) {
+            Some(l) => {
+                l.minimized = !l.minimized;
+                true
+            }
+            None => false,
         }
     }
 
@@ -248,26 +273,29 @@ impl State {
 
     fn split_node(&mut self, leaf: NodeId, dir: Dir, child_a: NodeId, child_b: NodeId) {
         if let Some((parent, idx)) = self.tree.find_parent(leaf) {
-            let same_dir =
-                matches!(self.tree.get(parent), Some(Node::Branch { dir: d, .. }) if *d == dir);
+            let same_dir = self.tree.branch(parent).is_some_and(|b| b.dir == dir);
             if same_dir {
-                if let Some(Node::Branch {
-                    children, ratios, ..
-                }) = self.tree.get_mut(parent)
-                {
-                    let old_r = ratios[idx];
-                    ratios[idx] = old_r * theme::SPLIT_RATIO;
-                    ratios.insert(idx + 1, old_r * (1.0 - theme::SPLIT_RATIO));
-                    children[idx] = child_a;
-                    children.insert(idx + 1, child_b);
+                if let Some(b) = self.tree.branch_mut(parent) {
+                    let old_r = b.children()[idx].ratio;
+                    b.children_mut()[idx] = Child {
+                        node: child_a,
+                        ratio: old_r * theme::SPLIT_RATIO,
+                    };
+                    b.insert(
+                        idx + 1,
+                        Child {
+                            node: child_b,
+                            ratio: old_r * (1.0 - theme::SPLIT_RATIO),
+                        },
+                    );
                 }
                 return;
             }
             let branch = self
                 .tree
                 .make_branch(dir, theme::SPLIT_RATIO, child_a, child_b);
-            if let Some(Node::Branch { children, .. }) = self.tree.get_mut(parent) {
-                children[idx] = branch;
+            if let Some(b) = self.tree.branch_mut(parent) {
+                b.children_mut()[idx].node = branch;
             }
         } else {
             // leaf is root
@@ -317,17 +345,13 @@ impl State {
         // if it is empty, otherwise onto the taskbar.
         let client = self.tree.leaf(leaf).and_then(|l| l.client);
         let dest_child = {
-            let children = match self.tree.get(parent) {
-                Some(Node::Branch { children, .. }) => children.clone(),
-                _ => return false,
-            };
-            if children.len() < 2 {
-                // Degenerate single-child branch: no sibling to fall back
-                // to (and `children[1]` below would be out of bounds).
+            let Some(b) = self.tree.branch(parent) else {
                 return false;
-            }
+            };
+            // A branch always has a sibling to fall back to (`Branch` holds
+            // at least two children by construction).
             let dest_idx = if idx > 0 { idx - 1 } else { 1 };
-            self.tree.first_leaf(children[dest_idx])
+            self.tree.first_leaf(b.children()[dest_idx].node)
         };
         if let Some(c) = client {
             let dest_free = self
@@ -357,27 +381,20 @@ impl State {
     /// the nearest surviving neighbour.
     fn close_focused_nary(&mut self, parent: NodeId, idx: usize, leaf: NodeId) {
         // n-ary: remove this child, redistribute its ratio.
-        if let Some(Node::Branch {
-            children, ratios, ..
-        }) = self.tree.get_mut(parent)
-        {
-            let removed = ratios[idx];
-            children.remove(idx);
-            ratios.remove(idx);
-            let remaining: f64 = ratios.iter().sum();
+        let mut new_focus = self.focused_leaf;
+        if let Some(b) = self.tree.branch_mut(parent) {
+            let removed = b.remove(idx).ratio;
+            let remaining: f64 = b.children().iter().map(|c| c.ratio).sum();
             if remaining > 0.0 {
-                for r in ratios.iter_mut() {
-                    *r += removed * *r / remaining;
+                for c in b.children_mut() {
+                    c.ratio += removed * c.ratio / remaining;
                 }
             }
+            let fb = idx.min(b.children().len() - 1);
+            new_focus = b.children()[fb].node;
         }
         self.tree.remove_node(leaf);
-        let children = match self.tree.get(parent) {
-            Some(Node::Branch { children, .. }) => children.clone(),
-            _ => unreachable!(),
-        };
-        let fb = idx.min(children.len() - 1);
-        self.focused_leaf = self.tree.first_leaf(children[fb]);
+        self.focused_leaf = self.tree.first_leaf(new_focus);
     }
 
     /// Binary close path: collapse `parent`, the surviving sibling (at index
@@ -386,9 +403,9 @@ impl State {
     /// attachment, resolved by `close_focused` before any relocation.
     fn close_focused_binary(&mut self, parent: NodeId, idx: usize, attach: Attach, leaf: NodeId) {
         // binary: collapse parent, sibling takes its place.
-        let sibling = match self.tree.get(parent) {
-            Some(Node::Branch { children, .. }) => children[usize::from(idx == 0)],
-            _ => return,
+        let sibling = match self.tree.branch(parent) {
+            Some(b) => b.children()[usize::from(idx == 0)].node,
+            None => return,
         };
         self.tree.remove_node(leaf);
         // Resolve focus before any flattening: the sibling *node* may
@@ -397,10 +414,20 @@ impl State {
         let new_focus = self.tree.first_leaf(sibling);
         self.tree.remove_node(parent);
         match attach {
-            Attach::Root => self.tree.root = sibling,
+            Attach::Root => {
+                self.tree.root = sibling;
+                // The root leaf is never minimized: its whole-frame restore
+                // button is disabled (a root has nothing to collapse
+                // relative to), so a minimized leaf promoted to root would
+                // be a full-screen restore strip with no way back and its
+                // window unmapped. The promotion restores it instead.
+                if let Some(l) = self.tree.leaf_mut(sibling) {
+                    l.minimized = false;
+                }
+            }
             Attach::Child(grand, pidx) => {
-                if let Some(Node::Branch { children, .. }) = self.tree.get_mut(grand) {
-                    children[pidx] = sibling;
+                if let Some(b) = self.tree.branch_mut(grand) {
+                    b.children_mut()[pidx].node = sibling;
                 }
                 // The spliced-in sibling can be a branch in the
                 // grandparent's own direction; dissolve it so same-dir
@@ -419,9 +446,8 @@ impl State {
             return false; // root leaf: nothing to close
         };
 
-        let nchildren = match self.tree.get(parent) {
-            Some(Node::Branch { children, .. }) => children.len(),
-            _ => return false,
+        let Some(nchildren) = self.tree.branch(parent).map(|b| b.children().len()) else {
+            return false;
         };
 
         // Focus always moves to the nearest surviving neighbour: the closed
@@ -465,21 +491,15 @@ impl State {
         let Some((parent, idx)) = self.tree.find_parent(leaf) else {
             return false;
         };
-        if let Some(Node::Branch {
-            children, ratios, ..
-        }) = self.tree.get_mut(parent)
-        {
-            let n = children.len();
-            if n < 2 {
-                // No sibling to trade width with (also guards the `idx - 1`
-                // underflow below if a degenerate single-child branch ever
-                // exists).
-                return false;
-            }
+        if let Some(b) = self.tree.branch_mut(parent) {
+            // `Branch` holds at least two children by construction, so a
+            // sibling to trade width with always exists.
+            let n = b.children().len();
             let other = if idx + 1 < n { idx + 1 } else { idx - 1 };
             let min_r = theme::MIN_SPLIT_FRAC;
-            let cur = ratios[idx];
-            let cur_other = ratios[other];
+            let cs = b.children_mut();
+            let cur = cs[idx].ratio;
+            let cur_other = cs[other].ratio;
             // Cap the transfer at what each side can actually give, so the
             // pair's sum is exactly conserved — clamping both ends
             // independently would let the total ratio mass drift upward once
@@ -490,8 +510,8 @@ impl State {
             if delta == 0.0 {
                 return false;
             }
-            ratios[idx] = cur + delta;
-            ratios[other] = cur_other - delta;
+            cs[idx].ratio = cur + delta;
+            cs[other].ratio = cur_other - delta;
             true
         } else {
             false
@@ -633,14 +653,11 @@ impl State {
     /// general — it's only safe as a fallback because of the len-1
     /// guards around its callers.
     fn root_column_minimized(&self, root: NodeId, widths_len: usize) -> Vec<bool> {
-        match self.tree.get(root) {
-            Some(Node::Branch {
-                dir: Dir::H,
-                children,
-                ..
-            }) => children
+        match self.tree.branch(root) {
+            Some(b) if b.dir == Dir::H => b
+                .children()
                 .iter()
-                .map(|&c| self.tree.leaf(c).is_some_and(|l| l.minimized))
+                .map(|c| self.tree.leaf(c.node).is_some_and(|l| l.minimized))
                 .collect(),
             _ => vec![false; widths_len],
         }
@@ -668,18 +685,16 @@ impl State {
         if total <= 0 {
             return false;
         }
-        if let Some(Node::Branch {
-            dir: Dir::H,
-            ratios,
-            ..
-        }) = self.tree.get_mut(root)
-        {
-            // Only normal children's ratios matter to the layout
-            // (`child_sizes` normalises over them alone), so rewriting
-            // just those reproduces the pixel widths exactly.
-            for ((r, &w), &m) in ratios.iter_mut().zip(widths.iter()).zip(minimized) {
-                if !m {
-                    *r = f64::from(w) / f64::from(total);
+        if let Some(b) = self.tree.branch_mut(root) {
+            if b.dir == Dir::H {
+                // Only normal children's ratios matter to the layout
+                // (`child_sizes` normalises over them alone), so rewriting
+                // just those reproduces the pixel widths exactly.
+                for ((c, &w), &m) in b.children_mut().iter_mut().zip(widths.iter()).zip(minimized)
+                {
+                    if !m {
+                        c.ratio = f64::from(w) / f64::from(total);
+                    }
                 }
             }
         }
@@ -720,12 +735,13 @@ impl State {
     /// Set the split ratio at a boundary so the left child occupies fraction
     /// `frac` of the two neighbours' combined width (their sum is preserved).
     pub fn resize_boundary(&mut self, parent: NodeId, idx: usize, frac: f64) {
-        if let Some(Node::Branch { ratios, .. }) = self.tree.get_mut(parent) {
-            if idx + 1 < ratios.len() {
-                let combined = ratios[idx] + ratios[idx + 1];
+        if let Some(b) = self.tree.branch_mut(parent) {
+            let cs = b.children_mut();
+            if idx + 1 < cs.len() {
+                let combined = cs[idx].ratio + cs[idx + 1].ratio;
                 let f = frac.clamp(theme::MIN_SPLIT_FRAC, 1.0 - theme::MIN_SPLIT_FRAC);
-                ratios[idx] = combined * f;
-                ratios[idx + 1] = combined * (1.0 - f);
+                cs[idx].ratio = combined * f;
+                cs[idx + 1].ratio = combined * (1.0 - f);
             }
         }
     }
@@ -736,19 +752,16 @@ impl State {
     pub fn insert_at_root(&mut self, at: usize) -> NodeId {
         let new = self.tree.make_leaf();
         let root = self.tree.root;
-        let is_h = matches!(self.tree.get(root), Some(Node::Branch { dir: Dir::H, .. }));
+        let is_h = self.tree.branch(root).is_some_and(|b| b.dir == Dir::H);
         if is_h {
-            if let Some(Node::Branch {
-                children, ratios, ..
-            }) = self.tree.get_mut(root)
-            {
-                let avg = ratios.iter().sum::<f64>() / ratios.len() as f64;
-                let i = at.min(children.len());
-                children.insert(i, new);
-                ratios.insert(i, avg);
-                let s: f64 = ratios.iter().sum();
-                for r in ratios.iter_mut() {
-                    *r /= s;
+            if let Some(b) = self.tree.branch_mut(root) {
+                let n = b.children().len();
+                let avg = b.children().iter().map(|c| c.ratio).sum::<f64>() / n as f64;
+                let i = at.min(n);
+                b.insert(i, Child { node: new, ratio: avg });
+                let s: f64 = b.children().iter().map(|c| c.ratio).sum();
+                for c in b.children_mut() {
+                    c.ratio /= s;
                 }
             }
         } else {
@@ -800,6 +813,17 @@ mod tests {
         h: 800,
     };
 
+    /// The root branch's per-child ratios; panics when the root is a leaf.
+    fn root_ratios(s: &State) -> Vec<f64> {
+        s.tree
+            .branch(s.tree.root)
+            .expect("root not a branch")
+            .children()
+            .iter()
+            .map(|c| c.ratio)
+            .collect()
+    }
+
     #[test]
     fn insert_at_root_grows_columns() {
         let mut s = State::new();
@@ -810,12 +834,8 @@ mod tests {
         // The inserted leaf is focused and empty.
         assert!(s.focused_client().is_none());
         // Ratios renormalise to sum 1.
-        if let Some(Node::Branch { ratios, .. }) = s.tree.get(s.tree.root) {
-            let sum: f64 = ratios.iter().sum();
-            assert!((sum - 1.0).abs() < 1e-9, "ratios sum {sum}");
-        } else {
-            panic!("root not a branch");
-        }
+        let sum: f64 = root_ratios(&s).iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9, "ratios sum {sum}");
     }
 
     #[test]
@@ -823,10 +843,7 @@ mod tests {
         let mut s = State::new();
         s.insert_at_root(0); // root is a lone leaf -> wrap into H-branch
         assert_eq!(s.tree.collect_leaves().len(), 2);
-        assert!(matches!(
-            s.tree.get(s.tree.root),
-            Some(Node::Branch { dir: Dir::H, .. })
-        ));
+        assert!(s.tree.branch(s.tree.root).is_some_and(|b| b.dir == Dir::H));
     }
 
     /// Wrapping a lone leaf must keep the *existing* content on the larger
@@ -839,17 +856,17 @@ mod tests {
             let mut s = State::new();
             let existing = s.tree.first_leaf(s.tree.root);
             s.insert_at_root(at);
-            let (children, ratios) = match s.tree.get(s.tree.root) {
-                Some(Node::Branch {
-                    children, ratios, ..
-                }) => (children.clone(), ratios.clone()),
-                _ => panic!("root not a branch"),
-            };
-            assert_eq!(children[existing_idx], existing, "at={at}");
+            let children = s
+                .tree
+                .branch(s.tree.root)
+                .expect("root not a branch")
+                .children()
+                .to_vec();
+            assert_eq!(children[existing_idx].node, existing, "at={at}");
             assert!(
-                (ratios[existing_idx] - theme::SPLIT_RATIO).abs() < 1e-9,
+                (children[existing_idx].ratio - theme::SPLIT_RATIO).abs() < 1e-9,
                 "at={at}: existing content got ratio {}",
-                ratios[existing_idx]
+                children[existing_idx].ratio
             );
         }
     }
@@ -859,18 +876,11 @@ mod tests {
         let mut s = State::new();
         s.split_focused(Dir::H);
         let root = s.tree.root;
-        let before = match s.tree.get(root) {
-            Some(Node::Branch { ratios, .. }) => ratios[0] + ratios[1],
-            _ => panic!(),
-        };
+        let before: f64 = root_ratios(&s).iter().sum();
         s.resize_boundary(root, 0, 0.25);
-        match s.tree.get(root) {
-            Some(Node::Branch { ratios, .. }) => {
-                assert!((ratios[0] + ratios[1] - before).abs() < 1e-9);
-                assert!((ratios[0] / (ratios[0] + ratios[1]) - 0.25).abs() < 1e-9);
-            }
-            _ => panic!(),
-        }
+        let ratios = root_ratios(&s);
+        assert!((ratios[0] + ratios[1] - before).abs() < 1e-9);
+        assert!((ratios[0] / (ratios[0] + ratios[1]) - 0.25).abs() < 1e-9);
     }
 
     #[test]
@@ -931,7 +941,7 @@ mod tests {
     /// `dock_extra` must open up exactly enough extra scroll room to slide
     /// the docked sidebar fully into view, mirroring `Wm::place_dock`'s
     /// `x = wa.x + canvas_w - overlap - scroll_x` formula (overlap =
-    /// `DOCK_OVERLAP` clamped to the dock's width, see `Wm::dock_overlap`),
+    /// `DOCK_OVERLAP` clamped to the dock's width, see `Dock::overlap`),
     /// even when there's only one column and the canvas alone has no scroll
     /// room of its own.
     #[test]
@@ -1202,20 +1212,36 @@ mod tests {
         assert!(s.tree.is_leaf(a) && s.tree.is_leaf(b));
     }
 
-    /// A degenerate single-child branch must not panic `close_focused`
-    /// (`children[1]` when there is no sibling).
+    /// A minimized sibling promoted to root by a binary collapse must be
+    /// restored: the root leaf is never minimized — its whole-frame restore
+    /// button is disabled, so the promotion would otherwise leave a
+    /// full-screen restore strip with no way back and its window unmapped.
     #[test]
-    fn close_focused_survives_single_child_branch() {
+    fn collapse_unminimizes_a_leaf_promoted_to_root() {
         let mut s = State::new();
-        let leaf = s.tree.first_leaf(s.tree.root);
-        let branch = s.tree.insert_node(Node::Branch {
-            dir: Dir::H,
-            children: vec![leaf],
-            ratios: vec![1.0],
-        });
-        s.tree.root = branch;
-        s.focused_leaf = leaf;
-        assert!(!s.close_focused());
+        s.pin_client(1);
+        s.split_focused(Dir::H); // H[A(win 1), B]
+        let leaves = s.tree.collect_leaves();
+        let (a, b) = (leaves[0], leaves[1]);
+        s.assign_to_leaf(1, b); // A empty, B holds the window
+        s.toggle_minimize(b);
+        s.focus_leaf(a);
+        assert!(s.close_focused()); // nothing to relocate out of A
+        assert_eq!(s.tree.root, b, "sibling takes the root");
+        assert!(
+            !s.tree.leaf(b).unwrap().minimized,
+            "promotion must restore the leaf"
+        );
+        assert_eq!(s.focused_client(), Some(1));
+    }
+
+    /// The root leaf can't be minimized: nothing exists to restore it.
+    #[test]
+    fn toggle_minimize_refuses_the_root_leaf() {
+        let mut s = State::new();
+        let root = s.tree.root;
+        assert!(!s.toggle_minimize(root));
+        assert!(!s.tree.leaf(root).unwrap().minimized);
     }
 
     /// Repeated growing must stop once the neighbour bottoms out at
@@ -1228,38 +1254,16 @@ mod tests {
         s.split_focused(Dir::H);
         s.insert_at_root(2); // three columns
         s.focused_leaf = s.tree.collect_leaves()[0];
-        let sum_before: f64 = match s.tree.get(s.tree.root) {
-            Some(Node::Branch { ratios, .. }) => ratios.iter().sum(),
-            _ => panic!(),
-        };
+        let sum_before: f64 = root_ratios(&s).iter().sum();
         for _ in 0..100 {
             s.resize_focused(theme::RESIZE_STEP);
         }
-        let ratios = match s.tree.get(s.tree.root) {
-            Some(Node::Branch { ratios, .. }) => ratios.clone(),
-            _ => panic!(),
-        };
+        let ratios = root_ratios(&s);
         let sum_after: f64 = ratios.iter().sum();
         assert!((sum_after - sum_before).abs() < 1e-9, "sum drifted");
         assert!(ratios.iter().all(|&r| r >= theme::MIN_SPLIT_FRAC - 1e-9));
         // Once the neighbour is at its floor, further growth is refused.
         assert!(!s.resize_focused(theme::RESIZE_STEP));
-    }
-
-    /// A degenerate single-child branch must not panic `resize_focused`
-    /// (`idx - 1` underflow when there is no sibling).
-    #[test]
-    fn resize_focused_survives_single_child_branch() {
-        let mut s = State::new();
-        let leaf = s.tree.first_leaf(s.tree.root);
-        let branch = s.tree.insert_node(Node::Branch {
-            dir: Dir::H,
-            children: vec![leaf],
-            ratios: vec![1.0],
-        });
-        s.tree.root = branch;
-        s.focused_leaf = leaf;
-        assert!(!s.resize_focused(0.1));
     }
 
     /// Collapsing a binary branch must dissolve a same-direction sibling
@@ -1278,19 +1282,15 @@ mod tests {
         assert!(s.close_focused());
         // The V-branch collapses; H[x1, x2] splices into the root H-branch
         // and must flatten into it: one H-branch, three leaf children.
-        match s.tree.get(s.tree.root) {
-            Some(Node::Branch {
-                dir: Dir::H,
-                children,
-                ratios,
-            }) => {
-                assert_eq!(children.len(), 3, "nested same-dir branch survived");
-                assert!((ratios.iter().sum::<f64>() - 1.0).abs() < 1e-9);
-                for &c in children {
-                    assert!(s.tree.is_leaf(c));
-                }
+        {
+            let b = s.tree.branch(s.tree.root).expect("root not a branch");
+            assert_eq!(b.dir, Dir::H, "root not an H-branch");
+            assert_eq!(b.children().len(), 3, "nested same-dir branch survived");
+            let ratio_sum: f64 = b.children().iter().map(|c| c.ratio).sum();
+            assert!((ratio_sum - 1.0).abs() < 1e-9);
+            for c in b.children() {
+                assert!(s.tree.is_leaf(c.node));
             }
-            _ => panic!("root not an H-branch"),
         }
         // Focus landed on a surviving leaf, and every root-level gap is
         // insert-eligible again.
@@ -1371,16 +1371,10 @@ mod tests {
         s.update_canvas(WA, 0);
         let leaves = s.tree.collect_leaves();
         s.toggle_minimize(leaves[1]); // middle column pinned to `gap` px
-        let ratio_before = match s.tree.get(s.tree.root) {
-            Some(Node::Branch { ratios, .. }) => ratios[1],
-            _ => panic!(),
-        };
+        let ratio_before = root_ratios(&s)[1];
         let (_, w) = s.edge_span(WA, false).unwrap();
         assert_eq!(s.resize_edge(WA, false, w - 40), -40);
-        let ratios = match s.tree.get(s.tree.root) {
-            Some(Node::Branch { ratios, .. }) => ratios.clone(),
-            _ => panic!(),
-        };
+        let ratios = root_ratios(&s);
         assert!(
             (ratios[1] - ratio_before).abs() < 1e-9,
             "minimized column's ratio was rewritten from its pinned width"

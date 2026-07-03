@@ -64,13 +64,75 @@ impl Leaf {
     }
 }
 
+/// One child slot of a branch: the node it holds and its share of the
+/// branch's span. A single struct rather than parallel `children`/`ratios`
+/// vectors, so a slot's node and ratio can never desync in length or pairing.
+#[derive(Clone, Copy)]
+pub struct Child {
+    pub node: NodeId,
+    pub ratio: f64,
+}
+
+/// A split branch. `children` is private so its "at least two children"
+/// invariant holds by construction: every constructor and mutation below
+/// preserves it, so consumers (`Tree::first_leaf`'s `children()[0]`,
+/// `State::close_focused`'s sibling lookup, `State::resize_focused`'s
+/// neighbour index) need no degenerate-branch guards.
+pub struct Branch {
+    pub dir: Dir,
+    children: Vec<Child>,
+}
+
+impl Branch {
+    pub fn new(dir: Dir, a: Child, b: Child) -> Self {
+        Self {
+            dir,
+            children: vec![a, b],
+        }
+    }
+
+    pub fn children(&self) -> &[Child] {
+        &self.children
+    }
+
+    /// Mutable slot access (ratio rewrites, node swaps); a slice keeps the
+    /// length fixed, so arity can't be broken through it.
+    pub fn children_mut(&mut self) -> &mut [Child] {
+        &mut self.children
+    }
+
+    pub fn insert(&mut self, idx: usize, c: Child) {
+        self.children.insert(idx, c);
+    }
+
+    /// Remove one child. Only valid on branches keeping two or more children
+    /// afterwards — a binary branch collapses via its parent instead
+    /// (`State::close_focused_binary`) — so a violation is a caller bug and
+    /// fails loudly rather than leaving a degenerate branch in the tree.
+    pub fn remove(&mut self, idx: usize) -> Child {
+        assert!(
+            self.children.len() > 2,
+            "Branch::remove would leave a degenerate branch"
+        );
+        self.children.remove(idx)
+    }
+
+    /// Replace the child at `idx` with `replacement` (how
+    /// `Tree::flatten_same_dir` splices a dissolved same-dir branch's
+    /// children into its parent). `replacement` comes from a live branch, so
+    /// it holds at least two entries and arity only grows.
+    pub fn splice(&mut self, idx: usize, replacement: Vec<Child>) {
+        assert!(
+            !replacement.is_empty(),
+            "Branch::splice with an empty replacement would shrink the branch"
+        );
+        self.children.splice(idx..=idx, replacement);
+    }
+}
+
 pub enum Node {
     Leaf(Leaf),
-    Branch {
-        dir: Dir,
-        children: Vec<NodeId>,
-        ratios: Vec<f64>,
-    },
+    Branch(Branch),
 }
 
 pub struct Tree {
@@ -139,20 +201,20 @@ impl Tree {
         let id = self.gen_id();
         self.nodes.insert(
             id,
-            Node::Branch {
+            Node::Branch(Branch::new(
                 dir,
-                children: vec![a, b],
-                ratios: vec![ratio, 1.0 - ratio],
-            },
+                Child { node: a, ratio },
+                Child {
+                    node: b,
+                    ratio: 1.0 - ratio,
+                },
+            )),
         );
         id
     }
 
     pub fn get(&self, id: NodeId) -> Option<&Node> {
         self.nodes.get(&id)
-    }
-    pub fn get_mut(&mut self, id: NodeId) -> Option<&mut Node> {
-        self.nodes.get_mut(&id)
     }
     pub fn leaf(&self, id: NodeId) -> Option<&Leaf> {
         match self.nodes.get(&id) {
@@ -163,6 +225,18 @@ impl Tree {
     pub fn leaf_mut(&mut self, id: NodeId) -> Option<&mut Leaf> {
         match self.nodes.get_mut(&id) {
             Some(Node::Leaf(l)) => Some(l),
+            _ => None,
+        }
+    }
+    pub fn branch(&self, id: NodeId) -> Option<&Branch> {
+        match self.nodes.get(&id) {
+            Some(Node::Branch(b)) => Some(b),
+            _ => None,
+        }
+    }
+    pub fn branch_mut(&mut self, id: NodeId) -> Option<&mut Branch> {
+        match self.nodes.get_mut(&id) {
+            Some(Node::Branch(b)) => Some(b),
             _ => None,
         }
     }
@@ -188,30 +262,25 @@ impl Tree {
     /// grandparent — leaving it nested would demote its gaps from
     /// root-level boundaries, silently losing their "+" insert buttons.
     pub fn flatten_same_dir(&mut self, parent: NodeId, idx: usize) {
-        let (pdir, child, slot_r) = match self.get(parent) {
-            Some(Node::Branch {
-                dir,
-                children,
-                ratios,
-            }) if idx < children.len() => (*dir, children[idx], ratios[idx]),
+        let (pdir, slot) = match self.branch(parent) {
+            Some(b) if idx < b.children().len() => (b.dir, b.children()[idx]),
             _ => return,
         };
-        let (sub_children, sub_ratios) = match self.get(child) {
-            Some(Node::Branch {
-                dir,
-                children,
-                ratios,
-            }) if *dir == pdir => (children.clone(), ratios.clone()),
+        let sub: Vec<Child> = match self.branch(slot.node) {
+            Some(b) if b.dir == pdir => b
+                .children()
+                .iter()
+                .map(|c| Child {
+                    node: c.node,
+                    ratio: c.ratio * slot.ratio,
+                })
+                .collect(),
             _ => return,
         };
-        if let Some(Node::Branch {
-            children, ratios, ..
-        }) = self.get_mut(parent)
-        {
-            children.splice(idx..=idx, sub_children);
-            ratios.splice(idx..=idx, sub_ratios.into_iter().map(|r| r * slot_r));
+        if let Some(b) = self.branch_mut(parent) {
+            b.splice(idx, sub);
         }
-        self.remove_node(child);
+        self.remove_node(slot.node);
     }
 
     /// Depth-first leaf ids in layout order.
@@ -223,9 +292,9 @@ impl Tree {
     pub fn collect_from(&self, node: NodeId, out: &mut Vec<NodeId>) {
         match self.nodes.get(&node) {
             Some(Node::Leaf(_)) => out.push(node),
-            Some(Node::Branch { children, .. }) => {
-                for &c in children {
-                    self.collect_from(c, out);
+            Some(Node::Branch(b)) => {
+                for c in b.children() {
+                    self.collect_from(c.node, out);
                 }
             }
             None => {}
@@ -235,7 +304,7 @@ impl Tree {
     /// First leaf in subtree (left/top-most).
     pub fn first_leaf(&self, node: NodeId) -> NodeId {
         match self.nodes.get(&node) {
-            Some(Node::Branch { children, .. }) => self.first_leaf(children[0]),
+            Some(Node::Branch(b)) => self.first_leaf(b.children()[0].node),
             _ => node,
         }
     }
@@ -247,9 +316,10 @@ impl Tree {
     fn find_leaf_for_client_from(&self, node: NodeId, c: Win) -> Option<NodeId> {
         match self.nodes.get(&node)? {
             Node::Leaf(l) => (l.client == Some(c)).then_some(node),
-            Node::Branch { children, .. } => children
+            Node::Branch(b) => b
+                .children()
                 .iter()
-                .find_map(|&child| self.find_leaf_for_client_from(child, c)),
+                .find_map(|child| self.find_leaf_for_client_from(child.node, c)),
         }
     }
 
@@ -263,8 +333,8 @@ impl Tree {
     /// avoiding the O(n²) blowup of calling `find_parent` once per leaf.
     pub fn find_parent(&self, target: NodeId) -> Option<(NodeId, usize)> {
         for (&id, node) in &self.nodes {
-            if let Node::Branch { children, .. } = node {
-                if let Some(idx) = children.iter().position(|&c| c == target) {
+            if let Node::Branch(b) = node {
+                if let Some(idx) = b.children().iter().position(|c| c.node == target) {
                     return Some((id, idx));
                 }
             }
@@ -278,9 +348,9 @@ impl Tree {
     pub fn parent_map(&self) -> HashMap<NodeId, (NodeId, usize)> {
         let mut out = HashMap::new();
         for (&id, node) in &self.nodes {
-            if let Node::Branch { children, .. } = node {
-                for (i, &c) in children.iter().enumerate() {
-                    out.insert(c, (id, i));
+            if let Node::Branch(b) = node {
+                for (i, c) in b.children().iter().enumerate() {
+                    out.insert(c.node, (id, i));
                 }
             }
         }
@@ -297,20 +367,13 @@ impl Tree {
 
     fn h_units_from(&self, node: NodeId) -> i32 {
         match self.nodes.get(&node) {
-            Some(Node::Branch {
-                dir: Dir::H,
-                children,
-                ..
-            }) => children.iter().map(|&c| self.h_units_from(c)).sum(),
-            Some(Node::Branch {
-                dir: Dir::V,
-                children,
-                ..
-            }) => children
-                .iter()
-                .map(|&c| self.h_units_from(c))
-                .max()
-                .unwrap_or(1),
+            Some(Node::Branch(b)) => {
+                let units = b.children().iter().map(|c| self.h_units_from(c.node));
+                match b.dir {
+                    Dir::H => units.sum(),
+                    Dir::V => units.max().unwrap_or(1),
+                }
+            }
             Some(Node::Leaf(_)) => 1,
             None => 0,
         }
@@ -323,11 +386,10 @@ impl Tree {
     /// (is-minimized, ratio) for each child, the shared input `child_sizes`
     /// needs — factored out since both the leaf-geometry and boundary walks
     /// build the exact same thing per branch.
-    fn child_meta(&self, children: &[NodeId], ratios: &[f64]) -> Vec<(bool, f64)> {
+    fn child_meta(&self, children: &[Child]) -> Vec<(bool, f64)> {
         children
             .iter()
-            .enumerate()
-            .map(|(i, &c)| (self.leaf(c).is_some_and(|l| l.minimized), ratios[i]))
+            .map(|c| (self.leaf(c.node).is_some_and(|l| l.minimized), c.ratio))
             .collect()
     }
 }
@@ -399,15 +461,14 @@ impl Tree {
     /// `compute`'s `w - 2 * gap`).
     pub fn root_h_sizes(&self, usable_w: i32, gap: i32) -> Option<Vec<i32>> {
         match self.get(self.root)? {
-            Node::Leaf(_) => Some(vec![usable_w.max(0)]),
-            Node::Branch { dir: Dir::V, .. } => Some(vec![usable_w.max(0)]),
-            Node::Branch {
-                dir: Dir::H,
-                children,
-                ratios,
-            } => {
-                let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
-                let meta = self.child_meta(children, ratios);
+            Node::Leaf(_)
+            | Node::Branch(Branch {
+                dir: Dir::V,
+                ..
+            }) => Some(vec![usable_w.max(0)]),
+            Node::Branch(b) => {
+                let n = i32::try_from(b.children().len()).unwrap_or(i32::MAX);
+                let meta = self.child_meta(b.children());
                 let usable = (usable_w - gap * (n - 1)).max(0);
                 Some(child_sizes(&meta, usable, gap))
             }
@@ -423,22 +484,18 @@ impl Tree {
     /// consistent with the layout's spacing rather than needing a size of
     /// its own.
     fn walk_children(&self, node: NodeId, at: Rect, gap: i32, f: &mut impl FnMut(ChildSlot)) {
-        let Some(Node::Branch {
-            dir,
-            children,
-            ratios,
-        }) = self.nodes.get(&node)
-        else {
+        let Some(b) = self.branch(node) else {
             return;
         };
-        let n = i32::try_from(children.len()).unwrap_or(i32::MAX);
-        let meta = self.child_meta(children, ratios);
-        let span = if *dir == Dir::H { at.w } else { at.h };
+        let dir = b.dir;
+        let n = i32::try_from(b.children().len()).unwrap_or(i32::MAX);
+        let meta = self.child_meta(b.children());
+        let span = if dir == Dir::H { at.w } else { at.h };
         let usable = (span - gap * (n - 1)).max(0);
         let sizes = child_sizes(&meta, usable, gap);
-        let mut pos = if *dir == Dir::H { at.x } else { at.y };
-        for (i, (&child, &sz)) in children.iter().zip(&sizes).enumerate() {
-            let rect = if *dir == Dir::H {
+        let mut pos = if dir == Dir::H { at.x } else { at.y };
+        for (i, (child, &sz)) in b.children().iter().zip(&sizes).enumerate() {
+            let rect = if dir == Dir::H {
                 Rect {
                     x: pos,
                     w: sz,
@@ -453,8 +510,8 @@ impl Tree {
             };
             f(ChildSlot {
                 idx: i,
-                child,
-                dir: *dir,
+                child: child.node,
+                dir,
                 rect,
                 next_size: sizes.get(i + 1).copied(),
                 resizable: i + 1 < meta.len() && !meta[i].0 && !meta[i + 1].0,

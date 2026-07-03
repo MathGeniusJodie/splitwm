@@ -8,14 +8,14 @@ use x11rb::protocol::xproto::{
     ChangeWindowAttributesAux, ConfigureWindowAux, ConnectionExt, ImageFormat, StackMode, Window,
 };
 
-use super::clients::{WM_STATE_ICONIC, WM_STATE_NORMAL};
+use super::clients::WmState;
 use super::types::{
-    clamp_dim, ease_out_back, lerp_rect, BtnKind, FrameRect, LayoutAnim, LeafMeta, Placement,
-    ShmSeg, ShmState, Wm, R,
+    clamp_dim, ease_out_back, lerp_rect, BtnKind, Dock, FrameRect, LayoutAnim, LeafMeta,
+    Placement, ShmSeg, ShmState, Wm, R,
 };
 use crate::render::{LeafView, TabInfo, TaskItem};
 use crate::theme;
-use crate::tree::{Dir, Node, NodeId, Rect, Win};
+use crate::tree::{Dir, NodeId, Rect, Win};
 
 impl Wm {
     pub(crate) fn arrange(&mut self) -> R<()> {
@@ -26,11 +26,7 @@ impl Wm {
         // supplies the inputs it alone knows. The dock is tucked
         // DOCK_OVERLAP px under the canvas edge, so that much less scroll
         // room is needed to bring it fully into view.
-        let dock_extra = if self.dock.win.is_some() {
-            self.dock.w - self.dock_overlap()
-        } else {
-            0
-        };
+        let dock_extra = self.dock.docked.map_or(0, |d| d.w - d.overlap());
         self.state.update_canvas(wa, dock_extra);
 
         let leaves = self.state.tree.collect_leaves();
@@ -85,10 +81,11 @@ impl Wm {
         // the composited chrome interpolates. A non-animated arrange cancels
         // any transition in flight (it describes a newer layout).
         if std::mem::take(&mut self.animate) {
-            let starts: Vec<FrameRect> = placed
+            let placed_from: Vec<(FrameRect, Placement)> = placed
                 .iter()
                 .map(|p| {
-                    self.prev_frame_rect
+                    let from = self
+                        .prev_frame_rect
                         .get(&p.leaf)
                         .copied()
                         .unwrap_or(FrameRect {
@@ -96,15 +93,15 @@ impl Wm {
                             y: p.target.y,
                             w: 1,
                             h: p.target.h,
-                        })
+                        });
+                    (from, *p)
                 })
                 .collect();
             self.anim_seq += 1;
             self.anim = Some(LayoutAnim {
                 seq: self.anim_seq,
                 start: std::time::Instant::now(),
-                starts,
-                placed: placed.clone(),
+                placed: placed_from,
             });
             // First frame from the pre-transition rects so content visibly slides.
             self.anim_frame(0.0)?;
@@ -296,10 +293,7 @@ impl Wm {
         frame: FrameRect,
         parent: Option<(NodeId, usize)>,
     ) -> LeafMeta {
-        let parent_dir = parent.and_then(|(p, _)| match self.state.tree.get(p) {
-            Some(Node::Branch { dir, .. }) => Some(*dir),
-            _ => None,
-        });
+        let parent_dir = parent.and_then(|(p, _)| self.state.tree.branch(p).map(|b| b.dir));
         let wider = frame.w >= frame.h;
         let split_dir = if wider { Dir::H } else { Dir::V };
         LeafMeta {
@@ -384,7 +378,7 @@ impl Wm {
             if let Some(cl) = self.clients.get_mut(&w) {
                 cl.mapped = false;
             }
-            self.set_wm_state(w, WM_STATE_ICONIC)?;
+            self.set_wm_state(w, WmState::Iconic)?;
         }
         Ok(())
     }
@@ -397,7 +391,7 @@ impl Wm {
             .get_mut(&win)
             .is_some_and(|cl| !std::mem::replace(&mut cl.mapped, true));
         if newly_mapped {
-            self.set_wm_state(win, WM_STATE_NORMAL)?;
+            self.set_wm_state(win, WmState::Normal)?;
         }
         Ok(())
     }
@@ -430,43 +424,33 @@ impl Wm {
         Ok(())
     }
 
-    /// Position the docked sidebar at the right end of the tiling canvas,
-    /// tucked `theme::DOCK_OVERLAP` px under it (the canvas edge overlaps
-    /// the dock, not the other way round: the dock stacks just above the
-    /// underlay, below every tiled client) in canvas space, then shift by
-    /// the current scroll like any other leaf. It's (mostly) off-screen at
-    /// `scroll_x = 0` and only slides fully into view once the canvas is
-    /// scrolled all the way right (`State::dock_extra` extends `max_scroll`
-    /// to make that reachable); a no-op if nothing is docked.
-    /// `theme::DOCK_OVERLAP` clamped to the dock's own width — an overlap
-    /// wider than the dock would otherwise shove its right edge permanently
-    /// away from the screen edge (fully tucked is the useful maximum).
-    pub(crate) fn dock_overlap(&self) -> i32 {
-        theme::DOCK_OVERLAP.min(self.dock.w)
-    }
-
     /// The dock's pinned screen geometry `(x, y, w, h)`: parked at the right
-    /// end of the tiling canvas, tucked `dock_overlap` px under it, shifted
-    /// by the current scroll like any other leaf. Full monitor height, not
-    /// `la()`'s (which is trimmed for the bottom taskbar) — the dock spans
-    /// the entire screen, overlapping the taskbar strip in its column. The
-    /// single formula behind `place_dock` (configuring) and
-    /// `tracked_geometry` (answering denied ConfigureRequests).
-    pub(crate) fn dock_geometry(&self) -> (i32, i32, i32, i32) {
+    /// end of the tiling canvas, tucked `Dock::overlap` px under it (the
+    /// canvas edge overlaps the dock, not the other way round: the dock
+    /// stacks just above the underlay, below every tiled client), shifted
+    /// by the current scroll like any other leaf. It's (mostly) off-screen
+    /// at `scroll_x = 0` and only slides fully into view once the canvas is
+    /// scrolled all the way right (`State::dock_extra` extends `max_scroll`
+    /// to make that reachable). Full monitor height, not `la()`'s (which is
+    /// trimmed for the bottom taskbar) — the dock spans the entire screen,
+    /// overlapping the taskbar strip in its column. The single formula
+    /// behind `place_dock` (configuring) and `tracked_geometry` (answering
+    /// denied ConfigureRequests).
+    pub(crate) fn dock_geometry(&self, d: Dock) -> (i32, i32, i32, i32) {
         let wa = self.la();
         let full = self.wa();
         let canvas_w = self.state.canvas_w(wa);
-        let x = wa.x + canvas_w - self.dock_overlap() - self.state.scroll_x();
-        (x, full.y, self.dock.w.max(1), full.h.max(1))
+        let x = wa.x + canvas_w - d.overlap() - self.state.scroll_x();
+        (x, full.y, d.w.max(1), full.h.max(1))
     }
 
     fn place_dock(&self) -> R<()> {
-        let Some(win) = self.dock.win else {
+        let Some(d) = self.dock.docked else {
             return Ok(());
         };
-        let (x, y, w, h) = self.dock_geometry();
+        let (x, y, w, h) = self.dock_geometry(d);
         self.conn.configure_window(
-            win,
+            d.win,
             &ConfigureWindowAux::new()
                 .x(x)
                 .y(y)
@@ -476,7 +460,7 @@ impl Wm {
                 .sibling(self.underlay)
                 .stack_mode(StackMode::ABOVE),
         )?;
-        self.conn.map_window(win)?;
+        self.conn.map_window(d.win)?;
         Ok(())
     }
 
@@ -512,12 +496,9 @@ impl Wm {
         let interp: Vec<Placement> = anim
             .placed
             .iter()
-            .zip(&anim.starts)
-            .map(|(p, s)| Placement {
-                leaf: p.leaf,
-                target: lerp_rect(*s, p.target, e),
-                active_client: p.active_client,
-                focused: p.focused,
+            .map(|&(from, p)| Placement {
+                target: lerp_rect(from, p.target, e),
+                ..p
             })
             .collect();
         let wa = self.la();
@@ -543,7 +524,8 @@ impl Wm {
         if t >= 1.0 {
             let anim = self.anim.take().expect("checked above");
             let wa = self.la();
-            self.compose(wa, &anim.placed, true)?;
+            let finals: Vec<Placement> = anim.placed.iter().map(|&(_, p)| p).collect();
+            self.compose(wa, &finals, true)?;
             self.conn.flush()?;
             return Ok(());
         }

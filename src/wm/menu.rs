@@ -7,7 +7,7 @@ use std::rc::Rc;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt, StackMode, Window};
 
-use super::types::{FrameRect, IconSlot, MenuColumn, Wm, R};
+use super::types::{FrameRect, IconSlot, MenuColumn, MenuState, Wm, R};
 use crate::icon::Icon;
 use crate::menu::{frame_size, Item, Menu, MENU_BORDER, MENU_ROW_H};
 use crate::render::MenuView;
@@ -22,8 +22,8 @@ impl Wm {
         if !sub {
             return Some(&self.menu.tree.main);
         }
-        let cat = self.menu.open_cat?;
-        let &Item::Submenu(idx) = self.menu.tree.main.items.get(cat)? else {
+        let cat = self.menu.open_cat()?;
+        let Item::Submenu(idx) = self.menu.tree.main.rows.get(cat)?.item else {
             return None;
         };
         self.menu.tree.subs.get(idx)
@@ -87,12 +87,16 @@ impl Wm {
         let menu = self
             .column_menu(sub)
             .expect("caller established the column's data");
-        let rows = menu.labels.len();
+        let rows = menu.rows.len();
         // Rows with no `Icon=` name have nothing to look up: born resolved.
         let icons: Vec<IconSlot> = menu
-            .icons
+            .rows
             .iter()
-            .map(|n| n.clone().map_or(IconSlot::Ready(None), IconSlot::Pending))
+            .map(|r| {
+                r.icon
+                    .clone()
+                    .map_or(IconSlot::Ready(None), IconSlot::Pending)
+            })
             .collect();
         let vis = self.visible_rows(rows);
         let (w, h) = frame_size(i32::try_from(vis).unwrap_or(0), cw);
@@ -128,12 +132,11 @@ impl Wm {
     /// Open the launcher menu for `leaf`, with its bottom-right corner anchored
     /// at screen (ax, ay) so it rises above the bottom taskbar.
     pub(crate) fn open_menu(&mut self, leaf: NodeId, ax: i32, ay: i32) -> R<()> {
-        let m = &self.menu.tree.main;
-        let any_icon = m.icons.iter().any(Option::is_some);
-        let cw = self.renderer.menu_content_w(&m.labels, true, any_icon);
-        self.menu.open_cat = None;
-        self.menu.target_leaf = leaf;
-        self.menu.open = true;
+        let cw = self.renderer.menu_content_w(&self.menu.tree.main.rows);
+        self.menu.state = MenuState::Open {
+            target_leaf: leaf,
+            open_cat: None,
+        };
         self.conn.unmap_window(self.menu.sub.win)?;
         self.show_column(false, cw, |wm, w, h| {
             let wa = wm.wa();
@@ -146,13 +149,12 @@ impl Wm {
 
     /// Open the submenu for main row `cat` to the right of that row.
     pub(crate) fn open_submenu(&mut self, cat: usize) -> R<()> {
-        self.menu.open_cat = Some(cat);
+        self.menu.set_open_cat(Some(cat));
         let Some(sub) = self.column_menu(true) else {
-            self.menu.open_cat = None;
+            self.menu.set_open_cat(None);
             return Ok(());
         };
-        let any_icon = sub.icons.iter().any(Option::is_some);
-        let cw = self.renderer.menu_content_w(&sub.labels, false, any_icon);
+        let cw = self.renderer.menu_content_w(&sub.rows);
         let main = self.menu.main.rect;
         // The hovered row's *on-screen* position: `cat` is an absolute row
         // index, the window shows rows from `scroll` down.
@@ -176,23 +178,22 @@ impl Wm {
     /// Clients are raised to the top on every `arrange`/focus, so the menu must
     /// be re-raised afterwards to stay visible.
     pub(crate) fn raise_menu(&self) -> R<()> {
-        if !self.menu.open {
+        if !self.menu.is_open() {
             return Ok(());
         }
         let above = ConfigureWindowAux::new().stack_mode(StackMode::ABOVE);
         self.conn.configure_window(self.menu.main.win, &above)?;
-        if self.menu.open_cat.is_some() {
+        if self.menu.open_cat().is_some() {
             self.conn.configure_window(self.menu.sub.win, &above)?;
         }
         Ok(())
     }
 
     pub(crate) fn close_menu(&mut self) -> R<()> {
-        if !self.menu.open {
+        if !self.menu.is_open() {
             return Ok(());
         }
-        self.menu.open = false;
-        self.menu.open_cat = None;
+        self.menu.state = MenuState::Closed;
         self.conn.unmap_window(self.menu.main.win)?;
         self.conn.unmap_window(self.menu.sub.win)?;
         self.conn.flush()?;
@@ -253,10 +254,6 @@ impl Wm {
             return Ok(());
         };
         let col = self.column(sub);
-        let seps: Vec<bool> = menu.items[range.clone()]
-            .iter()
-            .map(|it| matches!(it, Item::Separator))
-            .collect();
         let icons: Vec<Option<Rc<Icon>>> = col.icons[range.clone()]
             .iter()
             .map(|s| match s {
@@ -265,16 +262,14 @@ impl Wm {
             })
             .collect();
         let fb = self.renderer.draw_menu(&MenuView {
-            labels: &menu.labels[range.clone()],
-            arrows: &menu.arrows[range.clone()],
-            seps: &seps,
+            rows: &menu.rows[range.clone()],
             icons: &icons,
             content_w: col.cw,
             hi: col
                 .hi
                 .and_then(|h| h.checked_sub(start))
                 .filter(|&r| r < range.len()),
-            icon_col: menu.icons.iter().any(Option::is_some),
+            icon_col: menu.rows.iter().any(|r| r.icon.is_some()),
         });
         let win = col.win;
         self.blit_fb(win, &fb)
@@ -339,30 +334,43 @@ impl Wm {
         };
         let row = self.column_row_at(sub, lx, ly);
         if !sub {
-            let row =
-                row.filter(|&r| !matches!(self.menu.tree.main.items.get(r), Some(Item::Separator)));
+            let row = row.filter(|&r| {
+                !self
+                    .menu
+                    .tree
+                    .main
+                    .rows
+                    .get(r)
+                    .is_some_and(|row| matches!(row.item, Item::Separator))
+            });
             if row != self.menu.main.hi {
                 self.menu.main.hi = row;
                 self.paint_column(false)?;
             }
             // Hovering a category opens its submenu; hovering anything else
             // closes it.
-            let hovered_cat =
-                row.filter(|&r| matches!(self.menu.tree.main.items.get(r), Some(Item::Submenu(_))));
+            let hovered_cat = row.filter(|&r| {
+                self.menu
+                    .tree
+                    .main
+                    .rows
+                    .get(r)
+                    .is_some_and(crate::menu::Row::arrow)
+            });
             match hovered_cat {
                 Some(r) => {
-                    if self.menu.open_cat != Some(r) {
+                    if self.menu.open_cat() != Some(r) {
                         self.open_submenu(r)?;
                     }
                 }
                 None => {
-                    if self.menu.open_cat.is_some() {
-                        self.menu.open_cat = None;
+                    if self.menu.open_cat().is_some() {
+                        self.menu.set_open_cat(None);
                         self.conn.unmap_window(self.menu.sub.win)?;
                     }
                 }
             }
-        } else if self.menu.open_cat.is_some() && row != self.menu.sub.hi {
+        } else if self.menu.open_cat().is_some() && row != self.menu.sub.hi {
             self.menu.sub.hi = row;
             self.paint_column(true)?;
         }
@@ -376,8 +384,8 @@ impl Wm {
     /// rather than clearing outright.
     pub(crate) fn on_menu_leave(&mut self, win: Window) -> R<()> {
         if win == self.menu.main.win {
-            if self.menu.main.hi != self.menu.open_cat {
-                self.menu.main.hi = self.menu.open_cat;
+            if self.menu.main.hi != self.menu.open_cat() {
+                self.menu.main.hi = self.menu.open_cat();
                 self.paint_column(false)?;
                 self.conn.flush()?;
             }
@@ -399,16 +407,16 @@ impl Wm {
         let Some(menu) = self.column_menu(sub) else {
             return Ok(());
         };
-        let cmd = match menu.items.get(row) {
+        let cmd = match menu.rows.get(row).map(|r| &r.item) {
             Some(Item::Launch(c)) => c.clone(),
             // Clicking a main-column category just (re)opens its submenu.
             Some(Item::Submenu(_)) if !sub => return self.open_submenu(row),
             _ => return Ok(()),
         };
-        // Route the new window into the leaf the menu was opened for.
-        let leaf = self.menu.target_leaf;
-        if self.state.tree.is_leaf(leaf) {
-            self.state.focused_leaf = leaf;
+        // Route the new window into the leaf the menu was opened for; a
+        // target closed while the menu was open is ignored by `focus_leaf`.
+        if let MenuState::Open { target_leaf, .. } = self.menu.state {
+            self.state.focus_leaf(target_leaf);
         }
         self.spawn(&cmd);
         self.close_menu()

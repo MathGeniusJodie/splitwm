@@ -361,22 +361,36 @@ pub struct Wm {
     pub icons_stale: bool,
 }
 
-/// The window pinned past the right end of the scrolling canvas, and its
-/// tracked geometry/title.
+/// The docked-sidebar identity config and the currently docked window.
 pub struct DockState {
     /// The window pinned past the right end of the scrolling canvas, only
     /// revealed by scrolling all the way right (see `DockState::title`),
     /// if one is currently mapped. It lives outside `clients`/the split
     /// tree/`bar_order` entirely: no chrome, no taskbar entry, not part of
     /// focus cycling, and normal tiled columns never lay out under it.
-    pub win: Option<Win>,
-    /// Width of `win`, captured from its own requested geometry when it
-    /// was first managed.
-    pub w: i32,
+    pub docked: Option<Dock>,
     /// Identity that marks the dock window — matched against either half of
     /// its `WM_CLASS` (`SPLITWM_DOCK_TITLE`, default `theme::DOCK_TITLE`);
     /// also the desktop id used to autostart it.
     pub title: String,
+}
+
+/// A docked window and the width captured from its own requested geometry
+/// when it was first managed — the width only exists while something is
+/// docked, so the pair travels as one value.
+#[derive(Clone, Copy)]
+pub struct Dock {
+    pub win: Win,
+    pub w: i32,
+}
+
+impl Dock {
+    /// `theme::DOCK_OVERLAP` clamped to the dock's own width — an overlap
+    /// wider than the dock would otherwise shove its right edge permanently
+    /// away from the screen edge (fully tucked is the useful maximum).
+    pub fn overlap(self) -> i32 {
+        crate::theme::DOCK_OVERLAP.min(self.w)
+    }
 }
 
 /// Foreign notification windows and our own served-notification popups.
@@ -397,10 +411,10 @@ pub struct NoteState {
     /// Incoming notification events from the daemon thread.
     pub rx: std::sync::mpsc::Receiver<crate::notify::NoteMsg>,
     /// `(id, close reason)` of popups the WM closed itself — user click
-    /// (`notify::CLOSE_REASON_DISMISSED`) or popup-cap eviction
-    /// (`notify::CLOSE_REASON_UNDEFINED`) — reported back to the daemon
-    /// thread so it emits the matching `NotificationClosed` signal.
-    pub dismiss: std::sync::mpsc::Sender<(u32, u32)>,
+    /// (`CloseReason::Dismissed`) or popup-cap eviction
+    /// (`CloseReason::Undefined`) — reported back to the daemon thread so
+    /// it emits the matching `NotificationClosed` signal.
+    pub dismiss: std::sync::mpsc::Sender<(u32, crate::notify::CloseReason)>,
 }
 
 /// In-progress gap/float/edge drags.
@@ -531,15 +545,47 @@ pub struct EdgeDrag {
 /// in its own override-redirect window composited like the underlay.
 pub struct MenuUi {
     pub tree: crate::menu::MenuTree,
-    pub open: bool,
+    pub state: MenuState,
     pub main: MenuColumn,
     pub sub: MenuColumn,
-    pub open_cat: Option<usize>,
-    pub target_leaf: NodeId,
     /// Decoded app icons keyed by the desktop entry's `Icon=` value. Only
     /// successes are cached; failures retry on the next open so icons
     /// installed mid-session are picked up (see `Wm::resolve_icon_slot`).
     pub icon_cache: std::collections::HashMap<String, Rc<crate::icon::Icon>>,
+}
+
+/// The launcher's open state. The target leaf and the open submenu only
+/// exist while the menu is open, so a stale target or a dangling submenu
+/// index on a closed menu is unrepresentable.
+pub enum MenuState {
+    Closed,
+    Open {
+        /// The leaf a launched app's window is routed into.
+        target_leaf: NodeId,
+        /// The open category submenu's row index in the main column.
+        open_cat: Option<usize>,
+    },
+}
+
+impl MenuUi {
+    pub fn is_open(&self) -> bool {
+        matches!(self.state, MenuState::Open { .. })
+    }
+
+    pub fn open_cat(&self) -> Option<usize> {
+        match self.state {
+            MenuState::Open { open_cat, .. } => open_cat,
+            MenuState::Closed => None,
+        }
+    }
+
+    /// Change which category submenu is open; a no-op while the menu is
+    /// closed (there is no open menu for a submenu to attach to).
+    pub fn set_open_cat(&mut self, cat: Option<usize>) {
+        if let MenuState::Open { open_cat, .. } = &mut self.state {
+            *open_cat = cat;
+        }
+    }
 }
 
 /// One menu column (the main menu or the open submenu): its window plus the
@@ -697,9 +743,9 @@ pub struct LayoutAnim {
     /// animation it triggered.
     pub seq: u64,
     pub start: std::time::Instant,
-    /// Per-placement start rect (parallel to `placed`).
-    pub starts: Vec<FrameRect>,
-    pub placed: Vec<Placement>,
+    /// Each animated leaf's start rect paired with its target placement —
+    /// one entry per leaf, so start and target can't desync.
+    pub placed: Vec<(FrameRect, Placement)>,
 }
 
 /// The MIT-SHM segment shared with the X server for frame blits: created

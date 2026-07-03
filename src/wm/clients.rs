@@ -23,10 +23,15 @@ use crate::icon::{self, Icon};
 use crate::theme;
 use crate::tree::Win;
 
-/// ICCCM WM_STATE values.
-pub(crate) const WM_STATE_WITHDRAWN: u32 = 0;
-pub(crate) const WM_STATE_NORMAL: u32 = 1;
-pub(crate) const WM_STATE_ICONIC: u32 = 3;
+/// ICCCM `WM_STATE` values. An enum rather than bare `u32` constants so a
+/// state write can only name one of the three states the protocol defines;
+/// the wire value is produced at the property-write edge (`set_wm_state`).
+#[derive(Clone, Copy)]
+pub(crate) enum WmState {
+    Withdrawn = 0,
+    Normal = 1,
+    Iconic = 3,
+}
 
 impl Wm {
     /// Adopt windows already mapped on the root when splitwm starts, so
@@ -81,9 +86,9 @@ impl Wm {
         self.set_wm_state(
             win,
             if mapped {
-                WM_STATE_NORMAL
+                WmState::Normal
             } else {
-                WM_STATE_ICONIC
+                WmState::Iconic
             },
         )
     }
@@ -125,7 +130,7 @@ impl Wm {
             return self.manage_float(win);
         }
         if self.matches_dock(win) {
-            if self.dock.win.is_none() {
+            if self.dock.docked.is_none() {
                 return self.manage_dock(win);
             }
             eprintln!(
@@ -160,10 +165,19 @@ impl Wm {
                 class: class.clone(),
                 icon_slot,
                 mapped: already_mapped,
+                // Clamped to the CARD16 wire range: hints are client-
+                // controlled, and an absurd minimum would otherwise make
+                // every arrange configure a size the server rejects with
+                // BadValue, freezing the window at stale geometry.
                 min_size: self
                     .size_hints(win)
                     .and_then(|h| h.min_size)
-                    .map_or((1, 1), |(w, h)| (w.max(1), h.max(1))),
+                    .map_or((1, 1), |(w, h)| {
+                        (
+                            w.clamp(1, i32::from(u16::MAX)),
+                            h.clamp(1, i32::from(u16::MAX)),
+                        )
+                    }),
                 focus: self.focus_model(win),
                 icon_fetched: std::time::Instant::now(),
                 icon_stale: false,
@@ -212,13 +226,15 @@ impl Wm {
             .ok()
             .and_then(|c| c.reply().ok())
             .map_or(240, |g| i32::from(g.width));
-        self.dock.win = Some(win);
-        self.dock.w = width.max(1);
+        self.dock.docked = Some(super::types::Dock {
+            win,
+            w: width.max(1),
+        });
 
         self.select_and_grab(win, EventMask::STRUCTURE_NOTIFY, true)?;
         // The dock is a mapped managed client too: give it the ICCCM
         // WM_STATE some toolkits misbehave without (see `set_wm_state`).
-        self.set_wm_state(win, WM_STATE_NORMAL)?;
+        self.set_wm_state(win, WmState::Normal)?;
 
         // arrange() calls place_dock() against the freshly computed canvas,
         // so no separate initial placement is needed here.
@@ -407,7 +423,7 @@ impl Wm {
         self.update_client_list()?;
         self.restack_float(win)?;
         self.paint_float_frame(frame)?;
-        self.set_wm_state(win, WM_STATE_NORMAL)?;
+        self.set_wm_state(win, WmState::Normal)?;
         self.focus_float(win)?;
         self.raise_notifications()?;
         // Same pre-map `_NET_WM_STATE` fullscreen honouring as tiled clients.
@@ -617,7 +633,7 @@ impl Wm {
         self.conn.map_window(win)?;
         // Notifications are mapped managed windows too: record the ICCCM
         // WM_STATE (see `set_wm_state`).
-        self.set_wm_state(win, WM_STATE_NORMAL)?;
+        self.set_wm_state(win, WmState::Normal)?;
         self.conn.flush()?;
         Ok(())
     }
@@ -718,10 +734,10 @@ impl Wm {
         let wins: Vec<Win> = self.clients.keys().copied().collect();
         for win in wins {
             self.conn.map_window(win)?;
-            self.set_wm_state(win, WM_STATE_NORMAL)?;
+            self.set_wm_state(win, WmState::Normal)?;
         }
-        if let Some(dock) = self.dock.win {
-            self.conn.map_window(dock)?;
+        if let Some(d) = self.dock.docked {
+            self.conn.map_window(d.win)?;
         }
         for f in &self.floats {
             self.conn.map_window(f.win)?;
@@ -737,13 +753,13 @@ impl Wm {
 
     /// Set the ICCCM `WM_STATE` property (Normal/Iconic/Withdrawn) — some
     /// toolkits (notably Java's) misbehave without it.
-    pub(crate) fn set_wm_state(&self, win: Win, state: u32) -> R<()> {
+    pub(crate) fn set_wm_state(&self, win: Win, state: WmState) -> R<()> {
         self.conn.change_property32(
             PropMode::REPLACE,
             win,
             self.atoms.wm_state,
             self.atoms.wm_state,
-            &[state, 0],
+            &[state as u32, 0],
         )?;
         Ok(())
     }
@@ -754,7 +770,7 @@ impl Wm {
     /// after mapping would otherwise leave the dock tiled as an ordinary
     /// window forever.
     pub(crate) fn on_dock_identity_change(&mut self, win: Win, changed_atom: u32) -> R<()> {
-        if self.dock.win.is_some() {
+        if self.dock.docked.is_some() {
             return Ok(());
         }
         let Some(client) = self.clients.get(&win) else {
@@ -795,7 +811,7 @@ impl Wm {
     pub(crate) fn update_client_list(&self) -> R<()> {
         let mut list = self.bar_order.clone();
         list.extend(self.floats.iter().map(|f| f.win));
-        list.extend(self.dock.win);
+        list.extend(self.dock.docked.map(|d| d.win));
         self.conn.change_property32(
             PropMode::REPLACE,
             self.root,

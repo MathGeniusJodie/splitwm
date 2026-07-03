@@ -801,7 +801,10 @@ impl Renderer {
 
     /// The `size`x`size` nearest-scaled palette-index buffer for `img`
     /// (`TRANSPARENT_INDEX` where alpha < 50%), computed once per
-    /// icon+size and reused every frame after.
+    /// icon+size and reused every frame after. Aspect-preserving: the
+    /// icon's larger dimension maps to `size` and the other scales
+    /// proportionally, centred — a non-square `_NET_WM_ICON` block renders
+    /// letterboxed on transparent padding instead of stretched.
     fn cached_icon_indices(&self, img: &Icon, size: i32) -> Rc<[u8]> {
         // Callers (`draw_icon`) pre-check dims; the `img.h - 1` /
         // `img.w - 1` below would wrap to u32::MAX on a zero-sized icon,
@@ -815,16 +818,23 @@ impl Renderer {
             return Rc::clone(v);
         }
         let sz = size as usize;
+        let (iw, ih) = (img.w as usize, img.h as usize);
+        let (dw, dh) = if iw >= ih {
+            (sz, (ih * sz / iw).max(1))
+        } else {
+            ((iw * sz / ih).max(1), sz)
+        };
+        let (ox, oy) = ((sz - dw) / 2, (sz - dh) / 2);
         let mut idx = vec![TRANSPARENT_INDEX; sz * sz];
-        for ty in 0..size {
-            let sy = (ty as u32 * img.h / size as u32).min(img.h - 1);
-            for tx in 0..size {
-                let sx = (tx as u32 * img.w / size as u32).min(img.w - 1);
-                let s = img.argb[(sy * img.w + sx) as usize];
+        for ty in 0..dh {
+            let sy = (ty * ih / dh).min(ih - 1);
+            for tx in 0..dw {
+                let sx = (tx * iw / dw).min(iw - 1);
+                let s = img.argb[sy * iw + sx];
                 if (s >> 24) & 0xff < 128 {
                     continue;
                 }
-                idx[ty as usize * sz + tx as usize] = self.palette.nearest_index(PgRgb {
+                idx[(oy + ty) * sz + ox + tx] = self.palette.nearest_index(PgRgb {
                     r: ((s >> 16) & 0xff) as u8,
                     g: ((s >> 8) & 0xff) as u8,
                     b: (s & 0xff) as u8,
@@ -1082,15 +1092,13 @@ const MENU_ARROW_W: i32 = 16;
 const MENU_ICON_SZ: i32 = 16;
 const MENU_ICON_GAP: i32 = 8;
 
-/// One menu column's *visible* row slice, bundled for `draw_menu`. The
-/// parallel slices are cut from the same range by the caller
-/// (`Wm::paint_column`), so they can't drift in length.
+/// One menu column's *visible* row slice, bundled for `draw_menu`.
 pub struct MenuView<'a> {
-    pub labels: &'a [String],
-    /// Rows that open a submenu get a trailing arrow glyph.
-    pub arrows: &'a [bool],
-    /// Divider rows.
-    pub seps: &'a [bool],
+    /// The rows to draw (label, action, icon name in one record).
+    pub rows: &'a [crate::menu::Row],
+    /// The rows' *resolved* icons, cut from the same range by the caller
+    /// (`Wm::paint_column`) — per-open view state, so it can't live on the
+    /// rows themselves.
     pub icons: &'a [Option<Rc<Icon>>],
     /// Inner content width (shared across a menu + submenu so they line up).
     pub content_w: i32,
@@ -1113,14 +1121,19 @@ impl Renderer {
     }
 
     /// Inner content width (excludes the black border) for a menu column.
-    /// `any_icon` reserves a leading icon column so labels stay aligned.
-    pub fn menu_content_w(&self, labels: &[String], any_arrow: bool, any_icon: bool) -> i32 {
+    /// Any submenu row reserves the trailing arrow column and any icon
+    /// reserves the leading icon column, so labels stay aligned.
+    pub fn menu_content_w(&self, rows: &[crate::menu::Row]) -> i32 {
         let mut w = 0;
-        for l in labels {
-            w = w.max(self.text_width(l));
+        for r in rows {
+            w = w.max(self.text_width(&r.label));
         }
-        let arrow = if any_arrow { MENU_ARROW_W } else { 0 };
-        let icon = if any_icon {
+        let arrow = if rows.iter().any(crate::menu::Row::arrow) {
+            MENU_ARROW_W
+        } else {
+            0
+        };
+        let icon = if rows.iter().any(|r| r.icon.is_some()) {
             MENU_ICON_SZ + MENU_ICON_GAP
         } else {
             0
@@ -1131,23 +1144,20 @@ impl Renderer {
     /// Render a menu column's visible rows to its own framebuffer.
     pub fn draw_menu(&self, v: &MenuView) -> Framebuffer {
         let &MenuView {
-            labels,
-            arrows,
-            seps,
+            rows,
             icons,
             content_w,
             hi,
             icon_col,
         } = v;
-        let rows = labels.len() as i32;
-        let (fw, fh) = frame_size(rows, content_w);
+        let (fw, fh) = frame_size(rows.len() as i32, content_w);
         let (w, h) = (fw.max(1) as usize, fh.max(1) as usize);
         let mut fb = Framebuffer::new(w, h, palette_color::BLACK);
         let b = MENU_BORDER;
         let cw = content_w;
-        for (i, label) in labels.iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             let ry = b + i as i32 * MENU_ROW_H;
-            if seps.get(i).copied().unwrap_or(false) {
+            if matches!(row.item, crate::menu::Item::Separator) {
                 // Faint divider line centred in the row.
                 fill(
                     &mut fb,
@@ -1191,9 +1201,9 @@ impl Renderer {
                         0
                     };
                 let ty = ry + (MENU_ROW_H - font.cell_h() as i32) / 2;
-                font.draw_text(&mut fb, label, tx as usize, ty.max(0) as usize, self.fg);
+                font.draw_text(&mut fb, &row.label, tx as usize, ty.max(0) as usize, self.fg);
             }
-            if arrows.get(i).copied().unwrap_or(false) {
+            if row.arrow() {
                 // Small right-pointing triangle (▸): stacked shrinking rows.
                 let ax = b + cw - MENU_ARROW_W + 4;
                 let ay = ry + MENU_ROW_H / 2;

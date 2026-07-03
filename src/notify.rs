@@ -11,7 +11,6 @@
 //! `NotificationClosed` signal can be emitted from the thread that owns the
 //! bus connection.
 
-use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -42,12 +41,22 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const MAX_NOTES: usize = 8;
 
 /// Freedesktop `NotificationClosed` reasons. The daemon emits
-/// expired/closed itself; dismissed/undefined are reported by the WM over
-/// the dismiss channel and relayed onto the bus verbatim.
-pub const CLOSE_REASON_EXPIRED: u32 = 1; // expire_timeout elapsed
-pub const CLOSE_REASON_DISMISSED: u32 = 2; // dismissed by the user (click)
-pub const CLOSE_REASON_CLOSED: u32 = 3; // closed by a CloseNotification call
-pub const CLOSE_REASON_UNDEFINED: u32 = 4; // evicted for space; no exact fit
+/// Expired/Closed itself; Dismissed/Undefined are reported by the WM over
+/// the dismiss channel and relayed onto the bus. An enum rather than bare
+/// `u32` constants so the channel and the signal can only ever carry one of
+/// the four reasons the spec defines; the wire value is produced at the
+/// bus edge (`emit_closed`).
+#[derive(Clone, Copy)]
+pub enum CloseReason {
+    /// `expire_timeout` elapsed.
+    Expired = 1,
+    /// Dismissed by the user (click).
+    Dismissed = 2,
+    /// Closed by a `CloseNotification` call.
+    Closed = 3,
+    /// Evicted for space; the spec has no exact fit.
+    Undefined = 4,
+}
 
 pub struct Note {
     pub id: u32,
@@ -64,12 +73,12 @@ pub enum NoteMsg {
 }
 
 /// Spawn the daemon thread. Returns the sender the WM uses to report a
-/// popup it closed as `(id, close reason)` — `CLOSE_REASON_DISMISSED` for a
-/// user click, `CLOSE_REASON_UNDEFINED` for a popup-cap eviction — so the
+/// popup it closed as `(id, close reason)` — `CloseReason::Dismissed` for a
+/// user click, `CloseReason::Undefined` for a popup-cap eviction — so the
 /// matching `NotificationClosed` signal goes out on the bus with the truth.
 /// Bus errors (no session bus, name already owned) only disable
 /// notifications: they log and let the WM run on.
-pub fn spawn(to_wm: Sender<NoteMsg>) -> Sender<(u32, u32)> {
+pub fn spawn(to_wm: Sender<NoteMsg>) -> Sender<(u32, CloseReason)> {
     let (dismiss_tx, dismiss_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         if let Err(e) = serve(&to_wm, &dismiss_rx) {
@@ -111,7 +120,25 @@ fn connect_bus() -> R<Connection> {
     Err(last_err)
 }
 
-fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
+/// One outstanding notification in `serve`'s ledger. Every fact about a
+/// live id travels in one record (rather than parallel id-keyed maps), so
+/// an id can't linger in one bookkeeping structure after leaving another.
+struct Outstanding {
+    id: u32,
+    /// Bus *unique* name that created the id: a `replaces_id` is only
+    /// honoured for the notification's own sender — any client could
+    /// otherwise replace/re-time another app's live notification by
+    /// guessing its (small, sequential) id. Keying by unique name means an
+    /// app that drops off the bus and reconnects cannot replace its own
+    /// still-live notification; accepted, since matching on well-known
+    /// names or app_name would reopen the spoofing hole.
+    owner: String,
+    /// When the note auto-closes; `None` never expires (timeout 0, or
+    /// critical urgency per spec).
+    expiry: Option<Instant>,
+}
+
+fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, CloseReason)>) -> R<()> {
     // Own X connection purely for waking the WM's blocking event loop.
     // Established before the bus so a bus failure can still be shown to the
     // user as a popup (below) rather than only a stderr line nobody sees.
@@ -151,50 +178,40 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
     };
 
     let mut next_id: u32 = 1;
-    let mut expiries: HashMap<u32, Instant> = HashMap::new();
-    // FIFO of currently-outstanding ids, oldest first; used only to enforce
-    // `MAX_NOTES` by evicting the oldest popup once a new one would exceed
-    // it.
-    let mut order: Vec<u32> = Vec::new();
-    // Bus sender (unique name) that created each outstanding id, so a
-    // `replaces_id` is only honoured for the notification's own sender —
-    // any client could otherwise replace/re-time another app's live
-    // notification by guessing its (small, sequential) id.
-    let mut owners: HashMap<u32, String> = HashMap::new();
+    // Outstanding notifications, oldest first — the order `MAX_NOTES`
+    // eviction consumes.
+    let mut notes: Vec<Outstanding> = Vec::new();
 
     loop {
-        // Drop owner records for ids no longer outstanding (dismissed,
-        // expired, closed or evicted since last time); `order` stays tiny
-        // (<= MAX_NOTES), so this sweep is trivially cheap.
-        owners.retain(|id, _| order.contains(id));
         // Popups the WM closed (click-dismissal or popup-cap eviction):
         // relay the reason it reported onto the bus.
         while let Ok((id, reason)) = dismissed.try_recv() {
-            expiries.remove(&id);
-            order.retain(|&o| o != id);
+            notes.retain(|n| n.id != id);
             emit_closed(conn.channel(), id, reason);
         }
 
         let now = Instant::now();
-        let expired: Vec<u32> = expiries
-            .iter()
-            .filter(|&(_, t)| *t <= now)
-            .map(|(&id, _)| id)
-            .collect();
+        let mut expired: Vec<u32> = Vec::new();
+        notes.retain(|n| {
+            let done = n.expiry.is_some_and(|t| t <= now);
+            if done {
+                expired.push(n.id);
+            }
+            !done
+        });
         for id in expired {
-            expiries.remove(&id);
-            order.retain(|&o| o != id);
             to_wm
                 .send(NoteMsg::Close(id))
                 .map_err(|_| "wm channel closed")?;
-            emit_closed(conn.channel(), id, CLOSE_REASON_EXPIRED);
+            emit_closed(conn.channel(), id, CloseReason::Expired);
             ping();
         }
 
         // Sleep until the next expiry, but never so long that a dismissal
         // report from the WM sits unserviced.
-        let wait = expiries
-            .values()
+        let wait = notes
+            .iter()
+            .filter_map(|n| n.expiry)
             .map(|t| t.saturating_duration_since(now))
             .min()
             .unwrap_or(Duration::from_millis(250))
@@ -219,8 +236,7 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
         match msg.member().as_deref() {
             Some("Notify") => {
                 let sender = msg.sender().map(|s| s.to_string()).unwrap_or_default();
-                let Some((note, timeout)) =
-                    parse_notify(&msg, &mut next_id, &order, &owners, &sender)
+                let Some((note, timeout)) = parse_notify(&msg, &mut next_id, &notes, &sender)
                 else {
                     error_reply(
                         conn.channel(),
@@ -231,34 +247,32 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
                     continue;
                 };
                 let id = note.id;
-                owners.insert(id, sender);
-                // A `replaces_id` re-show must not inherit the replaced
-                // note's deadline: clear it unconditionally, then re-arm
-                // below only if the *new* notification wants a timeout
-                // (a critical/never-expire replacement would otherwise keep
-                // the replaced note's expiry and get auto-closed by it).
-                expiries.remove(&id);
                 // 0 means never expire; so does critical urgency per spec.
-                match timeout {
+                let expiry = match timeout {
                     _ if note.urgency >= 2 => None,
                     0 => None,
-                    t if t > 0 => Some(Duration::from_millis(t as u64)),
-                    _ => Some(DEFAULT_TIMEOUT),
-                }
-                .map(|d| expiries.insert(id, Instant::now() + d));
-                order.retain(|&o| o != id); // a `replaces_id` re-show moves to newest
-                order.push(id);
+                    t if t > 0 => Some(Instant::now() + Duration::from_millis(t as u64)),
+                    _ => Some(Instant::now() + DEFAULT_TIMEOUT),
+                };
+                // A `replaces_id` re-show moves to newest and carries the
+                // *new* expiry — inheriting the replaced note's deadline
+                // would auto-close a critical/never-expire replacement.
+                notes.retain(|n| n.id != id);
+                notes.push(Outstanding {
+                    id,
+                    owner: sender,
+                    expiry,
+                });
                 // Cap outstanding notifications: evict the oldest rather
                 // than let the popup pile grow without bound.
-                if order.len() > MAX_NOTES {
-                    let evict = order.remove(0);
-                    expiries.remove(&evict);
+                if notes.len() > MAX_NOTES {
+                    let evict = notes.remove(0);
                     to_wm
-                        .send(NoteMsg::Close(evict))
+                        .send(NoteMsg::Close(evict.id))
                         .map_err(|_| "wm channel closed")?;
                     // No spec reason fits "evicted for space" exactly;
                     // undefined/reserved is the closest fit.
-                    emit_closed(conn.channel(), evict, CLOSE_REASON_UNDEFINED);
+                    emit_closed(conn.channel(), evict.id, CloseReason::Undefined);
                 }
                 to_wm
                     .send(NoteMsg::Show(note))
@@ -271,13 +285,12 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
                 // an outstanding notification — success would also make the
                 // daemon emit a spurious NotificationClosed.
                 match msg.read1::<u32>() {
-                    Ok(id) if order.contains(&id) => {
-                        expiries.remove(&id);
-                        order.retain(|&o| o != id);
+                    Ok(id) if notes.iter().any(|n| n.id == id) => {
+                        notes.retain(|n| n.id != id);
                         to_wm
                             .send(NoteMsg::Close(id))
                             .map_err(|_| "wm channel closed")?;
-                        emit_closed(conn.channel(), id, CLOSE_REASON_CLOSED);
+                        emit_closed(conn.channel(), id, CloseReason::Closed);
                         ping();
                         reply(conn.channel(), msg.method_return())?;
                     }
@@ -312,18 +325,17 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
 
 /// Decode a `Notify` call's eight arguments into a `Note` plus its raw
 /// `expire_timeout`. Returns `None` on a malformed call. `outstanding` is
-/// the set of still-live ids: a fresh allocation skips them (so a
+/// the still-live ledger: a fresh allocation skips its ids (so a
 /// wrapped-around `next_id` can't alias a never-expiring notification), and
-/// `replaces_id` is only honoured when it names one of them *created by the
-/// same bus sender* (per `owners`/`sender`) — the spec says an unknown
+/// `replaces_id` is only honoured when it names an entry *created by the
+/// same bus sender* (see `Outstanding::owner`) — the spec says an unknown
 /// `replaces_id` behaves like a new notification, and honouring arbitrary
 /// values let any bus client resurrect stale ids or (with a guessed id)
 /// replace/re-time another app's live notification.
 fn parse_notify(
     msg: &Message,
     next_id: &mut u32,
-    outstanding: &[u32],
-    owners: &HashMap<u32, String>,
+    outstanding: &[Outstanding],
     sender: &str,
 ) -> Option<(Note, i32)> {
     let mut it = msg.iter_init();
@@ -336,21 +348,17 @@ fn parse_notify(
     let hints: PropMap = it.read().ok()?;
     let timeout: i32 = it.read().ok()?;
 
-    // Ownership is keyed by the bus *unique* name: an app that drops off
-    // the bus and reconnects gets a new unique name, so it cannot replace
-    // its own still-live notification — its replaces_id is treated as a
-    // new notification. Accepted: the alternative (matching on well-known
-    // names or app_name) would reopen the spoofing hole this check closes.
     let id = if replaces != 0
-        && outstanding.contains(&replaces)
-        && owners.get(&replaces).is_some_and(|o| o == sender)
+        && outstanding
+            .iter()
+            .any(|n| n.id == replaces && n.owner == sender)
     {
         replaces
     } else {
         loop {
             let id = *next_id;
             *next_id = next_id.wrapping_add(1).max(1);
-            if !outstanding.contains(&id) {
+            if !outstanding.iter().any(|n| n.id == id) {
                 break id;
             }
         }
@@ -389,10 +397,10 @@ pub(crate) fn cap_chars(s: &str, cap: usize) -> &str {
 /// Emit `NotificationClosed(id, reason)`, best-effort: a failed signal send
 /// only logs — one bus hiccup must not kill notifications for the whole
 /// session (a truly dead bus surfaces at the next `blocking_pop_message`).
-fn emit_closed(ch: &Channel, id: u32, reason: u32) {
+fn emit_closed(ch: &Channel, id: u32, reason: CloseReason) {
     let sent = Message::new_signal(PATH, IFACE, "NotificationClosed")
         .map_err(|e| format!("bad signal: {e}").into())
-        .and_then(|sig| reply(ch, sig.append2(id, reason)));
+        .and_then(|sig| reply(ch, sig.append2(id, reason as u32)));
     if let Err(e) = sent {
         eprintln!("splitwm: failed to emit NotificationClosed({id}): {e}");
     }

@@ -27,32 +27,37 @@ pub enum Item {
     Separator,
 }
 
+/// One menu row: its label, what activating it does, and its icon. A single
+/// struct rather than parallel per-fact vectors, so a row's facts can't
+/// desync in length or pairing.
+pub struct Row {
+    pub label: String,
+    pub item: Item,
+    /// Icon name/path (from the desktop entry's `Icon=`), resolved and
+    /// decoded lazily by `wm` when the row first becomes visible.
+    pub icon: Option<String>,
+}
+
+impl Row {
+    /// Rows that open a submenu get a trailing ▸ arrow — derived from
+    /// `item` rather than stored, so the two can't disagree.
+    pub fn arrow(&self) -> bool {
+        matches!(self.item, Item::Submenu(_))
+    }
+}
+
 /// A single column of rows (the main menu or one category submenu).
 pub struct Menu {
-    pub labels: Vec<String>,
-    pub items: Vec<Item>,
-    /// Rows that open a submenu get a trailing ▸ arrow.
-    pub arrows: Vec<bool>,
-    /// Per-row icon name/path (from the desktop entry's `Icon=`), resolved
-    /// and decoded lazily by `wm` when the row first becomes visible.
-    pub icons: Vec<Option<String>>,
+    pub rows: Vec<Row>,
 }
 
 impl Menu {
     fn new() -> Self {
-        Self {
-            labels: Vec::new(),
-            items: Vec::new(),
-            arrows: Vec::new(),
-            icons: Vec::new(),
-        }
+        Self { rows: Vec::new() }
     }
 
-    fn push(&mut self, label: String, item: Item, arrow: bool, icon: Option<String>) {
-        self.labels.push(label);
-        self.items.push(item);
-        self.arrows.push(arrow);
-        self.icons.push(icon);
+    fn push(&mut self, label: String, item: Item, icon: Option<String>) {
+        self.rows.push(Row { label, item, icon });
     }
 }
 
@@ -383,16 +388,16 @@ pub fn build() -> MenuTree {
         }
         let mut sub = Menu::new();
         for a in apps {
-            sub.push(a.name, Item::Launch(a.exec), false, a.icon);
+            sub.push(a.name, Item::Launch(a.exec), a.icon);
         }
         let idx = subs.len();
         subs.push(sub);
-        main.push(cat, Item::Submenu(idx), true, None);
+        main.push(cat, Item::Submenu(idx), None);
     }
 
-    main.push(String::new(), Item::Separator, false, None);
+    main.push(String::new(), Item::Separator, None);
     for (label, cmd, icon) in quick_rows {
-        main.push(label, Item::Launch(cmd), false, icon);
+        main.push(label, Item::Launch(cmd), icon);
     }
 
     MenuTree { main, subs }

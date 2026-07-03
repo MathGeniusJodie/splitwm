@@ -11,7 +11,7 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::protocol::Event;
 
-use super::clients::WM_STATE_WITHDRAWN;
+use super::clients::WmState;
 use super::types::{
     clamp_dim, rect_contains, Action, BtnKind, Drag, EdgeDrag, FloatDrag, FrameRect, Wm, MOD4, R,
 };
@@ -126,7 +126,9 @@ impl Wm {
         }
         let p = self.conn.query_pointer(self.root)?.reply()?;
         let allowed =
-            if p.child == x11rb::NONE || p.child == self.underlay || Some(p.child) == self.dock.win
+            if p.child == x11rb::NONE
+                || p.child == self.underlay
+                || self.dock.docked.is_some_and(|d| d.win == p.child)
             {
                 true
             } else {
@@ -207,7 +209,7 @@ impl Wm {
                     // Vertical wheel over an open menu column scrolls its
                     // rows (a column taller than the screen clamps and
                     // scrolls; see `on_menu_scroll`).
-                    if self.menu.open && self.is_menu_window(e.event) && matches!(e.detail, 4 | 5) {
+                    if self.menu.is_open() && self.is_menu_window(e.event) && matches!(e.detail, 4 | 5) {
                         let d = if e.detail == 5 { 1 } else { -1 };
                         match pending_menu_scroll.iter_mut().find(|(w, _)| *w == e.event) {
                             Some((_, acc)) => *acc += d,
@@ -312,7 +314,7 @@ impl Wm {
             // Pointer left a menu window: retire its hover highlight (the
             // main column keeps highlighting an open category so the
             // submenu still reads as attached to its row).
-            Event::LeaveNotify(e) if self.menu.open && self.is_menu_window(e.event) => {
+            Event::LeaveNotify(e) if self.menu.is_open() && self.is_menu_window(e.event) => {
                 self.on_menu_leave(e.event)?;
             }
             // Keyboard layout / modifier mapping changed: rebind everything.
@@ -387,7 +389,7 @@ impl Wm {
         // The dock's geometry is ours (set once in manage_dock and reasserted
         // by every place_dock): granting its request would let it drift for
         // one frame and then snap back. Deny + echo, like tiled clients.
-        if self.dock.win == Some(e.window) {
+        if self.dock.docked.is_some_and(|d| d.win == e.window) {
             return self.send_synthetic_configure(e.window);
         }
         let aux = ConfigureWindowAux::from_configure_request(e);
@@ -451,8 +453,8 @@ impl Wm {
     /// `place_clients` applies, min-size clamp included), or the dock's
     /// pinned column. `None` for anything else (hidden clients, unknowns).
     fn tracked_geometry(&self, win: Win) -> Option<(i32, i32, i32, i32)> {
-        if self.dock.win == Some(win) {
-            return Some(self.dock_geometry());
+        if let Some(d) = self.dock.docked.filter(|d| d.win == win) {
+            return Some(self.dock_geometry(d));
         }
         if self.fullscreen == Some(win) {
             let full = self.wa();
@@ -585,10 +587,10 @@ impl Wm {
             return self.bring_into_layout(e.window);
         }
         // The dock re-requesting a map must not fall through to manage():
-        // matches_dock would see dock.win already set to this same window,
-        // misread it as a second dock, and tile it while place_dock still
-        // manages it — a permanently leaked, geometry-fighting duplicate.
-        if self.dock.win == Some(e.window) {
+        // matches_dock would see this same window already docked, misread
+        // it as a second dock, and tile it while place_dock still manages
+        // it — a permanently leaked, geometry-fighting duplicate.
+        if self.dock.docked.is_some_and(|d| d.win == e.window) {
             self.conn.map_window(e.window)?;
             return Ok(());
         }
@@ -631,29 +633,27 @@ impl Wm {
                 return Ok(());
             }
         }
-        if self.dock.win == Some(win) {
-            self.dock.win = None;
-            self.dock.w = 0;
+        if self.dock.docked.is_some_and(|d| d.win == win) {
+            self.dock.docked = None;
             return self.arrange();
         }
         if self.notes.foreign.iter().any(|n| n.win == win) {
             return self.forget_notification(win);
         }
         if self.floats.iter().any(|f| f.win == win) {
-            self.set_wm_state(win, WM_STATE_WITHDRAWN)?;
+            self.set_wm_state(win, WmState::Withdrawn)?;
             return self.forget_float(win);
         }
         if self.clients.contains_key(&win) {
-            self.set_wm_state(win, WM_STATE_WITHDRAWN)?;
+            self.set_wm_state(win, WmState::Withdrawn)?;
             self.forget_client(win)?;
         }
         Ok(())
     }
 
     fn on_destroy(&mut self, win: u32) -> R<()> {
-        if self.dock.win == Some(win) {
-            self.dock.win = None;
-            self.dock.w = 0;
+        if self.dock.docked.is_some_and(|d| d.win == win) {
+            self.dock.docked = None;
             return self.arrange();
         }
         if self.notes.foreign.iter().any(|n| n.win == win) {
@@ -670,19 +670,6 @@ impl Wm {
         let Some(action) = self.lookup_action(e.state.into(), e.detail) else {
             return Ok(());
         };
-        // Media-style keys don't touch the layout; handle them before the
-        // animate/arrange bookkeeping below.
-        match action {
-            Action::BrightnessUp => {
-                adjust_brightness(5);
-                return Ok(());
-            }
-            Action::BrightnessDown => {
-                adjust_brightness(-5);
-                return Ok(());
-            }
-            _ => {}
-        }
         // Swallow keyboard auto-repeat for the layout-mutating actions:
         // holding Mod4+V must not carve ~20 splits a second, each queueing
         // its own animation. Resize/focus actions deliberately keep
@@ -731,14 +718,16 @@ impl Wm {
                     .copied()
             })
             .flatten();
+        // A refused mutation (root-leaf close, resize at its clamp, no
+        // adjacent split) cancels the queued animation: there is nothing to
+        // slide, and a no-op transition still costs 280 ms of frame-paced
+        // full-screen recomposites.
         match action {
             Action::SpawnTerminal => self.spawn_terminal(),
             Action::SpawnLauncher => self.spawn("rofi -show drun"),
             Action::SplitH => self.try_split(Dir::H),
             Action::SplitV => self.try_split(Dir::V),
-            Action::Close => {
-                self.state.close_focused();
-            }
+            Action::Close => self.animate &= self.state.close_focused(),
             Action::FocusNext => {
                 self.state.focus_direction(true);
             }
@@ -752,17 +741,13 @@ impl Wm {
                 self.state.cycle_taskbar(false);
             }
             Action::MoveTabNext => {
-                self.state.move_tab_to_direction(true);
+                self.animate &= self.state.move_tab_to_direction(true).is_some();
             }
             Action::MoveTabPrev => {
-                self.state.move_tab_to_direction(false);
+                self.animate &= self.state.move_tab_to_direction(false).is_some();
             }
-            Action::Grow => {
-                self.state.resize_focused(theme::RESIZE_STEP);
-            }
-            Action::Shrink => {
-                self.state.resize_focused(-theme::RESIZE_STEP);
-            }
+            Action::Grow => self.animate &= self.state.resize_focused(theme::RESIZE_STEP),
+            Action::Shrink => self.animate &= self.state.resize_focused(-theme::RESIZE_STEP),
             Action::CloseWindow => {
                 // A focused float (dialog) is the keyboard target before the
                 // focused split's client.
@@ -774,7 +759,17 @@ impl Wm {
                 self.running = false;
                 return Ok(());
             }
-            Action::BrightnessUp | Action::BrightnessDown => unreachable!("handled above"),
+            // Media keys touch no layout state: no commit_layout, no
+            // animation. Off-thread, so a wedged backlight device can't
+            // stall input handling.
+            Action::BrightnessUp => {
+                adjust_brightness(5);
+                return Ok(());
+            }
+            Action::BrightnessDown => {
+                adjust_brightness(-5);
+                return Ok(());
+            }
         }
         if let Some(rect) = pre_split {
             self.prev_frame_rect
@@ -850,7 +845,7 @@ impl Wm {
                 } else {
                     base
                 };
-                self.state.focused_leaf = leaf;
+                self.state.focus_leaf(leaf);
                 let pre = self.prev_frame_rect.get(&leaf).copied();
                 self.state.split_focused(dir);
                 // Carry the pre-split frame so content slides from its old spot.
@@ -864,16 +859,14 @@ impl Wm {
                 if meta.parent_dir.is_none() {
                     return Ok(());
                 }
-                self.state.focused_leaf = leaf;
-                self.state.close_focused();
-                self.animate = true;
+                self.state.focus_leaf(leaf);
+                self.animate = self.state.close_focused();
             }
             BtnKind::Minimize => {
                 if meta.parent_dir.is_none() {
                     return Ok(());
                 }
-                self.state.toggle_minimize(leaf);
-                self.animate = true;
+                self.animate = self.state.toggle_minimize(leaf);
             }
         }
         self.commit_layout()
@@ -902,7 +895,7 @@ impl Wm {
         }
         // Clicks inside the launcher menu select an item; clicks elsewhere
         // dismiss it before falling through to normal handling.
-        if self.menu.open {
+        if self.menu.is_open() {
             if self.is_menu_window(e.event) {
                 if e.detail == 1 {
                     self.on_menu_click(e.event, i32::from(e.event_x), i32::from(e.event_y))?;
@@ -954,7 +947,7 @@ impl Wm {
                 }
                 // Click a title (tab) or an empty split's body to focus it.
                 Hit::Tab(leaf) | Hit::LeafBody(leaf) => {
-                    self.state.focused_leaf = leaf;
+                    self.state.focus_leaf(leaf);
                     self.arrange()?;
                     self.focus(self.state.focused_client())?;
                 }
@@ -1009,7 +1002,7 @@ impl Wm {
             } else if self.floats.iter().any(|f| f.win == e.event) {
                 self.focus_float(e.event)?;
                 self.raise_notifications()?;
-            } else if self.dock.win == Some(e.event) {
+            } else if self.dock.docked.is_some_and(|d| d.win == e.event) {
                 // Outside the tree/`clients`, so `focus()` (which only knows
                 // tiled windows) can't take it; set input focus directly.
                 // The press's own timestamp, not CURRENT_TIME — same race
@@ -1027,7 +1020,7 @@ impl Wm {
     }
 
     fn on_motion(&mut self, e: &MotionNotifyEvent) -> R<()> {
-        if self.menu.open && self.is_menu_window(e.event) {
+        if self.menu.is_open() && self.is_menu_window(e.event) {
             return self.on_menu_motion(e.event, i32::from(e.event_x), i32::from(e.event_y));
         }
         if let Some(fd) = self.drags.float {
@@ -1251,9 +1244,9 @@ impl Wm {
     fn on_expose(&mut self, e: ExposeEvent) -> R<()> {
         // The underlay needs no handling here: its composited image is its
         // `background_pixmap`, so the server repaints exposed areas itself.
-        if self.menu.open && e.window == self.menu.main.win {
+        if self.menu.is_open() && e.window == self.menu.main.win {
             self.paint_column(false)?;
-        } else if self.menu.open && e.window == self.menu.sub.win {
+        } else if self.menu.is_open() && e.window == self.menu.sub.win {
             self.paint_column(true)?;
         } else if self.floats.iter().any(|f| f.frame == e.window) {
             self.paint_float_frame(e.window)?;

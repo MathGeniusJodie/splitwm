@@ -281,8 +281,7 @@ pub fn run(replace: bool) -> R<()> {
         pending_events: Vec::new(),
         bar_order: Vec::new(),
         dock: DockState {
-            win: None,
-            w: 0,
+            docked: None,
             title: std::env::var("SPLITWM_DOCK_TITLE")
                 .unwrap_or_else(|_| theme::DOCK_TITLE.to_string()),
         },
@@ -665,11 +664,9 @@ fn create_menu_windows(
     }
     Ok(MenuUi {
         tree: crate::menu::build(),
-        open: false,
+        state: MenuState::Closed,
         main: MenuColumn::new(menu_main),
         sub: MenuColumn::new(menu_sub),
-        open_cat: None,
-        target_leaf: crate::tree::NodeId::default(),
         icon_cache: HashMap::new(),
     })
 }
@@ -705,7 +702,7 @@ fn startup_adopt_and_arrange(wm: &mut Wm, root: Window) -> R<()> {
     // Autostart the docked sidebar from its freedesktop entry (the desktop
     // id must match the dock title, e.g. cozyui.desktop), unless a previous
     // WM already handed a running one over.
-    if wm.dock.win.is_none() {
+    if wm.dock.docked.is_none() {
         match crate::menu::desktop_entry_cmd(&wm.dock.title) {
             Some(cmd) => wm.spawn(&cmd),
             None => eprintln!(
@@ -723,17 +720,30 @@ fn startup_adopt_and_arrange(wm: &mut Wm, root: Window) -> R<()> {
 /// don't queue behind eye candy, structural (map/unmap/destroy/configure/
 /// client-message) so a window appearing or dying mid-animation is handled
 /// against the final layout promptly.
-fn cuts_animation(ev: &Event) -> bool {
-    matches!(
-        ev,
+///
+/// A self-inflicted `UnmapNotify` (the layout hiding a client, recorded in
+/// `Wm::ignore_unmaps`) is exempt: layout changes that hide a window issue
+/// the unmap in the very arrange that starts the animation, and its echo
+/// arrives on the next iteration — cutting on it would snap every
+/// minimize/close-to-taskbar transition after a single frame. Matched by
+/// (window, sequence) exactly like `Wm::on_unmap`, and consulted before
+/// `handle_batch` consumes the record; both delivered copies (root
+/// SubstructureNotify and the client's own StructureNotify) carry the same
+/// pair, so both are exempted.
+fn cuts_animation(wm: &Wm, ev: &Event) -> bool {
+    match ev {
+        Event::UnmapNotify(e) => !wm
+            .ignore_unmaps
+            .get(&e.window)
+            .is_some_and(|seqs| seqs.contains(&e.sequence)),
         Event::KeyPress(_)
-            | Event::ButtonPress(_)
-            | Event::MapRequest(_)
-            | Event::UnmapNotify(_)
-            | Event::DestroyNotify(_)
-            | Event::ConfigureRequest(_)
-            | Event::ClientMessage(_)
-    )
+        | Event::ButtonPress(_)
+        | Event::MapRequest(_)
+        | Event::DestroyNotify(_)
+        | Event::ConfigureRequest(_)
+        | Event::ClientMessage(_) => true,
+        _ => false,
+    }
 }
 
 fn event_loop(wm: &mut Wm) -> R<()> {
@@ -794,7 +804,7 @@ fn event_loop(wm: &mut Wm) -> R<()> {
         // against the animation in flight *before* the batch runs, and only
         // honoured if that same animation is still running afterwards, so a
         // batch never kills the animation it itself just started.
-        let cut = wm.anim.is_some() && batch.iter().any(cuts_animation);
+        let cut = wm.anim.is_some() && batch.iter().any(|e| cuts_animation(wm, e));
         let pre_seq = wm.anim.as_ref().map(|a| a.seq);
         // A handling error (e.g. a reply from a window that raced us and
         // died) must not take down the whole session — but a broken

@@ -109,7 +109,7 @@ impl Wm {
                     let _ = self
                         .notes
                         .dismiss
-                        .send((evicted.note.id, crate::notify::CLOSE_REASON_UNDEFINED));
+                        .send((evicted.note.id, crate::notify::CloseReason::Undefined));
                     self.conn.destroy_window(evicted.win)?;
                 }
                 win
@@ -220,7 +220,7 @@ impl Wm {
         let _ = self
             .notes
             .dismiss
-            .send((p.note.id, crate::notify::CLOSE_REASON_DISMISSED));
+            .send((p.note.id, crate::notify::CloseReason::Dismissed));
         self.conn.destroy_window(p.win)?;
         self.place_note_popups()?;
         self.conn.flush()?;
