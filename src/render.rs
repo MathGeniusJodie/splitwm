@@ -430,13 +430,27 @@ impl Renderer {
     /// pixels. Format is sniffed from the file's magic bytes, not its
     /// extension.
     fn decode_image(path: &str) -> Option<(usize, usize, Vec<Rgba>)> {
+        // Widest wallpaper dimension worth decoding; a hostile header can
+        // otherwise demand a multi-gigabyte allocation (and an O(w*h)
+        // dither pass) before the size is ever looked at.
+        const MAX_DIM: usize = 16_384;
         let bytes = std::fs::read(path).ok()?;
         if !bytes.starts_with(&[0xff, 0xd8]) {
+            let (dw, dh) = crate::icon::png_declared_dims(&bytes)?;
+            if dw as usize > MAX_DIM || dh as usize > MAX_DIM {
+                return None;
+            }
             return decode_png_with_size(path).ok();
         }
         let mut dec = zune_jpeg::JpegDecoder::new(std::io::Cursor::new(&bytes));
-        let data = dec.decode().ok()?;
+        // Headers first: reject oversized dimensions before `decode`
+        // allocates the pixel buffer.
+        dec.decode_headers().ok()?;
         let (w, h) = dec.dimensions()?;
+        if w > MAX_DIM || h > MAX_DIM {
+            return None;
+        }
+        let data = dec.decode().ok()?;
         // Guard against a degenerate/truncated decode: zero dimensions or a
         // pixel buffer shorter than w*h would panic downstream (indexing,
         // slicing) if allowed through.
@@ -1113,10 +1127,13 @@ impl Renderer {
             .map(|(l, _)| self.text_width(l) as usize)
             .max()
             .unwrap_or(0);
-        let w = (text_w + NOTE_PAD_LEFT + NOTE_PAD_RIGHT).clamp(
-            bubble.width,
-            NOTE_TEXT_MAX_W + NOTE_PAD_LEFT + NOTE_PAD_RIGHT,
-        );
+        // min/max, not clamp(): clamp panics if min > max, and nothing ties
+        // the baked bubble art's width to the text-cap constants — if the
+        // art ever grows past the cap, its width wins as the floor instead
+        // of panicking on every incoming notification.
+        let w = (text_w + NOTE_PAD_LEFT + NOTE_PAD_RIGHT)
+            .min(NOTE_TEXT_MAX_W + NOTE_PAD_LEFT + NOTE_PAD_RIGHT)
+            .max(bubble.width);
         let h = (lines.len().max(1) * line_h + NOTE_PAD_TOP + NOTE_PAD_BOTTOM)
             .max(BUBBLE_CAP_TOP + BUBBLE_CAP_BOTTOM + 1);
 

@@ -198,15 +198,23 @@ const ICON_SIZES: &[&str] = &[
 /// `pixmaps` (a deliberately minimal cut of the freedesktop icon-theme
 /// lookup — no theme inheritance, PNG only).
 pub fn find_icon_file(icon: &str) -> Option<std::path::PathBuf> {
-    // Repeated menu rows/redraws re-resolve the same icon names; the
-    // filesystem scan below is pure per-process (nothing installs/uninstalls
-    // themes while we run), so cache results keyed by the raw `icon` string.
-    static CACHE: OnceLock<Mutex<HashMap<String, Option<std::path::PathBuf>>>> = OnceLock::new();
+    // Repeated menu rows/redraws re-resolve the same icon names, so cache
+    // results keyed by the raw `icon` string. Hits are trusted forever
+    // (nothing uninstalls a theme mid-session), but *misses* expire: an
+    // icon theme installed while we run should start resolving without a
+    // WM restart.
+    const NEG_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+    type Entry = (Option<std::path::PathBuf>, std::time::Instant);
+    static CACHE: OnceLock<Mutex<HashMap<String, Entry>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(hit) = cache
+    if let Some((hit, at)) = cache
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner).get(icon) {
-        return hit.clone();
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(icon)
+    {
+        if hit.is_some() || at.elapsed() < NEG_TTL {
+            return hit.clone();
+        }
     }
     let found = find_icon_file_uncached(icon);
     let mut cache = cache
@@ -217,7 +225,7 @@ pub fn find_icon_file(icon: &str) -> Option<std::path::PathBuf> {
     if cache.len() >= 1024 {
         cache.clear();
     }
-    cache.insert(icon.to_string(), found.clone());
+    cache.insert(icon.to_string(), (found.clone(), std::time::Instant::now()));
     found
 }
 

@@ -37,10 +37,31 @@ impl Icon {
     }
 }
 
+/// Widest icon dimension worth decoding: anything larger than this is not a
+/// plausible app icon, and a hostile PNG header can otherwise demand a
+/// multi-gigabyte pixel allocation before we ever see the size.
+const MAX_ICON_DIM: u32 = 2048;
+
+/// The width/height a PNG file *declares* in its IHDR chunk (always the
+/// first chunk: bytes 16..24, big-endian), read without decoding any pixel
+/// data — the cheap pre-decode size check for untrusted files.
+pub fn png_declared_dims(bytes: &[u8]) -> Option<(u32, u32)> {
+    let w = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
+    let h = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
+    Some((w, h))
+}
+
 /// Decode a PNG file (e.g. a launcher icon resolved from the icon theme)
-/// into an `Icon`.
+/// into an `Icon`. Icon paths come from `.desktop` `Icon=` entries — found
+/// on disk rather than trusted — so the declared size is checked before the
+/// decoder is allowed to allocate for it.
 pub fn load_png(path: &std::path::Path) -> Option<Icon> {
-    let (w, h, pixels) = pixel_graphics::decode_png_with_size(path.to_str()?).ok()?;
+    let bytes = std::fs::read(path).ok()?;
+    let (dw, dh) = png_declared_dims(&bytes)?;
+    if dw == 0 || dh == 0 || dw > MAX_ICON_DIM || dh > MAX_ICON_DIM {
+        return None;
+    }
+    let (w, h, pixels) = pixel_graphics::decode_png_bytes(&bytes).ok()?;
     if w == 0 || h == 0 {
         return None;
     }

@@ -331,8 +331,9 @@ pub struct DockState {
     /// Width of `win`, captured from its own requested geometry when it
     /// was first managed.
     pub w: i32,
-    /// `WM_NAME` that marks the dock window (`SPLITWM_DOCK_TITLE`, default
-    /// `theme::DOCK_TITLE`).
+    /// Identity that marks the dock window — matched against either half of
+    /// its `WM_CLASS` (`SPLITWM_DOCK_TITLE`, default `theme::DOCK_TITLE`);
+    /// also the desktop id used to autostart it.
     pub title: String,
 }
 
@@ -497,9 +498,10 @@ pub struct MenuUi {
     pub sub_cw: i32,
     pub sub_hi: Option<usize>,
     pub target_leaf: NodeId,
-    /// Decoded app icons keyed by the desktop entry's `Icon=` value; `None`
-    /// caches a failed lookup so it isn't retried on every open.
-    pub icon_cache: std::collections::HashMap<String, Option<Rc<crate::icon::Icon>>>,
+    /// Decoded app icons keyed by the desktop entry's `Icon=` value. Only
+    /// successes are cached; failures retry on the next open so icons
+    /// installed mid-session are picked up (see `Wm::resolve_menu_icons`).
+    pub icon_cache: std::collections::HashMap<String, Rc<crate::icon::Icon>>,
     /// Per-row icons of the currently shown main column / submenu, resolved
     /// from `icon_cache` when the column opens.
     pub main_icons: Vec<Option<Rc<crate::icon::Icon>>>,
@@ -515,13 +517,9 @@ pub enum BtnKind {
     Close,
 }
 
-#[derive(Clone, Copy, Default)]
-pub struct FrameRect {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
-}
+/// Screen-space rect; the same shape as canvas-space `tree::Rect`, aliased
+/// so signatures can still say which space they mean.
+pub type FrameRect = Rect;
 
 /// A bottom-bar tile with its window and accent/visibility resolved once at
 /// compute time, so per-frame compositing needs no tree walks.

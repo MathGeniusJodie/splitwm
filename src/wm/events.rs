@@ -244,15 +244,17 @@ impl Wm {
             Event::PropertyNotify(e) if e.atom == self.atoms.net_wm_icon => {
                 self.on_icon_change(e.window)?;
             }
-            // A managed client (re)set its title. The dock is identified by
-            // title alone (see `Wm::manage`), and some toolkits only set it
-            // after mapping — a late-titled dock would otherwise tile as a
-            // normal window forever.
+            // A managed client (re)set its WM_CLASS or title. The dock is
+            // identified by class with a title fallback for classless
+            // windows (see `Wm::matches_dock`), and some toolkits set these
+            // only after mapping — a late-identified dock would otherwise
+            // tile as a normal window forever.
             Event::PropertyNotify(e)
-                if e.atom == self.atoms.net_wm_name
+                if e.atom == u32::from(x11rb::protocol::xproto::AtomEnum::WM_CLASS)
+                    || e.atom == self.atoms.net_wm_name
                     || e.atom == u32::from(x11rb::protocol::xproto::AtomEnum::WM_NAME) =>
             {
-                self.on_title_change(e.window)?;
+                self.on_dock_identity_change(e.window)?;
             }
             // Pointer left a menu window: retire its hover highlight (the
             // main column keeps highlighting an open category so the
@@ -441,19 +443,24 @@ impl Wm {
         self.focus(f)
     }
 
+    /// Bring a managed tiled window into view and focus it: into its split
+    /// if it has one, otherwise into the focused split. The shared policy
+    /// behind `_NET_ACTIVE_WINDOW` activation and ICCCM deiconify
+    /// MapRequests. It takes focus, so a focused dialog yields the keyboard.
+    fn bring_into_layout(&mut self, win: u32) -> R<()> {
+        self.focused_float = None;
+        if !self.state.activate_client(win) {
+            let leaf = self.state.focused_leaf_valid();
+            self.state.assign_to_leaf(win, leaf);
+        }
+        self.commit_layout()
+    }
+
     /// `_NET_ACTIVE_WINDOW` ClientMessage: bring the window into view and
-    /// focus it — into its split if it has one, otherwise into the focused
-    /// split (same policy as a deiconify MapRequest); floats just take focus.
+    /// focus it (see `bring_into_layout`); floats just take focus.
     fn on_activate_request(&mut self, win: u32) -> R<()> {
         if self.clients.contains_key(&win) {
-            // An explicit activation targets the tiled window; a focused
-            // dialog yields the keyboard.
-            self.focused_float = None;
-            if !self.state.activate_client(win) {
-                let leaf = self.state.focused_leaf_valid();
-                self.state.assign_to_leaf(win, leaf);
-            }
-            return self.commit_layout();
+            return self.bring_into_layout(win);
         }
         if self.floats.iter().any(|f| f.win == win) {
             self.focus_float(win)?;
@@ -474,14 +481,8 @@ impl Wm {
         if self.clients.contains_key(&e.window) {
             // A map request for a window we manage but have hidden is the
             // ICCCM deiconify request (Iconic -> Normal): bring it into a
-            // split rather than blindly mapping it over the layout. It
-            // takes focus, so a focused dialog yields the keyboard.
-            self.focused_float = None;
-            if !self.state.activate_client(e.window) {
-                let leaf = self.state.focused_leaf_valid();
-                self.state.assign_to_leaf(e.window, leaf);
-            }
-            return self.commit_layout();
+            // split rather than blindly mapping it over the layout.
+            return self.bring_into_layout(e.window);
         }
         self.manage(e.window, false)?;
         Ok(())
@@ -622,10 +623,10 @@ impl Wm {
                 self.state.focus_direction(false);
             }
             Action::NextTab => {
-                self.state.cycle_taskbar(1);
+                self.state.cycle_taskbar(true);
             }
             Action::PrevTab => {
-                self.state.cycle_taskbar(-1);
+                self.state.cycle_taskbar(false);
             }
             Action::MoveTabNext => {
                 self.state.move_tab_to_direction(true);
@@ -1109,7 +1110,11 @@ fn adjust_brightness(pct: i64) {
         let (Some(cur), Some(max)) = (read("brightness"), read("max_brightness")) else {
             continue;
         };
-        let new = (cur + max * pct / 100).clamp(1, max);
+        // Integer percent of a small `max_brightness` rounds to zero; step
+        // by at least one unit so the key always does something.
+        let step = max * pct / 100;
+        let step = if step == 0 { pct.signum() } else { step };
+        let new = (cur + step).clamp(1, max);
         if let Err(e) = std::fs::write(dir.join("brightness"), new.to_string()) {
             eprintln!("splitwm: brightness write to {} failed: {e}", dir.display());
         }

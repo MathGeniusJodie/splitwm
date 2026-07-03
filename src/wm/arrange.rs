@@ -330,8 +330,10 @@ impl Wm {
                 }
                 let r = p.target;
                 // Never configure a client below its WM_NORMAL_HINTS
-                // minimum: the split shows it at min size (clipped by the
-                // chrome) rather than handing it geometry it can't honour.
+                // minimum, so apps aren't handed geometry they can't
+                // honour. Nothing clips the window to its split: one held
+                // at its minimum overhangs the frame and paints over the
+                // neighbouring split until the column is widened again.
                 let (min_w, min_h) = self.clients.get(&c).map_or((1, 1), |cl| cl.min_size);
                 let cw = (r.w - 2 * bw).max(min_w).max(1);
                 let ch = (r.h - tb_h - bw).max(min_h).max(1);
@@ -525,8 +527,11 @@ impl Wm {
                     focused: p.focused,
                 })
                 .collect();
+            // Only the chrome animates. Client windows are configured once,
+            // at the final rect (by the arrange that called us): moving them
+            // per frame delivered ~17 ConfigureNotifys per transition, and
+            // real apps re-layout and repaint on every one.
             self.compose(wa, &interp, false)?;
-            self.place_clients(&interp)?;
             self.conn.flush()?;
             if t >= 1.0 {
                 break;

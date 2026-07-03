@@ -152,12 +152,14 @@ impl Wm {
         Ok(())
     }
 
-    /// Stack the popups bottom-right above the taskbar, oldest nearest the
-    /// corner, mirroring `place_notifications` for foreign popups.
+    /// Stack the popups bottom-right, oldest nearest the corner, continuing
+    /// upward from wherever the foreign-notification pile ends (see
+    /// `place_notifications`) so the two kinds never overlap.
     pub(crate) fn place_note_popups(&self) -> R<()> {
         let wa = self.wa();
         let gap = theme::GAP;
-        let mut bottom = wa.y + wa.h - Self::taskbar_h();
+        let foreign_h: i32 = self.notes.foreign.iter().map(|n| gap + n.h).sum();
+        let mut bottom = wa.y + wa.h - Self::taskbar_h() - foreign_h;
         for p in &self.notes.popups {
             bottom -= gap + p.h;
             self.conn.configure_window(

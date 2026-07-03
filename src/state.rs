@@ -147,12 +147,11 @@ impl State {
 
     /// Swap the focused split's window with the next/prev taskbar entry,
     /// cycling which off-screen window is shown.
-    pub fn cycle_taskbar(&mut self, offset: i32) -> Option<Win> {
+    pub fn cycle_taskbar(&mut self, forward: bool) -> Option<Win> {
         if self.taskbar.is_empty() {
             return None;
         }
         let lid = self.focused_leaf_valid();
-        let forward = offset >= 0;
         let displaced = self.tree.leaf(lid).and_then(|l| l.client);
         let next = if forward {
             self.taskbar.remove(0)
@@ -257,9 +256,11 @@ impl State {
         let leaf = self.focused_leaf_valid();
         // child_a keeps the original split's window *and* its accent colour, so
         // colour stays with the content; child_b gets a fresh colour.
+        // `leaf` should always resolve (it came from `focused_leaf_valid`),
+        // but a dangling id degrades to an empty leaf rather than panicking.
         let child_a = self
             .tree
-            .insert_node(Node::Leaf(self.tree.leaf(leaf).unwrap().clone()));
+            .insert_node(Node::Leaf(self.tree.leaf(leaf).cloned().unwrap_or_default()));
         let child_b = self.tree.make_leaf();
         // Insert a branch in place of `leaf`, with child_a carrying the window.
         self.split_node(leaf, dir, child_a, child_b);
@@ -490,6 +491,22 @@ impl State {
             return 0;
         };
         let idx = if left { 0 } else { widths.len() - 1 };
+        // Which root children are minimized leaves: their pixel width is
+        // pinned to `gap` regardless of ratio (see `child_sizes`), so their
+        // stored ratios must survive the rewrite below untouched — deriving
+        // a ratio from the pinned width would crush the share they restore
+        // to. And the end column itself being minimized makes the whole
+        // drag meaningless (old_w is the pinned gap, not a real width).
+        let minimized: Vec<bool> = match self.tree.get(root) {
+            Some(Node::Branch { children, .. }) => children
+                .iter()
+                .map(|&c| self.tree.leaf(c).is_some_and(|l| l.minimized))
+                .collect(),
+            _ => vec![false],
+        };
+        if widths.len() > 1 && minimized[idx] {
+            return 0;
+        }
         let old_w = widths[idx];
         let min_w = theme::min_split_w();
         let new_w = target_w.max(min_w);
@@ -499,7 +516,11 @@ impl State {
         }
         if widths.len() > 1 {
             widths[idx] = new_w;
-            let total: i32 = widths.iter().sum();
+            let total: i32 = widths
+                .iter()
+                .zip(&minimized)
+                .filter_map(|(&w, &m)| (!m).then_some(w))
+                .sum();
             if total <= 0 {
                 return 0;
             }
@@ -509,8 +530,13 @@ impl State {
                 ..
             }) = self.tree.get_mut(root)
             {
-                for (r, &w) in ratios.iter_mut().zip(widths.iter()) {
-                    *r = f64::from(w) / f64::from(total);
+                // Only normal children's ratios matter to the layout
+                // (`child_sizes` normalises over them alone), so rewriting
+                // just those reproduces the pixel widths exactly.
+                for ((r, &w), &m) in ratios.iter_mut().zip(widths.iter()).zip(&minimized) {
+                    if !m {
+                        *r = f64::from(w) / f64::from(total);
+                    }
                 }
             }
         }
@@ -811,7 +837,7 @@ mod tests {
         // Leaf shows 3; taskbar is [10, 1, 2].
         assert_eq!(s.focused_client(), Some(3));
 
-        let shown: Vec<_> = (0..4).map(|_| s.cycle_taskbar(-1).unwrap()).collect();
+        let shown: Vec<_> = (0..4).map(|_| s.cycle_taskbar(false).unwrap()).collect();
         assert_eq!(shown, vec![2, 1, 10, 3], "prev must rotate, not toggle");
     }
 
@@ -824,8 +850,8 @@ mod tests {
             s.pin_client(w);
         }
         let before = s.taskbar.clone();
-        s.cycle_taskbar(1);
-        s.cycle_taskbar(-1);
+        s.cycle_taskbar(true);
+        s.cycle_taskbar(false);
         assert_eq!(s.focused_client(), Some(3));
         assert_eq!(s.taskbar, before);
     }
@@ -1024,6 +1050,38 @@ mod tests {
         for leaf in s.tree.collect_leaves() {
             assert_eq!(map.get(&leaf).copied(), s.tree.find_parent(leaf));
         }
+    }
+
+    /// An edge resize must not rewrite a minimized column's ratio from its
+    /// pinned pixel width (regression: un-minimizing after an edge drag
+    /// restored the column as a sliver of its former share), and dragging
+    /// an end column that is itself minimized is refused outright.
+    #[test]
+    fn resize_edge_leaves_minimized_ratio_alone() {
+        let mut s = State::new();
+        s.split_focused(Dir::H);
+        s.insert_at_root(2); // three columns
+        s.canvas_w = Some(WA.w);
+        let leaves = s.tree.collect_leaves();
+        s.toggle_minimize(leaves[1]); // middle column pinned to `gap` px
+        let ratio_before = match s.tree.get(s.tree.root) {
+            Some(Node::Branch { ratios, .. }) => ratios[1],
+            _ => panic!(),
+        };
+        let (_, w) = s.edge_span(WA, false).unwrap();
+        assert_eq!(s.resize_edge(WA, false, w - 40), -40);
+        let ratios = match s.tree.get(s.tree.root) {
+            Some(Node::Branch { ratios, .. }) => ratios.clone(),
+            _ => panic!(),
+        };
+        assert!(
+            (ratios[1] - ratio_before).abs() < 1e-9,
+            "minimized column's ratio was rewritten from its pinned width"
+        );
+        // Minimize the right end column: dragging that edge is refused.
+        s.toggle_minimize(leaves[1]);
+        s.toggle_minimize(leaves[2]);
+        assert_eq!(s.resize_edge(WA, false, 500), 0);
     }
 
     /// Same as above, mirrored for the right edge (shrinking instead).

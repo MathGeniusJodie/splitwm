@@ -16,7 +16,7 @@ pub enum Dir {
     V,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,

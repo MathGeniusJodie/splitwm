@@ -68,8 +68,7 @@ impl Wm {
         if self.wants_float(win) {
             return self.manage_float(win);
         }
-        let title = self.client_title(win);
-        if title.as_ref() == self.dock.title {
+        if self.matches_dock(win) {
             if self.dock.win.is_none() {
                 return self.manage_dock(win);
             }
@@ -309,12 +308,7 @@ impl Wm {
         let around = parent
             .and_then(|p| self.state.tree.find_leaf_for_client(p))
             .and_then(|l| self.prev_frame_rect.get(&l).copied())
-            .map_or(self.la(), |f| crate::tree::Rect {
-                x: f.x,
-                y: f.y,
-                w: f.w,
-                h: f.h,
-            });
+            .unwrap_or_else(|| self.la());
         let wa = self.la();
         let x = (around.x + (around.w - w) / 2).clamp(wa.x, (wa.x + wa.w - w).max(wa.x));
         let y = (around.y + (around.h - h) / 2).clamp(wa.y, (wa.y + wa.h - h).max(wa.y));
@@ -582,7 +576,11 @@ impl Wm {
 
     /// Position every notification: right-aligned to the screen edge (split
     /// gap margin), stacked bottom-up starting just above the taskbar, each
-    /// raised to the top of the stacking order (oldest at the bottom).
+    /// raised to the top of the stacking order (oldest at the bottom). Our
+    /// own served-notification popups continue the same pile upward (see
+    /// `place_note_popups`), so both kinds share one stack instead of
+    /// overlapping — which is also why a foreign-pile change must re-place
+    /// the popups.
     pub(crate) fn place_notifications(&self) -> R<()> {
         let wa = self.wa();
         let gap = theme::GAP;
@@ -597,7 +595,7 @@ impl Wm {
                     .stack_mode(StackMode::ABOVE),
             )?;
         }
-        Ok(())
+        self.place_note_popups()
     }
 
     /// Restack every notification to the top, preserving their relative
@@ -629,7 +627,14 @@ impl Wm {
     /// Stop managing `win` (destroyed or withdrawn): drop all bookkeeping,
     /// re-tile, and keep focus inside the leaf the window lived in.
     pub(crate) fn forget_client(&mut self, win: Win) -> R<()> {
-        if self.clients.remove(&win).is_none() {
+        let known = self.clients.remove(&win).is_some();
+        // A window can occupy a leaf/taskbar slot without an entry in
+        // `clients` if `manage` errored out partway (it pins into the tree
+        // before its X requests); clean the layout up regardless, or the
+        // split shows a phantom occupant forever.
+        let in_layout = self.state.tree.find_leaf_for_client(win).is_some()
+            || self.state.taskbar.contains(&win);
+        if !known && !in_layout {
             return Ok(());
         }
         if self.fullscreen == Some(win) {
@@ -702,15 +707,13 @@ impl Wm {
         Ok(())
     }
 
-    /// A managed client (re)set its title: if it now matches the dock title
-    /// (and nothing is docked yet), pull it out of tiling and dock it —
-    /// toolkits that set `WM_NAME` only after mapping would otherwise leave
-    /// the dock tiled as an ordinary window forever.
-    pub(crate) fn on_title_change(&mut self, win: Win) -> R<()> {
-        if self.dock.win.is_some()
-            || !self.clients.contains_key(&win)
-            || self.client_title(win).as_ref() != self.dock.title
-        {
+    /// A managed client (re)set its `WM_CLASS` or title: if it now matches
+    /// the dock identity (and nothing is docked yet), pull it out of tiling
+    /// and dock it — a toolkit that sets its identifying property only
+    /// after mapping would otherwise leave the dock tiled as an ordinary
+    /// window forever.
+    pub(crate) fn on_dock_identity_change(&mut self, win: Win) -> R<()> {
+        if self.dock.win.is_some() || !self.clients.contains_key(&win) || !self.matches_dock(win) {
             return Ok(());
         }
         self.clients.remove(&win);
@@ -865,10 +868,32 @@ impl Wm {
         Rc::from(String::from_utf8_lossy(name).as_ref())
     }
 
+    /// Whether `win` is the dock: either half of its `WM_CLASS`
+    /// ("instance\0class\0") equals `DockState::title`, falling back to the
+    /// window title only when it sets no `WM_CLASS` at all (the stock dock
+    /// app doesn't). Class is preferred because a title is client-controlled
+    /// free text that changes at runtime — any window titling itself
+    /// "cozyui" (a browser tab, say) used to get yanked out of tiling and
+    /// pinned as the dock; a window that *does* declare a class must now
+    /// match on that alone.
+    fn matches_dock(&self, win: Win) -> bool {
+        let class = self
+            .conn
+            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| r.value)
+            .unwrap_or_default();
+        let mut parts = class.split(|&b| b == 0).filter(|p| !p.is_empty()).peekable();
+        if parts.peek().is_some() {
+            return parts.any(|part| part == self.dock.title.as_bytes());
+        }
+        self.client_title(win).as_ref() == self.dock.title
+    }
+
     /// The window's title — `_NET_WM_NAME` (UTF-8) with a latin-1 `WM_NAME`
-    /// fallback, so toolkits that only set the EWMH property still match.
-    /// Used to identify windows that never set `WM_CLASS` (e.g. the
-    /// `Wm::dock_title` sidebar).
+    /// fallback. Only consulted as the dock identity of last resort for
+    /// windows that never set `WM_CLASS` (see `matches_dock`).
     fn client_title(&self, win: Win) -> Rc<str> {
         let read = |atom: u32, ty: u32| -> Option<Vec<u8>> {
             let v = self

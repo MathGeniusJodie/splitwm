@@ -149,7 +149,7 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
         }
         match msg.member().as_deref() {
             Some("Notify") => {
-                let Some((note, timeout)) = parse_notify(&msg, &mut next_id) else {
+                let Some((note, timeout)) = parse_notify(&msg, &mut next_id, &order) else {
                     continue;
                 };
                 let id = note.id;
@@ -226,8 +226,10 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
 }
 
 /// Decode a `Notify` call's eight arguments into a `Note` plus its raw
-/// `expire_timeout`. Returns `None` on a malformed call.
-fn parse_notify(msg: &Message, next_id: &mut u32) -> Option<(Note, i32)> {
+/// `expire_timeout`. Returns `None` on a malformed call. `outstanding` is
+/// the set of still-live ids, skipped when allocating a fresh one so a
+/// wrapped-around `next_id` can't alias a never-expiring notification.
+fn parse_notify(msg: &Message, next_id: &mut u32, outstanding: &[u32]) -> Option<(Note, i32)> {
     let mut it = msg.iter_init();
     let _app: String = it.read().ok()?;
     let replaces: u32 = it.read().ok()?;
@@ -241,9 +243,13 @@ fn parse_notify(msg: &Message, next_id: &mut u32) -> Option<(Note, i32)> {
     let id = if replaces != 0 {
         replaces
     } else {
-        let id = *next_id;
-        *next_id = next_id.wrapping_add(1).max(1);
-        id
+        loop {
+            let id = *next_id;
+            *next_id = next_id.wrapping_add(1).max(1);
+            if !outstanding.contains(&id) {
+                break id;
+            }
+        }
     };
     let urgency = hints
         .get("urgency")

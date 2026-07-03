@@ -9,7 +9,10 @@ use crate::tree::NodeId;
 
 impl Wm {
     /// Resolve one menu column's `Icon=` names into decoded icons via the
-    /// cache (failed lookups are cached as `None` and never retried).
+    /// cache. Only successes are cached: a failed lookup retries on the
+    /// next open (cheap — the filesystem scan underneath is cached with its
+    /// own expiry in `menu::find_icon_file`), so an icon that appears on
+    /// disk mid-session starts showing without a WM restart.
     fn resolve_menu_icons(
         &mut self,
         names: &[Option<String>],
@@ -23,18 +26,15 @@ impl Wm {
             .iter()
             .map(|n| {
                 let n = n.as_ref()?;
-                self.menu
-                    .icon_cache
-                    .entry(n.clone())
-                    .or_insert_with(|| {
-                        let img = crate::menu::find_icon_file(n)
-                            .and_then(|p| crate::icon::load_png(&p))?;
-                        Some(std::rc::Rc::new(crate::icon::quantize(
-                            self.renderer.palette(),
-                            &img,
-                        )))
-                    })
-                    .clone()
+                if let Some(hit) = self.menu.icon_cache.get(n) {
+                    return Some(hit.clone());
+                }
+                let img = crate::menu::find_icon_file(n)
+                    .and_then(|p| crate::icon::load_png(&p))?;
+                let icon =
+                    std::rc::Rc::new(crate::icon::quantize(self.renderer.palette(), &img));
+                self.menu.icon_cache.insert(n.clone(), icon.clone());
+                Some(icon)
             })
             .collect()
     }
