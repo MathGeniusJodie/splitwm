@@ -121,6 +121,10 @@ impl State {
                     self.taskbar.retain(|&w| w != p);
                     if let Some(l) = self.tree.leaf_mut(lid) {
                         l.client = Some(p);
+                        // A leaf showing a window is never minimized (the
+                        // same invariant assign_to_leaf/activate_client
+                        // maintain): the restored window must be mapped.
+                        l.minimized = false;
                     }
                 }
             }
@@ -374,6 +378,16 @@ impl State {
             Some(Node::Branch { children, .. }) => children[usize::from(idx == 0)],
             _ => return false,
         };
+        // Resolve the parent's own attachment *before* mutating: a parent
+        // that is neither the root nor anyone's child is an orphan subtree,
+        // and collapsing inside it would leave `focused_leaf` pointing at a
+        // leaf unreachable from the root (still a leaf by `is_leaf`, so
+        // `focused_leaf_valid` would keep returning it while `compute`
+        // never lays it out). Refuse instead.
+        let grand = self.tree.find_parent(parent);
+        if parent != self.tree.root && grand.is_none() {
+            return false;
+        }
         self.tree.remove_node(leaf);
         // Resolve focus before any flattening: the sibling *node* may
         // be dissolved into the grandparent below, but its leaves
@@ -382,7 +396,7 @@ impl State {
         if parent == self.tree.root {
             self.tree.root = sibling;
             self.tree.remove_node(parent);
-        } else if let Some((grand, pidx)) = self.tree.find_parent(parent) {
+        } else if let Some((grand, pidx)) = grand {
             if let Some(Node::Branch { children, .. }) = self.tree.get_mut(grand) {
                 children[pidx] = sibling;
             }
@@ -391,8 +405,6 @@ impl State {
             // grandparent's own direction; dissolve it so same-dir
             // splits stay one flat n-ary branch.
             self.tree.flatten_same_dir(grand, pidx);
-        } else {
-            self.tree.remove_node(parent);
         }
         self.focused_leaf = new_focus;
         true
@@ -1087,6 +1099,38 @@ mod tests {
         s.toggle_minimize(leaf);
         s.assign_to_leaf(2, leaf);
         assert!(!s.tree.leaf(leaf).unwrap().minimized);
+    }
+
+    /// Restoring the displaced window into a leaf that was minimized in the
+    /// meantime must clear the minimized flag: a leaf showing a window is
+    /// never minimized (its window would otherwise stay unmapped forever).
+    #[test]
+    fn popup_restore_unminimizes_the_leaf() {
+        let mut s = State::new();
+        s.pin_client(1);
+        s.split_focused(Dir::H);
+        s.pin_client(99); // displaces 1 -> taskbar, prev = 1
+        let leaf = s.tree.find_leaf_for_client(99).unwrap();
+        s.toggle_minimize(leaf);
+        s.unpin_client(99); // popup dies while its leaf is minimized
+        assert_eq!(s.tree.leaf(leaf).unwrap().client, Some(1));
+        assert!(!s.tree.leaf(leaf).unwrap().minimized);
+    }
+
+    /// Closing inside an orphan subtree (a branch reachable from neither the
+    /// root nor any other branch) must be refused: collapsing it would leave
+    /// `focused_leaf` pointing at a leaf `compute` never lays out.
+    #[test]
+    fn close_focused_refuses_orphan_subtree() {
+        let mut s = State::new();
+        let a = s.tree.make_leaf();
+        let b = s.tree.make_leaf();
+        let orphan = s.tree.make_branch(Dir::H, 0.5, a, b);
+        assert_ne!(orphan, s.tree.root);
+        s.focused_leaf = a;
+        assert!(!s.close_focused());
+        // Both orphan leaves survive; focus resolution stays inside leaves.
+        assert!(s.tree.is_leaf(a) && s.tree.is_leaf(b));
     }
 
     /// A degenerate single-child branch must not panic `close_focused`

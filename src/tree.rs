@@ -338,13 +338,23 @@ fn child_sizes(children: &[(bool, f64)], usable: i32, min_sz: i32) -> Vec<i32> {
         ratio_sum = 1.0;
     }
     let usable_normal = (usable - min_total).max(0);
+    let normals_total = children.iter().filter(|&&(is_min, _)| !is_min).count() as i32;
     let mut sizes = vec![0i32; n];
     let mut allocated = 0;
+    let mut normals_seen = 0;
     for (i, &(is_min, r)) in children.iter().enumerate() {
         if is_min {
             sizes[i] = min_sz;
         } else if Some(i) != last_normal {
-            let sz = ((f64::from(usable_normal) * r / ratio_sum).floor() as i32).max(1);
+            normals_seen += 1;
+            // Never allocate past what's left minus 1px for each later
+            // normal child: the per-child 1px floor could otherwise push
+            // the sum past `usable` on a degenerate tiny viewport, making
+            // children overlap their siblings' slots.
+            let left = usable_normal - allocated - (normals_total - normals_seen);
+            let sz = ((f64::from(usable_normal) * r / ratio_sum).floor() as i32)
+                .max(1)
+                .min(left.max(1));
             sizes[i] = sz;
             allocated += sz;
         }
@@ -494,6 +504,16 @@ mod child_sizes_tests {
         let kids = [(true, 0.5), (true, 0.5)];
         let sizes = child_sizes(&kids, 100, 20);
         assert_eq!(sizes, vec![20, 20]);
+    }
+
+    #[test]
+    fn skewed_ratios_never_sum_past_usable() {
+        // A dominant first ratio floors the middle child to 1px; the last
+        // child's remainder floor must not push the sum past `usable`.
+        let kids = [(false, 0.9), (false, 0.05), (false, 0.05)];
+        let sizes = child_sizes(&kids, 10, 2);
+        assert!(sizes.iter().sum::<i32>() <= 10, "sizes {sizes:?}");
+        assert!(sizes.iter().all(|&s| s >= 1));
     }
 
     #[test]
