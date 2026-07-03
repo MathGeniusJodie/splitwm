@@ -833,8 +833,22 @@ fn event_loop(wm: &mut Wm) -> R<()> {
             Event::XinputRawMotion(e) => wm.hscroll_delta(e) != 0.0,
             _ => false,
         });
+        // Drag motions deserve the same frame-pacing as scroll bursts: a
+        // mouse reports at device rate (hundreds of Hz), and handling each
+        // motion individually recomposites per report — and an edge drag
+        // additionally moves the docked sidebar per report, making its app
+        // repaint at that rate, which is more damage than the X server can
+        // absorb (frames then reach the glass late and the dragged edge
+        // trails the pointer even though the WM keeps up). Collecting until
+        // the frame deadline coalesces the burst into one recomposite and
+        // at most one dock move per frame. Gated on a motion actually being
+        // in the batch so an idle drag (button held, hand still) keeps
+        // blocking on the socket instead of spinning at 60 Hz.
+        let drag_motion =
+            (wm.drags.split.is_some() || wm.drags.edge.is_some() || wm.drags.float.is_some())
+                && batch.iter().any(|e| matches!(e, Event::MotionNotify(_)));
         // Skip while animating: the loop is already frame-paced below.
-        if wm.anim.is_none() && has_scroll && wm.hscroll_allowed()? {
+        if wm.anim.is_none() && (drag_motion || (has_scroll && wm.hscroll_allowed()?)) {
             let deadline = frame_start + FRAME;
             while let Some(ev) = wait_event_deadline(&wm.conn, Some(deadline))? {
                 batch.push(ev);

@@ -211,6 +211,27 @@ impl Wm {
                     continue;
                 }
                 Event::ButtonRelease(e) if (4..=7).contains(&e.detail) => continue,
+                // High-rate client chatter that neither reads nor mutates
+                // drag/pointer/layout state, handled in place *without*
+                // flushing the coalesced motion. A dock app answers every
+                // per-frame reconfigure (an edge drag moves it with the
+                // canvas) with a ConfigureRequest / property update /
+                // expose, and those land interleaved with the motion
+                // stream — flushing on each would slice the batch back
+                // into per-motion pieces, one full recomposite each, and
+                // the drag falls seconds behind the pointer (the exact
+                // backlog coalescing exists to prevent). The root's own
+                // ConfigureNotify (a screen resize) is not exempt: it
+                // changes the workarea every motion handler computes
+                // against, so it still flushes below.
+                Event::PropertyNotify(_) | Event::Expose(_) | Event::ConfigureRequest(_) => {
+                    contain(self.handle_event(&ev), "event")?;
+                    continue;
+                }
+                Event::ConfigureNotify(e) if e.window != self.root => {
+                    contain(self.handle_event(&ev), "event")?;
+                    continue;
+                }
                 _ => {}
             }
             // Flush pending motion/scroll before any other event so ordering
