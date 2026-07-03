@@ -279,6 +279,9 @@ pub mod ks {
     pub const C: u32 = 0x63;
     pub const SPACE: u32 = 0x20;
     pub const F4: u32 = 0xffc1;
+    pub const XF86_AUDIO_LOWER_VOLUME: u32 = 0x1008_ff11;
+    pub const XF86_AUDIO_MUTE: u32 = 0x1008_ff12;
+    pub const XF86_AUDIO_RAISE_VOLUME: u32 = 0x1008_ff13;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -300,6 +303,9 @@ pub enum Action {
     /// Ask the focused window to close via `WM_DELETE_WINDOW`, falling back
     /// to disconnecting its client if it doesn't speak the protocol.
     CloseWindow,
+    VolumeUp,
+    VolumeDown,
+    VolumeMuteToggle,
 }
 
 /// Raw X modifier bits, so this module needs no x11rb dependency.
@@ -333,6 +339,10 @@ pub const BINDINGS: &[(u16, u32, Action)] = &[
     (MOD4, ks::MINUS, Action::Shrink),
     (MOD4 | SHIFT, ks::C, Action::CloseWindow),
     (MOD1, ks::F4, Action::CloseWindow),
+    // Media keys carry no modifier: the keysym itself is the whole chord.
+    (0, ks::XF86_AUDIO_RAISE_VOLUME, Action::VolumeUp),
+    (0, ks::XF86_AUDIO_LOWER_VOLUME, Action::VolumeDown),
+    (0, ks::XF86_AUDIO_MUTE, Action::VolumeMuteToggle),
 ];
 
 // --- taskbar quick-launch entries ---

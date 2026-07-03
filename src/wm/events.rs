@@ -694,6 +694,21 @@ impl Wm {
         // slide, and a no-op transition still costs 280 ms of frame-paced
         // full-screen recomposites.
         match action {
+            // Volume keys auto-repeat while held, and nothing in the layout
+            // changes: skip the commit epilogue rather than recomposite ~20
+            // times a second for a held key.
+            Action::VolumeUp => {
+                self.spawn("wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+");
+                return Ok(());
+            }
+            Action::VolumeDown => {
+                self.spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
+                return Ok(());
+            }
+            Action::VolumeMuteToggle => {
+                self.spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+                return Ok(());
+            }
             Action::SpawnTerminal => self.spawn_terminal(),
             Action::SpawnLauncher => self.spawn("rofi -show drun"),
             Action::SplitH => self.try_split(Dir::H),
