@@ -33,7 +33,6 @@ for i in $(seq 1 40); do
     DISPLAY="$DPY" xdotool getdisplaygeometry >/dev/null 2>&1 && break
     sleep 0.25
 done
-kill -0 "$XEPHYR_PID" 2>/dev/null || { echo "Xephyr DOWN"; cat /tmp/drive-xephyr.log; exit 1; }
 DISPLAY="$DPY" xdotool getdisplaygeometry >/dev/null 2>&1 || { echo "Xephyr DOWN"; cat /tmp/drive-xephyr.log; exit 1; }
 echo "Xephyr up"
 

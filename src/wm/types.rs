@@ -195,7 +195,7 @@ pub struct Client {
     /// transfer up to 16 MiB and forces a full recomposite, and the property
     /// is client-controlled: `on_icon_change` rate-limits fetches against
     /// this (see `ICON_FETCH_COOLDOWN`).
-    pub icon_fetched: Option<std::time::Instant>,
+    pub icon_fetched: std::time::Instant,
     /// An icon PropertyNotify arrived inside the cooldown window; the fetch
     /// is deferred to `Wm::flush_stale_icons` so a burst's final icon still
     /// lands.
@@ -355,6 +355,10 @@ pub struct Wm {
     /// every tiled client and float. Its split slot is kept, so leaving
     /// fullscreen drops it straight back into the layout.
     pub fullscreen: Option<Win>,
+    /// Whether any client has `icon_stale` set, so the per-batch
+    /// `Wm::flush_stale_icons` can skip its clients scan in the (usual)
+    /// steady state where no icon refresh was throttled.
+    pub icons_stale: bool,
 }
 
 /// The window pinned past the right end of the scrolling canvas, and its
@@ -580,8 +584,10 @@ impl MenuColumn {
 /// A menu row's icon: decoded lazily the first time the row is on screen,
 /// so opening a large column doesn't stat+decode every row's icon up front.
 pub enum IconSlot {
-    /// Not looked up yet; holds the desktop entry's `Icon=` value.
-    Pending(Option<String>),
+    /// Not looked up yet; holds the desktop entry's `Icon=` value. Rows
+    /// with no `Icon=` name are born `Ready(None)` — there is nothing to
+    /// resolve for them.
+    Pending(String),
     /// Looked up (successfully or not) for this open of the column.
     Ready(Option<Rc<crate::icon::Icon>>),
 }

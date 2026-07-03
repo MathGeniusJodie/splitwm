@@ -1253,11 +1253,8 @@ impl Renderer {
                     // wide, so a line NOTE_TEXT_MAX_W px wide holds at most
                     // NOTE_TEXT_MAX_W chars.
                     let budget = (NOTE_MAX_LINES - lines.len()) * NOTE_TEXT_MAX_W;
-                    let cut = para
-                        .char_indices()
-                        .nth(budget)
-                        .map_or(para.len(), |(i, _)| i);
-                    lines.extend(layout.wrap(&para[..cut]).into_iter().map(|l| (l, bold)));
+                    let capped = crate::notify::cap_chars(para, budget);
+                    lines.extend(layout.wrap(capped).into_iter().map(|l| (l, bold)));
                 }
             }
         }

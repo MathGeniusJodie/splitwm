@@ -7,7 +7,7 @@ use std::rc::Rc;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt, StackMode, Window};
 
-use super::types::{FrameRect, IconSlot, Wm, R};
+use super::types::{FrameRect, IconSlot, MenuColumn, Wm, R};
 use crate::icon::Icon;
 use crate::menu::{frame_size, Item, Menu, MENU_BORDER, MENU_ROW_H};
 use crate::render::MenuView;
@@ -27,6 +27,23 @@ impl Wm {
             return None;
         };
         self.menu.tree.subs.get(idx)
+    }
+
+    /// One column's view state: the submenu's, or the main column's.
+    fn column(&self, sub: bool) -> &MenuColumn {
+        if sub {
+            &self.menu.sub
+        } else {
+            &self.menu.main
+        }
+    }
+
+    fn column_mut(&mut self, sub: bool) -> &mut MenuColumn {
+        if sub {
+            &mut self.menu.sub
+        } else {
+            &mut self.menu.main
+        }
     }
 
     /// Which column `win` is: `Some(is_sub)`, or `None` for other windows.
@@ -71,7 +88,12 @@ impl Wm {
             .column_menu(sub)
             .expect("caller established the column's data");
         let rows = menu.labels.len();
-        let icons: Vec<IconSlot> = menu.icons.iter().cloned().map(IconSlot::Pending).collect();
+        // Rows with no `Icon=` name have nothing to look up: born resolved.
+        let icons: Vec<IconSlot> = menu
+            .icons
+            .iter()
+            .map(|n| n.clone().map_or(IconSlot::Ready(None), IconSlot::Pending))
+            .collect();
         let vis = self.visible_rows(rows);
         let (w, h) = frame_size(i32::try_from(vis).unwrap_or(0), cw);
         let (w, h) = (
@@ -79,11 +101,7 @@ impl Wm {
             h.clamp(1, i32::from(u16::MAX)),
         );
         let (x, y) = place(self, w, h);
-        let col = if sub {
-            &mut self.menu.sub
-        } else {
-            &mut self.menu.main
-        };
+        let col = self.column_mut(sub);
         col.rect = FrameRect { x, y, w, h };
         col.cw = cw;
         col.hi = None;
@@ -186,8 +204,7 @@ impl Wm {
     /// (cheap — the filesystem scan underneath is cached with its own
     /// expiry in `menu::find_icon_file`), so an icon that appears on disk
     /// mid-session starts showing without a WM restart.
-    fn resolve_icon_slot(&mut self, name: Option<&str>) -> Option<Rc<Icon>> {
-        let n = name?;
+    fn resolve_icon_slot(&mut self, n: &str) -> Option<Rc<Icon>> {
         // Same wholesale-clear policy as the renderer's icon caches: menus
         // are bounded in practice, but no cache here grows without a cap.
         // Clearing drops the `Rc<Icon>`s, so re-decoded entries get *new*
@@ -209,17 +226,17 @@ impl Wm {
     /// Repaint a column: resolve the visible rows' icons (lazily, so a big
     /// column never stats+decodes off-screen rows), then render and blit
     /// the visible slice.
-    fn paint_column(&mut self, sub: bool) -> R<()> {
+    pub(crate) fn paint_column(&mut self, sub: bool) -> R<()> {
         if self.column_menu(sub).is_none() {
             return Ok(());
         }
-        let col = if sub { &self.menu.sub } else { &self.menu.main };
+        let col = self.column(sub);
         let vis = self.visible_rows(col.rows);
         let start = col.scroll.min(col.rows.saturating_sub(vis));
         let range = start..(start + vis).min(col.rows);
 
         // Decode icons for rows entering view (first hover/scroll only).
-        let pending: Vec<(usize, Option<String>)> = self.column_icons(sub)[range.clone()]
+        let pending: Vec<(usize, String)> = self.column(sub).icons[range.clone()]
             .iter()
             .enumerate()
             .filter_map(|(i, s)| match s {
@@ -228,12 +245,14 @@ impl Wm {
             })
             .collect();
         for (i, name) in pending {
-            let icon = self.resolve_icon_slot(name.as_deref());
-            self.column_icons_mut(sub)[i] = IconSlot::Ready(icon);
+            let icon = self.resolve_icon_slot(&name);
+            self.column_mut(sub).icons[i] = IconSlot::Ready(icon);
         }
 
-        let menu = self.column_menu(sub).expect("checked above");
-        let col = if sub { &self.menu.sub } else { &self.menu.main };
+        let Some(menu) = self.column_menu(sub) else {
+            return Ok(());
+        };
+        let col = self.column(sub);
         let seps: Vec<bool> = menu.items[range.clone()]
             .iter()
             .map(|it| matches!(it, Item::Separator))
@@ -261,30 +280,6 @@ impl Wm {
         self.blit_fb(win, &fb)
     }
 
-    fn column_icons(&self, sub: bool) -> &[IconSlot] {
-        if sub {
-            &self.menu.sub.icons
-        } else {
-            &self.menu.main.icons
-        }
-    }
-
-    fn column_icons_mut(&mut self, sub: bool) -> &mut [IconSlot] {
-        if sub {
-            &mut self.menu.sub.icons
-        } else {
-            &mut self.menu.main.icons
-        }
-    }
-
-    pub(crate) fn paint_menu_main(&mut self) -> R<()> {
-        self.paint_column(false)
-    }
-
-    pub(crate) fn paint_menu_sub(&mut self) -> R<()> {
-        self.paint_column(true)
-    }
-
     /// Absolute row index under window-local (lx, ly), or None for the
     /// border padding — including the left/right border strips, so a click
     /// beside a row's text can't activate it. `scroll` is the column's
@@ -303,33 +298,32 @@ impl Wm {
 
     /// The absolute row under (lx, ly) in the given column.
     fn column_row_at(&self, sub: bool, lx: i32, ly: i32) -> Option<usize> {
-        let col = if sub { &self.menu.sub } else { &self.menu.main };
+        let col = self.column(sub);
         let row = Self::menu_row_at(lx, ly, col.scroll, col.rows, col.cw)?;
         // Below the last visible row lies the bottom border.
         (row < col.scroll + self.visible_rows(col.rows)).then_some(row)
     }
 
     /// Wheel scroll over a column taller than the screen: shift the visible
-    /// window of rows and repaint. No-op for columns that fit.
-    pub(crate) fn on_menu_scroll(&mut self, win: Window, down: bool) -> R<()> {
+    /// window of rows by `detents` wheel clicks (positive scrolls down) and
+    /// repaint. No-op for columns that fit. Callers batch a burst's detents
+    /// into one call — only the final scroll position is ever visible.
+    pub(crate) fn on_menu_scroll(&mut self, win: Window, detents: i32) -> R<()> {
         let Some(sub) = self.column_for(win) else {
             return Ok(());
         };
         let vis = self.menu_max_rows();
-        let col = if sub {
-            &mut self.menu.sub
-        } else {
-            &mut self.menu.main
-        };
+        let col = self.column_mut(sub);
         if col.rows <= vis {
             return Ok(());
         }
         const WHEEL_ROWS: usize = 3;
         let max = col.rows - vis;
-        let new = if down {
-            (col.scroll + WHEEL_ROWS).min(max)
+        let step = WHEEL_ROWS.saturating_mul(detents.unsigned_abs() as usize);
+        let new = if detents > 0 {
+            col.scroll.saturating_add(step).min(max)
         } else {
-            col.scroll.saturating_sub(WHEEL_ROWS)
+            col.scroll.saturating_sub(step)
         };
         if new != col.scroll {
             col.scroll = new;

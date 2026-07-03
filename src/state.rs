@@ -29,6 +29,15 @@ pub struct State {
     pub taskbar: Vec<Win>,
 }
 
+/// How a collapsing branch hangs in the tree: it is the root, or child
+/// `usize` of a grandparent branch. Resolved by `close_focused` *before*
+/// relocating any window, so an orphan subtree (a parent that is neither)
+/// is refused up front — there is deliberately no variant for one.
+enum Attach {
+    Root,
+    Child(NodeId, usize),
+}
+
 impl State {
     pub fn new() -> Self {
         let tree = Tree::new();
@@ -98,8 +107,7 @@ impl State {
             self.push_taskbar(prev);
         }
         if let Some(l) = self.tree.leaf_mut(dst) {
-            l.client = Some(c);
-            l.minimized = false;
+            l.show(c);
             if displaced.is_some() {
                 l.prev = displaced;
             }
@@ -120,11 +128,7 @@ impl State {
                 if self.taskbar.contains(&p) {
                     self.taskbar.retain(|&w| w != p);
                     if let Some(l) = self.tree.leaf_mut(lid) {
-                        l.client = Some(p);
-                        // A leaf showing a window is never minimized (the
-                        // same invariant assign_to_leaf/activate_client
-                        // maintain): the restored window must be mapped.
-                        l.minimized = false;
+                        l.show(p);
                     }
                 }
             }
@@ -336,11 +340,7 @@ impl State {
                 // still works after the split it happened in is closed.
                 let prev = self.tree.leaf(leaf).and_then(|l| l.prev);
                 if let Some(d) = self.tree.leaf_mut(dest_child) {
-                    d.client = Some(c);
-                    // A leaf showing a window is never minimized (the same
-                    // invariant assign_to_leaf/activate_client maintain):
-                    // the relocated window must be mapped.
-                    d.minimized = false;
+                    d.show(c);
                     if d.prev.is_none() {
                         d.prev = prev;
                     }
@@ -382,43 +382,33 @@ impl State {
 
     /// Binary close path: collapse `parent`, the surviving sibling (at index
     /// `idx`'s opposite) takes its place, and same-direction branches are
-    /// flattened back into the grandparent.
-    fn close_focused_binary(&mut self, parent: NodeId, idx: usize, leaf: NodeId) -> bool {
+    /// flattened back into the grandparent. `attach` is `parent`'s own
+    /// attachment, resolved by `close_focused` before any relocation.
+    fn close_focused_binary(&mut self, parent: NodeId, idx: usize, attach: Attach, leaf: NodeId) {
         // binary: collapse parent, sibling takes its place.
         let sibling = match self.tree.get(parent) {
             Some(Node::Branch { children, .. }) => children[usize::from(idx == 0)],
-            _ => return false,
+            _ => return,
         };
-        // Resolve the parent's own attachment *before* mutating: a parent
-        // that is neither the root nor anyone's child is an orphan subtree,
-        // and collapsing inside it would leave `focused_leaf` pointing at a
-        // leaf unreachable from the root (still a leaf by `is_leaf`, so
-        // `focused_leaf_valid` would keep returning it while `compute`
-        // never lays it out). Refuse instead.
-        let grand = self.tree.find_parent(parent);
-        if parent != self.tree.root && grand.is_none() {
-            return false;
-        }
         self.tree.remove_node(leaf);
         // Resolve focus before any flattening: the sibling *node* may
         // be dissolved into the grandparent below, but its leaves
         // survive.
         let new_focus = self.tree.first_leaf(sibling);
-        if parent == self.tree.root {
-            self.tree.root = sibling;
-            self.tree.remove_node(parent);
-        } else if let Some((grand, pidx)) = grand {
-            if let Some(Node::Branch { children, .. }) = self.tree.get_mut(grand) {
-                children[pidx] = sibling;
+        self.tree.remove_node(parent);
+        match attach {
+            Attach::Root => self.tree.root = sibling,
+            Attach::Child(grand, pidx) => {
+                if let Some(Node::Branch { children, .. }) = self.tree.get_mut(grand) {
+                    children[pidx] = sibling;
+                }
+                // The spliced-in sibling can be a branch in the
+                // grandparent's own direction; dissolve it so same-dir
+                // splits stay one flat n-ary branch.
+                self.tree.flatten_same_dir(grand, pidx);
             }
-            self.tree.remove_node(parent);
-            // The spliced-in sibling can be a branch in the
-            // grandparent's own direction; dissolve it so same-dir
-            // splits stay one flat n-ary branch.
-            self.tree.flatten_same_dir(grand, pidx);
         }
         self.focused_leaf = new_focus;
-        true
     }
 
     /// Close the focused leaf. Its window moves into the adjacent sibling if
@@ -434,27 +424,38 @@ impl State {
             _ => return false,
         };
 
-        // Refusal checks come before relocation: a false return means the
-        // close did not happen, so no window may have been evicted from its
-        // leaf yet. This mirrors close_focused_binary's orphan-subtree
-        // refusal, which would otherwise fire only after relocation.
-        if nchildren == 2 && parent != self.tree.root && self.tree.find_parent(parent).is_none() {
-            return false;
-        }
-
-        if !self.relocate_closed_window(parent, idx, leaf) {
-            return false;
-        }
-
         // Focus always moves to the nearest surviving neighbour: the closed
         // leaf *was* the focused one (node ids are never reused, so it can't
         // still be found anywhere in the tree after removal).
         if nchildren > 2 {
+            if !self.relocate_closed_window(parent, idx, leaf) {
+                return false;
+            }
             self.close_focused_nary(parent, idx, leaf);
-            true
-        } else {
-            self.close_focused_binary(parent, idx, leaf)
+            return true;
         }
+
+        // Binary: resolve `parent`'s attachment before relocating — a false
+        // return means the close did not happen, so no window may have been
+        // evicted from its leaf yet. A parent that is neither the root nor
+        // anyone's child is an orphan subtree; collapsing inside it would
+        // leave `focused_leaf` pointing at a leaf unreachable from the root
+        // (still a leaf by `is_leaf`, so `focused_leaf_valid` would keep
+        // returning it while `compute` never lays it out). Refuse instead —
+        // `Attach` deliberately has no variant for it.
+        let attach = if parent == self.tree.root {
+            Attach::Root
+        } else if let Some((grand, pidx)) = self.tree.find_parent(parent) {
+            Attach::Child(grand, pidx)
+        } else {
+            return false;
+        };
+
+        if !self.relocate_closed_window(parent, idx, leaf) {
+            return false;
+        }
+        self.close_focused_binary(parent, idx, attach, leaf);
+        true
     }
 
     // --- resize ---

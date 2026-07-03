@@ -222,15 +222,11 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
                 let Some((note, timeout)) =
                     parse_notify(&msg, &mut next_id, &order, &owners, &sender)
                 else {
-                    // A malformed Notify call still needs *a* reply, or the
-                    // caller blocks until its own timeout.
-                    reply(
+                    error_reply(
                         conn.channel(),
-                        msg.error(
-                            &"org.freedesktop.DBus.Error.InvalidArgs".into(),
-                            &std::ffi::CString::new("malformed Notify call")
-                                .expect("static string has no NUL"),
-                        ),
+                        &msg,
+                        "org.freedesktop.DBus.Error.InvalidArgs",
+                        "malformed Notify call",
                     )?;
                     continue;
                 };
@@ -285,13 +281,11 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
                         ping();
                         reply(conn.channel(), msg.method_return())?;
                     }
-                    _ => reply(
+                    _ => error_reply(
                         conn.channel(),
-                        msg.error(
-                            &"org.freedesktop.Notifications.Error.InvalidId".into(),
-                            &std::ffi::CString::new("no such notification")
-                                .expect("static string has no NUL"),
-                        ),
+                        &msg,
+                        "org.freedesktop.Notifications.Error.InvalidId",
+                        "no such notification",
                     )?,
                 }
             }
@@ -385,7 +379,7 @@ fn parse_notify(
 const NOTE_TEXT_CAP: usize = 4096;
 
 /// Truncate to at most `cap` chars, on a char boundary.
-fn cap_chars(s: &str, cap: usize) -> &str {
+pub(crate) fn cap_chars(s: &str, cap: usize) -> &str {
     match s.char_indices().nth(cap) {
         Some((i, _)) => &s[..i],
         None => s,
@@ -407,6 +401,18 @@ fn emit_closed(ch: &Channel, id: u32, reason: u32) {
 fn reply(ch: &Channel, msg: Message) -> R<()> {
     ch.send(msg).map_err(|()| "dbus send failed")?;
     Ok(())
+}
+
+/// Reply to `msg` with a D-Bus error: a malformed or unknown call still
+/// needs *a* reply, or the caller blocks until its own timeout.
+fn error_reply(ch: &Channel, msg: &Message, name: &str, text: &str) -> R<()> {
+    reply(
+        ch,
+        msg.error(
+            &name.into(),
+            &std::ffi::CString::new(text).expect("static string has no NUL"),
+        ),
+    )
 }
 
 /// The spec allows a small HTML subset in the body; we render plain text, so

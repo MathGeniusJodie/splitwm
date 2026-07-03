@@ -165,7 +165,7 @@ impl Wm {
                     .and_then(|h| h.min_size)
                     .map_or((1, 1), |(w, h)| (w.max(1), h.max(1))),
                 focus: self.focus_model(win),
-                icon_fetched: Some(std::time::Instant::now()),
+                icon_fetched: std::time::Instant::now(),
                 icon_stale: false,
             },
         );
@@ -1091,7 +1091,8 @@ impl Wm {
     /// that set the property only after mapping (Electron, notably) would
     /// otherwise keep whatever `manage` resolved at map time.
     pub(crate) fn on_icon_change(&mut self, win: Win) -> R<()> {
-        let Some(class) = self.clients.get(&win).map(|c| c.class.clone()) else {
+        let now = std::time::Instant::now();
+        let Some(client) = self.clients.get_mut(&win) else {
             return Ok(());
         };
         // Rate-limit: the fetch below moves up to 16 MiB of client-
@@ -1100,21 +1101,21 @@ impl Wm {
         // per notify. A throttled notify is remembered as stale and
         // re-fetched by `flush_stale_icons` once the cooldown passes, so a
         // burst's final icon is never lost.
-        let now = std::time::Instant::now();
-        let client = self.clients.get_mut(&win).expect("checked above");
-        if client
-            .icon_fetched
-            .is_some_and(|t| now.duration_since(t) < ICON_FETCH_COOLDOWN)
-        {
+        if now.duration_since(client.icon_fetched) < ICON_FETCH_COOLDOWN {
             client.icon_stale = true;
+            self.icons_stale = true;
             return Ok(());
         }
-        client.icon_fetched = Some(now);
+        client.icon_fetched = now;
         client.icon_stale = false;
+        let class = client.class.clone();
         let Some(icon) = self.fetch_icon(win) else {
             return Ok(());
         };
-        let client = self.clients.get_mut(&win).expect("checked above");
+        let client = self
+            .clients
+            .get_mut(&win)
+            .expect("present above; fetch_icon doesn't unmanage");
         client.icon = Some(icon);
         client.icon_rotated = None;
         self.refresh_icon_rotations(&class);
@@ -1124,22 +1125,25 @@ impl Wm {
     /// Re-fetch icons whose refresh was deferred by `on_icon_change`'s
     /// rate limit. Runs once per event batch (the WM has no timers, so
     /// "after the cooldown" means the first batch that arrives past it — a
-    /// pointer motion at the latest).
+    /// pointer motion at the latest); the `icons_stale` flag keeps the
+    /// usual no-stale-icons batch from paying for a clients scan.
     pub(crate) fn flush_stale_icons(&mut self) -> R<()> {
+        if !self.icons_stale {
+            return Ok(());
+        }
         let now = std::time::Instant::now();
         let due: Vec<Win> = self
             .clients
             .iter()
             .filter(|(_, c)| {
-                c.icon_stale
-                    && c.icon_fetched
-                        .is_none_or(|t| now.duration_since(t) >= ICON_FETCH_COOLDOWN)
+                c.icon_stale && now.duration_since(c.icon_fetched) >= ICON_FETCH_COOLDOWN
             })
             .map(|(&w, _)| w)
             .collect();
         for win in due {
             self.on_icon_change(win)?;
         }
+        self.icons_stale = self.clients.values().any(|c| c.icon_stale);
         Ok(())
     }
 
@@ -1228,39 +1232,46 @@ impl Wm {
                 let model = self.clients[&w].focus;
                 self.give_focus(w, model)?;
                 // Raising the focused client puts it above everything;
-                // re-apply arrange's stacking policy above it (floats, then
-                // fullscreen, then notifications; the menu below).
+                // re-apply the shared stacking policy above it.
                 self.conn
                     .configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
-                self.raise_floats()?;
-                self.raise_fullscreen()?;
-                self.raise_notifications()?;
-                self.conn.change_property32(
-                    PropMode::REPLACE,
-                    self.root,
-                    self.atoms.net_active_window,
-                    AtomEnum::WINDOW,
-                    &[w],
-                )?;
+                self.apply_stacking()?;
+                self.set_net_active_window(w)?;
             }
             _ => {
                 self.focused_float = None;
                 let time = self.focus_timestamp()?;
                 self.conn
                     .set_input_focus(InputFocus::POINTER_ROOT, self.root, time)?;
-                self.conn.change_property32(
-                    PropMode::REPLACE,
-                    self.root,
-                    self.atoms.net_active_window,
-                    AtomEnum::WINDOW,
-                    &[x11rb::NONE],
-                )?;
+                self.set_net_active_window(x11rb::NONE)?;
+                self.raise_menu()?;
             }
         }
-        // Raising the focused client puts it above everything, including an
-        // open launcher menu; the menu must stay on top (`arrange` does the
-        // same after its raises).
-        self.raise_menu()?;
+        Ok(())
+    }
+
+    /// The stacking order above tiled clients, bottom to top: floats, the
+    /// fullscreen window, notifications, then an open launcher menu.
+    /// `arrange` and `focus` both raise windows to the top and re-apply
+    /// this same sequence afterwards — inserting a new layer means adding
+    /// it here, once.
+    pub(crate) fn apply_stacking(&self) -> R<()> {
+        self.raise_floats()?;
+        self.raise_fullscreen()?;
+        self.raise_notifications()?;
+        self.raise_menu()
+    }
+
+    /// Advertise `win` (or `x11rb::NONE`) as `_NET_ACTIVE_WINDOW` on the
+    /// root, keeping pagers in step with every focus path.
+    pub(crate) fn set_net_active_window(&self, win: Win) -> R<()> {
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.root,
+            self.atoms.net_active_window,
+            AtomEnum::WINDOW,
+            &[win],
+        )?;
         Ok(())
     }
 

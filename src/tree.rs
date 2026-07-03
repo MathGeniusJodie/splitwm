@@ -52,6 +52,18 @@ pub struct Leaf {
     pub color: crate::Index,
 }
 
+impl Leaf {
+    /// Show `c` in this leaf. Owns the "a leaf showing a window is never
+    /// minimized" invariant: a minimized leaf's window is never mapped, so
+    /// assigning a client without clearing the flag would leave the window
+    /// unviewable. Every path that puts a window into a leaf goes through
+    /// here.
+    pub fn show(&mut self, c: Win) {
+        self.client = Some(c);
+        self.minimized = false;
+    }
+}
+
 pub enum Node {
     Leaf(Leaf),
     Branch {

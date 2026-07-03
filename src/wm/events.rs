@@ -4,13 +4,12 @@
 use x11rb::connection::Connection;
 use x11rb::protocol::xinput;
 use x11rb::protocol::xproto::{
-    Allow, AtomEnum, ButtonPressEvent, ButtonReleaseEvent, ChangeWindowAttributesAux, ConfigWindow,
+    Allow, ButtonPressEvent, ButtonReleaseEvent, ChangeWindowAttributesAux, ConfigWindow,
     ConfigureNotifyEvent, ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, EventMask,
     ExposeEvent, InputFocus, KeyPressEvent, MapRequestEvent, Mapping, MappingNotifyEvent, ModMask,
-    MotionNotifyEvent, PropMode, UnmapNotifyEvent,
+    MotionNotifyEvent, UnmapNotifyEvent, Window,
 };
 use x11rb::protocol::Event;
-use x11rb::wrapper::ConnectionExt as _;
 
 use super::clients::WM_STATE_WITHDRAWN;
 use super::types::{
@@ -169,6 +168,10 @@ impl Wm {
         // scroll + arrange, for the same reason motion is coalesced: a swipe
         // reports far faster than we can recomposite the whole screen.
         let mut pending_hscroll = 0.0f64;
+        // Menu wheel detents, coalesced per column for the same reason:
+        // each application repaints and blits the whole visible column, and
+        // only the batch's final scroll position is ever visible.
+        let mut pending_menu_scroll: Vec<(Window, i32)> = Vec::new();
         for ev in batch {
             match ev {
                 Event::MotionNotify(e) => {
@@ -205,7 +208,11 @@ impl Wm {
                     // rows (a column taller than the screen clamps and
                     // scrolls; see `on_menu_scroll`).
                     if self.menu.open && self.is_menu_window(e.event) && matches!(e.detail, 4 | 5) {
-                        self.on_menu_scroll(e.event, e.detail == 5)?;
+                        let d = if e.detail == 5 { 1 } else { -1 };
+                        match pending_menu_scroll.iter_mut().find(|(w, _)| *w == e.event) {
+                            Some((_, acc)) => *acc += d,
+                            None => pending_menu_scroll.push((e.event, d)),
+                        }
                         continue;
                     }
                     if self.hscroll.is_empty() {
@@ -221,23 +228,33 @@ impl Wm {
                 _ => {}
             }
             // Flush pending motion/scroll before any other event so ordering
-            // (e.g. a button release ending a drag) is preserved.
+            // (e.g. a button release ending a drag, or a click whose row hit
+            // depends on the menu's scroll position) is preserved.
             for m in pending_motion.drain(..) {
-                contain(self.on_motion(&m))?;
+                contain(self.on_motion(&m), "event")?;
+            }
+            for (win, d) in pending_menu_scroll.drain(..) {
+                contain(self.on_menu_scroll(win, d), "event")?;
             }
             if pending_hscroll != 0.0 {
                 if self.debug_scroll {
                     eprintln!("splitwm: mid-batch flush forced by {ev:?}");
                 }
-                contain(self.apply_hscroll(std::mem::take(&mut pending_hscroll)))?;
+                contain(
+                    self.apply_hscroll(std::mem::take(&mut pending_hscroll)),
+                    "event",
+                )?;
             }
-            contain(self.handle_event(&ev))?;
+            contain(self.handle_event(&ev), "event")?;
         }
         for m in pending_motion {
-            contain(self.on_motion(&m))?;
+            contain(self.on_motion(&m), "event")?;
+        }
+        for (win, d) in pending_menu_scroll {
+            contain(self.on_menu_scroll(win, d), "event")?;
         }
         if pending_hscroll != 0.0 {
-            contain(self.apply_hscroll(pending_hscroll))?;
+            contain(self.apply_hscroll(pending_hscroll), "event")?;
         }
         Ok(())
     }
@@ -1003,13 +1020,7 @@ impl Wm {
                 // every other focus path — pagers otherwise show the
                 // previous window as active while the user types into the
                 // dock.
-                self.conn.change_property32(
-                    PropMode::REPLACE,
-                    self.root,
-                    self.atoms.net_active_window,
-                    AtomEnum::WINDOW,
-                    &[e.event],
-                )?;
+                self.set_net_active_window(e.event)?;
             }
         }
         Ok(())
@@ -1241,9 +1252,9 @@ impl Wm {
         // The underlay needs no handling here: its composited image is its
         // `background_pixmap`, so the server repaints exposed areas itself.
         if self.menu.open && e.window == self.menu.main.win {
-            self.paint_menu_main()?;
+            self.paint_column(false)?;
         } else if self.menu.open && e.window == self.menu.sub.win {
-            self.paint_menu_sub()?;
+            self.paint_column(true)?;
         } else if self.floats.iter().any(|f| f.frame == e.window) {
             self.paint_float_frame(e.window)?;
         } else {
@@ -1253,14 +1264,15 @@ impl Wm {
     }
 }
 
-/// Contain one event's non-fatal error so the rest of the batch still runs:
-/// aborting the batch can drop a queued ButtonRelease and leave a drag armed
-/// with no button held (hover motion then keeps resizing a boundary).
-/// Fatal (connection) errors still propagate — the loop must exit on those.
-fn contain(r: R<()>) -> R<()> {
+/// Contain a non-fatal error (logged, tagged with `what`) so surrounding
+/// work still runs: aborting an event batch can drop a queued ButtonRelease
+/// and leave a drag armed with no button held (hover motion then keeps
+/// resizing a boundary). Fatal (connection) errors still propagate — the
+/// loop must exit on those.
+pub(super) fn contain(r: R<()>, what: &str) -> R<()> {
     match r {
         Err(e) if !e.is_fatal() => {
-            eprintln!("splitwm: error handling event: {e}");
+            eprintln!("splitwm: error handling {what}: {e}");
             Ok(())
         }
         other => other,

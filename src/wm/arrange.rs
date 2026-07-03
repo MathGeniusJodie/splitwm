@@ -114,15 +114,9 @@ impl Wm {
         }
         self.place_clients(&placed)?;
         self.place_dock()?;
-        // place_clients/place_dock raise their windows to the top; keep
-        // floats above tiled clients, fullscreen above those, notifications
-        // above that, and an open launcher menu above everything (an arrange
-        // can be triggered while it's open). `Wm::focus` re-applies the same
-        // raise order after its own raises.
-        self.raise_floats()?;
-        self.raise_fullscreen()?;
-        self.raise_notifications()?;
-        self.raise_menu()?;
+        // place_clients/place_dock raise their windows to the top; re-apply
+        // the shared stacking policy above tiled clients.
+        self.apply_stacking()?;
 
         // Cache final rects as the start point for the next transition.
         self.prev_frame_rect = frame_rects;

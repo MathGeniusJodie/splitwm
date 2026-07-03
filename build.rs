@@ -16,34 +16,10 @@ use pixel_graphics::{Palette, Sprite};
 
 const PALETTE_PNG: &str = "assets/na16-1x.png";
 
-const SPRITES: &[&str] = &[
-    "assets/bubble.png",
-    "assets/close.png",
-    "assets/cursor_disabled.png",
-    "assets/cursor_hand.png",
-    "assets/cursor_pointer.png",
-    "assets/cursor_text.png",
-    "assets/close_disabled.png",
-    "assets/hsplit.png",
-    "assets/hsplit_disabled.png",
-    "assets/minimize.png",
-    "assets/minimize_disabled.png",
-    "assets/minimize_h.png",
-    "assets/minimize_h_disabled.png",
-    "assets/vsplit.png",
-    "assets/vsplit_disabled.png",
-    "assets/winborder.png",
-    "assets/winmin.png",
-    "assets/winmin_h.png",
-];
-
 fn main() {
+    // A directory path makes cargo watch every file under it, so this one
+    // line covers edits, additions, and deletions of any asset.
     println!("cargo::rerun-if-changed=assets");
-    println!("cargo::rerun-if-changed={PALETTE_PNG}");
-    for path in SPRITES {
-        println!("cargo::rerun-if-changed={path}");
-    }
-    check_no_unlisted_assets();
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let palette = Palette::load(PALETTE_PNG)
@@ -62,31 +38,21 @@ fn main() {
          include_bytes!(concat!(env!(\"OUT_DIR\"), \"/palette.bin\"));\n",
     );
 
-    for path in SPRITES {
-        bake_sprite(Path::new(path), &palette, &out_dir, &mut out);
+    // Bake every PNG in assets/ (the palette image itself is the one
+    // exception): the sprite list is the directory, so a dropped-in asset
+    // can never be silently missing from the binary. Sorted so the
+    // generated file is stable across filesystems.
+    let mut sprites: Vec<PathBuf> = std::fs::read_dir("assets")
+        .expect("assets/ directory must exist")
+        .filter_map(|e| Some(e.ok()?.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "png") && p != Path::new(PALETTE_PNG))
+        .collect();
+    sprites.sort();
+    for path in &sprites {
+        bake_sprite(path, &palette, &out_dir, &mut out);
     }
 
     std::fs::write(out_dir.join("baked_assets.rs"), out).unwrap();
-}
-
-/// Fail the build if `assets/` holds a PNG that neither `SPRITES` nor
-/// `PALETTE_PNG` lists: a dropped-in asset that never gets baked is
-/// otherwise silently invisible to the binary.
-fn check_no_unlisted_assets() {
-    let unlisted: Vec<String> = std::fs::read_dir("assets")
-        .expect("assets/ directory must exist")
-        .filter_map(|e| Some(e.ok()?.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "png"))
-        .filter_map(|p| {
-            let s = p.to_str()?.to_string();
-            (s != PALETTE_PNG && !SPRITES.contains(&s.as_str())).then_some(s)
-        })
-        .collect();
-    assert!(
-        unlisted.is_empty(),
-        "PNGs in assets/ missing from build.rs SPRITES (add them or delete the files): \
-         {unlisted:?}"
-    );
 }
 
 fn bake_sprite(path: &Path, palette: &Palette, out_dir: &Path, out: &mut String) {
@@ -101,8 +67,8 @@ fn bake_sprite(path: &Path, palette: &Palette, out_dir: &Path, out: &mut String)
         .collect();
     std::fs::write(out_dir.join(format!("{name}.bin")), &pixels).unwrap();
 
-    // dead_code allowed: every PNG in assets/ is baked (enforced by
-    // `check_no_unlisted_assets`), including art not yet referenced.
+    // dead_code allowed: every PNG in assets/ is baked (the list is
+    // enumerated from the directory), including art not yet referenced.
     writeln!(
         out,
         "#[allow(dead_code)] pub(crate) fn {name}() -> Sprite {{ Sprite::from_indices({w}, {h}, \

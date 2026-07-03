@@ -321,6 +321,7 @@ pub fn run(replace: bool) -> R<()> {
         hscroll_gate: None,
         ignore_unmaps: HashMap::new(),
         fullscreen: None,
+        icons_stale: false,
         conn,
         root,
     };
@@ -798,20 +799,11 @@ fn event_loop(wm: &mut Wm) -> R<()> {
         // A handling error (e.g. a reply from a window that raced us and
         // died) must not take down the whole session — but a broken
         // connection must: retrying the loop on one would just spin on the
-        // dead socket. `WmError` classifies the two at construction time.
-        if let Err(e) = wm.handle_batch(batch) {
-            if e.is_fatal() {
-                return Err(e);
-            }
-            eprintln!("splitwm: error handling event batch: {e}");
-        }
+        // dead socket. `WmError` classifies the two at construction time;
+        // `contain` propagates only the fatal kind.
+        events::contain(wm.handle_batch(batch), "event batch")?;
         // Icon refreshes deferred by `on_icon_change`'s rate limit.
-        if let Err(e) = wm.flush_stale_icons() {
-            if e.is_fatal() {
-                return Err(e);
-            }
-            eprintln!("splitwm: error refreshing icons: {e}");
-        }
+        events::contain(wm.flush_stale_icons(), "deferred icon refresh")?;
         if debug_scroll {
             eprintln!(
                 "splitwm: scroll-bearing batch of {batch_len} events took {:?}",
