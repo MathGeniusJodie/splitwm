@@ -1,8 +1,8 @@
 //! App launching support: resolving the taskbar quick-launch entries
-//! (`theme::QUICK`) to commands and icons, resolving `.desktop` entries to
-//! spawnable commands (the dock autostart), and the minimal freedesktop
-//! icon-file lookup behind both. Pure data; the X windows and rendering
-//! live in `wm`.
+//! (`theme::QUICK`) to commands, resolving `.desktop` entries to spawnable
+//! commands (the dock autostart), and the freedesktop icon-theme file
+//! lookup behind the taskbar's icons. Pure data; the X windows and
+//! rendering live in `wm`.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -12,14 +12,9 @@ pub struct QuickLaunch {
     pub label: &'static str,
     /// The command to spawn (the entry's env override or its default).
     pub cmd: String,
-    /// Icon name/path for `find_icon_file`, when one could be inferred.
-    pub icon: Option<String>,
-}
-
-/// A scanned `.desktop` application: just the facts icon inference needs.
-struct App {
-    exec: String,
-    icon: String,
+    /// Freedesktop icon-theme name for `find_icon_file`.
+    pub icon: &'static str,
+    pub show: crate::theme::ShowWhen,
 }
 
 /// Strip desktop-entry field codes (`%f`, `%U`, …) from an Exec line;
@@ -47,41 +42,6 @@ fn clean_exec(exec: &str) -> String {
         }
     }
     out.trim().to_string()
-}
-
-/// Parse one `.desktop` file's `[Desktop Entry]` group into `(exec, icon)`
-/// when it is a displayable Application with both set.
-fn parse_desktop(text: &str) -> Option<(String, String)> {
-    let mut in_entry = false;
-    let (mut exec, mut icon): (Option<String>, Option<String>) = (None, None);
-    let (mut no_display, mut hidden, mut is_app) = (false, false, true);
-    for line in text.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_entry = line == "[Desktop Entry]";
-            continue;
-        }
-        if !in_entry {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        match k.trim() {
-            "Exec" if exec.is_none() => exec = Some(clean_exec(v.trim())),
-            "Icon" if icon.is_none() => icon = Some(v.trim().to_string()),
-            "NoDisplay" => no_display = v.trim().eq_ignore_ascii_case("true"),
-            "Hidden" => hidden = v.trim().eq_ignore_ascii_case("true"),
-            "Type" => is_app = v.trim() == "Application",
-            _ => {}
-        }
-    }
-    if no_display || hidden || !is_app {
-        return None;
-    }
-    let exec = exec.filter(|e| !e.is_empty())?;
-    let icon = icon.filter(|i| !i.is_empty())?;
-    Some((exec, icon))
 }
 
 /// Standard XDG data directories (per-user first, so it wins).
@@ -118,17 +78,10 @@ fn app_dirs() -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// Icon sizes worth loading for taskbar-tile icons, best (largest useful)
-/// first: the tiles draw the icon at ~36px, so a clean downscale from 48
-/// beats a blocky 16px upscale.
-const ICON_SIZES: &[&str] = &[
-    "48x48", "64x64", "32x32", "128x128", "256x256", "24x24", "22x22", "16x16",
-];
-
-/// Resolve an `Icon=` value to a PNG file. Absolute paths are used as-is;
-/// names are looked up in the hicolor theme's `apps` dirs and `pixmaps` (a
-/// deliberately minimal cut of the freedesktop icon-theme lookup — no theme
-/// inheritance, PNG only).
+/// Resolve an icon name to a PNG file. Absolute paths are used as-is; names
+/// are looked up through the configured icon theme and its inheritance
+/// chain (see `theme_search_dirs`), then `pixmaps` (a deliberately minimal
+/// cut of the freedesktop icon-theme lookup — PNG only, no SVG).
 pub fn find_icon_file(icon: &str) -> Option<std::path::PathBuf> {
     // Repeated lookups re-resolve the same icon names, so cache results
     // keyed by the raw `icon` string. Hits are trusted forever (nothing
@@ -166,13 +119,18 @@ fn find_icon_file_uncached(icon: &str) -> Option<std::path::PathBuf> {
         return (p.extension().is_some_and(|x| x == "png") && p.is_file()).then_some(p);
     }
     let file = format!("{icon}.png");
-    for d in data_dirs() {
-        for size in ICON_SIZES {
-            let p = d.join("icons/hicolor").join(size).join("apps").join(&file);
+    let data = data_dirs();
+    // Theme-major order: every base dir of a theme is preferred over any
+    // dir of the theme it inherits from, per the freedesktop lookup.
+    for rel in theme_search_dirs() {
+        for d in &data {
+            let p = d.join("icons").join(rel).join(&file);
             if p.is_file() {
                 return Some(p);
             }
         }
+    }
+    for d in &data {
         let p = d.join("pixmaps").join(&file);
         if p.is_file() {
             return Some(p);
@@ -181,35 +139,135 @@ fn find_icon_file_uncached(icon: &str) -> Option<std::path::PathBuf> {
     None
 }
 
-/// Scan every `.desktop` file once into a flat app list (earlier, more
-/// user-specific dirs win per app id) — the corpus `quick_icon` infers
-/// icons from.
-fn scan() -> Vec<App> {
-    let mut apps = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for dir in app_dirs() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+/// One lookup directory inside an icon theme, from its `index.theme`.
+struct ThemeDir {
+    path: String,
+    size: i32,
+    scale: i32,
+}
+
+/// Rank a theme directory for lookup order: unscaled dirs before `@2x`
+/// ones, then by size — the smallest size >= 48 first (a clean downscale to
+/// the ~36px taskbar tile), then the largest smaller size (the mildest
+/// upscale).
+fn dir_rank(d: &ThemeDir) -> (bool, i32) {
+    let size_rank = if d.size >= 48 { d.size - 48 } else { 10_000 - d.size };
+    (d.scale != 1, size_rank)
+}
+
+/// Parse an `index.theme`: its ranked lookup directories and the themes it
+/// inherits from.
+fn parse_index_theme(text: &str) -> (Vec<ThemeDir>, Vec<String>) {
+    let mut group = "";
+    let mut directories: Vec<&str> = Vec::new();
+    let mut inherits: Vec<String> = Vec::new();
+    // Per-directory groups carry the dir's nominal Size and Scale.
+    let mut props: HashMap<&str, (i32, i32)> = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(g) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            group = g;
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
             continue;
         };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().is_none_or(|x| x != "desktop") {
-                continue;
+        let (k, v) = (k.trim(), v.trim());
+        if group == "Icon Theme" {
+            let items = || v.split(',').map(str::trim).filter(|s| !s.is_empty());
+            match k {
+                "Directories" => directories = items().collect(),
+                "Inherits" => inherits = items().map(String::from).collect(),
+                _ => {}
             }
-            let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
-                continue;
-            };
-            if !seen.insert(stem.to_string()) {
-                continue;
-            }
-            if let Ok(text) = std::fs::read_to_string(&p) {
-                if let Some((exec, icon)) = parse_desktop(&text) {
-                    apps.push(App { exec, icon });
-                }
+        } else {
+            let e = props.entry(group).or_insert((0, 1));
+            match (k, v.parse::<i32>()) {
+                ("Size", Ok(n)) => e.0 = n,
+                ("Scale", Ok(n)) => e.1 = n,
+                _ => {}
             }
         }
     }
-    apps
+    let mut dirs: Vec<ThemeDir> = directories
+        .into_iter()
+        .filter_map(|d| {
+            // A directory without a Size can't be ranked; skip it.
+            let &(size, scale) = props.get(d)?;
+            (size > 0).then(|| ThemeDir {
+                path: d.to_string(),
+                size,
+                scale,
+            })
+        })
+        .collect();
+    dirs.sort_by_key(dir_rank);
+    (dirs, inherits)
+}
+
+/// The user's icon theme name from GTK's `gtk-3.0/settings.ini` — the WM
+/// links no GTK, but that ini is where the theme is conventionally
+/// configured per user.
+fn configured_icon_theme() -> Option<String> {
+    let config = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var("HOME").ok().map(|h| format!("{h}/.config")))?;
+    let text = std::fs::read_to_string(format!("{config}/gtk-3.0/settings.ini")).ok()?;
+    for line in text.lines() {
+        if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == "gtk-icon-theme-name" {
+                return Some(v.trim().trim_matches('"').to_string());
+            }
+        }
+    }
+    None
+}
+
+/// The flattened icon search directories (`<theme>/<subdir>`, relative to a
+/// data dir's `icons/`) for the configured icon theme and everything it
+/// inherits, ending at hicolor. Resolved once — switching icon themes takes
+/// a WM restart.
+fn theme_search_dirs() -> &'static [std::path::PathBuf] {
+    static DIRS: OnceLock<Vec<std::path::PathBuf>> = OnceLock::new();
+    DIRS.get_or_init(|| {
+        let data = data_dirs();
+        let mut queue = vec![configured_icon_theme().unwrap_or_else(|| "hicolor".into())];
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let mut i = 0;
+        loop {
+            while let Some(theme) = queue.get(i).cloned() {
+                i += 1;
+                if !seen.insert(theme.clone()) {
+                    continue;
+                }
+                let Some(index) = data
+                    .iter()
+                    .find_map(|d| std::fs::read_to_string(d.join("icons").join(&theme).join("index.theme")).ok())
+                else {
+                    continue;
+                };
+                let (dirs, inherits) = parse_index_theme(&index);
+                out.extend(dirs.into_iter().map(|d| std::path::Path::new(&theme).join(d.path)));
+                queue.extend(inherits);
+            }
+            // hicolor is the spec's implicit final fallback; visit it even
+            // when no Inherits chain reached it.
+            if seen.contains("hicolor") {
+                break;
+            }
+            queue.push("hicolor".into());
+        }
+        // No readable index.theme anywhere (bare setups): fall back to
+        // hicolor's conventional layout blind.
+        if out.is_empty() {
+            for size in [48, 64, 32, 128, 256, 24, 22, 16] {
+                out.push(format!("hicolor/{size}x{size}/apps").into());
+            }
+        }
+        out
+    })
 }
 
 /// Resolve `<id>.desktop` from the standard application dirs into a
@@ -253,42 +311,23 @@ pub fn desktop_entry_cmd(id: &str) -> Option<String> {
     })
 }
 
-/// Icon name for a quick-launch command: the icon of the scanned app whose
-/// Exec starts with the same program, else the program's own name (themed
-/// icons are often named after the binary).
-fn quick_icon(apps: &[App], cmd: &str) -> Option<String> {
-    let prog = cmd.split_whitespace().next()?;
-    let bin = prog.rsplit('/').next()?;
-    for a in apps {
-        let app_prog = a.exec.split_whitespace().next().unwrap_or("");
-        if app_prog.rsplit('/').next() == Some(bin) {
-            return Some(a.icon.clone());
-        }
-    }
-    Some(bin.to_string())
-}
-
-/// Resolve every `theme::QUICK` entry (env override or default command, plus
-/// an inferred icon). Scans the system's `.desktop` files once.
+/// Resolve every `theme::QUICK` entry: its env override or default command,
+/// carrying the entry's icon name and visibility rule through.
 pub fn quick_launches() -> Vec<QuickLaunch> {
-    let apps = scan();
     crate::theme::QUICK
         .iter()
-        .map(|q| {
-            let cmd = std::env::var(q.env).unwrap_or_else(|_| q.default.to_string());
-            let icon = quick_icon(&apps, &cmd);
-            QuickLaunch {
-                label: q.label,
-                cmd,
-                icon,
-            }
+        .map(|q| QuickLaunch {
+            label: q.label,
+            cmd: std::env::var(q.env).unwrap_or_else(|_| q.default.to_string()),
+            icon: q.icon,
+            show: q.show,
         })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_exec, parse_desktop, quick_icon, App};
+    use super::{clean_exec, dir_rank, parse_index_theme};
 
     #[test]
     fn clean_exec_strips_field_codes() {
@@ -306,42 +345,30 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_normal_application() {
-        let text = "[Desktop Entry]\nType=Application\nName=Foo\nExec=foo %U\nIcon=foo\nCategories=Network;WebBrowser;\n";
-        let (exec, icon) = parse_desktop(text).unwrap();
-        assert_eq!(exec, "foo");
-        assert_eq!(icon, "foo");
+    fn index_theme_dirs_are_parsed_and_ranked() {
+        let text = "[Icon Theme]\nName=T\nDirectories=apps/16,apps/48@2x,places/64,apps/48,nosize\nInherits=Parent, hicolor\n\n\
+            [apps/16]\nSize=16\nContext=Applications\n\
+            [apps/48@2x]\nSize=48\nScale=2\n\
+            [places/64]\nSize=64\n\
+            [apps/48]\nSize=48\n";
+        let (dirs, inherits) = parse_index_theme(text);
+        let order: Vec<&str> = dirs.iter().map(|d| d.path.as_str()).collect();
+        // Smallest >= 48 first, @2x behind every unscaled dir, no-Size
+        // dirs dropped.
+        assert_eq!(order, ["apps/48", "places/64", "apps/16", "apps/48@2x"]);
+        assert_eq!(inherits, ["Parent", "hicolor"]);
     }
 
     #[test]
-    fn hidden_nodisplay_and_non_apps_are_skipped() {
-        for extra in ["NoDisplay=true", "Hidden=true", "Type=Link"] {
-            let text =
-                format!("[Desktop Entry]\nType=Application\nName=X\nExec=x\nIcon=x\n{extra}\n");
-            assert!(parse_desktop(&text).is_none(), "{extra} should filter");
-        }
-    }
-
-    #[test]
-    fn keys_outside_desktop_entry_group_are_ignored() {
-        let text = "[Desktop Action new]\nExec=evil\n[Desktop Entry]\nType=Application\nName=A\nExec=good\nIcon=a\n";
-        let (exec, _) = parse_desktop(text).unwrap();
-        assert_eq!(exec, "good");
-    }
-
-    #[test]
-    fn quick_icon_matches_by_binary_and_falls_back_to_it() {
-        let apps = vec![App {
-            exec: "/usr/bin/firefox --new-window".into(),
-            icon: "firefox-icon".into(),
-        }];
-        assert_eq!(
-            quick_icon(&apps, "firefox https://x").as_deref(),
-            Some("firefox-icon")
-        );
-        assert_eq!(
-            quick_icon(&apps, "alacritty -e sh").as_deref(),
-            Some("alacritty")
-        );
+    fn dir_rank_prefers_mild_downscale_over_any_upscale() {
+        let d = |size, scale| super::ThemeDir {
+            path: String::new(),
+            size,
+            scale,
+        };
+        assert!(dir_rank(&d(48, 1)) < dir_rank(&d(64, 1)));
+        assert!(dir_rank(&d(256, 1)) < dir_rank(&d(32, 1)));
+        assert!(dir_rank(&d(32, 1)) < dir_rank(&d(16, 1)));
+        assert!(dir_rank(&d(16, 1)) < dir_rank(&d(48, 2)));
     }
 }

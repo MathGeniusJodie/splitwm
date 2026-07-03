@@ -26,34 +26,34 @@ impl Wm {
         let overlap = 4;
         let pad = (theme::TASKBAR_H - (isz + cbs - overlap)) / 2;
         let y = wa.y + wa.h - theme::TASKBAR_H + pad;
-        // Quick-launch icons are pinned right-aligned at the bar's right
-        // edge, in `theme::QUICK` order; window tiles fill from the left in
-        // the space that remains, with a separator pill between the groups.
-        let bar_right = wa.x + wa.w - theme::GAP;
-        let nq = i32::try_from(self.quick.len()).unwrap_or(0);
-        let quick_w = (nq * (isz + gap) - gap).max(0);
-        let mut qx = bar_right - quick_w;
-        self.widgets.quick_regions.clear();
-        for i in 0..self.quick.len() {
-            self.widgets.quick_regions.push((
-                FrameRect {
-                    x: qx,
-                    y,
-                    w: isz,
-                    h: isz,
-                },
-                i,
-            ));
-            qx += isz + gap;
-        }
-        // Tiles fill from the left, stopping short of the separator + quick
-        // group. Left/right edge margins match the split gap. When the bar
-        // can't hold every window at full pitch, the stride compresses
-        // (tiles overlap like fanned cards, rightmost on top — draw order
-        // and the reversed hit-tests in `on_button` agree on that) instead
-        // of silently dropping tiles: a window without a tile would be
+        // Which quick-launch entries are visible right now: each entry's
+        // `ShowWhen` rule is keyed on whether a managed window's class
+        // matches it.
+        let running = |class: &str| {
+            self.clients
+                .values()
+                .any(|c| c.class.eq_ignore_ascii_case(class))
+        };
+        let visible: Vec<usize> = (0..self.quick.len())
+            .filter(|&i| match self.quick[i].show {
+                theme::ShowWhen::Always => true,
+                theme::ShowWhen::UnlessRunning(class) => !running(class),
+            })
+            .collect();
+        // Window tiles fill from the left; the quick-launch icons (in
+        // `theme::QUICK` order) follow the last tile, walled off by the
+        // separator pill. Left/right edge margins match the split gap.
+        // Tiles may claim everything up to where the quick group would be
+        // pushed against the bar's right edge: when the bar can't hold
+        // every window at full pitch, the stride compresses (tiles overlap
+        // like fanned cards, rightmost on top — draw order and the
+        // reversed hit-tests in `on_button` agree on that) instead of
+        // silently dropping tiles: a window without a tile would be
         // unreachable by mouse entirely.
-        let sep_w = 6;
+        let bar_right = wa.x + wa.w - theme::GAP;
+        let nq = i32::try_from(visible.len()).unwrap_or(0);
+        let quick_w = (nq * (isz + gap) - gap).max(0);
+        let sep_w = 4;
         let right = if nq > 0 {
             bar_right - quick_w - gap - sep_w - gap
         } else {
@@ -68,12 +68,6 @@ impl Wm {
         } else {
             full_stride
         };
-        self.widgets.taskbar_sep = (nq > 0 && !self.bar_order.is_empty()).then(|| FrameRect {
-            x: right + gap,
-            y,
-            w: sep_w,
-            h: isz,
-        });
         // One tree walk for every tile's leaf lookup — `find_leaf_for_client`
         // per tile is O(tiles × tree) on a per-arrange path.
         let mut client_leaf = std::collections::HashMap::new();
@@ -110,6 +104,32 @@ impl Wm {
                 in_split: leaf.is_some(),
             });
             x += stride;
+        }
+        // Quick icons trail the last tile (or sit at the bar's left edge
+        // when there are no windows, with no pill to separate).
+        let tail = tiles.last().map(|t: &TaskTile| t.rect.x + isz);
+        self.widgets.taskbar_sep = tail.filter(|_| nq > 0).map(|t| FrameRect {
+            x: t + gap,
+            y,
+            w: sep_w,
+            h: isz,
+        });
+        let mut qx = match tail {
+            Some(t) => t + gap + sep_w + gap,
+            None => left,
+        };
+        self.widgets.quick_regions.clear();
+        for i in visible {
+            self.widgets.quick_regions.push((
+                FrameRect {
+                    x: qx,
+                    y,
+                    w: isz,
+                    h: isz,
+                },
+                i,
+            ));
+            qx += isz + gap;
         }
         self.widgets.taskbar_regions = tiles;
     }

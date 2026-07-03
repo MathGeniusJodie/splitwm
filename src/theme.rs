@@ -332,14 +332,28 @@ pub const BINDINGS: &[(u16, u32, Action)] = &[
     (MOD4 | SHIFT, ks::C, Action::CloseWindow),
 ];
 
-// --- launcher quick entries ---
+// --- taskbar quick-launch entries ---
 
-/// A quick-launch shortcut shown at the top of the launcher menu's main
-/// column: `env` overrides `default` when set.
+/// When a quick-launch icon is present in the taskbar, keyed on whether a
+/// managed window's WM_CLASS matches (case-insensitively).
+#[derive(Clone, Copy)]
+pub enum ShowWhen {
+    Always,
+    /// Hidden while a matching window is open — for single-instance apps
+    /// whose window tile already covers reaching them.
+    UnlessRunning(&'static str),
+}
+
+/// A quick-launch shortcut shown as an icon in the taskbar: `env` overrides
+/// `default` when set. `icon` is a freedesktop icon-theme name — the generic
+/// role icon (terminal, browser, …), deliberately not the icon of whichever
+/// app the command resolves to.
 pub struct Quick {
     pub label: &'static str,
     pub env: &'static str,
     pub default: &'static str,
+    pub icon: &'static str,
+    pub show: ShowWhen,
 }
 
 pub const QUICK: &[Quick] = &[
@@ -347,26 +361,36 @@ pub const QUICK: &[Quick] = &[
         label: "Terminal",
         env: "TERMINAL",
         default: "xterm",
+        icon: "utilities-terminal",
+        show: ShowWhen::Always,
     },
     Quick {
         label: "Browser",
         env: "BROWSER",
         default: "xdg-open https://",
+        icon: "web-browser",
+        show: ShowWhen::Always,
     },
     Quick {
         label: "Files",
         env: "FILEMANAGER",
         default: "xdg-open .",
+        icon: "system-file-manager",
+        show: ShowWhen::Always,
     },
     Quick {
         label: "Obsidian",
         env: "OBSIDIAN",
         default: "obsidian",
+        icon: "obsidian",
+        show: ShowWhen::UnlessRunning("obsidian"),
     },
     Quick {
         label: "Claude",
         env: "CLAUDE_DESKTOP",
         default: "claude-desktop",
+        icon: "claude-desktop",
+        show: ShowWhen::UnlessRunning("claude"),
     },
 ];
 

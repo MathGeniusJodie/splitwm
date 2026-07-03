@@ -208,8 +208,8 @@ impl Wm {
                 );
                 crate::render::draw_close_badge(m, t.close.x, t.close.y, t.close.w);
             }
-            // Quick-launch icons at the right end of the bar, walled off
-            // from the window tiles by the separator pill.
+            // Quick-launch icons after the window tiles, walled off from
+            // them by the separator pill.
             if let Some(sep) = self.widgets.taskbar_sep {
                 crate::render::draw_taskbar_sep(m, sep);
             }

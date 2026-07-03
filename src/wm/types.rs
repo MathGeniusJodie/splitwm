@@ -325,8 +325,8 @@ pub struct Wm {
     /// Every hit-testable widget rect for the current layout, rebuilt as one
     /// unit by `compute_widgets` each arrange (see `Widgets`).
     pub widgets: Widgets,
-    /// The quick-launch entries shown as icons at the right end of the
-    /// taskbar (see `QuickSlot`), resolved once at startup.
+    /// The quick-launch entries shown as taskbar icons after the window
+    /// tiles (see `QuickSlot`), resolved once at startup.
     pub quick: Vec<QuickSlot>,
     /// In-progress gap/float/edge drags (see `DragState`).
     pub drags: DragState,
@@ -437,8 +437,9 @@ pub struct DragState {
 pub struct Widgets {
     pub handle_regions: Vec<(FrameRect, Boundary)>,
     pub plus_regions: Vec<(FrameRect, usize)>,
-    /// Quick-launch icons at the right end of the bottom taskbar, paired
-    /// with their `Wm::quick` index.
+    /// Quick-launch icons in the bottom taskbar (after the window tiles),
+    /// paired with their `Wm::quick` index; entries hidden by their
+    /// `ShowWhen` rule get no region.
     pub quick_regions: Vec<(FrameRect, usize)>,
     /// The pill separating window tiles from the quick-launch icons; only
     /// present when both groups are (an unpaired separator is just clutter).
@@ -556,6 +557,9 @@ pub struct QuickSlot {
     pub icon: Option<Rc<crate::icon::Icon>>,
     /// First letter of the entry's label, the no-icon fallback glyph.
     pub label: char,
+    /// Visibility rule, re-evaluated against the managed clients each
+    /// arrange (see `compute_taskbar`).
+    pub show: crate::theme::ShowWhen,
 }
 
 /// The three split-control buttons on the right of every leaf's tab bar

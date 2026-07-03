@@ -30,8 +30,7 @@ enum Hit {
     TaskbarClose(Win),
     /// A taskbar tile body.
     TaskbarTile(Win),
-    /// A quick-launch icon at the right end of the taskbar (`Wm::quick`
-    /// index).
+    /// A quick-launch icon in the taskbar (`Wm::quick` index).
     QuickLaunch(usize),
     /// A leaf's titlebar tab.
     Tab(NodeId),

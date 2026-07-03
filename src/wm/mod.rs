@@ -695,16 +695,14 @@ fn quick_slots(renderer: &Renderer) -> Vec<QuickSlot> {
     crate::launch::quick_launches()
         .into_iter()
         .map(|q| {
-            let icon = q
-                .icon
-                .as_deref()
-                .and_then(crate::launch::find_icon_file)
+            let icon = crate::launch::find_icon_file(q.icon)
                 .and_then(|p| crate::icon::load_png(&p))
                 .map(|img| std::rc::Rc::new(crate::icon::quantize(renderer.palette(), &img)));
             QuickSlot {
                 cmd: q.cmd,
                 icon,
                 label: q.label.chars().next().unwrap_or('?'),
+                show: q.show,
             }
         })
         .collect()
@@ -910,8 +908,7 @@ impl Wm {
     }
 
     /// Height reserved at the bottom for the window bar. Always present so
-    /// the quick-launch icons at its right end are reachable even with no
-    /// windows open.
+    /// the quick-launch icons are reachable even with no windows open.
     pub(crate) const fn taskbar_h() -> i32 {
         theme::TASKBAR_H
     }
