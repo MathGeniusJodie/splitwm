@@ -895,7 +895,10 @@ impl Wm {
             .and_then(|c| c.reply().ok())
             .map(|r| r.value)
             .unwrap_or_default();
-        let mut parts = class.split(|&b| b == 0).filter(|p| !p.is_empty()).peekable();
+        let mut parts = class
+            .split(|&b| b == 0)
+            .filter(|p| !p.is_empty())
+            .peekable();
         if parts.peek().is_some() {
             return parts.any(|part| part == self.dock.title.as_bytes());
         }
@@ -1078,9 +1081,7 @@ impl Wm {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             match super::wait_event_deadline(&self.conn, Some(deadline))? {
-                Some(x11rb::protocol::Event::PropertyNotify(e))
-                    if e.window == self.sel_owner =>
-                {
+                Some(x11rb::protocol::Event::PropertyNotify(e)) if e.window == self.sel_owner => {
                     self.last_event_time = e.time;
                     self.last_event_instant = std::time::Instant::now();
                     return Ok(e.time);

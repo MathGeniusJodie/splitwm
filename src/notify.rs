@@ -207,7 +207,8 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
         match msg.member().as_deref() {
             Some("Notify") => {
                 let sender = msg.sender().map(|s| s.to_string()).unwrap_or_default();
-                let Some((note, timeout)) = parse_notify(&msg, &mut next_id, &order, &owners, &sender)
+                let Some((note, timeout)) =
+                    parse_notify(&msg, &mut next_id, &order, &owners, &sender)
                 else {
                     continue;
                 };
@@ -457,7 +458,10 @@ mod tests {
     fn numeric_entities_decode() {
         assert_eq!(strip_markup("&#64;&#x41;&#X61;"), "@Aa");
         // Malformed or out-of-range references pass through literally.
-        assert_eq!(strip_markup("&#xZZ; &#1114112; &nope; &"), "&#xZZ; &#1114112; &nope; &");
+        assert_eq!(
+            strip_markup("&#xZZ; &#1114112; &nope; &"),
+            "&#xZZ; &#1114112; &nope; &"
+        );
     }
 
     #[test]

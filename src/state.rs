@@ -271,19 +271,21 @@ impl State {
         // colour stays with the content; child_b gets a fresh colour.
         // `leaf` should always resolve (it came from `focused_leaf_valid`),
         // but a dangling id degrades to an empty leaf rather than panicking.
-        let child_a = self.tree.insert_node(Node::Leaf(
-            self.tree.leaf(leaf).cloned().unwrap_or_else(|| {
-                debug_assert!(
-                    false,
-                    "split_focused: focused_leaf_valid() returned a dangling id {leaf:?}"
-                );
-                eprintln!(
-                    "split_focused: focused leaf {leaf:?} not found in tree; \
+        let child_a =
+            self.tree
+                .insert_node(Node::Leaf(self.tree.leaf(leaf).cloned().unwrap_or_else(
+                    || {
+                        debug_assert!(
+                            false,
+                            "split_focused: focused_leaf_valid() returned a dangling id {leaf:?}"
+                        );
+                        eprintln!(
+                            "split_focused: focused leaf {leaf:?} not found in tree; \
                      falling back to an empty leaf"
-                );
-                Default::default()
-            }),
-        ));
+                        );
+                        Default::default()
+                    },
+                )));
         let child_b = self.tree.make_leaf();
         // Insert a branch in place of `leaf`, with child_a carrying the window.
         self.split_node(leaf, dir, child_a, child_b);
@@ -1196,7 +1198,11 @@ mod tests {
         assert!(s.close_focused()); // 2 moves into the empty sibling
         assert_eq!(s.focused_client(), Some(2));
         s.unpin_client(2); // popup dies: 1 must come back
-        assert_eq!(s.focused_client(), Some(1), "prev restore survives collapse");
+        assert_eq!(
+            s.focused_client(),
+            Some(1),
+            "prev restore survives collapse"
+        );
     }
 
     /// Closing a middle column moves focus to a surviving neighbour.

@@ -359,8 +359,7 @@ impl Wm {
                 // overhangs the frame and paints over the neighbouring
                 // split until the column is widened again.
                 let min_size = self.clients.get(&c).map_or((1, 1), |cl| cl.min_size);
-                let (cx, cy, cw, ch) =
-                    super::types::client_rect_in_frame(p.target, min_size);
+                let (cx, cy, cw, ch) = super::types::client_rect_in_frame(p.target, min_size);
                 self.conn.configure_window(
                     c,
                     &ConfigureWindowAux::new()
@@ -548,11 +547,7 @@ impl Wm {
     /// rendering never gets more than one full frame ahead of the server.
     /// Without MIT-SHM, present into the staging buffer and fall back to
     /// chunked core-protocol `PutImage`.
-    pub(crate) fn blit_fb(
-        &mut self,
-        drawable: Window,
-        fb: &pixel_graphics::Framebuffer,
-    ) -> R<()> {
+    pub(crate) fn blit_fb(&mut self, drawable: Window, fb: &pixel_graphics::Framebuffer) -> R<()> {
         let (w, h) = (fb.width as u16, fb.height as u16);
         let len = fb.width * fb.height * 4;
         self.ensure_shm(len);

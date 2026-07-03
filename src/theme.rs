@@ -36,22 +36,86 @@ pub mod palette_color {
 /// row order doesn't matter (a pair of parallel arrays indexed by palette
 /// position would desync silently if either were reordered).
 const SHADES: [(Index, Index, Index); 16] = [
-    (palette_color::LAVENDER, palette_color::GUNMETAL, palette_color::CREAM),
-    (palette_color::GUNMETAL, palette_color::PLUM, palette_color::LAVENDER),
-    (palette_color::PLUM, palette_color::BLACK, palette_color::PURPLE),
-    (palette_color::BROWN, palette_color::PLUM, palette_color::PEACH),
-    (palette_color::PEACH, palette_color::BROWN, palette_color::CREAM),
-    (palette_color::CREAM, palette_color::BROWN, palette_color::CREAM),
-    (palette_color::LIME, palette_color::GREEN, palette_color::CREAM),
-    (palette_color::GREEN, palette_color::PLUM, palette_color::LIME),
-    (palette_color::ORANGE, palette_color::BROWN, palette_color::CREAM),
-    (palette_color::CRIMSON, palette_color::PLUM, palette_color::ROSE),
-    (palette_color::ROSE, palette_color::CRIMSON, palette_color::PEACH),
-    (palette_color::PURPLE, palette_color::PLUM, palette_color::LAVENDER),
-    (palette_color::CYAN, palette_color::BLUE, palette_color::CREAM),
-    (palette_color::BLUE, palette_color::PINE, palette_color::CYAN),
-    (palette_color::PINE, palette_color::BLACK, palette_color::GREEN),
-    (palette_color::BLACK, palette_color::BLACK, palette_color::PLUM),
+    (
+        palette_color::LAVENDER,
+        palette_color::GUNMETAL,
+        palette_color::CREAM,
+    ),
+    (
+        palette_color::GUNMETAL,
+        palette_color::PLUM,
+        palette_color::LAVENDER,
+    ),
+    (
+        palette_color::PLUM,
+        palette_color::BLACK,
+        palette_color::PURPLE,
+    ),
+    (
+        palette_color::BROWN,
+        palette_color::PLUM,
+        palette_color::PEACH,
+    ),
+    (
+        palette_color::PEACH,
+        palette_color::BROWN,
+        palette_color::CREAM,
+    ),
+    (
+        palette_color::CREAM,
+        palette_color::BROWN,
+        palette_color::CREAM,
+    ),
+    (
+        palette_color::LIME,
+        palette_color::GREEN,
+        palette_color::CREAM,
+    ),
+    (
+        palette_color::GREEN,
+        palette_color::PLUM,
+        palette_color::LIME,
+    ),
+    (
+        palette_color::ORANGE,
+        palette_color::BROWN,
+        palette_color::CREAM,
+    ),
+    (
+        palette_color::CRIMSON,
+        palette_color::PLUM,
+        palette_color::ROSE,
+    ),
+    (
+        palette_color::ROSE,
+        palette_color::CRIMSON,
+        palette_color::PEACH,
+    ),
+    (
+        palette_color::PURPLE,
+        palette_color::PLUM,
+        palette_color::LAVENDER,
+    ),
+    (
+        palette_color::CYAN,
+        palette_color::BLUE,
+        palette_color::CREAM,
+    ),
+    (
+        palette_color::BLUE,
+        palette_color::PINE,
+        palette_color::CYAN,
+    ),
+    (
+        palette_color::PINE,
+        palette_color::BLACK,
+        palette_color::GREEN,
+    ),
+    (
+        palette_color::BLACK,
+        palette_color::BLACK,
+        palette_color::PLUM,
+    ),
 ];
 
 /// The `SHADES` row for `index`, found by matching the accent column. An

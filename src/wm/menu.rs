@@ -29,10 +29,8 @@ impl Wm {
                 if let Some(hit) = self.menu.icon_cache.get(n) {
                     return Some(hit.clone());
                 }
-                let img = crate::menu::find_icon_file(n)
-                    .and_then(|p| crate::icon::load_png(&p))?;
-                let icon =
-                    std::rc::Rc::new(crate::icon::quantize(self.renderer.palette(), &img));
+                let img = crate::menu::find_icon_file(n).and_then(|p| crate::icon::load_png(&p))?;
+                let icon = std::rc::Rc::new(crate::icon::quantize(self.renderer.palette(), &img));
                 self.menu.icon_cache.insert(n.clone(), icon.clone());
                 Some(icon)
             })
@@ -264,7 +262,8 @@ impl Wm {
     pub(crate) fn on_menu_click(&mut self, win: Window, ly: i32) -> R<()> {
         let cmd = if win == self.menu.main_win {
             let n = self.menu.tree.main.labels.len();
-            match Self::menu_row_at(ly, n).and_then(|r| self.menu.tree.main.items.get(r).zip(Some(r)))
+            match Self::menu_row_at(ly, n)
+                .and_then(|r| self.menu.tree.main.items.get(r).zip(Some(r)))
             {
                 Some((Item::Launch(c), _)) => Some(c.clone()),
                 // Clicking a category just (re)opens its submenu.
@@ -281,8 +280,7 @@ impl Wm {
                         let Some(sub) = self.menu.tree.subs.get(idx) else {
                             return Ok(());
                         };
-                        match Self::menu_row_at(ly, sub.labels.len())
-                            .and_then(|r| sub.items.get(r))
+                        match Self::menu_row_at(ly, sub.labels.len()).and_then(|r| sub.items.get(r))
                         {
                             Some(Item::Launch(c)) => Some(c.clone()),
                             _ => return Ok(()),

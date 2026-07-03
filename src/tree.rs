@@ -413,9 +413,17 @@ impl Tree {
         let mut pos = if *dir == Dir::H { at.x } else { at.y };
         for (i, (&child, &sz)) in children.iter().zip(&sizes).enumerate() {
             let rect = if *dir == Dir::H {
-                Rect { x: pos, w: sz, ..at }
+                Rect {
+                    x: pos,
+                    w: sz,
+                    ..at
+                }
             } else {
-                Rect { y: pos, h: sz, ..at }
+                Rect {
+                    y: pos,
+                    h: sz,
+                    ..at
+                }
             };
             f(ChildSlot {
                 idx: i,

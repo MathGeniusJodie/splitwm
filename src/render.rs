@@ -367,7 +367,10 @@ impl Renderer {
         // present_into — `out` is typically the MIT-SHM mapping, and a
         // framebuffer/segment resize race must not become a deep panic (or
         // worse) inside pixel-graphics.
-        assert_eq!(out.len(), fb.width * fb.height * Framebuffer::BYTES_PER_PIXEL);
+        assert_eq!(
+            out.len(),
+            fb.width * fb.height * Framebuffer::BYTES_PER_PIXEL
+        );
         fb.present_into(out, &self.lut);
     }
 

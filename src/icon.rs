@@ -122,7 +122,10 @@ mod tests {
         // Arbitrary bytes long enough to reach 16..24 must not be misread
         // as dimensions.
         assert_eq!(png_declared_dims(&[0u8; 64]), None);
-        assert_eq!(png_declared_dims(b"JFIF-not-a-png-but-long-enough-data"), None);
+        assert_eq!(
+            png_declared_dims(b"JFIF-not-a-png-but-long-enough-data"),
+            None
+        );
     }
 
     #[test]

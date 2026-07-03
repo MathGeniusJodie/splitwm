@@ -68,7 +68,9 @@ pub(crate) fn wait_event_deadline(
                     return Ok(None);
                 }
                 // Round up so a sub-millisecond remainder can't busy-loop.
-                i32::try_from(remaining.as_millis()).unwrap_or(i32::MAX).max(1)
+                i32::try_from(remaining.as_millis())
+                    .unwrap_or(i32::MAX)
+                    .max(1)
             }
         };
         let mut pfd = libc::pollfd {
@@ -340,7 +342,10 @@ pub fn run(replace: bool) -> R<()> {
 
 /// Become the window manager. STRUCTURE_NOTIFY is included so the root's
 /// own ConfigureNotify reports screen (RandR) resizes.
-fn grab_substructure_redirect(conn: &x11rb::rust_connection::RustConnection, root: Window) -> R<()> {
+fn grab_substructure_redirect(
+    conn: &x11rb::rust_connection::RustConnection,
+    root: Window,
+) -> R<()> {
     let mask = EventMask::SUBSTRUCTURE_REDIRECT
         | EventMask::SUBSTRUCTURE_NOTIFY
         | EventMask::STRUCTURE_NOTIFY
@@ -1073,7 +1078,10 @@ mod tests {
     use x11rb::protocol::xinput::Fp3232;
 
     const fn fp(i: i32) -> Fp3232 {
-        Fp3232 { integral: i, frac: 0 }
+        Fp3232 {
+            integral: i,
+            frac: 0,
+        }
     }
 
     /// `axisvalues` holds one entry per set mask bit, in bit order — the
@@ -1110,7 +1118,10 @@ mod tests {
     /// The fractional part is a 32-bit binary fraction.
     #[test]
     fn fp3232_fraction_converts() {
-        let half = Fp3232 { integral: 2, frac: 0x8000_0000 };
+        let half = Fp3232 {
+            integral: 2,
+            frac: 0x8000_0000,
+        };
         assert_eq!(valuator_value(&[0b1], &[half], 0), Some(2.5));
     }
 }
