@@ -191,6 +191,15 @@ pub struct Client {
     /// ICCCM focus model, read from `WM_HINTS.input` / `WM_TAKE_FOCUS` in
     /// `WM_PROTOCOLS` at manage time (see `Wm::give_focus`).
     pub focus: FocusModel,
+    /// When `_NET_WM_ICON` was last fetched for this window. A fetch can
+    /// transfer up to 16 MiB and forces a full recomposite, and the property
+    /// is client-controlled: `on_icon_change` rate-limits fetches against
+    /// this (see `ICON_FETCH_COOLDOWN`).
+    pub icon_fetched: Option<std::time::Instant>,
+    /// An icon PropertyNotify arrived inside the cooldown window; the fetch
+    /// is deferred to `Wm::flush_stale_icons` so a burst's final icon still
+    /// lands.
+    pub icon_stale: bool,
 }
 
 /// How a window wants keyboard focus delivered (ICCCM 4.1.7): whether

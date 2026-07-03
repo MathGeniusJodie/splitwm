@@ -225,6 +225,16 @@ impl NineSlice {
             sw >= l as usize + r as usize && sh >= t as usize + b as usize,
             "NineSlice sprite ({sw}x{sh}) too small for insets l={l} t={t} r={r} b={b}"
         );
+        // The edge-sample columns assume the art spans them; a narrower
+        // redrawn asset would otherwise just render quietly truncated tiles
+        // (`draw_sprite_full` clamps the source rect) with no loud failure.
+        debug_assert!(
+            sw >= Self::EDGE_SAMPLE_X1,
+            "NineSlice sprite ({sw}px wide) doesn't cover edge-sample columns \
+             {}..{}",
+            Self::EDGE_SAMPLE_X0,
+            Self::EDGE_SAMPLE_X1
+        );
         if sw < l as usize + r as usize || sh < t as usize + b as usize {
             // Release-build fallback: nothing sane to draw, skip rather than
             // underflow.
@@ -526,7 +536,12 @@ impl Renderer {
             fb.fill_rect_paint(0, 0, w, h, PgPaint::Solid(palette_color::BLACK));
         }
         if let Some(wp) = &self.wallpaper {
-            fb.blit_from(wp, 0, 0);
+            // `copy_from`, not `blit_from`: the quantized wallpaper only
+            // ever holds real palette indices (never `TRANSPARENT`), and
+            // this is a full-screen blit on every composited frame —
+            // `blit_from`'s per-pixel transparency test would be ~8M
+            // pointless branches per 4K frame.
+            fb.copy_from(wp, 0, 0);
         }
         fb
     }
@@ -838,7 +853,11 @@ impl Renderer {
         if let Some(v) = self.icon_ring_cache.borrow().get(&key) {
             return Some(Rc::clone(v));
         }
-        let mask = scaled_mask(img, size)?;
+        // The mask is exactly the cached index buffer's opacity: deriving it
+        // there keeps one sampling loop (and one alpha threshold) instead of
+        // a second scaler that could drift.
+        let idx = self.cached_icon_indices(img, size);
+        let mask: Vec<bool> = idx.iter().map(|&i| i != TRANSPARENT_INDEX).collect();
         let sz = size as usize;
         let rsz = sz + 6;
         let mut ring = vec![false; rsz * rsz];
@@ -902,25 +921,6 @@ pub(crate) fn insert_capped<K: std::hash::Hash + Eq, V>(
         map.clear();
     }
     map.insert(key, value);
-}
-
-/// The `size`x`size` nearest-scaled opacity mask of `img` (alpha >= 50%),
-/// row-major; `None` for empty inputs.
-fn scaled_mask(img: &Icon, size: i32) -> Option<Vec<bool>> {
-    if img.w == 0 || img.h == 0 || size < 1 {
-        return None;
-    }
-    let sz = size as usize;
-    let mut mask = vec![false; sz * sz];
-    for ty in 0..sz {
-        let sy = (ty as u32 * img.h / size as u32).min(img.h - 1);
-        for tx in 0..sz {
-            let sx = (tx as u32 * img.w / size as u32).min(img.w - 1);
-            let s = img.argb[(sy * img.w + sx) as usize];
-            mask[ty * sz + tx] = (s >> 24) & 0xff >= 128;
-        }
-    }
-    Some(mask)
 }
 
 /// A taskbar tile rectangle (screen coords) for the renderer.
@@ -1244,7 +1244,20 @@ impl Renderer {
             );
             for (text, bold) in [(summary, true), (body, false)] {
                 for para in text.split('\n').filter(|p| !p.is_empty()) {
-                    lines.extend(layout.wrap(para).into_iter().map(|l| (l, bold)));
+                    if lines.len() >= NOTE_MAX_LINES {
+                        break;
+                    }
+                    // Wrapping is O(input) and the body is unauthenticated
+                    // bus input of unbounded length: feed the wrapper only
+                    // what can still be shown. Every glyph is at least 1px
+                    // wide, so a line NOTE_TEXT_MAX_W px wide holds at most
+                    // NOTE_TEXT_MAX_W chars.
+                    let budget = (NOTE_MAX_LINES - lines.len()) * NOTE_TEXT_MAX_W;
+                    let cut = para
+                        .char_indices()
+                        .nth(budget)
+                        .map_or(para.len(), |(i, _)| i);
+                    lines.extend(layout.wrap(&para[..cut]).into_iter().map(|l| (l, bold)));
                 }
             }
         }

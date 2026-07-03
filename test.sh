@@ -19,8 +19,13 @@ trap cleanup EXIT INT TERM
 
 Xephyr ":${DPY}" -ac -screen "${SIZE}" -resizeable >/tmp/xephyr.log 2>&1 &
 XEPHYR_PID=$!
-sleep 1
+for i in $(seq 1 40); do
+    kill -0 "$XEPHYR_PID" 2>/dev/null || break
+    DISPLAY=":${DPY}" xdotool getdisplaygeometry >/dev/null 2>&1 && break
+    sleep 0.25
+done
 if ! kill -0 "$XEPHYR_PID" 2>/dev/null; then echo "Xephyr failed"; cat /tmp/xephyr.log; exit 1; fi
+DISPLAY=":${DPY}" xdotool getdisplaygeometry >/dev/null 2>&1 || { echo "Xephyr failed"; cat /tmp/xephyr.log; exit 1; }
 
 cargo build --manifest-path "$DIR/Cargo.toml" 2>/tmp/build.log || { cat /tmp/build.log; exit 1; }
 
@@ -29,4 +34,6 @@ DISPLAY=":${DPY}" TERMINAL="${TERMINAL:-xterm}" "$DIR/target/debug/splitwm" >/tm
 WM_PID=$!
 echo "splitwm pid $WM_PID"
 wait $WM_PID
+STATUS=$?
 WM_PID=""
+exit "$STATUS"

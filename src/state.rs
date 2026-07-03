@@ -157,9 +157,16 @@ impl State {
         false
     }
 
-    /// Currently shown client of the focused leaf.
+    /// Currently *shown* client of the focused leaf. A minimized leaf shows
+    /// nothing — its window is unmapped, and handing it out as a focus
+    /// target would mean `SetInputFocus` on an unviewable window (a
+    /// BadMatch) and a `_NET_ACTIVE_WINDOW` naming an invisible one.
     pub fn focused_client(&self) -> Option<Win> {
-        self.tree.leaf(self.focused_leaf_valid())?.client
+        let l = self.tree.leaf(self.focused_leaf_valid())?;
+        if l.minimized {
+            return None;
+        }
+        l.client
     }
 
     /// Swap the focused split's window with the next/prev taskbar entry,
@@ -330,6 +337,10 @@ impl State {
                 let prev = self.tree.leaf(leaf).and_then(|l| l.prev);
                 if let Some(d) = self.tree.leaf_mut(dest_child) {
                     d.client = Some(c);
+                    // A leaf showing a window is never minimized (the same
+                    // invariant assign_to_leaf/activate_client maintain):
+                    // the relocated window must be mapped.
+                    d.minimized = false;
                     if d.prev.is_none() {
                         d.prev = prev;
                     }
@@ -418,14 +429,22 @@ impl State {
             return false; // root leaf: nothing to close
         };
 
-        if !self.relocate_closed_window(parent, idx, leaf) {
-            return false;
-        }
-
         let nchildren = match self.tree.get(parent) {
             Some(Node::Branch { children, .. }) => children.len(),
             _ => return false,
         };
+
+        // Refusal checks come before relocation: a false return means the
+        // close did not happen, so no window may have been evicted from its
+        // leaf yet. This mirrors close_focused_binary's orphan-subtree
+        // refusal, which would otherwise fire only after relocation.
+        if nchildren == 2 && parent != self.tree.root && self.tree.find_parent(parent).is_none() {
+            return false;
+        }
+
+        if !self.relocate_closed_window(parent, idx, leaf) {
+            return false;
+        }
 
         // Focus always moves to the nearest surviving neighbour: the closed
         // leaf *was* the focused one (node ids are never reused, so it can't
@@ -1115,6 +1134,55 @@ mod tests {
         s.unpin_client(99); // popup dies while its leaf is minimized
         assert_eq!(s.tree.leaf(leaf).unwrap().client, Some(1));
         assert!(!s.tree.leaf(leaf).unwrap().minimized);
+    }
+
+    /// Closing a window whose empty adjacent sibling is a minimized leaf
+    /// relocates the window into it *and* restores it — the same "a leaf
+    /// showing a window is never minimized" invariant as assignment and
+    /// activation; the relocated window would otherwise be unmapped and in
+    /// no taskbar, visible nowhere.
+    #[test]
+    fn close_into_minimized_sibling_unminimizes() {
+        let mut s = State::new();
+        s.pin_client(1);
+        s.split_focused(Dir::H);
+        let win_leaf = s.tree.find_leaf_for_client(1).unwrap();
+        let sibling = s
+            .tree
+            .collect_leaves()
+            .into_iter()
+            .find(|&l| l != win_leaf)
+            .unwrap();
+        s.toggle_minimize(sibling);
+        s.focused_leaf = win_leaf;
+        assert!(s.close_focused());
+        let dst = s.tree.find_leaf_for_client(1).unwrap();
+        assert!(!s.tree.leaf(dst).unwrap().minimized);
+        assert_eq!(s.focused_client(), Some(1));
+        assert!(s.taskbar.is_empty());
+    }
+
+    /// Closing when the adjacent sibling already shows a window pushes the
+    /// closed leaf's window to the taskbar instead of displacing the
+    /// sibling's occupant.
+    #[test]
+    fn close_with_occupied_sibling_pushes_to_taskbar() {
+        let mut s = State::new();
+        s.pin_client(1);
+        s.split_focused(Dir::H);
+        let a = s.tree.find_leaf_for_client(1).unwrap();
+        let b = s
+            .tree
+            .collect_leaves()
+            .into_iter()
+            .find(|&l| l != a)
+            .unwrap();
+        s.focused_leaf = b;
+        s.pin_client(2);
+        s.focused_leaf = a;
+        assert!(s.close_focused());
+        assert_eq!(s.taskbar, vec![1]);
+        assert_eq!(s.focused_client(), Some(2));
     }
 
     /// Closing inside an orphan subtree (a branch reachable from neither the

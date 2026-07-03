@@ -14,6 +14,11 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::CURRENT_TIME;
 
 use super::types::{clamp_dim, Client, FloatWin, FocusModel, Wm, R};
+
+/// Minimum spacing between `_NET_WM_ICON` fetches per window (see
+/// `Wm::on_icon_change`). Long enough to blunt a rewrite loop, short
+/// enough that a real icon change still lands promptly.
+const ICON_FETCH_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(500);
 use crate::icon::{self, Icon};
 use crate::theme;
 use crate::tree::Win;
@@ -160,6 +165,8 @@ impl Wm {
                     .and_then(|h| h.min_size)
                     .map_or((1, 1), |(w, h)| (w.max(1), h.max(1))),
                 focus: self.focus_model(win),
+                icon_fetched: Some(std::time::Instant::now()),
+                icon_stale: false,
             },
         );
         self.refresh_icon_rotations(&class);
@@ -772,9 +779,11 @@ impl Wm {
         }
         self.state.unpin_client(win);
         self.update_client_list()?;
-        // Drop the click-to-focus grab `manage` installed: `manage_dock`
-        // re-issues the identical passive grab, and grabbing a combination
-        // that is already grabbed raises BadAccess.
+        // Drop the click-to-focus grab `manage` installed before
+        // `manage_dock` re-issues the identical passive grab. Re-grabbing
+        // one's own combination is actually allowed (BadAccess is only for
+        // *another* client's grab) — this just keeps the grab's bookkeeping
+        // an explicit install/remove pair rather than leaning on that quirk.
         self.conn
             .ungrab_button(ButtonIndex::M1, win, ModMask::ANY)?;
         self.manage_dock(win)
@@ -832,9 +841,11 @@ impl Wm {
             }
         }
         if is_client {
-            self.state.activate_client(win);
-            self.arrange()?;
-            self.focus(Some(win))?;
+            // `bring_into_layout` rather than a bare arrange+focus: leaving
+            // fullscreen in a split that was since scrolled out of view must
+            // scroll it back in before focusing, or the focus would target a
+            // window `place_clients` keeps unmapped.
+            self.bring_into_layout(win)?;
         } else {
             // Float: `arrange`'s fullscreen block applies/keeps the
             // full-workarea geometry while it's active.
@@ -865,20 +876,30 @@ impl Wm {
     }
 
     /// Mirror our fullscreen bookkeeping onto the client's `_NET_WM_STATE`
-    /// property (the whole list is just this one state — we support no
-    /// others).
+    /// property. Only the fullscreen atom is ours to add or remove: states
+    /// the client set itself (MODAL, SKIP_TASKBAR, ABOVE, …) must survive
+    /// the rewrite, or pagers reading the property see them vanish.
     fn set_net_wm_state_fullscreen(&self, win: Win, on: bool) -> R<()> {
-        let states: &[u32] = if on {
-            &[self.atoms.net_wm_state_fullscreen]
-        } else {
-            &[]
-        };
+        let fs = self.atoms.net_wm_state_fullscreen;
+        // A failed read (window racing to destruction) degrades to an empty
+        // list; the write below then fails or is moot anyway.
+        let mut states: Vec<u32> = self
+            .conn
+            .get_property(false, win, self.atoms.net_wm_state, AtomEnum::ATOM, 0, 1024)?
+            .reply()
+            .ok()
+            .and_then(|r| r.value32().map(Iterator::collect))
+            .unwrap_or_default();
+        states.retain(|&s| s != fs);
+        if on {
+            states.push(fs);
+        }
         self.conn.change_property32(
             PropMode::REPLACE,
             win,
             self.atoms.net_wm_state,
             AtomEnum::ATOM,
-            states,
+            &states,
         )?;
         Ok(())
     }
@@ -1073,6 +1094,23 @@ impl Wm {
         let Some(class) = self.clients.get(&win).map(|c| c.class.clone()) else {
             return Ok(());
         };
+        // Rate-limit: the fetch below moves up to 16 MiB of client-
+        // controlled property data and ends in a full recomposite, so a
+        // client rewriting its icon in a loop must not be able to run it
+        // per notify. A throttled notify is remembered as stale and
+        // re-fetched by `flush_stale_icons` once the cooldown passes, so a
+        // burst's final icon is never lost.
+        let now = std::time::Instant::now();
+        let client = self.clients.get_mut(&win).expect("checked above");
+        if client
+            .icon_fetched
+            .is_some_and(|t| now.duration_since(t) < ICON_FETCH_COOLDOWN)
+        {
+            client.icon_stale = true;
+            return Ok(());
+        }
+        client.icon_fetched = Some(now);
+        client.icon_stale = false;
         let Some(icon) = self.fetch_icon(win) else {
             return Ok(());
         };
@@ -1081,6 +1119,28 @@ impl Wm {
         client.icon_rotated = None;
         self.refresh_icon_rotations(&class);
         self.arrange()
+    }
+
+    /// Re-fetch icons whose refresh was deferred by `on_icon_change`'s
+    /// rate limit. Runs once per event batch (the WM has no timers, so
+    /// "after the cooldown" means the first batch that arrives past it — a
+    /// pointer motion at the latest).
+    pub(crate) fn flush_stale_icons(&mut self) -> R<()> {
+        let now = std::time::Instant::now();
+        let due: Vec<Win> = self
+            .clients
+            .iter()
+            .filter(|(_, c)| {
+                c.icon_stale
+                    && c.icon_fetched
+                        .is_none_or(|t| now.duration_since(t) >= ICON_FETCH_COOLDOWN)
+            })
+            .map(|(&w, _)| w)
+            .collect();
+        for win in due {
+            self.on_icon_change(win)?;
+        }
+        Ok(())
     }
 
     // --- focus & spawning ---

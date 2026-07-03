@@ -392,7 +392,15 @@ fn grab_substructure_redirect(
     let change = ChangeWindowAttributesAux::new().event_mask(mask);
     conn.change_window_attributes(root, &change)?
         .check()
-        .map_err(|_| "another window manager is already running".into())
+        .map_err(|e| match e {
+            // Only an X error (BadAccess from a competing redirect grab)
+            // means another WM; anything else keeps its own message and —
+            // via the `From` impl — its fatal/non-fatal classification.
+            x11rb::errors::ReplyError::X11Error(_) => {
+                WmError::from("another window manager is already running")
+            }
+            other => other.into(),
+        })
 }
 
 /// Minimal EWMH presence: announce what we support, and point
@@ -796,6 +804,13 @@ fn event_loop(wm: &mut Wm) -> R<()> {
                 return Err(e);
             }
             eprintln!("splitwm: error handling event batch: {e}");
+        }
+        // Icon refreshes deferred by `on_icon_change`'s rate limit.
+        if let Err(e) = wm.flush_stale_icons() {
+            if e.is_fatal() {
+                return Err(e);
+            }
+            eprintln!("splitwm: error refreshing icons: {e}");
         }
         if debug_scroll {
             eprintln!(

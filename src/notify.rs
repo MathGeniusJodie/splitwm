@@ -222,6 +222,16 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
                 let Some((note, timeout)) =
                     parse_notify(&msg, &mut next_id, &order, &owners, &sender)
                 else {
+                    // A malformed Notify call still needs *a* reply, or the
+                    // caller blocks until its own timeout.
+                    reply(
+                        conn.channel(),
+                        msg.error(
+                            &"org.freedesktop.DBus.Error.InvalidArgs".into(),
+                            &std::ffi::CString::new("malformed Notify call")
+                                .expect("static string has no NUL"),
+                        ),
+                    )?;
                     continue;
                 };
                 let id = note.id;
@@ -358,12 +368,28 @@ fn parse_notify(
     Some((
         Note {
             id,
-            summary: strip_markup(&summary),
-            body: strip_markup(&body),
+            summary: strip_markup(cap_chars(&summary, NOTE_TEXT_CAP)),
+            body: strip_markup(cap_chars(&body, NOTE_TEXT_CAP)),
             urgency,
         },
         timeout,
     ))
+}
+
+/// Cap on stored summary/body length, in chars. The bus is unauthenticated
+/// and imposes no length limit of its own, while the popup renderer can show
+/// only a few hundred chars — storing more per note would keep megabytes of
+/// hostile input alive (and re-feed them to markup stripping and text
+/// wrapping) for the popup's whole lifetime. Generously above what any
+/// bubble can display so no legitimate note is ever visibly truncated.
+const NOTE_TEXT_CAP: usize = 4096;
+
+/// Truncate to at most `cap` chars, on a char boundary.
+fn cap_chars(s: &str, cap: usize) -> &str {
+    match s.char_indices().nth(cap) {
+        Some((i, _)) => &s[..i],
+        None => s,
+    }
 }
 
 /// Emit `NotificationClosed(id, reason)`, best-effort: a failed signal send

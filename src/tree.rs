@@ -339,6 +339,12 @@ fn child_sizes(children: &[(bool, f64)], usable: i32, min_sz: i32) -> Vec<i32> {
     }
     let usable_normal = (usable - min_total).max(0);
     let normals_total = children.iter().filter(|&&(is_min, _)| !is_min).count() as i32;
+    // The per-child 1px floor is best-effort: with fewer usable pixels than
+    // normal children (viewport shrunk below the layout's demands), floors
+    // of 1 would sum past `usable` no matter how the rest is clamped, so
+    // they give way to 0 and the sum stays bounded instead of children
+    // overlapping their siblings' slots.
+    let floor = i32::from(usable_normal >= normals_total);
     let mut sizes = vec![0i32; n];
     let mut allocated = 0;
     let mut normals_seen = 0;
@@ -347,20 +353,18 @@ fn child_sizes(children: &[(bool, f64)], usable: i32, min_sz: i32) -> Vec<i32> {
             sizes[i] = min_sz;
         } else if Some(i) != last_normal {
             normals_seen += 1;
-            // Never allocate past what's left minus 1px for each later
-            // normal child: the per-child 1px floor could otherwise push
-            // the sum past `usable` on a degenerate tiny viewport, making
-            // children overlap their siblings' slots.
-            let left = usable_normal - allocated - (normals_total - normals_seen);
+            // Never allocate past what's left minus one floor for each
+            // later normal child.
+            let left = usable_normal - allocated - (normals_total - normals_seen) * floor;
             let sz = ((f64::from(usable_normal) * r / ratio_sum).floor() as i32)
-                .max(1)
-                .min(left.max(1));
+                .max(floor)
+                .min(left.max(floor));
             sizes[i] = sz;
             allocated += sz;
         }
     }
     if let Some(ln) = last_normal {
-        sizes[ln] = (usable_normal - allocated).max(1);
+        sizes[ln] = (usable_normal - allocated).max(floor);
     }
     sizes
 }
@@ -517,6 +521,18 @@ mod child_sizes_tests {
     }
 
     #[test]
+    fn more_children_than_pixels_never_overlaps() {
+        // 3 normal children on 2 usable px: the per-child 1px floors must
+        // give way (to 0) so the sum stays within `usable` — children
+        // spilling past their branch's span would overlap the next sibling.
+        let third = 1.0 / 3.0;
+        let kids = [(false, third), (false, third), (false, third)];
+        let sizes = child_sizes(&kids, 2, 2);
+        assert!(sizes.iter().sum::<i32>() <= 2, "sizes {sizes:?}");
+        assert!(sizes.iter().all(|&s| s >= 0), "sizes {sizes:?}");
+    }
+
+    #[test]
     fn zero_ratio_sum_falls_back() {
         // Degenerate ratios must not divide by zero.
         let kids = [(false, 0.0), (false, 0.0)];
@@ -529,7 +545,11 @@ mod child_sizes_tests {
         let kids = [(true, 0.5), (false, 0.5)];
         let sizes = child_sizes(&kids, 10, 20);
         assert_eq!(sizes[0], 20);
-        assert_eq!(sizes[1], 1, "normal child bottoms out at 1, not negative");
+        assert_eq!(
+            sizes[1], 0,
+            "no usable space left: the 1px floor gives way rather than \
+             pushing the sum further past `usable`"
+        );
     }
 }
 

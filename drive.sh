@@ -11,36 +11,43 @@ export DISPLAY_HOST="${DISPLAY:-:0}"
 # expand unset variables inside cleanup.
 WM_PID=""
 XEPHYR_PID=""
+FAILED=0
 cleanup() {
     [ -n "$WM_PID" ] && kill "$WM_PID" 2>/dev/null
     [ -n "$XEPHYR_PID" ] && kill "$XEPHYR_PID" 2>/dev/null
 }
 trap cleanup EXIT
 
+# Overridable so a server already on :1 (someone's live session) can't get
+# hijacked: default to a display an interactive session won't be using.
+DPY=":${SPLITWM_DRIVE_DPY:-9}"
+
 # cargo test/check don't produce the binary this script runs; build it here
 # so the drive never exercises a stale target/debug/splitwm.
-cargo build --manifest-path "$DIR/Cargo.toml" 2>/tmp/build.log || { cat /tmp/build.log; exit 1; }
+cargo build --manifest-path "$DIR/Cargo.toml" 2>/tmp/drive-build.log || { cat /tmp/drive-build.log; exit 1; }
 
-DISPLAY="$DISPLAY_HOST" Xephyr :1 -ac -screen 1280x800 >/tmp/xephyr.log 2>&1 &
+DISPLAY="$DISPLAY_HOST" Xephyr "$DPY" -ac -screen 1280x800 >/tmp/drive-xephyr.log 2>&1 &
 XEPHYR_PID=$!
 for i in $(seq 1 40); do
-    DISPLAY=:1 xdotool getdisplaygeometry >/dev/null 2>&1 && break
+    kill -0 "$XEPHYR_PID" 2>/dev/null || { echo "Xephyr DOWN"; cat /tmp/drive-xephyr.log; exit 1; }
+    DISPLAY="$DPY" xdotool getdisplaygeometry >/dev/null 2>&1 && break
     sleep 0.25
 done
-DISPLAY=:1 xdotool getdisplaygeometry >/dev/null 2>&1 || { echo "Xephyr DOWN"; cat /tmp/xephyr.log; exit 1; }
+kill -0 "$XEPHYR_PID" 2>/dev/null || { echo "Xephyr DOWN"; cat /tmp/drive-xephyr.log; exit 1; }
+DISPLAY="$DPY" xdotool getdisplaygeometry >/dev/null 2>&1 || { echo "Xephyr DOWN"; cat /tmp/drive-xephyr.log; exit 1; }
 echo "Xephyr up"
 
-DISPLAY=:1 TERMINAL=xterm SPLITWM_WALLPAPER=/tmp/wall.png "$DIR/target/debug/splitwm" >/tmp/splitwm.log 2>&1 &
+DISPLAY="$DPY" TERMINAL=xterm SPLITWM_WALLPAPER=/tmp/wall.png "$DIR/target/debug/splitwm" >/tmp/drive-splitwm.log 2>&1 &
 WM_PID=$!
 sleep 0.7
-kill -0 $WM_PID 2>/dev/null || { echo "WM DOWN"; cat /tmp/splitwm.log; exit 1; }
+kill -0 $WM_PID 2>/dev/null || { echo "WM DOWN"; cat /tmp/drive-splitwm.log; exit 1; }
 echo "WM up"
 
-shot() { DISPLAY=:1 import -window root "$SHOTS/$1.png" 2>/dev/null && echo "shot $1" || echo "shot $1 FAILED"; }
-key() { DISPLAY=:1 xdotool key --clearmodifiers "$1"; sleep 0.4; }
-term() { DISPLAY=:1 xterm -e "sleep 3000" & sleep 1.2; }
+shot() { DISPLAY="$DPY" import -window root "$SHOTS/$1.png" 2>/dev/null && echo "shot $1" || { echo "shot $1 FAILED"; FAILED=1; }; }
+key() { DISPLAY="$DPY" xdotool key --clearmodifiers "$1"; sleep 0.4; }
+term() { DISPLAY="$DPY" xterm -e "sleep 3000" & sleep 1.2; }
 # A solid-colour terminal so window-content sampling has something to read.
-cterm() { DISPLAY=:1 xterm -bg "$1" -e "sleep 3000" & sleep 1.2; }
+cterm() { DISPLAY="$DPY" xterm -bg "$1" -e "sleep 3000" & sleep 1.2; }
 
 # 1: two terminals stacked as tabs in one split
 term; term
@@ -82,7 +89,7 @@ key "super+v"; term
 key "super+v"; term
 key "super+v"; term
 shot 10_many_splits
-DISPLAY=:1 xdotool keydown super; DISPLAY=:1 xdotool click 4; DISPLAY=:1 xdotool click 4; DISPLAY=:1 xdotool keyup super
+DISPLAY="$DPY" xdotool keydown super; DISPLAY="$DPY" xdotool click 4; DISPLAY="$DPY" xdotool click 4; DISPLAY="$DPY" xdotool keyup super
 sleep 0.4
 shot 11_scrolled
 
@@ -91,5 +98,10 @@ key "super+q"
 shot 12_closed
 
 echo "=== splitwm.log tail ==="
-tail -5 /tmp/splitwm.log
-echo "DONE"
+tail -5 /tmp/drive-splitwm.log
+if [ "$FAILED" -eq 0 ]; then
+    echo "DONE"
+else
+    echo "DONE (with failures)"
+    exit 1
+fi

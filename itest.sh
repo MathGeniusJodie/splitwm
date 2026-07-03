@@ -69,7 +69,7 @@ wait_for "Xephyr up" env DISPLAY="$DPY" xdotool getdisplaygeometry || exit 1
 DISPLAY="$DPY" TERMINAL=xterm "$DIR/target/debug/splitwm" >/tmp/itest-wm.log 2>&1 &
 WM_PID=$!
 wait_for "EWMH WM check published" \
-    sh -c "xprop -display $DPY -root _NET_SUPPORTING_WM_CHECK | grep -q 0x"
+    sh -c "xprop -display $DPY -root _NET_SUPPORTING_WM_CHECK | grep -q 0x" || exit 1
 
 # --- manage: first client is listed, Normal, and active ---
 spawn_xterm W1 || exit 1

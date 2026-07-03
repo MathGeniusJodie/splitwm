@@ -4,12 +4,13 @@
 use x11rb::connection::Connection;
 use x11rb::protocol::xinput;
 use x11rb::protocol::xproto::{
-    Allow, ButtonPressEvent, ButtonReleaseEvent, ChangeWindowAttributesAux, ConfigWindow,
+    Allow, AtomEnum, ButtonPressEvent, ButtonReleaseEvent, ChangeWindowAttributesAux, ConfigWindow,
     ConfigureNotifyEvent, ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, EventMask,
     ExposeEvent, InputFocus, KeyPressEvent, MapRequestEvent, Mapping, MappingNotifyEvent, ModMask,
-    MotionNotifyEvent, UnmapNotifyEvent,
+    MotionNotifyEvent, PropMode, UnmapNotifyEvent,
 };
 use x11rb::protocol::Event;
+use x11rb::wrapper::ConnectionExt as _;
 
 use super::clients::WM_STATE_WITHDRAWN;
 use super::types::{
@@ -222,26 +223,28 @@ impl Wm {
             // Flush pending motion/scroll before any other event so ordering
             // (e.g. a button release ending a drag) is preserved.
             for m in pending_motion.drain(..) {
-                self.on_motion(&m)?;
+                contain(self.on_motion(&m))?;
             }
             if pending_hscroll != 0.0 {
                 if self.debug_scroll {
                     eprintln!("splitwm: mid-batch flush forced by {ev:?}");
                 }
-                self.apply_hscroll(std::mem::take(&mut pending_hscroll))?;
+                contain(self.apply_hscroll(std::mem::take(&mut pending_hscroll)))?;
             }
-            self.handle_event(&ev)?;
+            contain(self.handle_event(&ev))?;
         }
         for m in pending_motion {
-            self.on_motion(&m)?;
+            contain(self.on_motion(&m))?;
         }
         if pending_hscroll != 0.0 {
-            self.apply_hscroll(pending_hscroll)?;
+            contain(self.apply_hscroll(pending_hscroll))?;
         }
         Ok(())
     }
 
     fn handle_event(&mut self, ev: &Event) -> R<()> {
+        // NOTE: errors from here are contained per-event by `contain` in
+        // `handle_batch`; only fatal (connection) errors abort the batch.
         // Track the last real server timestamp for ICCCM focus handoffs
         // (`Wm::give_focus` wants a real time, not CURRENT_TIME).
         // PropertyNotify counts too: clients update properties while the
@@ -358,7 +361,11 @@ impl Wm {
             let (frame, w, h, x, y) = (f.frame, f.w, f.h, f.x, f.y);
             self.configure_float_frame(e.window, frame, x, y, w, h)?;
             self.paint_float_frame(frame)?;
-            return Ok(());
+            // The position (and any denied field) stayed ours, so the
+            // request may have been a complete no-op — X emits no
+            // ConfigureNotify for one, and ICCCM 4.1.5 requires the
+            // synthetic echo so a client blocking on it doesn't hang.
+            return self.send_synthetic_configure(e.window);
         }
         // The dock's geometry is ours (set once in manage_dock and reasserted
         // by every place_dock): granting its request would let it drift for
@@ -433,6 +440,11 @@ impl Wm {
         if self.fullscreen == Some(win) {
             let full = self.wa();
             return Some((full.x, full.y, full.w.max(1), full.h.max(1)));
+        }
+        // Floats: `f.x`/`f.y` are the client window's root coordinates (the
+        // frame is a sibling underneath, not a reparent).
+        if let Some(f) = self.floats.iter().find(|f| f.win == win) {
+            return Some((f.x, f.y, f.w.max(1), f.h.max(1)));
         }
         let leaf = self.state.tree.find_leaf_for_client(win)?;
         // A hidden window (minimized, or its split scrolled off-screen) was
@@ -518,7 +530,7 @@ impl Wm {
     /// if it has one, otherwise into the focused split. The shared policy
     /// behind `_NET_ACTIVE_WINDOW` activation and ICCCM deiconify
     /// MapRequests. It takes focus, so a focused dialog yields the keyboard.
-    fn bring_into_layout(&mut self, win: u32) -> R<()> {
+    pub(crate) fn bring_into_layout(&mut self, win: u32) -> R<()> {
         self.focused_float = None;
         if !self.state.activate_client(win) {
             let leaf = self.state.focused_leaf_valid();
@@ -908,20 +920,14 @@ impl Wm {
                 // The corner "x" badge on a bottom-bar tile: politely close
                 // that window.
                 Hit::TaskbarClose(win) => return self.close_client(win),
-                // A bottom-bar icon: focus its split if already on-screen,
-                // otherwise bring that window into the focused split.
+                // A bottom-bar icon: bring that window into view and focus
+                // it — via `bring_into_layout`, whose `commit_layout` also
+                // scrolls a split that sits outside the viewport back in
+                // (activating a window `place_clients` keeps unmapped would
+                // otherwise focus an unviewable window).
                 Hit::TaskbarTile(win) => {
-                    if self.state.activate_client(win) {
-                        self.arrange()?;
-                        self.focus(Some(win))?;
-                        return Ok(());
-                    }
-                    let leaf = self.state.focused_leaf_valid();
-                    self.state.assign_to_leaf(win, leaf);
                     self.animate = true;
-                    self.arrange()?;
-                    let f = self.state.focused_client();
-                    self.focus(f)?;
+                    return self.bring_into_layout(win);
                 }
                 // Taskbar "+" opens the app launcher into the focused split.
                 Hit::TaskbarPlus => {
@@ -993,6 +999,17 @@ impl Wm {
                 // `give_focus` guards against.
                 self.conn
                     .set_input_focus(InputFocus::POINTER_ROOT, e.event, e.time)?;
+                // Keep `_NET_ACTIVE_WINDOW` in step with the keyboard like
+                // every other focus path — pagers otherwise show the
+                // previous window as active while the user types into the
+                // dock.
+                self.conn.change_property32(
+                    PropMode::REPLACE,
+                    self.root,
+                    self.atoms.net_active_window,
+                    AtomEnum::WINDOW,
+                    &[e.event],
+                )?;
             }
         }
         Ok(())
@@ -1236,10 +1253,35 @@ impl Wm {
     }
 }
 
+/// Contain one event's non-fatal error so the rest of the batch still runs:
+/// aborting the batch can drop a queued ButtonRelease and leave a drag armed
+/// with no button held (hover motion then keeps resizing a boundary).
+/// Fatal (connection) errors still propagate — the loop must exit on those.
+fn contain(r: R<()>) -> R<()> {
+    match r {
+        Err(e) if !e.is_fatal() => {
+            eprintln!("splitwm: error handling event: {e}");
+            Ok(())
+        }
+        other => other,
+    }
+}
+
 /// Step every `/sys/class/backlight` device by `pct` percent of its maximum,
 /// clamped to `[1, max]` so the panel never turns fully off. Writing the
 /// sysfs file needs group write access (udev rule + `video` group).
+///
+/// Runs on a spawned thread: sysfs reads/writes are synchronous kernel I/O,
+/// and a wedged backlight device would otherwise stall the single event-loop
+/// thread — all input handling — for as long as the driver blocks. One
+/// short-lived thread per keypress; concurrent steps may clobber each
+/// other's read-modify-write, which at worst loses a repeat-step, never the
+/// clamp.
 fn adjust_brightness(pct: i64) {
+    std::thread::spawn(move || adjust_brightness_sync(pct));
+}
+
+fn adjust_brightness_sync(pct: i64) {
     let Ok(entries) = std::fs::read_dir("/sys/class/backlight") else {
         return;
     };

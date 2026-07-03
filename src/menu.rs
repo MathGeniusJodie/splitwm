@@ -174,10 +174,17 @@ fn parse_desktop(text: &str) -> Option<(String, String, String, Option<String>)>
 /// Standard XDG data directories (per-user first, so it wins).
 fn data_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
-    if let Ok(home) = std::env::var("HOME") {
-        let data =
-            std::env::var("XDG_DATA_HOME").unwrap_or_else(|_| format!("{home}/.local/share"));
-        dirs.push(std::path::PathBuf::from(data));
+    // A set-but-empty XDG_DATA_HOME counts as unset per the XDG spec.
+    let xdg_data_home = std::env::var("XDG_DATA_HOME")
+        .ok()
+        .filter(|v| !v.is_empty());
+    match xdg_data_home {
+        Some(data) => dirs.push(std::path::PathBuf::from(data)),
+        None => {
+            if let Ok(home) = std::env::var("HOME") {
+                dirs.push(std::path::PathBuf::from(format!("{home}/.local/share")));
+            }
+        }
     }
     let system =
         std::env::var("XDG_DATA_DIRS").unwrap_or_else(|_| "/usr/local/share:/usr/share".into());
