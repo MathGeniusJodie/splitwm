@@ -91,10 +91,15 @@ impl Wm {
                 // the eviction back to the daemon like a click-dismissal:
                 // otherwise it keeps the id outstanding forever (a
                 // never-expiring note has no other way out) and the sender
-                // still believes its notification is on screen.
+                // still believes its notification is on screen. Reported
+                // with the "undefined" reason (matching the daemon's own
+                // evictions), not as a user dismissal — it wasn't one.
                 if self.notes.popups.len() > MAX_NOTE_POPUPS {
                     let evicted = self.notes.popups.remove(0);
-                    let _ = self.notes.dismiss.send(evicted.note.id);
+                    let _ = self
+                        .notes
+                        .dismiss
+                        .send((evicted.note.id, crate::notify::CLOSE_REASON_UNDEFINED));
                     self.conn.destroy_window(evicted.win)?;
                 }
                 win
@@ -186,7 +191,10 @@ impl Wm {
             return Ok(false);
         };
         let p = self.notes.popups.remove(i);
-        let _ = self.notes.dismiss.send(p.note.id);
+        let _ = self
+            .notes
+            .dismiss
+            .send((p.note.id, crate::notify::CLOSE_REASON_DISMISSED));
         self.conn.destroy_window(p.win)?;
         self.place_note_popups()?;
         self.conn.flush()?;

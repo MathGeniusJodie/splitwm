@@ -69,7 +69,7 @@ impl Wm {
                 },
                 win,
                 accent: leaf.map_or(theme::palette_color::CREAM, |l| self.leaf_color_index(l)),
-                on_screen: leaf.is_some(),
+                in_split: leaf.is_some(),
             });
             x += stride;
         }

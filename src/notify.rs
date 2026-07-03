@@ -35,11 +35,16 @@ pub const PING_ATOM: &str = "SPLITWM_NOTE";
 /// `expire_timeout: -1` ("server decides") becomes this.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Cap on outstanding notifications; also used by `wm::notes` as its popup
-/// cap (re-exported as `crate::wm::notes::MAX_NOTE_POPUPS`), since this
-/// daemon's `Show`/`Close` traffic ultimately drives that popup pile and the
-/// two must stay coherent.
+/// Cap on outstanding notifications; also aliased by `wm::notes` as its own
+/// popup cap (its private `MAX_NOTE_POPUPS`), since this daemon's
+/// `Show`/`Close` traffic ultimately drives that popup pile and the two must
+/// stay coherent.
 pub const MAX_NOTES: usize = 8;
+
+/// Freedesktop `NotificationClosed` reasons the WM reports back over the
+/// dismiss channel (the daemon relays them onto the bus verbatim).
+pub const CLOSE_REASON_DISMISSED: u32 = 2; // dismissed by the user (click)
+pub const CLOSE_REASON_UNDEFINED: u32 = 4; // evicted for space; no exact fit
 
 pub struct Note {
     pub id: u32,
@@ -56,10 +61,13 @@ pub enum NoteMsg {
 }
 
 /// Spawn the daemon thread. Returns the sender the WM uses to report a
-/// popup the user dismissed (so the matching signal goes out on the bus).
+/// popup it closed as `(id, close reason)` — `CLOSE_REASON_DISMISSED` for a
+/// user click, `CLOSE_REASON_UNDEFINED` for a popup-cap eviction — so the
+/// matching `NotificationClosed` signal goes out on the bus with the truth
+/// (eviction used to be reported as "dismissed by the user").
 /// Bus errors (no session bus, name already owned) only disable
 /// notifications: they log and let the WM run on.
-pub fn spawn(to_wm: Sender<NoteMsg>) -> Sender<u32> {
+pub fn spawn(to_wm: Sender<NoteMsg>) -> Sender<(u32, u32)> {
     let (dismiss_tx, dismiss_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         if let Err(e) = serve(&to_wm, &dismiss_rx) {
@@ -69,7 +77,7 @@ pub fn spawn(to_wm: Sender<NoteMsg>) -> Sender<u32> {
     dismiss_tx
 }
 
-fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
+fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
     let conn = Connection::new_session()?;
     // Take over from a lingering daemon (e.g. xfce4-notifyd) but never queue
     // behind one: without the name we'd just be a dead letterbox.
@@ -98,14 +106,23 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
     // `MAX_NOTES` by evicting the oldest popup once a new one would exceed
     // it.
     let mut order: Vec<u32> = Vec::new();
+    // Bus sender (unique name) that created each outstanding id, so a
+    // `replaces_id` is only honoured for the notification's own sender —
+    // any client could otherwise replace/re-time another app's live
+    // notification by guessing its (small, sequential) id.
+    let mut owners: HashMap<u32, String> = HashMap::new();
 
     loop {
-        // Popups the WM closed on click: emit the spec's "dismissed by the
-        // user" close reason.
-        while let Ok(id) = dismissed.try_recv() {
+        // Drop owner records for ids no longer outstanding (dismissed,
+        // expired, closed or evicted since last time); `order` stays tiny
+        // (<= MAX_NOTES), so this sweep is trivially cheap.
+        owners.retain(|id, _| order.contains(id));
+        // Popups the WM closed (click-dismissal or popup-cap eviction):
+        // relay the reason it reported onto the bus.
+        while let Ok((id, reason)) = dismissed.try_recv() {
             expiries.remove(&id);
             order.retain(|&o| o != id);
-            emit_closed(conn.channel(), id, 2)?;
+            emit_closed(conn.channel(), id, reason)?;
         }
 
         let now = Instant::now();
@@ -151,10 +168,13 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
         }
         match msg.member().as_deref() {
             Some("Notify") => {
-                let Some((note, timeout)) = parse_notify(&msg, &mut next_id, &order) else {
+                let sender = msg.sender().map(|s| s.to_string()).unwrap_or_default();
+                let Some((note, timeout)) = parse_notify(&msg, &mut next_id, &order, &owners, &sender)
+                else {
                     continue;
                 };
                 let id = note.id;
+                owners.insert(id, sender);
                 // A `replaces_id` re-show must not inherit the replaced
                 // note's deadline: clear it unconditionally, then re-arm
                 // below only if the *new* notification wants a timeout
@@ -229,9 +249,20 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<u32>) -> R<()> {
 
 /// Decode a `Notify` call's eight arguments into a `Note` plus its raw
 /// `expire_timeout`. Returns `None` on a malformed call. `outstanding` is
-/// the set of still-live ids, skipped when allocating a fresh one so a
-/// wrapped-around `next_id` can't alias a never-expiring notification.
-fn parse_notify(msg: &Message, next_id: &mut u32, outstanding: &[u32]) -> Option<(Note, i32)> {
+/// the set of still-live ids: a fresh allocation skips them (so a
+/// wrapped-around `next_id` can't alias a never-expiring notification), and
+/// `replaces_id` is only honoured when it names one of them *created by the
+/// same bus sender* (per `owners`/`sender`) — the spec says an unknown
+/// `replaces_id` behaves like a new notification, and honouring arbitrary
+/// values let any bus client resurrect stale ids or (with a guessed id)
+/// replace/re-time another app's live notification.
+fn parse_notify(
+    msg: &Message,
+    next_id: &mut u32,
+    outstanding: &[u32],
+    owners: &HashMap<u32, String>,
+    sender: &str,
+) -> Option<(Note, i32)> {
     let mut it = msg.iter_init();
     let _app: String = it.read().ok()?;
     let replaces: u32 = it.read().ok()?;
@@ -242,7 +273,10 @@ fn parse_notify(msg: &Message, next_id: &mut u32, outstanding: &[u32]) -> Option
     let hints: PropMap = it.read().ok()?;
     let timeout: i32 = it.read().ok()?;
 
-    let id = if replaces != 0 {
+    let id = if replaces != 0
+        && outstanding.contains(&replaces)
+        && owners.get(&replaces).is_some_and(|o| o == sender)
+    {
         replaces
     } else {
         loop {

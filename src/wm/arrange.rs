@@ -45,6 +45,12 @@ impl Wm {
         } else {
             0
         };
+        // Re-clamp the scroll to the (possibly changed) scrollable range:
+        // a RandR shrink or a canvas-narrowing layout change could otherwise
+        // leave `scroll_x` past `max_scroll` until the next scroll event.
+        let max_scroll = self.state.max_scroll(wa);
+        self.state.scroll_target = self.state.scroll_target.clamp(0, max_scroll);
+        self.state.scroll_x = self.state.scroll_x.clamp(0, max_scroll);
 
         let leaves = self.state.tree.collect_leaves();
         let geos = self.state.compute(wa);
@@ -168,12 +174,16 @@ impl Wm {
         // though the split layout only uses the area above the taskbar.
         let wa = self.wa();
         let (w, h) = (wa.w.max(1) as u32, wa.h.max(1) as u32);
-        let mut fb = self.renderer.screen_base(w, h);
+        let mut fb = self.renderer.take_screen_base(w, h);
         {
             let m = &mut fb;
             for p in placed {
                 let view = self.leaf_view(p.leaf, p.target.w, p.target.h);
                 self.renderer.draw_leaf(m, p.target.x, p.target.y, &view);
+                if p.focused {
+                    self.renderer
+                        .draw_focus_outline(m, p.target.x, p.target.y, p.target.w, p.target.h);
+                }
             }
             if widgets {
                 for (r, _) in &self.widgets.plus_regions {
@@ -239,7 +249,7 @@ impl Wm {
                     icon.as_deref(),
                     self.clients.get(&t.win).map_or('?', |c| c.label),
                     t.accent,
-                    t.on_screen,
+                    t.in_split,
                 );
                 crate::render::draw_close_badge(m, t.close.x, t.close.y, t.close.w);
             }
@@ -267,6 +277,7 @@ impl Wm {
             )?;
         }
         self.blit_fb(self.underlay_pix, &fb)?;
+        self.renderer.retire_frame(fb);
         self.conn.clear_area(false, self.underlay, 0, 0, 0, 0)?;
         Ok(())
     }
@@ -445,7 +456,7 @@ impl Wm {
     /// `theme::DOCK_OVERLAP` clamped to the dock's own width — an overlap
     /// wider than the dock would otherwise shove its right edge permanently
     /// away from the screen edge (fully tucked is the useful maximum).
-    fn dock_overlap(&self) -> i32 {
+    pub(crate) fn dock_overlap(&self) -> i32 {
         theme::DOCK_OVERLAP.min(self.dock.w)
     }
 
@@ -547,9 +558,14 @@ impl Wm {
 
     /// Blit a rendered framebuffer to a drawable. With MIT-SHM the pixels
     /// are presented straight into the shared segment and shipped as one
-    /// zero-copy `ShmPutImage` (checked, which also serialises reuse of the
-    /// single segment: the request has been fully processed by the time the
-    /// next frame overwrites it). Without it, present into the staging
+    /// zero-copy `ShmPutImage`. The segment holds two frame-sized halves
+    /// used alternately: the put goes out unchecked (errors surface as
+    /// `Event::Error` like every other unchecked request), and reuse of a
+    /// half is serialised by one round trip *before overwriting it* — by
+    /// then its put is two frames old and long processed, so the reply is
+    /// already on the socket and the wait is effectively free, unlike the
+    /// old per-blit `.check()` which stalled the event loop for a full
+    /// round trip on every frame. Without MIT-SHM, present into the staging
     /// buffer and fall back to chunked core-protocol `PutImage`.
     pub(crate) fn blit_fb(
         &mut self,
@@ -560,28 +576,34 @@ impl Wm {
         let len = fb.width * fb.height * 4;
         self.ensure_shm(len);
         if let ShmState::Active(seg) = &mut self.shm {
+            if seg.pending[seg.half] {
+                // Any round trip confirms every earlier request (the X
+                // stream is FIFO), including both halves' puts.
+                self.conn.get_input_focus()?.reply()?;
+                seg.pending = [false; 2];
+            }
             self.renderer.present_into_slice(fb, seg.slice(len));
-            let seg_id = seg.seg;
+            let (seg_id, offset) = (seg.seg, seg.offset());
             use x11rb::protocol::shm::ConnectionExt as _;
-            self.conn
-                .shm_put_image(
-                    drawable,
-                    self.gc,
-                    w,
-                    h,
-                    0,
-                    0,
-                    w,
-                    h,
-                    0,
-                    0,
-                    self.depth,
-                    u8::from(ImageFormat::Z_PIXMAP),
-                    false,
-                    seg_id,
-                    0,
-                )?
-                .check()?;
+            self.conn.shm_put_image(
+                drawable,
+                self.gc,
+                w,
+                h,
+                0,
+                0,
+                w,
+                h,
+                0,
+                0,
+                self.depth,
+                u8::from(ImageFormat::Z_PIXMAP),
+                false,
+                seg_id,
+                offset as u32,
+            )?;
+            seg.pending[seg.half] = true;
+            seg.half ^= 1;
             return Ok(());
         }
         let mut buf = std::mem::take(&mut self.bgrx);
@@ -590,14 +612,15 @@ impl Wm {
         self.put_image(drawable, w, h, &self.bgrx)
     }
 
-    /// Make sure the SHM segment exists and holds at least `len` bytes,
-    /// creating it on first use and recreating it when a frame outgrows it
-    /// (RandR growth). Failure is remembered: without the extension every
-    /// blit falls back to `put_image` with no per-frame re-probing.
+    /// Make sure the SHM segment exists and each of its two halves holds at
+    /// least `len` bytes, creating it on first use and recreating it when a
+    /// frame outgrows it (RandR growth). Failure is remembered: without the
+    /// extension every blit falls back to `put_image` with no per-frame
+    /// re-probing.
     fn ensure_shm(&mut self, len: usize) {
         match &self.shm {
             ShmState::Unavailable => return,
-            ShmState::Active(seg) if seg.len >= len => return,
+            ShmState::Active(seg) if seg.half_len() >= len => return,
             _ => {}
         }
         if let ShmState::Active(seg) = std::mem::replace(&mut self.shm, ShmState::Unavailable) {
@@ -608,8 +631,9 @@ impl Wm {
         }
         // Size to the workarea when that's bigger, so the common full-screen
         // frame never triggers a second create right after a small one.
+        // Doubled: the segment holds two alternating frame halves.
         let wa = self.wa();
-        let len = len.max((wa.w.max(1) as usize) * (wa.h.max(1) as usize) * 4);
+        let len = 2 * len.max((wa.w.max(1) as usize) * (wa.h.max(1) as usize) * 4);
         match self.create_shm(len) {
             Ok(seg) => self.shm = ShmState::Active(seg),
             Err(e) => {

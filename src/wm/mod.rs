@@ -779,11 +779,16 @@ fn event_loop(wm: &mut Wm) -> R<()> {
             // Pace only while a next frame is still owed — but wait out the
             // remainder on the socket, not asleep: input arriving mid-frame
             // lands in the very next batch (where it can cut the animation)
-            // instead of waiting for the frame timer.
+            // instead of waiting for the frame timer. Keep draining until the
+            // deadline actually passes: returning on the *first* event let a
+            // stream of non-cutting events (pointer motion reports at up to
+            // ~1 kHz) re-enter the loop immediately and step the animation —
+            // a full-screen recomposite — once per event instead of once per
+            // frame.
             if wm.anim.is_some() {
                 wm.conn.flush()?;
                 let deadline = frame_start + FRAME;
-                if let Some(ev) = wait_event_deadline(&wm.conn, Some(deadline))? {
+                while let Some(ev) = wait_event_deadline(&wm.conn, Some(deadline))? {
                     wm.pending_events.push(ev);
                 }
             }

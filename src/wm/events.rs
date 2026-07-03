@@ -388,27 +388,74 @@ impl Wm {
     }
 
     /// Echo a managed window's current geometry back as a synthetic
-    /// ConfigureNotify (ICCCM 4.1.5, for denied ConfigureRequests). The
-    /// window is a root child, so `GetGeometry`'s x/y are already
-    /// root-relative, as the synthetic event requires.
+    /// ConfigureNotify (ICCCM 4.1.5, for denied ConfigureRequests).
+    /// Answered from our own tracked geometry when we have it — some
+    /// toolkits fight a tiler with a stream of ConfigureRequests, and a
+    /// `GetGeometry` round trip per denial stalls the event loop — falling
+    /// back to `GetGeometry` only for windows whose geometry we don't track
+    /// (hidden/taskbar'd clients). The window is a root child, so both
+    /// sources are root-relative, as the synthetic event requires.
     fn send_synthetic_configure(&self, win: u32) -> R<()> {
-        let g = self.conn.get_geometry(win)?.reply()?;
+        let (x, y, w, h) = match self.tracked_geometry(win) {
+            Some(g) => g,
+            None => {
+                let g = self.conn.get_geometry(win)?.reply()?;
+                (
+                    i32::from(g.x),
+                    i32::from(g.y),
+                    i32::from(g.width),
+                    i32::from(g.height),
+                )
+            }
+        };
         let ev = ConfigureNotifyEvent {
             response_type: x11rb::protocol::xproto::CONFIGURE_NOTIFY_EVENT,
             sequence: 0,
             event: win,
             window: win,
             above_sibling: x11rb::NONE,
-            x: g.x,
-            y: g.y,
-            width: g.width,
-            height: g.height,
+            x: i16::try_from(x).unwrap_or(0),
+            y: i16::try_from(y).unwrap_or(0),
+            width: u16::try_from(w.max(1)).unwrap_or(1),
+            height: u16::try_from(h.max(1)).unwrap_or(1),
             border_width: 0,
             override_redirect: false,
         };
         self.conn
             .send_event(false, win, EventMask::STRUCTURE_NOTIFY, ev)?;
         Ok(())
+    }
+
+    /// The screen geometry `(x, y, w, h)` we last configured `win` to, when
+    /// derivable without asking the server: the fullscreen client's
+    /// workarea, a visible tiled client's slot (the same formula
+    /// `place_clients` applies, min-size clamp included), or the dock's
+    /// pinned column. `None` for anything else (hidden clients, unknowns).
+    fn tracked_geometry(&self, win: Win) -> Option<(i32, i32, i32, i32)> {
+        if self.dock.win == Some(win) {
+            let wa = self.la();
+            let full = self.wa();
+            let canvas_w = self.state.canvas_w.unwrap_or(wa.w);
+            let x = wa.x + canvas_w - self.dock_overlap() - self.state.scroll_x;
+            return Some((x, full.y, self.dock.w.max(1), full.h.max(1)));
+        }
+        if self.fullscreen == Some(win) {
+            let full = self.wa();
+            return Some((full.x, full.y, full.w.max(1), full.h.max(1)));
+        }
+        let leaf = self.state.tree.find_leaf_for_client(win)?;
+        if self.state.tree.leaf(leaf).is_some_and(|l| l.minimized) {
+            return None; // its window is hidden, not configured to the slot
+        }
+        let r = self.prev_frame_rect.get(&leaf)?;
+        let (bw, tb) = (theme::BORDER_LEFT, theme::tb_h());
+        let (min_w, min_h) = self.clients.get(&win).map_or((1, 1), |c| c.min_size);
+        Some((
+            r.x + bw,
+            r.y + tb,
+            (r.w - 2 * bw).max(min_w).max(1),
+            (r.h - tb - bw).max(min_h).max(1),
+        ))
     }
 
     /// The screen changed size (RandR): refresh the cached workarea, resize
@@ -653,8 +700,26 @@ impl Wm {
         match action {
             Action::SpawnTerminal => self.spawn_terminal(),
             Action::SpawnLauncher => self.spawn("rofi -show drun"),
-            Action::SplitH => self.state.split_focused(Dir::H),
-            Action::SplitV => self.state.split_focused(Dir::V),
+            // Same gating as the titlebar Split button (which checks
+            // `leaf_meta.can_split` and skips minimized leaves): the keyboard
+            // used to split a minimized leaf — cloning the minimized flag
+            // into `child_a`, a state the button logic considers invalid —
+            // and split frames already too small for the direction, whose
+            // windows then overhang and paint over neighbours.
+            Action::SplitH => {
+                if self.can_split_focused(Dir::H) {
+                    self.state.split_focused(Dir::H);
+                } else {
+                    self.animate = false;
+                }
+            }
+            Action::SplitV => {
+                if self.can_split_focused(Dir::V) {
+                    self.state.split_focused(Dir::V);
+                } else {
+                    self.animate = false;
+                }
+            }
             Action::Close => {
                 self.state.close_focused();
             }
@@ -700,6 +765,33 @@ impl Wm {
                 .insert(self.state.focused_leaf_valid(), rect);
         }
         self.commit_layout()
+    }
+
+    /// Whether the focused leaf can be split in `dir`, mirroring the
+    /// titlebar Split button's thresholds (`leaf_meta`'s `can_v`/`can_h`):
+    /// never a minimized leaf, and the frame must fit two children of the
+    /// direction's minimum size plus the gap between them.
+    fn can_split_focused(&self, dir: Dir) -> bool {
+        let leaf = self.state.focused_leaf_valid();
+        if self.state.tree.leaf(leaf).is_some_and(|l| l.minimized) {
+            return false;
+        }
+        let wa = self.la();
+        let frame = self
+            .prev_frame_rect
+            .get(&leaf)
+            .copied()
+            .unwrap_or(FrameRect {
+                x: 0,
+                y: 0,
+                w: wa.w,
+                h: wa.h,
+            });
+        let gap = theme::GAP;
+        match dir {
+            Dir::H => frame.w >= 2 * theme::min_split_w() + gap,
+            Dir::V => frame.h >= 2 * theme::tb_h() + gap,
+        }
     }
 
     /// Act on a split-control button click. `secondary` is a right-click,

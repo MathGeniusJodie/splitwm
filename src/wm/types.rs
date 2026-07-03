@@ -288,9 +288,11 @@ pub struct NoteState {
     pub popups: Vec<NotePopup>,
     /// Incoming notification events from the daemon thread.
     pub rx: std::sync::mpsc::Receiver<crate::notify::NoteMsg>,
-    /// Ids of popups the user click-dismissed, reported back to the daemon
+    /// `(id, close reason)` of popups the WM closed itself — user click
+    /// (`notify::CLOSE_REASON_DISMISSED`) or popup-cap eviction
+    /// (`notify::CLOSE_REASON_UNDEFINED`) — reported back to the daemon
     /// thread so it emits the matching `NotificationClosed` signal.
-    pub dismiss: std::sync::mpsc::Sender<u32>,
+    pub dismiss: std::sync::mpsc::Sender<(u32, u32)>,
 }
 
 /// In-progress gap/float/edge drags.
@@ -464,7 +466,10 @@ pub struct TaskTile {
     pub close: FrameRect,
     pub win: Win,
     pub accent: crate::Index,
-    pub on_screen: bool,
+    /// Whether the window occupies a split (drives the accent highlight).
+    /// Deliberately not "on screen": a split scrolled out of the viewport
+    /// still counts.
+    pub in_split: bool,
 }
 
 /// Per-leaf state driving the split-control buttons' icons/enabled state.
@@ -545,11 +550,22 @@ pub enum ShmState {
 /// A memfd-backed shared memory segment attached to the server via
 /// `ShmAttachFd`. The fd is handed to the server at attach time; the local
 /// mapping outlives it.
+///
+/// The mapping is split into two halves used as alternating frame buffers:
+/// the blit path writes frame N+1 into one half while the server may still
+/// be reading frame N from the other, so no per-frame round trip is needed
+/// to serialise reuse (see `Wm::blit_fb`).
 pub struct ShmSeg {
     /// Server-side segment id (XID).
     pub seg: u32,
     ptr: *mut u8,
     pub len: usize,
+    /// Which half the next frame is written into.
+    pub half: usize,
+    /// Per-half: whether an unconfirmed `ShmPutImage` reading that half is
+    /// (potentially) still in flight. Set on put, cleared by the round trip
+    /// `Wm::blit_fb` performs before overwriting a pending half.
+    pub pending: [bool; 2],
 }
 
 impl ShmSeg {
@@ -558,14 +574,32 @@ impl ShmSeg {
     /// `len` bytes that this `ShmSeg` uniquely owns: `slice()` will hand out
     /// `&mut [u8]` views of it and `Drop` will `munmap(ptr, len)`.
     pub unsafe fn new(seg: u32, ptr: *mut u8, len: usize) -> Self {
-        Self { seg, ptr, len }
+        Self {
+            seg,
+            ptr,
+            len,
+            half: 0,
+            pending: [false; 2],
+        }
     }
 
-    /// The first `len` bytes of the mapping (callers size frames to fit).
+    /// Byte capacity of one half (a frame must fit in this).
+    pub fn half_len(&self) -> usize {
+        self.len / 2
+    }
+
+    /// Byte offset of the current half within the segment.
+    pub fn offset(&self) -> usize {
+        self.half * self.half_len()
+    }
+
+    /// The first `len` bytes of the *current half* of the mapping (callers
+    /// size frames to fit; see `half_len`).
     pub fn slice(&mut self, len: usize) -> &mut [u8] {
-        assert!(len <= self.len);
-        // SAFETY: ptr/len describe a live MAP_SHARED mapping owned by self.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, len) }
+        assert!(len <= self.half_len());
+        // SAFETY: ptr/len describe a live MAP_SHARED mapping owned by self,
+        // and offset + len stays within it.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(self.offset()), len) }
     }
 }
 

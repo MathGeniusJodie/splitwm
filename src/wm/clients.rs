@@ -304,6 +304,12 @@ impl Wm {
         if let Some((maxw, maxh)) = self.size_hints(win).and_then(|hints| hints.max_size) {
             (w, h) = (w.min(maxw.max(1)), h.min(maxh.max(1)));
         }
+        // Keep the frame's outer size within the u16 wire type: an absurd
+        // requested size used to make the `u16::try_from(..).unwrap_or(1)`
+        // below collapse the frame to 1px around a full-size client.
+        let (bw, tb) = Self::float_insets();
+        w = w.clamp(1, i32::from(u16::MAX) - 2 * bw);
+        h = h.clamp(1, i32::from(u16::MAX) - tb - bw);
         // Center over the parent's frame when we know it, else the workarea.
         let around = parent
             .and_then(|p| self.state.tree.find_leaf_for_client(p))
@@ -341,7 +347,6 @@ impl Wm {
         // The chrome frame: our own override-redirect window, painted with
         // the split border art and shaped so its rounded corners are
         // click-through. Button events on it start a move drag.
-        let (bw, tb) = Self::float_insets();
         let frame = self.conn.generate_id()?;
         self.conn.create_window(
             self.depth,
@@ -993,6 +998,11 @@ impl Wm {
     /// preferably >=) the tab height. The property is a list of
     /// `width, height, w*h ARGB pixels` blocks packed as 32-bit CARDINALs.
     fn fetch_icon(&self, win: Win) -> Option<Rc<Icon>> {
+        // Capped read, not u32::MAX: the property is client-controlled, and
+        // every other icon path bounds what a hostile client can make us
+        // buffer. 4M CARDINALs (16 MiB) fits a generous multi-size icon set;
+        // a bigger property just loses its trailing blocks.
+        const MAX_ICON_U32S: u32 = 4 * 1024 * 1024;
         let reply = self
             .conn
             .get_property(
@@ -1001,7 +1011,7 @@ impl Wm {
                 self.atoms.net_wm_icon,
                 AtomEnum::CARDINAL,
                 0,
-                u32::MAX,
+                MAX_ICON_U32S,
             )
             .ok()?
             .reply()

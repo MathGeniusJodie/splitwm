@@ -43,6 +43,10 @@ pub struct Renderer {
     /// Screen-sized scaled wallpaper (quantized to the palette); frame
     /// backgrounds copy it each frame.
     wallpaper: Option<Framebuffer>,
+    /// The full-screen compositing framebuffer, recycled between frames via
+    /// `take_screen_base`/`retire_frame` — allocating ~8 MB per composited
+    /// frame (60/s during animations) was pure churn.
+    frame: Option<Framebuffer>,
     /// Bitmap window border; palette-swapped to each leaf's accent at draw
     /// time via `accent_swap`.
     border: NineSlice,
@@ -309,6 +313,7 @@ impl Renderer {
             lut,
             fg,
             wallpaper: None,
+            frame: None,
             border: NineSlice {
                 sprite: crate::assets::winborder(),
                 l: theme::BORDER_LEFT,
@@ -492,15 +497,45 @@ impl Renderer {
         Some((w, h, pixels))
     }
 
-    /// A fresh screen-sized framebuffer initialised with the wallpaper (or
-    /// the solid background colour). All leaf chrome is composited onto this.
-    pub fn screen_base(&self, w: u32, h: u32) -> Framebuffer {
+    /// A screen-sized framebuffer initialised with the wallpaper (or the
+    /// solid background colour). All leaf chrome is composited onto this.
+    /// Recycles the previous frame's buffer (hand it back via
+    /// `retire_frame`) so per-frame compositing allocates nothing.
+    pub fn take_screen_base(&mut self, w: u32, h: u32) -> Framebuffer {
         let (w, h) = (w.max(1) as usize, h.max(1) as usize);
-        let mut fb = Framebuffer::new(w, h, palette_color::BLACK);
+        let mut fb = match self.frame.take() {
+            Some(f) if f.width == w && f.height == h => f,
+            _ => Framebuffer::new(w, h, palette_color::BLACK),
+        };
+        // A same-size wallpaper repaints every pixel on its own; only clear
+        // first when it can't (absent, or mid-resize before its rescale).
+        let covered = self
+            .wallpaper
+            .as_ref()
+            .is_some_and(|wp| wp.width >= w && wp.height >= h);
+        if !covered {
+            fb.fill_rect_paint(0, 0, w, h, PgPaint::Solid(palette_color::BLACK));
+        }
         if let Some(wp) = &self.wallpaper {
             fb.blit_from(wp, 0, 0);
         }
         fb
+    }
+
+    /// Return the compositing framebuffer for reuse by the next
+    /// `take_screen_base`.
+    pub fn retire_frame(&mut self, fb: Framebuffer) {
+        self.frame = Some(fb);
+    }
+
+    /// 2px focus outline traced just inside the focused split's frame rect,
+    /// in the palette's closest-to-white colour.
+    pub fn draw_focus_outline(&self, fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32) {
+        const T: i32 = 2;
+        fill(fb, x, y, w, T, self.fg);
+        fill(fb, x, y + h - T, w, T, self.fg);
+        fill(fb, x, y + T, T, h - 2 * T, self.fg);
+        fill(fb, x + w - T, y + T, T, h - 2 * T, self.fg);
     }
 
     /// Draw one leaf's chrome into the shared screen framebuffer at screen
