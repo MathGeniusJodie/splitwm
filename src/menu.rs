@@ -101,17 +101,27 @@ fn first_main_category(cats: &str) -> String {
 }
 
 /// Strip desktop-entry field codes (`%f`, `%U`, …) from an Exec line;
-/// `%%` is the spec's escape for a literal `%`.
+/// `%%` is the spec's escape for a literal `%`. Only the spec's field-code
+/// letters are treated as codes — any other `%x` pair passes through
+/// literally rather than being eaten (an Exec like `convert 50%x50%` must
+/// not lose characters).
 fn clean_exec(exec: &str) -> String {
+    const FIELD_CODES: &str = "fFuUdDnNickvm";
     let mut out = String::with_capacity(exec.len());
     let mut chars = exec.chars();
     while let Some(c) = chars.next() {
-        if c == '%' {
-            if chars.next() == Some('%') {
-                out.push('%');
-            }
-        } else {
+        if c != '%' {
             out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some(c2) if FIELD_CODES.contains(c2) => {}
+            Some(c2) => {
+                out.push('%');
+                out.push(c2);
+            }
+            None => out.push('%'),
         }
     }
     out.trim().to_string()
@@ -326,41 +336,6 @@ pub fn desktop_entry_cmd(id: &str) -> Option<String> {
     })
 }
 
-/// A quick-launch shortcut shown at the top of the main menu.
-struct Quick {
-    label: &'static str,
-    env: &'static str,
-    default: &'static str,
-}
-
-const QUICK: &[Quick] = &[
-    Quick {
-        label: "Terminal",
-        env: "TERMINAL",
-        default: "xterm",
-    },
-    Quick {
-        label: "Browser",
-        env: "BROWSER",
-        default: "xdg-open https://",
-    },
-    Quick {
-        label: "Files",
-        env: "FILEMANAGER",
-        default: "xdg-open .",
-    },
-    Quick {
-        label: "Obsidian",
-        env: "OBSIDIAN",
-        default: "obsidian",
-    },
-    Quick {
-        label: "Claude",
-        env: "CLAUDE_DESKTOP",
-        default: "claude-desktop",
-    },
-];
-
 /// Icon name for a quick-launch command: the icon of the scanned app whose
 /// Exec starts with the same program, else the program's own name (themed
 /// icons are often named after the binary).
@@ -385,7 +360,7 @@ pub fn build() -> MenuTree {
     let mut main = Menu::new();
     let mut subs = Vec::new();
     let mut quick_rows = Vec::new();
-    for q in QUICK {
+    for q in crate::theme::QUICK {
         let cmd = std::env::var(q.env).unwrap_or_else(|_| q.default.to_string());
         let icon = quick_icon(&by_cat, &cmd);
         quick_rows.push((q.label.to_string(), cmd, icon));
@@ -420,6 +395,14 @@ mod tests {
         assert_eq!(clean_exec("firefox %u"), "firefox");
         assert_eq!(clean_exec("app --flag %F --other"), "app --flag  --other");
         assert_eq!(clean_exec("echo 100%% done"), "echo 100% done");
+    }
+
+    #[test]
+    fn clean_exec_keeps_non_field_code_percents() {
+        // Only the spec's field-code letters are codes; other %x pairs (and
+        // a trailing %) must pass through, not lose characters.
+        assert_eq!(clean_exec("convert 50%x50% a.png"), "convert 50%x50% a.png");
+        assert_eq!(clean_exec("echo 100%"), "echo 100%");
     }
 
     #[test]

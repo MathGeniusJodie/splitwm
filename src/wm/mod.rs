@@ -501,6 +501,9 @@ pub fn run(replace: bool) -> R<()> {
         wallpaper_path: std::env::var("SPLITWM_WALLPAPER").ok(),
         debug_scroll,
         animate: false,
+        anim: None,
+        anim_seq: 0,
+        shm: ShmState::Untried,
         prev_frame_rect: HashMap::new(),
         widgets: Widgets::default(),
         menu,
@@ -576,16 +579,39 @@ pub fn run(replace: bool) -> R<()> {
     }
 }
 
+/// Events that cut a layout animation short: input so 280 ms of keypresses
+/// don't queue behind eye candy, structural (map/unmap/destroy/configure/
+/// client-message) so a window appearing or dying mid-animation is handled
+/// against the final layout promptly.
+fn cuts_animation(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::KeyPress(_)
+            | Event::ButtonPress(_)
+            | Event::MapRequest(_)
+            | Event::UnmapNotify(_)
+            | Event::DestroyNotify(_)
+            | Event::ConfigureRequest(_)
+            | Event::ClientMessage(_)
+    )
+}
+
 fn event_loop(wm: &mut Wm) -> R<()> {
+    // Animation frame pacing (~60 Hz); frames are full-screen recomposites,
+    // so an unpaced loop would pin a core for no visible benefit.
+    const FRAME: std::time::Duration = std::time::Duration::from_millis(16);
     while wm.running {
         wm.conn.flush()?;
+        let frame_start = std::time::Instant::now();
         // Collect a whole batch: block for one event, then drain everything the
         // server already has queued. Motion events that arrive faster than we
         // can render are coalesced (see handle_batch) so renders never pile up.
-        // Events drained mid-animation (see `run_layout_animation`) were
-        // stashed in `pending_events` and are consumed before blocking.
+        // Events drained elsewhere (see `Wm::fresh_timestamp`) were stashed in
+        // `pending_events` and are consumed before blocking. While a layout
+        // animation is in flight we never block: the loop runs frame-paced,
+        // handling whatever has arrived between frames.
         let mut batch = std::mem::take(&mut wm.pending_events);
-        if batch.is_empty() {
+        if batch.is_empty() && wm.anim.is_none() {
             batch.push(wm.conn.wait_for_event()?);
         }
         while let Some(ev) = wm.conn.poll_for_event()? {
@@ -610,7 +636,9 @@ fn event_loop(wm: &mut Wm) -> R<()> {
             Event::XinputRawMotion(e) => wm.hscroll_delta(e) != 0.0,
             _ => false,
         });
-        if has_scroll && wm.hscroll_allowed().unwrap_or(false) {
+        // Skip the batching sleep while animating: the loop is already
+        // frame-paced, which fattens batches the same way.
+        if wm.anim.is_none() && has_scroll && wm.hscroll_allowed().unwrap_or(false) {
             std::thread::sleep(std::time::Duration::from_millis(8));
             while let Some(ev) = wm.conn.poll_for_event()? {
                 batch.push(ev);
@@ -619,6 +647,12 @@ fn event_loop(wm: &mut Wm) -> R<()> {
         let debug_scroll = has_scroll && wm.debug_scroll;
         let batch_len = batch.len();
         let t0 = std::time::Instant::now();
+        // Whether this batch should cut the current animation short — decided
+        // against the animation in flight *before* the batch runs, and only
+        // honoured if that same animation is still running afterwards, so a
+        // batch never kills the animation it itself just started.
+        let cut = wm.anim.is_some() && batch.iter().any(cuts_animation);
+        let pre_seq = wm.anim.as_ref().map(|a| a.seq);
         // A handling error (e.g. a reply from a window that raced us and
         // died) must not take down the whole session — but a broken
         // connection must: retrying the loop on one would just spin on the
@@ -634,6 +668,20 @@ fn event_loop(wm: &mut Wm) -> R<()> {
                 "splitwm: scroll-bearing batch of {batch_len} events took {:?}",
                 t0.elapsed()
             );
+        }
+        if wm.anim.is_some() {
+            let cut = cut && wm.anim.as_ref().map(|a| a.seq) == pre_seq;
+            if let Err(e) = wm.step_animation(cut) {
+                if is_connection_error(e.as_ref()) {
+                    return Err(e);
+                }
+                eprintln!("splitwm: error stepping layout animation: {e}");
+                wm.anim = None;
+            }
+            // Pace only while a next frame is still owed.
+            if wm.anim.is_some() {
+                std::thread::sleep(FRAME.saturating_sub(frame_start.elapsed()));
+            }
         }
     }
     Ok(())
@@ -695,33 +743,6 @@ impl Wm {
     }
 
     pub(crate) fn grab_keys(&mut self) -> R<()> {
-        let shift = u16::from(ModMask::SHIFT);
-        let defs: &[(u16, u32, Action)] = &[
-            (MOD4, ks::RETURN, Action::SpawnTerminal),
-            (MOD4, ks::SPACE, Action::SpawnLauncher),
-            // Keys are named for the divider the user sees, actions for the
-            // branch direction: Mod4+V draws a Vertical divider, i.e. an
-            // H-branch (side-by-side children), and vice versa.
-            (MOD4, ks::V, Action::SplitH),
-            (MOD4, ks::H, Action::SplitV),
-            (MOD4, ks::Q, Action::Close),
-            (MOD4, ks::TAB, Action::FocusNext),
-            (MOD4 | shift, ks::TAB, Action::FocusPrev),
-            (MOD4, ks::RIGHT, Action::FocusNext),
-            (MOD4, ks::LEFT, Action::FocusPrev),
-            (MOD4, ks::BRACKETRIGHT, Action::NextTab),
-            (MOD4, ks::BRACKETLEFT, Action::PrevTab),
-            (MOD4 | shift, ks::BRACKETRIGHT, Action::MoveTabNext),
-            (MOD4 | shift, ks::BRACKETLEFT, Action::MoveTabPrev),
-            (MOD4, ks::L, Action::Grow),
-            (MOD4 | shift, ks::L, Action::Shrink),
-            (MOD4, ks::EQUAL, Action::Grow),
-            (MOD4, ks::MINUS, Action::Shrink),
-            (MOD4 | shift, ks::Q, Action::Quit),
-            (MOD4 | shift, ks::C, Action::CloseWindow),
-            (0, ks::XF86_MON_BRIGHTNESS_UP, Action::BrightnessUp),
-            (0, ks::XF86_MON_BRIGHTNESS_DOWN, Action::BrightnessDown),
-        ];
         // Also grab with Lock (CapsLock) and Mod2 (NumLock) variants.
         let extra = [
             0u16,
@@ -729,7 +750,7 @@ impl Wm {
             u16::from(ModMask::M2),
             u16::from(ModMask::LOCK) | u16::from(ModMask::M2),
         ];
-        for &(modmask, sym, action) in defs {
+        for &(modmask, sym, action) in theme::BINDINGS {
             if let Some(&kc) = self.keymap.get(&sym) {
                 self.bindings.push((modmask, kc, action));
                 for e in extra {
@@ -847,18 +868,30 @@ impl Wm {
 }
 
 /// Whether a batch-handling error means the X connection itself is gone
-/// (socket closed, server shut down) rather than one failed request.
-fn is_connection_error(e: &(dyn std::error::Error + 'static)) -> bool {
-    if e.is::<x11rb::errors::ConnectionError>() {
-        return true;
+/// (socket closed, server shut down) rather than one failed request. Walks
+/// the whole `source()` chain, not just the top error: anything that wraps
+/// an x11rb error (a `format!`-context string, a future typed error) must
+/// not silently demote a dead socket to "log and retry" — that would spin
+/// the event loop forever on a connection that can never deliver again.
+fn is_connection_error(mut e: &(dyn std::error::Error + 'static)) -> bool {
+    loop {
+        if e.is::<x11rb::errors::ConnectionError>()
+            || matches!(
+                e.downcast_ref::<x11rb::errors::ReplyError>(),
+                Some(x11rb::errors::ReplyError::ConnectionError(_))
+            )
+            || matches!(
+                e.downcast_ref::<x11rb::errors::ReplyOrIdError>(),
+                Some(x11rb::errors::ReplyOrIdError::ConnectionError(_))
+            )
+        {
+            return true;
+        }
+        match e.source() {
+            Some(src) => e = src,
+            None => return false,
+        }
     }
-    matches!(
-        e.downcast_ref::<x11rb::errors::ReplyError>(),
-        Some(x11rb::errors::ReplyError::ConnectionError(_))
-    ) || matches!(
-        e.downcast_ref::<x11rb::errors::ReplyOrIdError>(),
-        Some(x11rb::errors::ReplyOrIdError::ConnectionError(_))
-    )
 }
 
 /// The server's ARGB32 pict format, or `None` when RENDER cursors (>= 0.5)

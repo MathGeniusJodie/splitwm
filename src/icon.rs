@@ -44,8 +44,14 @@ const MAX_ICON_DIM: u32 = 2048;
 
 /// The width/height a PNG file *declares* in its IHDR chunk (always the
 /// first chunk: bytes 16..24, big-endian), read without decoding any pixel
-/// data — the cheap pre-decode size check for untrusted files.
+/// data — the cheap pre-decode size check for untrusted files. Verifies the
+/// PNG signature and the IHDR chunk tag first, so arbitrary non-PNG bytes
+/// aren't misread as dimensions.
 pub fn png_declared_dims(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIG: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if !bytes.starts_with(&PNG_SIG) || bytes.get(12..16)? != b"IHDR" {
+        return None;
+    }
     let w = u32::from_be_bytes(bytes.get(16..20)?.try_into().ok()?);
     let h = u32::from_be_bytes(bytes.get(20..24)?.try_into().ok()?);
     Some((w, h))
@@ -91,6 +97,29 @@ pub fn rotate(palette: &Palette, icon: &Icon, deg: f32) -> Icon {
 
 fn map_argb(icon: &Icon, f: impl Fn(u32) -> u32) -> Icon {
     Icon::new(icon.w, icon.h, icon.argb.iter().map(|&px| f(px)).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::png_declared_dims;
+
+    #[test]
+    fn png_dims_reject_non_png_bytes() {
+        // Arbitrary bytes long enough to reach 16..24 must not be misread
+        // as dimensions.
+        assert_eq!(png_declared_dims(&[0u8; 64]), None);
+        assert_eq!(png_declared_dims(b"JFIF-not-a-png-but-long-enough-data"), None);
+    }
+
+    #[test]
+    fn png_dims_read_a_real_header() {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.extend([0, 0, 0, 13]); // IHDR length
+        bytes.extend(*b"IHDR");
+        bytes.extend(16u32.to_be_bytes());
+        bytes.extend(32u32.to_be_bytes());
+        assert_eq!(png_declared_dims(&bytes), Some((16, 32)));
+    }
 }
 
 fn quantize_argb(palette: &Palette, px: u32) -> u32 {

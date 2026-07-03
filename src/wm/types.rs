@@ -20,49 +20,10 @@ use crate::tree::{Boundary, Dir, NodeId, Rect, Win};
 
 pub type R<T> = Result<T, Box<dyn std::error::Error>>;
 
-// --- X11 keysyms we bind ---
-pub mod ks {
-    pub const RETURN: u32 = 0xff0d;
-    pub const TAB: u32 = 0xff09;
-    pub const LEFT: u32 = 0xff51;
-    pub const RIGHT: u32 = 0xff53;
-    pub const BRACKETLEFT: u32 = 0x5b;
-    pub const BRACKETRIGHT: u32 = 0x5d;
-    pub const MINUS: u32 = 0x2d;
-    pub const EQUAL: u32 = 0x3d;
-    pub const V: u32 = 0x76;
-    pub const H: u32 = 0x68;
-    pub const Q: u32 = 0x71;
-    pub const L: u32 = 0x6c;
-    pub const C: u32 = 0x63;
-    pub const SPACE: u32 = 0x20;
-    pub const XF86_MON_BRIGHTNESS_UP: u32 = 0x1008_ff02;
-    pub const XF86_MON_BRIGHTNESS_DOWN: u32 = 0x1008_ff03;
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum Action {
-    SplitH,
-    SplitV,
-    Close,
-    FocusNext,
-    FocusPrev,
-    NextTab,
-    PrevTab,
-    MoveTabNext,
-    MoveTabPrev,
-    Grow,
-    Shrink,
-    SpawnTerminal,
-    /// Launch rofi in desktop-application (drun) mode.
-    SpawnLauncher,
-    Quit,
-    /// Ask the focused window to close via `WM_DELETE_WINDOW`, falling back
-    /// to disconnecting its client if it doesn't speak the protocol.
-    CloseWindow,
-    BrightnessUp,
-    BrightnessDown,
-}
+// Keyboard configuration (keysyms, actions, the binding table) lives in
+// `theme` with the rest of the user-tunable config; re-exported here so the
+// rest of `wm` keeps its existing imports.
+pub use crate::theme::{Action, MOD4};
 
 /// Interned atoms used for ICCCM/EWMH interop, fetched once at startup.
 pub struct Atoms {
@@ -248,9 +209,9 @@ pub struct Wm {
     /// `arrange` — per-event callers (`hover_cursor`, `click_split_button`)
     /// read this instead of paying `Tree::find_parent`'s full arena scan.
     pub parents: HashMap<NodeId, (NodeId, usize)>,
-    /// Events drained mid-animation (`run_layout_animation` polls so a
-    /// keypress/click can cut the animation short); the main loop consumes
-    /// these before blocking for new ones.
+    /// Events drained while waiting for something specific (currently only
+    /// `Wm::fresh_timestamp`'s PropertyNotify); the main loop consumes these
+    /// before blocking for new ones, preserving their order.
     pub pending_events: Vec<x11rb::protocol::Event>,
     /// Stable insertion order of managed windows, for the bottom bar.
     pub bar_order: Vec<Win>,
@@ -289,6 +250,13 @@ pub struct Wm {
     /// per-event hot paths.
     pub debug_scroll: bool,
     pub animate: bool,
+    /// The in-flight layout animation, if any (see `LayoutAnim`); stepped by
+    /// the main event loop, replaced or cancelled by the next `arrange`.
+    pub anim: Option<LayoutAnim>,
+    /// Monotonic counter stamping each `LayoutAnim` (see `LayoutAnim::seq`).
+    pub anim_seq: u64,
+    /// MIT-SHM frame-blit segment (see `ShmState`).
+    pub shm: ShmState,
     pub prev_frame_rect: HashMap<NodeId, FrameRect>,
     /// Every hit-testable widget rect for the current layout, rebuilt as one
     /// unit by `compute_widgets` each arrange (see `Widgets`).
@@ -574,4 +542,60 @@ pub fn lerp_rect(a: FrameRect, b: FrameRect, p: f32) -> FrameRect {
     }
 }
 
-pub const MOD4: u16 = 0x40; // ModMask::M4
+/// An in-flight layout animation, stepped by the main event loop (one frame
+/// per loop iteration, ~60 Hz) rather than a blocking render loop inside
+/// `arrange` — so events keep flowing while chrome slides. Client windows
+/// are already at their final rects (placed by the arrange that started
+/// this); only the composited chrome interpolates.
+pub struct LayoutAnim {
+    /// Distinguishes this animation from one started while handling the
+    /// same event batch, so a batch's cut-short signal can't kill the very
+    /// animation it triggered.
+    pub seq: u64,
+    pub start: std::time::Instant,
+    /// Per-placement start rect (parallel to `placed`).
+    pub starts: Vec<FrameRect>,
+    pub placed: Vec<Placement>,
+}
+
+/// The MIT-SHM segment shared with the X server for frame blits: created
+/// lazily on first use, grown (recreated) when a frame outgrows it, or
+/// permanently absent when the extension is (falls back to chunked
+/// `PutImage`).
+pub enum ShmState {
+    Untried,
+    Active(ShmSeg),
+    Unavailable,
+}
+
+/// A memfd-backed shared memory segment attached to the server via
+/// `ShmAttachFd`. The fd is handed to the server at attach time; the local
+/// mapping outlives it.
+pub struct ShmSeg {
+    /// Server-side segment id (XID).
+    pub seg: u32,
+    ptr: *mut u8,
+    pub len: usize,
+}
+
+impl ShmSeg {
+    pub fn new(seg: u32, ptr: *mut u8, len: usize) -> Self {
+        Self { seg, ptr, len }
+    }
+
+    /// The first `len` bytes of the mapping (callers size frames to fit).
+    pub fn slice(&mut self, len: usize) -> &mut [u8] {
+        assert!(len <= self.len);
+        // SAFETY: ptr/len describe a live MAP_SHARED mapping owned by self.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, len) }
+    }
+}
+
+impl Drop for ShmSeg {
+    fn drop(&mut self) {
+        // SAFETY: mapping was created by mmap with this exact ptr/len.
+        unsafe {
+            libc::munmap(self.ptr.cast(), self.len);
+        }
+    }
+}

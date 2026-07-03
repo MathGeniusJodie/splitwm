@@ -117,16 +117,8 @@ impl Wm {
             self.menu.main_cw,
             self.menu.main_hi,
         );
-        let mut buf = std::mem::take(&mut self.bgrx);
-        self.renderer.present(&fb, &mut buf);
-        self.bgrx = buf;
-        self.put_image(
-            self.menu.main_win,
-            fb.width as u16,
-            fb.height as u16,
-            &self.bgrx,
-        )?;
-        Ok(())
+        let win = self.menu.main_win;
+        self.blit_fb(win, &fb)
     }
 
     pub(crate) fn paint_menu_sub(&mut self) -> R<()> {
@@ -151,16 +143,8 @@ impl Wm {
             self.menu.sub_cw,
             self.menu.sub_hi,
         );
-        let mut buf = std::mem::take(&mut self.bgrx);
-        self.renderer.present(&fb, &mut buf);
-        self.bgrx = buf;
-        self.put_image(
-            self.menu.sub_win,
-            fb.width as u16,
-            fb.height as u16,
-            &self.bgrx,
-        )?;
-        Ok(())
+        let win = self.menu.sub_win;
+        self.blit_fb(win, &fb)
     }
 
     /// Open the submenu for main row `cat` to the right of that row.

@@ -182,7 +182,22 @@ impl Wm {
                 // scroll delta, defeating the coalescing above (a burst of
                 // N scroll reports meant N clicks meant N full recomposites,
                 // which is what "piling up" actually was).
-                Event::ButtonPress(e) if (4..=7).contains(&e.detail) => continue,
+                //
+                // Exception: on a server with no smooth-scroll devices at all
+                // (`hscroll` empty — XI2 missing or too old, e.g. some Xvfb/
+                // Xephyr setups) the legacy clicks are the *only* scroll
+                // input there is, so horizontal ticks (6 = left, 7 = right)
+                // feed the pan directly, one wheel-click per event.
+                Event::ButtonPress(e) if (4..=7).contains(&e.detail) => {
+                    if self.hscroll.is_empty() {
+                        match e.detail {
+                            6 => pending_hscroll -= 1.0,
+                            7 => pending_hscroll += 1.0,
+                            _ => {}
+                        }
+                    }
+                    continue;
+                }
                 Event::ButtonRelease(e) if (4..=7).contains(&e.detail) => continue,
                 _ => {}
             }
@@ -831,6 +846,15 @@ impl Wm {
         }
         // Click-to-focus on a client window.
         if e.detail == 1 {
+            // Replay *before* any of the focus/arrange work below: the press
+            // froze the pointer in a synchronous grab, and every call below
+            // can fail (the clicked window may have died in the race window)
+            // — an early `?` return that skipped the replay would leave the
+            // pointer frozen until the server timed the grab out. Use the
+            // grab event's own timestamp, not CURRENT_TIME — under latency
+            // CURRENT_TIME can release a *later* grab than the one this
+            // press froze.
+            self.conn.allow_events(Allow::REPLAY_POINTER, e.time)?;
             if self.clients.contains_key(&e.event) {
                 self.state.activate_client(e.event);
                 self.arrange()?;
@@ -844,10 +868,6 @@ impl Wm {
                 self.conn
                     .set_input_focus(InputFocus::POINTER_ROOT, e.event, CURRENT_TIME)?;
             }
-            // Replay so the click reaches the app. Use the grab event's own
-            // timestamp, not CURRENT_TIME — under latency CURRENT_TIME can
-            // release a *later* grab than the one this press froze.
-            self.conn.allow_events(Allow::REPLAY_POINTER, e.time)?;
         }
         Ok(())
     }

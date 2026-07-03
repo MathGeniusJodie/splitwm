@@ -9,7 +9,10 @@ use x11rb::protocol::xproto::{
 };
 
 use super::clients::{WM_STATE_ICONIC, WM_STATE_NORMAL};
-use super::types::{ease_out_back, lerp_rect, BtnKind, FrameRect, LeafMeta, Placement, Wm, R};
+use super::types::{
+    ease_out_back, lerp_rect, BtnKind, FrameRect, LayoutAnim, LeafMeta, Placement, ShmSeg,
+    ShmState, Wm, R,
+};
 use crate::render::{LeafView, TabInfo, TaskItem};
 use crate::theme;
 use crate::tree::{Dir, Node, NodeId, Rect, Win};
@@ -81,10 +84,43 @@ impl Wm {
         self.compute_widgets(wa, &placed);
         self.compute_taskbar();
 
+        // Layout-changing actions animate: capture start rects and hand the
+        // transition to the main event loop (`step_animation`), which steps
+        // one frame per iteration so events keep flowing — the old blocking
+        // in-arrange render loop had to drain and stash events itself, a
+        // re-entrancy hazard. Client windows are still configured at their
+        // final rects right away (below), so focus delivered right after
+        // this arrange targets a mapped window; only the composited chrome
+        // interpolates. A non-animated arrange cancels any transition in
+        // flight (it describes a newer layout).
         if std::mem::take(&mut self.animate) {
-            self.run_layout_animation(wa, &placed)?;
+            let starts: Vec<FrameRect> = placed
+                .iter()
+                .map(|p| {
+                    self.prev_frame_rect
+                        .get(&p.leaf)
+                        .copied()
+                        .unwrap_or(FrameRect {
+                            x: p.target.x,
+                            y: p.target.y,
+                            w: 1,
+                            h: p.target.h,
+                        })
+                })
+                .collect();
+            self.anim_seq += 1;
+            self.anim = Some(LayoutAnim {
+                seq: self.anim_seq,
+                start: std::time::Instant::now(),
+                starts,
+                placed: placed.clone(),
+            });
+            // First frame from the old rects so content visibly slides.
+            self.anim_frame(0.0)?;
+        } else {
+            self.anim = None;
+            self.compose(wa, &placed, true)?;
         }
-        self.compose(wa, &placed, true)?;
         self.place_clients(&placed)?;
         self.place_dock(wa, canvas_w)?;
         // place_clients/place_dock raise their windows to the top; keep
@@ -211,9 +247,6 @@ impl Wm {
             let pr = self.widgets.taskbar_plus;
             crate::render::draw_plus(m, pr.x + pr.w / 2, pr.y + pr.h / 2, pr.w);
         }
-        let mut buf = std::mem::take(&mut self.bgrx);
-        self.renderer.present(&fb, &mut buf);
-        self.bgrx = buf;
         // Blit into a pixmap installed as the underlay's background, not the
         // window itself: the server then repaints regions exposed by moving
         // (shaped) clients synchronously from the pixmap, instead of flashing
@@ -233,7 +266,7 @@ impl Wm {
                 &ChangeWindowAttributesAux::new().background_pixmap(pix),
             )?;
         }
-        self.put_image(self.underlay_pix, pw, ph, &self.bgrx)?;
+        self.blit_fb(self.underlay_pix, &fb)?;
         self.conn.clear_area(false, self.underlay, 0, 0, 0, 0)?;
         Ok(())
     }
@@ -456,91 +489,188 @@ impl Wm {
         }
     }
 
-    /// Animate the placed leaves from their previous rect (or a collapsed
-    /// sliver, for freshly-created leaves) to their target with an
-    /// ease-out-back curve, re-compositing the underlay each frame.
-    ///
-    /// Driven by wall-clock time, not a fixed frame count: each frame does a
-    /// full-screen software recomposite + blit (not cheap), so we step by how
-    /// much real time has elapsed and always finish in `DURATION`, ending
-    /// exactly on the target. Frames are paced to ~60 Hz — an unpaced loop
-    /// would hammer the server with full-screen `PutImage`s as fast as the
-    /// socket accepts them (and pin a core) for no visible benefit.
-    fn run_layout_animation(&mut self, wa: Rect, placed: &[Placement]) -> R<()> {
-        use std::time::{Duration, Instant};
-        const DURATION: Duration = Duration::from_millis(280);
-        const FRAME: Duration = Duration::from_millis(16);
-        let starts: Vec<FrameRect> = placed
+    /// How long a layout transition takes, wall-clock.
+    const ANIM_DURATION: std::time::Duration = std::time::Duration::from_millis(280);
+
+    /// Composite one interpolated animation frame (chrome only, no widgets).
+    /// Only the chrome animates: client windows were configured once, at
+    /// their final rect, by the arrange that started the animation — moving
+    /// them per frame delivered ~17 ConfigureNotifys per transition, and
+    /// real apps re-layout and repaint on every one.
+    fn anim_frame(&mut self, t: f32) -> R<()> {
+        let Some(anim) = &self.anim else {
+            return Ok(());
+        };
+        let e = ease_out_back(t);
+        let interp: Vec<Placement> = anim
+            .placed
             .iter()
-            .map(|p| {
-                self.prev_frame_rect
-                    .get(&p.leaf)
-                    .copied()
-                    .unwrap_or(FrameRect {
-                        x: p.target.x,
-                        y: p.target.y,
-                        w: 1,
-                        h: p.target.h,
-                    })
+            .zip(&anim.starts)
+            .map(|(p, s)| Placement {
+                leaf: p.leaf,
+                target: lerp_rect(*s, p.target, e),
+                active_client: p.active_client,
+                focused: p.focused,
             })
             .collect();
-        let start = Instant::now();
-        let mut cut_short = false;
-        loop {
-            let frame_start = Instant::now();
-            // Drain whatever arrived while the last frame rendered: a
-            // keypress or click cuts the animation short (snap to the final
-            // frame) instead of queueing 280 ms of input behind it. Every
-            // drained event is stashed for the main loop to process next.
-            while let Some(ev) = self.conn.poll_for_event()? {
-                // Any input or structural event cuts the animation short:
-                // input so 280 ms of keypresses don't queue behind eye candy,
-                // structural (map/unmap/destroy/configure/client-message) so
-                // a window appearing or dying mid-animation is handled
-                // promptly instead of waiting out the transition.
-                use x11rb::protocol::Event as E;
-                cut_short |= matches!(
-                    ev,
-                    E::KeyPress(_)
-                        | E::ButtonPress(_)
-                        | E::MapRequest(_)
-                        | E::UnmapNotify(_)
-                        | E::DestroyNotify(_)
-                        | E::ConfigureRequest(_)
-                        | E::ClientMessage(_)
-                );
-                self.pending_events.push(ev);
-            }
-            let t = if cut_short {
-                1.0
-            } else {
-                (start.elapsed().as_secs_f32() / DURATION.as_secs_f32()).min(1.0)
-            };
-            let e = ease_out_back(t);
-            let interp: Vec<Placement> = placed
-                .iter()
-                .zip(&starts)
-                .map(|(p, s)| Placement {
-                    leaf: p.leaf,
-                    target: lerp_rect(*s, p.target, e),
-                    active_client: p.active_client,
-                    focused: p.focused,
-                })
-                .collect();
-            // Only the chrome animates. Client windows are configured once,
-            // at the final rect (by the arrange that called us): moving them
-            // per frame delivered ~17 ConfigureNotifys per transition, and
-            // real apps re-layout and repaint on every one.
-            self.compose(wa, &interp, false)?;
-            self.conn.flush()?;
-            if t >= 1.0 {
-                break;
-            }
-            std::thread::sleep(FRAME.saturating_sub(frame_start.elapsed()));
-        }
+        let wa = self.la();
+        self.compose(wa, &interp, false)?;
+        self.conn.flush()?;
         Ok(())
     }
 
+    /// Advance the in-flight layout animation by wall-clock time (called by
+    /// the main event loop once per frame-paced iteration). `cut` snaps to
+    /// the end immediately — set when input or structural events arrived, so
+    /// nothing queues behind eye candy. The final frame recomposes with
+    /// widgets, matching what a non-animated arrange would have left.
+    pub(crate) fn step_animation(&mut self, cut: bool) -> R<()> {
+        let Some(anim) = &self.anim else {
+            return Ok(());
+        };
+        let t = if cut {
+            1.0
+        } else {
+            (anim.start.elapsed().as_secs_f32() / Self::ANIM_DURATION.as_secs_f32()).min(1.0)
+        };
+        if t >= 1.0 {
+            let anim = self.anim.take().expect("checked above");
+            let wa = self.la();
+            self.compose(wa, &anim.placed, true)?;
+            self.conn.flush()?;
+            return Ok(());
+        }
+        self.anim_frame(t)
+    }
+
+    // --- frame blits (MIT-SHM with a chunked-PutImage fallback) ---
+
+    /// Blit a rendered framebuffer to a drawable. With MIT-SHM the pixels
+    /// are presented straight into the shared segment and shipped as one
+    /// zero-copy `ShmPutImage` (checked, which also serialises reuse of the
+    /// single segment: the request has been fully processed by the time the
+    /// next frame overwrites it). Without it, present into the staging
+    /// buffer and fall back to chunked core-protocol `PutImage`.
+    pub(crate) fn blit_fb(
+        &mut self,
+        drawable: Window,
+        fb: &pixel_graphics::Framebuffer,
+    ) -> R<()> {
+        let (w, h) = (fb.width as u16, fb.height as u16);
+        let len = fb.width * fb.height * 4;
+        self.ensure_shm(len);
+        if let ShmState::Active(seg) = &mut self.shm {
+            self.renderer.present_into_slice(fb, seg.slice(len));
+            let seg_id = seg.seg;
+            use x11rb::protocol::shm::ConnectionExt as _;
+            self.conn
+                .shm_put_image(
+                    drawable,
+                    self.gc,
+                    w,
+                    h,
+                    0,
+                    0,
+                    w,
+                    h,
+                    0,
+                    0,
+                    self.depth,
+                    u8::from(ImageFormat::Z_PIXMAP),
+                    false,
+                    seg_id,
+                    0,
+                )?
+                .check()?;
+            return Ok(());
+        }
+        let mut buf = std::mem::take(&mut self.bgrx);
+        self.renderer.present(fb, &mut buf);
+        self.bgrx = buf;
+        self.put_image(drawable, w, h, &self.bgrx)
+    }
+
+    /// Make sure the SHM segment exists and holds at least `len` bytes,
+    /// creating it on first use and recreating it when a frame outgrows it
+    /// (RandR growth). Failure is remembered: without the extension every
+    /// blit falls back to `put_image` with no per-frame re-probing.
+    fn ensure_shm(&mut self, len: usize) {
+        match &self.shm {
+            ShmState::Unavailable => return,
+            ShmState::Active(seg) if seg.len >= len => return,
+            _ => {}
+        }
+        if let ShmState::Active(seg) = std::mem::replace(&mut self.shm, ShmState::Unavailable) {
+            use x11rb::protocol::shm::ConnectionExt as _;
+            // Detach the outgrown segment server-side; the mapping itself is
+            // unmapped by `ShmSeg`'s Drop.
+            let _ = self.conn.shm_detach(seg.seg);
+        }
+        // Size to the workarea when that's bigger, so the common full-screen
+        // frame never triggers a second create right after a small one.
+        let wa = self.wa();
+        let len = len.max((wa.w.max(1) as usize) * (wa.h.max(1) as usize) * 4);
+        match self.create_shm(len) {
+            Ok(seg) => self.shm = ShmState::Active(seg),
+            Err(e) => {
+                eprintln!("splitwm: MIT-SHM unavailable ({e}); using chunked PutImage");
+                self.shm = ShmState::Unavailable;
+            }
+        }
+    }
+
+    /// Create a memfd-backed shared segment of `len` bytes, map it, and
+    /// attach it to the server with `ShmAttachFd` (MIT-SHM 1.2's fd-passing
+    /// attach: no SysV shm ids, no /dev/shm files to leak). The fd is owned
+    /// by the attach request once sent; the local mapping stays valid.
+    fn create_shm(&self, len: usize) -> R<ShmSeg> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use x11rb::connection::RequestConnection;
+        use x11rb::protocol::shm::{self, ConnectionExt as _};
+        if self
+            .conn
+            .extension_information(shm::X11_EXTENSION_NAME)?
+            .is_none()
+        {
+            return Err("MIT-SHM extension not present".into());
+        }
+        // Version probe doubles as an fd-passing capability check: attach-fd
+        // needs 1.2, and a server that old enough to lack it errors here.
+        let v = self.conn.shm_query_version()?.reply()?;
+        if (v.major_version, v.minor_version) < (1, 2) {
+            return Err(format!("MIT-SHM {}.{} < 1.2", v.major_version, v.minor_version).into());
+        }
+        let raw = unsafe { libc::memfd_create(c"splitwm-shm".as_ptr(), libc::MFD_CLOEXEC) };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // From here the fd is owned (closed on any early return).
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let seg = self.conn.generate_id()?;
+        // Checked: an attach refusal (e.g. an SSH-forwarded display) must
+        // surface here, where the caller can fall back, not as a later
+        // async error on the first blit.
+        self.conn.shm_attach_fd(seg, fd, false)?.check()?;
+        Ok(ShmSeg::new(seg, ptr.cast(), len))
+    }
+
+    /// Chunked core-protocol `PutImage` fallback for servers without MIT-SHM.
     pub(crate) fn put_image(&self, drawable: Window, w: u16, h: u16, data: &[u8]) -> R<()> {
         let gc = self.gc;
         let stride = w as usize * 4;

@@ -351,6 +351,13 @@ impl Renderer {
         fb.present_into(out, &self.lut);
     }
 
+    /// `present` into a caller-provided slice of exactly
+    /// `w * h * BYTES_PER_PIXEL` bytes — e.g. the MIT-SHM mapping, so the
+    /// full-screen frame is written once, directly where the server reads it.
+    pub fn present_into_slice(&self, fb: &Framebuffer, out: &mut [u8]) {
+        fb.present_into(out, &self.lut);
+    }
+
     /// Load+scale a PNG wallpaper to cover `w`x`h`, quantized onto the na16
     /// palette. Returns whether it loaded.
     pub fn set_wallpaper(&mut self, path: &str, w: i32, h: i32) -> bool {

@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-x11rb = { version = "0.13", features = ["xinput", "render", "shape"] }
+x11rb = { version = "0.13", features = ["xinput", "render", "shape", "shm"] }
+# memfd_create/ftruncate/mmap for the MIT-SHM frame buffer shared with the X
+# server (the fd itself is passed over the wire via ShmAttachFd).
+libc = "0.2"
 # Session-bus server for org.freedesktop.Notifications (the WM doubles as the
 # notification daemon); binds the system libdbus, driven from its own thread.
 dbus = "0.9"

@@ -86,9 +86,15 @@ impl Wm {
                 // Cap live popups: the daemon caps outstanding notifications
                 // too (see `notify::MAX_NOTES`), but a burst can still land
                 // more `Show`s here before an eviction round-trips back —
-                // drop our own oldest rather than let the pile grow.
+                // drop our own oldest rather than let the pile grow. Report
+                // the eviction back to the daemon like a click-dismissal:
+                // otherwise it keeps the id outstanding forever (a
+                // never-expiring note has no other way out) and the sender
+                // still believes its notification is on screen.
                 if self.notes.popups.len() > MAX_NOTE_POPUPS {
-                    self.conn.destroy_window(self.notes.popups.remove(0).win)?;
+                    let evicted = self.notes.popups.remove(0);
+                    let _ = self.notes.dismiss.send(evicted.note.id);
+                    self.conn.destroy_window(evicted.win)?;
                 }
                 win
             }
@@ -108,10 +114,7 @@ impl Wm {
     }
 
     fn paint_note(&mut self, win: Window, fb: &Framebuffer) -> R<()> {
-        let mut buf = std::mem::take(&mut self.bgrx);
-        self.renderer.present(fb, &mut buf);
-        self.bgrx = buf;
-        self.put_image(win, fb.width as u16, fb.height as u16, &self.bgrx)
+        self.blit_fb(win, fb)
     }
 
     /// Shape a window to a framebuffer's opaque pixels: one 1-px-tall

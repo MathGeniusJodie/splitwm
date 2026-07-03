@@ -181,3 +181,125 @@ pub const ICON_HUE_STEPS: usize = 6;
 pub const fn icon_hue_rotation(slot: usize) -> f32 {
     (slot % ICON_HUE_STEPS) as f32 * (360.0 / ICON_HUE_STEPS as f32)
 }
+
+// --- keyboard configuration ---
+//
+// Everything a user might retune lives here rather than in `wm`: the keysym
+// constants, the action set, and the binding table `Wm::grab_keys` installs.
+
+/// X11 keysyms used by `BINDINGS`.
+pub mod ks {
+    pub const RETURN: u32 = 0xff0d;
+    pub const TAB: u32 = 0xff09;
+    pub const LEFT: u32 = 0xff51;
+    pub const RIGHT: u32 = 0xff53;
+    pub const BRACKETLEFT: u32 = 0x5b;
+    pub const BRACKETRIGHT: u32 = 0x5d;
+    pub const MINUS: u32 = 0x2d;
+    pub const EQUAL: u32 = 0x3d;
+    pub const V: u32 = 0x76;
+    pub const H: u32 = 0x68;
+    pub const Q: u32 = 0x71;
+    pub const L: u32 = 0x6c;
+    pub const C: u32 = 0x63;
+    pub const E: u32 = 0x65;
+    pub const SPACE: u32 = 0x20;
+    pub const XF86_MON_BRIGHTNESS_UP: u32 = 0x1008_ff02;
+    pub const XF86_MON_BRIGHTNESS_DOWN: u32 = 0x1008_ff03;
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Action {
+    SplitH,
+    SplitV,
+    Close,
+    FocusNext,
+    FocusPrev,
+    NextTab,
+    PrevTab,
+    MoveTabNext,
+    MoveTabPrev,
+    Grow,
+    Shrink,
+    SpawnTerminal,
+    /// Launch rofi in desktop-application (drun) mode.
+    SpawnLauncher,
+    Quit,
+    /// Ask the focused window to close via `WM_DELETE_WINDOW`, falling back
+    /// to disconnecting its client if it doesn't speak the protocol.
+    CloseWindow,
+    BrightnessUp,
+    BrightnessDown,
+}
+
+/// Raw X modifier bits, so this module needs no x11rb dependency.
+pub const MOD4: u16 = 0x40; // ModMask::M4
+pub const SHIFT: u16 = 0x01; // ModMask::SHIFT
+
+/// The key bindings `Wm::grab_keys` installs: (modifier mask, keysym, action).
+/// Keys are named for the divider the user sees, actions for the branch
+/// direction: Mod4+V draws a Vertical divider, i.e. an H-branch (side-by-side
+/// children), and vice versa. Quit deliberately does *not* share a base key
+/// with Close (it used to be Mod4+Shift+Q next to Mod4+Q): one sticky Shift
+/// must not turn "close a split" into "end the session".
+pub const BINDINGS: &[(u16, u32, Action)] = &[
+    (MOD4, ks::RETURN, Action::SpawnTerminal),
+    (MOD4, ks::SPACE, Action::SpawnLauncher),
+    (MOD4, ks::V, Action::SplitH),
+    (MOD4, ks::H, Action::SplitV),
+    (MOD4, ks::Q, Action::Close),
+    (MOD4, ks::TAB, Action::FocusNext),
+    (MOD4 | SHIFT, ks::TAB, Action::FocusPrev),
+    (MOD4, ks::RIGHT, Action::FocusNext),
+    (MOD4, ks::LEFT, Action::FocusPrev),
+    (MOD4, ks::BRACKETRIGHT, Action::NextTab),
+    (MOD4, ks::BRACKETLEFT, Action::PrevTab),
+    (MOD4 | SHIFT, ks::BRACKETRIGHT, Action::MoveTabNext),
+    (MOD4 | SHIFT, ks::BRACKETLEFT, Action::MoveTabPrev),
+    (MOD4, ks::L, Action::Grow),
+    (MOD4 | SHIFT, ks::L, Action::Shrink),
+    (MOD4, ks::EQUAL, Action::Grow),
+    (MOD4, ks::MINUS, Action::Shrink),
+    (MOD4 | SHIFT, ks::E, Action::Quit),
+    (MOD4 | SHIFT, ks::C, Action::CloseWindow),
+    (0, ks::XF86_MON_BRIGHTNESS_UP, Action::BrightnessUp),
+    (0, ks::XF86_MON_BRIGHTNESS_DOWN, Action::BrightnessDown),
+];
+
+// --- launcher quick entries ---
+
+/// A quick-launch shortcut shown at the top of the launcher menu's main
+/// column: `env` overrides `default` when set.
+pub struct Quick {
+    pub label: &'static str,
+    pub env: &'static str,
+    pub default: &'static str,
+}
+
+pub const QUICK: &[Quick] = &[
+    Quick {
+        label: "Terminal",
+        env: "TERMINAL",
+        default: "xterm",
+    },
+    Quick {
+        label: "Browser",
+        env: "BROWSER",
+        default: "xdg-open https://",
+    },
+    Quick {
+        label: "Files",
+        env: "FILEMANAGER",
+        default: "xdg-open .",
+    },
+    Quick {
+        label: "Obsidian",
+        env: "OBSIDIAN",
+        default: "obsidian",
+    },
+    Quick {
+        label: "Claude",
+        env: "CLAUDE_DESKTOP",
+        default: "claude-desktop",
+    },
+];

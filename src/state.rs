@@ -497,12 +497,22 @@ impl State {
         // a ratio from the pinned width would crush the share they restore
         // to. And the end column itself being minimized makes the whole
         // drag meaningless (old_w is the pinned gap, not a real width).
+        // Built strictly parallel to `widths`: per root H-child, or a single
+        // `false` for the one-column cases (lone leaf, V-branch root, where
+        // `root_h_sizes` returns one full-width span). Matching on any
+        // branch here used to index a V-root's *stacked children* with a
+        // column index — correct only by coincidence of the len-1 guards
+        // below.
         let minimized: Vec<bool> = match self.tree.get(root) {
-            Some(Node::Branch { children, .. }) => children
+            Some(Node::Branch {
+                dir: Dir::H,
+                children,
+                ..
+            }) => children
                 .iter()
                 .map(|&c| self.tree.leaf(c).is_some_and(|l| l.minimized))
                 .collect(),
-            _ => vec![false],
+            _ => vec![false; widths.len()],
         };
         if widths.len() > 1 && minimized[idx] {
             return 0;

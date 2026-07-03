@@ -449,10 +449,7 @@ impl Wm {
         );
         self.renderer.draw_leaf(&mut fb, 0, 0, &view);
         self.shape_to_opaque(frame, &fb)?;
-        let mut buf = std::mem::take(&mut self.bgrx);
-        self.renderer.present(&fb, &mut buf);
-        self.bgrx = buf;
-        self.put_image(frame, fw.max(1) as u16, fh.max(1) as u16, &self.bgrx)
+        self.blit_fb(frame, &fb)
     }
 
     /// Move a float (client + frame) so its client origin lands at (x, y),
@@ -1050,16 +1047,25 @@ impl Wm {
             &[],
         )?;
         self.conn.flush()?;
+        // Deadline-bounded, not a bare `wait_for_event` loop: if the notify
+        // is lost or the server wedges with the socket still open, blocking
+        // forever here bricks the whole WM. On timeout, degrade to
+        // CURRENT_TIME — a possibly-ignored focus request beats a hang.
+        // Connection errors still propagate.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            let ev = self.conn.wait_for_event()?;
-            if let x11rb::protocol::Event::PropertyNotify(e) = &ev {
-                if e.window == self.sel_owner {
+            match self.conn.poll_for_event()? {
+                Some(x11rb::protocol::Event::PropertyNotify(e))
+                    if e.window == self.sel_owner =>
+                {
                     self.last_event_time = e.time;
                     self.last_event_instant = std::time::Instant::now();
                     return Ok(e.time);
                 }
+                Some(ev) => self.pending_events.push(ev),
+                None if std::time::Instant::now() >= deadline => return Ok(CURRENT_TIME),
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
-            self.pending_events.push(ev);
         }
     }
 
@@ -1074,8 +1080,11 @@ impl Wm {
     fn give_focus(&mut self, win: Win, model: FocusModel) -> R<()> {
         let stale = self.last_event_time == 0
             || self.last_event_instant.elapsed() > std::time::Duration::from_secs(2);
+        // `?`, not unwrap_or: fresh_timestamp already degrades to
+        // CURRENT_TIME on timeout, so an Err from it is a real (likely
+        // connection) failure that must not be silently eaten here.
         let time = if stale {
-            self.fresh_timestamp().unwrap_or(CURRENT_TIME)
+            self.fresh_timestamp()?
         } else {
             self.last_event_time
         };
