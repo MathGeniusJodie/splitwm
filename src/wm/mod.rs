@@ -44,8 +44,8 @@ pub use types::*;
 
 /// Block until the connection has an event or `deadline` passes: the one
 /// wait primitive behind the event loop's frame pacing, `fresh_timestamp`,
-/// and the `--replace` handover — everywhere the old code slept in a
-/// poll-and-nap loop. Waits on the connection's socket with `poll(2)`, so
+/// and the `--replace` handover, everywhere a poll-and-nap sleep loop would
+/// otherwise run. Waits on the connection's socket with `poll(2)`, so
 /// events are picked up the moment they arrive instead of on the next tick.
 /// `None` deadline blocks indefinitely; returns `Ok(None)` on deadline.
 /// Callers must have flushed anything the awaited event depends on.
@@ -162,11 +162,14 @@ fn claim_manager_selection(
         b"splitwm",
     )?;
     conn.flush()?;
+    // Deadline-bounded like every other wait: if the PropertyNotify never
+    // arrives, failing with a message beats hanging before the WM exists.
+    let ts_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let timestamp = loop {
-        if let Event::PropertyNotify(e) = conn.wait_for_event()? {
-            if e.window == sel_owner {
-                break e.time;
-            }
+        match wait_event_deadline(conn, Some(ts_deadline))? {
+            Some(Event::PropertyNotify(e)) if e.window == sel_owner => break e.time,
+            Some(_) => {}
+            None => return Err("timed out waiting for the startup timestamp".into()),
         }
     };
 
@@ -736,7 +739,7 @@ fn event_loop(wm: &mut Wm) -> R<()> {
             _ => false,
         });
         // Skip while animating: the loop is already frame-paced below.
-        if wm.anim.is_none() && has_scroll && wm.hscroll_allowed().unwrap_or(false) {
+        if wm.anim.is_none() && has_scroll && wm.hscroll_allowed()? {
             let deadline = frame_start + FRAME;
             while let Some(ev) = wait_event_deadline(&wm.conn, Some(deadline))? {
                 batch.push(ev);

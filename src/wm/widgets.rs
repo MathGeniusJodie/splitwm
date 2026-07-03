@@ -44,13 +44,21 @@ impl Wm {
         } else {
             full_stride
         };
+        // One tree walk for every tile's leaf lookup — `find_leaf_for_client`
+        // per tile is O(tiles × tree) on a per-arrange path.
+        let mut client_leaf = std::collections::HashMap::new();
+        for l in self.state.tree.collect_leaves() {
+            if let Some(c) = self.state.tree.leaf(l).and_then(|lf| lf.client) {
+                client_leaf.insert(c, l);
+            }
+        }
         let mut x = left;
         let mut tiles = Vec::with_capacity(self.bar_order.len());
         for &win in &self.bar_order {
             // Even at minimum stride a pathological window count can run
             // past the edge; pin the excess at the right rather than lose it.
             let tx = x.min(right - isz);
-            let leaf = self.state.tree.find_leaf_for_client(win);
+            let leaf = client_leaf.get(&win).copied();
             tiles.push(TaskTile {
                 rect: FrameRect {
                     x: tx,
@@ -163,7 +171,7 @@ impl Wm {
         let gap = theme::GAP;
         let hw = (gap - Self::HANDLE_INSET).max(4);
         let scroll_x = self.state.scroll_x;
-        let canvas_w = self.state.canvas_w.unwrap_or(wa.w);
+        let canvas_w = self.state.canvas_w(wa);
         for b in self.state.boundaries(wa) {
             let rect = if b.dir == Dir::H {
                 // Vertical gap between columns: a full-height pill dragged

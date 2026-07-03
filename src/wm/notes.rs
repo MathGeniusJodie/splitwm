@@ -26,17 +26,27 @@ impl Wm {
     /// The daemon thread's ClientMessage wakeup: drain the channel and
     /// bring the popup pile up to date.
     pub(crate) fn on_note_ping(&mut self) -> R<()> {
+        // Contain per-item errors: the channel has no other wakeup, so an
+        // early `?` here would strand every message still queued behind the
+        // failed one until an unrelated ping. Connection errors resurface at
+        // the flush below.
         let mut changed = false;
         loop {
             match self.notes.rx.try_recv() {
                 Ok(NoteMsg::Show(note)) => {
-                    self.show_note(note)?;
-                    changed = true;
+                    let id = note.id;
+                    match self.show_note(note) {
+                        Ok(()) => changed = true,
+                        Err(e) => eprintln!("splitwm: failed to show notification {id}: {e}"),
+                    }
                 }
                 Ok(NoteMsg::Close(id)) => {
                     if let Some(i) = self.notes.popups.iter().position(|p| p.note.id == id) {
-                        self.conn.destroy_window(self.notes.popups.remove(i).win)?;
+                        let win = self.notes.popups.remove(i).win;
                         changed = true;
+                        if let Err(e) = self.conn.destroy_window(win) {
+                            eprintln!("splitwm: failed to close notification {id}: {e}");
+                        }
                     }
                 }
                 Err(_) => break,

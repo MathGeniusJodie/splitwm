@@ -365,7 +365,11 @@ pub fn build() -> MenuTree {
         let icon = quick_icon(&by_cat, &cmd);
         quick_rows.push((q.label.to_string(), cmd, icon));
     }
-    for (cat, apps) in by_cat {
+    // Alphabetical categories with the "Other" catch-all pinned last — the
+    // BTreeMap's lexical order would drop it in the middle of the list.
+    let mut cats: Vec<_> = by_cat.into_iter().collect();
+    cats.sort_by_key(|(cat, _)| cat == "Other"); // stable: alpha order kept
+    for (cat, apps) in cats {
         if apps.is_empty() {
             continue;
         }

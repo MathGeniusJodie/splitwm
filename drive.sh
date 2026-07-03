@@ -25,7 +25,7 @@ sleep 0.7
 kill -0 $WM_PID 2>/dev/null || { echo "WM DOWN"; cat /tmp/splitwm.log; exit 1; }
 echo "WM up"
 
-shot() { DISPLAY=:1 import -window root "$SHOTS/$1.png" 2>/dev/null && echo "shot $1"; }
+shot() { DISPLAY=:1 import -window root "$SHOTS/$1.png" 2>/dev/null && echo "shot $1" || echo "shot $1 FAILED"; }
 key() { DISPLAY=:1 xdotool key --clearmodifiers "$1"; sleep 0.4; }
 term() { DISPLAY=:1 xterm -e "sleep 3000" & sleep 1.2; }
 # A solid-colour terminal so window-content sampling has something to read.

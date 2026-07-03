@@ -235,8 +235,8 @@ pub const SHIFT: u16 = 0x01; // ModMask::SHIFT
 /// Keys are named for the divider the user sees, actions for the branch
 /// direction: Mod4+V draws a Vertical divider, i.e. an H-branch (side-by-side
 /// children), and vice versa. Quit deliberately does *not* share a base key
-/// with Close (it used to be Mod4+Shift+Q next to Mod4+Q): one sticky Shift
-/// must not turn "close a split" into "end the session".
+/// with Close: one sticky Shift must not turn "close a split" into "end the
+/// session".
 pub const BINDINGS: &[(u16, u32, Action)] = &[
     (MOD4, ks::RETURN, Action::SpawnTerminal),
     (MOD4, ks::SPACE, Action::SpawnLauncher),

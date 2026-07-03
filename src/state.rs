@@ -10,8 +10,9 @@ pub struct State {
     pub focused_leaf: NodeId,
     pub scroll_x: i32,
     pub scroll_target: i32,
-    /// Canvas width; None falls back to the workarea width.
-    pub canvas_w: Option<i32>,
+    /// Canvas width, derived by `update_canvas` (0 until the first call;
+    /// read through `canvas_w()`, which falls back to the viewport width).
+    canvas_w: i32,
     /// Extra scrollable width past `canvas_w` reserved for the docked
     /// sidebar (see `Wm::manage_dock`), so scrolling all the way right
     /// reveals it even though it sits outside the split tree and doesn't
@@ -19,7 +20,7 @@ pub struct State {
     pub dock_extra: i32,
     /// Cumulative manual adjustment to `canvas_w` from dragging an
     /// edge-of-canvas resize handle (see `resize_edge`), layered on top of
-    /// `Wm::arrange`'s own leaf-count-driven heuristic every frame so a
+    /// `update_canvas`'s column-count-driven heuristic every recompute so a
     /// manual resize isn't immediately overwritten by it.
     pub canvas_w_extra: i32,
     /// Windows not currently shown in any split, in the bottom taskbar.
@@ -35,7 +36,7 @@ impl State {
             focused_leaf: root,
             scroll_x: 0,
             scroll_target: 0,
-            canvas_w: None,
+            canvas_w: 0,
             dock_extra: 0,
             canvas_w_extra: 0,
             taskbar: Vec::new(),
@@ -452,10 +453,47 @@ impl State {
         }
     }
 
+    // --- canvas ---
+
+    /// The scrollable canvas width. Before the first `update_canvas` this
+    /// falls back to the viewport width, so pure-`State` callers (tests,
+    /// pre-first-arrange paths) see sane geometry.
+    pub fn canvas_w(&self, wa: Rect) -> i32 {
+        if self.canvas_w > 0 {
+            self.canvas_w
+        } else {
+            wa.w
+        }
+    }
+
+    /// Recompute the canvas width for the current tree and viewport; called
+    /// once per arrange. Width demand is measured in *columns*
+    /// (`Tree::h_units`), not leaves — a vertical stack of any depth still
+    /// occupies one column, so it must not open up phantom scroll space.
+    /// Each column gets a comfortable minimum so splits don't get crushed.
+    /// A manual edge-of-canvas resize layers on via `canvas_w_extra` and may
+    /// legitimately take the canvas narrower than the viewport (leaving
+    /// margin on the far side); `resize_edge`'s per-column `min_split_w`
+    /// clamp is what keeps that sane. `dock_extra` is the extra scroll room
+    /// the docked sidebar needs (zero when nothing is docked). Scroll
+    /// positions are re-clamped to the new range, so a viewport shrink or a
+    /// canvas-narrowing layout change can't leave them past `max_scroll`.
+    pub fn update_canvas(&mut self, wa: Rect, dock_extra: i32) {
+        let gap = theme::GAP;
+        let columns = self.tree.h_units().max(1);
+        let min_col_w = (theme::min_split_w() + 2 * gap).max(wa.w / 3);
+        let needed = columns.saturating_mul(min_col_w);
+        self.canvas_w = needed.max(wa.w) + self.canvas_w_extra;
+        self.dock_extra = dock_extra;
+        let max_scroll = self.max_scroll(wa);
+        self.scroll_target = self.scroll_target.clamp(0, max_scroll);
+        self.scroll_x = self.scroll_x.clamp(0, max_scroll);
+    }
+
     // --- scroll ---
 
     pub fn max_scroll(&self, wa: Rect) -> i32 {
-        (self.canvas_w.unwrap_or(wa.w) + self.dock_extra - wa.w).max(0)
+        (self.canvas_w(wa) + self.dock_extra - wa.w).max(0)
     }
 
     pub fn scroll_to(&mut self, wa: Rect, target: i32) {
@@ -470,14 +508,14 @@ impl State {
     /// Geometry of every leaf in canvas coordinates.
     pub fn compute(&self, wa: Rect) -> std::collections::HashMap<NodeId, Rect> {
         let gap = theme::GAP;
-        let canvas_w = self.canvas_w.unwrap_or(wa.w);
+        let canvas_w = self.canvas_w(wa);
         self.tree.compute(Rect { w: canvas_w, ..wa }, gap)
     }
 
     /// Gaps between adjacent splits, for drag handles / insert buttons.
     pub fn boundaries(&self, wa: Rect) -> Vec<Boundary> {
         let gap = theme::GAP;
-        let canvas_w = self.canvas_w.unwrap_or(wa.w);
+        let canvas_w = self.canvas_w(wa);
         self.tree.boundaries(Rect { w: canvas_w, ..wa }, gap)
     }
 
@@ -489,7 +527,7 @@ impl State {
     /// `Tree::root_h_sizes`). `None` only if the tree is somehow empty.
     pub fn edge_span(&self, wa: Rect, left: bool) -> Option<(i32, i32)> {
         let gap = theme::GAP;
-        let canvas_w = self.canvas_w.unwrap_or(wa.w);
+        let canvas_w = self.canvas_w(wa);
         let sizes = self.tree.root_h_sizes(canvas_w - 2 * gap, gap)?;
         let start_x = wa.x + gap;
         if left {
@@ -505,7 +543,7 @@ impl State {
     /// Resize the leftmost or rightmost root-level column to `target_w`
     /// pixels: the column absorbs the whole delta, every sibling keeps its
     /// exact current pixel width, and `canvas_w` grows/shrinks by that same
-    /// delta (via `canvas_w_extra`, layered on top of `Wm::arrange`'s
+    /// delta (via `canvas_w_extra`, layered on top of `update_canvas`'s
     /// heuristic each frame) — the canvas itself tracks the resize, the
     /// same way it grows when a new column is inserted. `theme::GAP` (the
     /// margin) never changes. A single leaf (or a vertical-branch root) has
@@ -526,10 +564,10 @@ impl State {
     /// share they restore to.
     /// Built strictly parallel to `widths`: per root H-child, or a single
     /// `false` for the one-column cases (lone leaf, V-branch root, where
-    /// `root_h_sizes` returns one full-width span). Matching on any
-    /// branch here used to index a V-root's *stacked children* with a
-    /// column index — correct only by coincidence of the len-1 guards
-    /// around its callers.
+    /// `root_h_sizes` returns one full-width span). Indexing a V-root's
+    /// *stacked children* with a column index here would be wrong in
+    /// general — it's only safe as a fallback because of the len-1
+    /// guards around its callers.
     fn root_column_minimized(&self, root: NodeId, widths_len: usize) -> Vec<bool> {
         match self.tree.get(root) {
             Some(Node::Branch {
@@ -587,7 +625,7 @@ impl State {
     pub fn resize_edge(&mut self, wa: Rect, left: bool, target_w: i32) -> i32 {
         let root = self.tree.root;
         let gap = theme::GAP;
-        let canvas_w = self.canvas_w.unwrap_or(wa.w);
+        let canvas_w = self.canvas_w(wa);
         let Some(widths) = self.tree.root_h_sizes(canvas_w - 2 * gap, gap) else {
             return 0;
         };
@@ -775,11 +813,11 @@ mod tests {
     fn boundaries_match_column_count() {
         let mut s = State::new();
         s.split_focused(Dir::H);
-        s.canvas_w = Some(WA.w);
+        s.update_canvas(WA, 0);
         // One gap between two columns.
         assert_eq!(s.boundaries(WA).len(), 1);
         s.insert_at_root(1);
-        s.canvas_w = Some(WA.w);
+        s.update_canvas(WA, 0);
         assert_eq!(s.boundaries(WA).len(), 2);
     }
 
@@ -835,14 +873,14 @@ mod tests {
     #[test]
     fn dock_extra_reveals_sidebar_at_max_scroll() {
         let mut s = State::new();
-        s.canvas_w = Some(WA.w); // single leaf: canvas == viewport, no scroll room on its own
         let docked_w = 300;
         let overlap = theme::DOCK_OVERLAP.min(docked_w);
-        s.dock_extra = docked_w - overlap;
+        // Single leaf: canvas == viewport, no scroll room of its own.
+        s.update_canvas(WA, docked_w - overlap);
 
         assert_eq!(s.max_scroll(WA), docked_w - overlap);
 
-        let canvas_w = s.canvas_w.unwrap();
+        let canvas_w = s.canvas_w(WA);
         let dock_x_at = |scroll_x: i32| WA.x + canvas_w - overlap - scroll_x;
 
         // Before scrolling, only the tucked-under overlap strip reaches
@@ -862,7 +900,7 @@ mod tests {
     #[test]
     fn edge_span_is_full_width_for_single_leaf() {
         let s = State::new();
-        let canvas_w = s.canvas_w.unwrap_or(WA.w);
+        let canvas_w = s.canvas_w(WA);
         let want = (WA.x + crate::theme::GAP, canvas_w - 2 * crate::theme::GAP);
         assert_eq!(s.edge_span(WA, true), Some(want));
         assert_eq!(s.edge_span(WA, false), Some(want));
@@ -874,7 +912,7 @@ mod tests {
     #[test]
     fn resize_edge_shrinks_lone_leaf() {
         let mut s = State::new();
-        s.canvas_w = Some(WA.w);
+        s.update_canvas(WA, 0);
         let (_, w_before) = s.edge_span(WA, false).unwrap();
 
         let shrink_by = 50;
@@ -882,7 +920,7 @@ mod tests {
         assert_eq!(applied, -shrink_by);
         assert_eq!(s.canvas_w_extra, -shrink_by);
 
-        s.canvas_w = Some(WA.w + s.canvas_w_extra);
+        s.update_canvas(WA, 0);
         let (_, w_after) = s.edge_span(WA, false).unwrap();
         assert_eq!(w_after, w_before - shrink_by);
     }
@@ -897,8 +935,8 @@ mod tests {
     fn resize_edge_grows_left_column_and_canvas() {
         let mut s = State::new();
         s.split_focused(Dir::H);
-        s.canvas_w = Some(WA.w);
-        let canvas_w_before = s.canvas_w.unwrap();
+        s.update_canvas(WA, 0);
+        let canvas_w_before = s.canvas_w(WA);
 
         let before = s.compute(WA);
         let leaves = s.tree.collect_leaves();
@@ -915,10 +953,10 @@ mod tests {
         assert_eq!(applied, grow_by);
         assert_eq!(s.canvas_w_extra, grow_by);
 
-        // `canvas_w` itself isn't updated by `resize_edge` (that's
-        // `Wm::arrange`'s job, layering `canvas_w_extra` on top of its
-        // heuristic each frame); simulate that here to check geometry.
-        s.canvas_w = Some(canvas_w_before + s.canvas_w_extra);
+        // `resize_edge` records the delta in `canvas_w_extra`; the next
+        // `update_canvas` (run once per arrange) layers it onto the width.
+        s.update_canvas(WA, 0);
+        assert_eq!(s.canvas_w(WA), canvas_w_before + grow_by);
         let after = s.compute(WA);
         assert_eq!(after[&left_id].w, left_w_before + grow_by);
         assert_eq!(after[&right_id].w, right_w_before);
@@ -1092,7 +1130,7 @@ mod tests {
         // Focus landed on a surviving leaf, and every root-level gap is
         // insert-eligible again.
         assert!(s.tree.is_leaf(s.focused_leaf));
-        s.canvas_w = Some(WA.w);
+        s.update_canvas(WA, 0);
         assert!(s.boundaries(WA).iter().all(|b| b.root));
     }
 
@@ -1161,7 +1199,7 @@ mod tests {
         let mut s = State::new();
         s.split_focused(Dir::H);
         s.insert_at_root(2); // three columns
-        s.canvas_w = Some(WA.w);
+        s.update_canvas(WA, 0);
         let leaves = s.tree.collect_leaves();
         s.toggle_minimize(leaves[1]); // middle column pinned to `gap` px
         let ratio_before = match s.tree.get(s.tree.root) {
@@ -1189,8 +1227,8 @@ mod tests {
     fn resize_edge_shrinks_right_column_and_canvas() {
         let mut s = State::new();
         s.split_focused(Dir::H);
-        s.canvas_w = Some(WA.w);
-        let canvas_w_before = s.canvas_w.unwrap();
+        s.update_canvas(WA, 0);
+        let canvas_w_before = s.canvas_w(WA);
 
         let before = s.compute(WA);
         let leaves = s.tree.collect_leaves();
@@ -1203,7 +1241,8 @@ mod tests {
         assert_eq!(applied, -shrink_by);
         assert_eq!(s.canvas_w_extra, -shrink_by);
 
-        s.canvas_w = Some(canvas_w_before + s.canvas_w_extra);
+        s.update_canvas(WA, 0);
+        assert_eq!(s.canvas_w(WA), canvas_w_before - shrink_by);
         let after = s.compute(WA);
         assert_eq!(after[&right_id].w, right_w_before - shrink_by);
         assert_eq!(after[&left_id].w, left_w_before);

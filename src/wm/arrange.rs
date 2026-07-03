@@ -20,37 +20,19 @@ use crate::tree::{Dir, Node, NodeId, Rect, Win};
 impl Wm {
     pub(crate) fn arrange(&mut self) -> R<()> {
         let wa = self.la();
-        let gap = theme::GAP;
 
-        // Grow the canvas if the tree is wider than the viewport. Width
-        // demand is measured in *columns* (`Tree::h_units`), not leaves — a
-        // vertical stack of any depth still occupies one column, so it must
-        // not open up phantom scroll space. Each column gets a comfortable
-        // minimum so splits don't get crushed. Any manual edge-of-canvas
-        // resize (`State::resize_edge`) layers on top via `canvas_w_extra`
-        // so it isn't clobbered by this recompute — not reclamped to `wa.w`
-        // afterward, since a deliberate edge-shrink can legitimately take
-        // the canvas narrower than the viewport (leaving margin on the far
-        // side); `resize_edge`'s own per-column `min_split_w` clamp is what
-        // actually keeps this sane.
-        let columns = self.state.tree.h_units().max(1);
-        let min_col_w = (theme::min_split_w() + 2 * gap).max(wa.w / 3);
-        let needed = columns.saturating_mul(min_col_w);
-        let canvas_w = needed.max(wa.w) + self.state.canvas_w_extra;
-        self.state.canvas_w = Some(canvas_w);
-        // The dock is tucked DOCK_OVERLAP px under the canvas edge, so that
-        // much less scroll room is needed to bring it fully into view.
-        self.state.dock_extra = if self.dock.win.is_some() {
+        // Canvas width, scroll clamping and the dock's extra scroll room are
+        // `State`'s own invariants (see `State::update_canvas`); the WM only
+        // supplies the inputs it alone knows. The dock is tucked
+        // DOCK_OVERLAP px under the canvas edge, so that much less scroll
+        // room is needed to bring it fully into view.
+        let dock_extra = if self.dock.win.is_some() {
             self.dock.w - self.dock_overlap()
         } else {
             0
         };
-        // Re-clamp the scroll to the (possibly changed) scrollable range:
-        // a RandR shrink or a canvas-narrowing layout change could otherwise
-        // leave `scroll_x` past `max_scroll` until the next scroll event.
-        let max_scroll = self.state.max_scroll(wa);
-        self.state.scroll_target = self.state.scroll_target.clamp(0, max_scroll);
-        self.state.scroll_x = self.state.scroll_x.clamp(0, max_scroll);
+        self.state.update_canvas(wa, dock_extra);
+        let canvas_w = self.state.canvas_w(wa);
 
         let leaves = self.state.tree.collect_leaves();
         let geos = self.state.compute(wa);

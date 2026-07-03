@@ -100,6 +100,11 @@ keyboard-mapping changes are handled.
 cargo build --release
 cargo test          # layout-state unit tests
 
+# Asserting ICCCM/EWMH integration test in a nested X server (Xephyr):
+# WM_STATE transitions, _NET_CLIENT_LIST, focus, withdrawal, restore-on-exit.
+# Exits nonzero on any failed assertion.
+./itest.sh
+
 # Launch in a nested X server (Xephyr) and drive an automated UI test that
 # splits, tabs, scrolls, resizes and closes, dropping screenshots in
 # /tmp/splitshots:

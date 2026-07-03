@@ -305,7 +305,7 @@ impl Wm {
             (w, h) = (w.min(maxw.max(1)), h.min(maxh.max(1)));
         }
         // Keep the frame's outer size within the u16 wire type: an absurd
-        // requested size used to make the `u16::try_from(..).unwrap_or(1)`
+        // requested size would make the `u16::try_from(..).unwrap_or(1)`
         // below collapse the frame to 1px around a full-size client.
         let (bw, tb) = Self::float_insets();
         w = w.clamp(1, i32::from(u16::MAX) - 2 * bw);
@@ -665,11 +665,15 @@ impl Wm {
     /// disconnecting its client only when it doesn't.
     pub(crate) fn close_client(&self, win: Win) -> R<()> {
         if self.supports_protocol(win, self.atoms.wm_delete_window) {
+            // A real timestamp, not CURRENT_TIME: some clients use it to
+            // arbitrate focus races on their "save changes?" prompt. A close
+            // is always user-initiated, so the last input event's time is
+            // fresh (and 0 degrades to CURRENT_TIME before any input).
             let msg = ClientMessageEvent::new(
                 32,
                 win,
                 self.atoms.wm_protocols,
-                [self.atoms.wm_delete_window, CURRENT_TIME, 0, 0, 0],
+                [self.atoms.wm_delete_window, self.last_event_time, 0, 0, 0],
             );
             self.conn.send_event(false, win, EventMask::NO_EVENT, msg)?;
         } else {
@@ -722,8 +726,22 @@ impl Wm {
     /// and dock it — a toolkit that sets its identifying property only
     /// after mapping would otherwise leave the dock tiled as an ordinary
     /// window forever.
-    pub(crate) fn on_dock_identity_change(&mut self, win: Win) -> R<()> {
-        if self.dock.win.is_some() || !self.clients.contains_key(&win) || !self.matches_dock(win) {
+    pub(crate) fn on_dock_identity_change(&mut self, win: Win, changed_atom: u32) -> R<()> {
+        if self.dock.win.is_some() {
+            return Ok(());
+        }
+        let Some(client) = self.clients.get(&win) else {
+            return Ok(());
+        };
+        // Title changes are frequent (terminals retitle per prompt) and can
+        // only affect dock identity for windows with no WM_CLASS at all
+        // (the title is matches_dock's last-resort fallback). Don't pay the
+        // property round trips for a title change on a classed window.
+        let class_changed = changed_atom == u32::from(AtomEnum::WM_CLASS);
+        if !class_changed && client.class.as_ref() != "?" {
+            return Ok(());
+        }
+        if !self.matches_dock(win) {
             return Ok(());
         }
         self.clients.remove(&win);
@@ -882,10 +900,10 @@ impl Wm {
     /// ("instance\0class\0") equals `DockState::title`, falling back to the
     /// window title only when it sets no `WM_CLASS` at all (the stock dock
     /// app doesn't). Class is preferred because a title is client-controlled
-    /// free text that changes at runtime — any window titling itself
-    /// "cozyui" (a browser tab, say) used to get yanked out of tiling and
-    /// pinned as the dock; a window that *does* declare a class must now
-    /// match on that alone.
+    /// free text that changes at runtime — matching on title alone would let
+    /// any window titling itself "cozyui" (a browser tab, say) get yanked
+    /// out of tiling and pinned as the dock; a window that *does* declare a
+    /// class must match on that alone.
     fn matches_dock(&self, win: Win) -> bool {
         let class = self
             .conn

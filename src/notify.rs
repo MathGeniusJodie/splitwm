@@ -63,8 +63,7 @@ pub enum NoteMsg {
 /// Spawn the daemon thread. Returns the sender the WM uses to report a
 /// popup it closed as `(id, close reason)` — `CLOSE_REASON_DISMISSED` for a
 /// user click, `CLOSE_REASON_UNDEFINED` for a popup-cap eviction — so the
-/// matching `NotificationClosed` signal goes out on the bus with the truth
-/// (eviction used to be reported as "dismissed by the user").
+/// matching `NotificationClosed` signal goes out on the bus with the truth.
 /// Bus errors (no session bus, name already owned) only disable
 /// notifications: they log and let the WM run on.
 pub fn spawn(to_wm: Sender<NoteMsg>) -> Sender<(u32, u32)> {
@@ -77,19 +76,42 @@ pub fn spawn(to_wm: Sender<NoteMsg>) -> Sender<(u32, u32)> {
     dismiss_tx
 }
 
-fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
-    let conn = Connection::new_session()?;
-    // Take over from a lingering daemon (e.g. xfce4-notifyd) but never queue
-    // behind one: without the name we'd just be a dead letterbox.
-    let granted = conn.request_name(BUS_NAME, false, true, true)?;
-    if !matches!(
-        granted,
-        dbus::blocking::stdintf::org_freedesktop_dbus::RequestNameReply::PrimaryOwner
-    ) {
-        return Err(format!("{BUS_NAME} is owned by another daemon").into());
+/// Connect to the session bus and claim the notification name. The bus
+/// connection is retried with backoff: at WM startup the session bus may not
+/// be up yet (dbus-launch race), and giving up on the first attempt disables
+/// notifications for the whole session. A name refusal is not retried — the
+/// request already asks to replace the owner, so a refusal means the owner
+/// forbids replacement and that won't change.
+fn connect_bus() -> R<Connection> {
+    let mut last_err: Box<dyn std::error::Error> = "no attempt".into();
+    for attempt in 0..10 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_secs(2));
+        }
+        match Connection::new_session() {
+            Ok(conn) => {
+                // Take over from a lingering daemon (e.g. xfce4-notifyd) but
+                // never queue behind one: without the name we'd just be a
+                // dead letterbox.
+                let granted = conn.request_name(BUS_NAME, false, true, true)?;
+                if !matches!(
+                    granted,
+                    dbus::blocking::stdintf::org_freedesktop_dbus::RequestNameReply::PrimaryOwner
+                ) {
+                    return Err(format!("{BUS_NAME} is owned by another daemon").into());
+                }
+                return Ok(conn);
+            }
+            Err(e) => last_err = e.into(),
+        }
     }
+    Err(last_err)
+}
 
+fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
     // Own X connection purely for waking the WM's blocking event loop.
+    // Established before the bus so a bus failure can still be shown to the
+    // user as a popup (below) rather than only a stderr line nobody sees.
     let (xc, screen) = x11rb::connect(None)?;
     let root = xc.setup().roots[screen].root;
     let ping_atom = xc.intern_atom(false, PING_ATOM.as_bytes())?.reply()?.atom;
@@ -98,6 +120,22 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
         xc.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT, ev)?;
         xc.flush()?;
         Ok(())
+    };
+
+    let conn = match connect_bus() {
+        Ok(c) => c,
+        Err(e) => {
+            // Notifications are dead for the session; say so where the user
+            // can see it — as the one popup this daemon will ever show.
+            let _ = to_wm.send(NoteMsg::Show(Note {
+                id: 0,
+                summary: "Notifications unavailable".to_string(),
+                body: format!("splitwm could not become the notification daemon: {e}"),
+                urgency: 2,
+            }));
+            let _ = ping(());
+            return Err(e);
+        }
     };
 
     let mut next_id: u32 = 1;
@@ -178,8 +216,8 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, u32)>) -> R<()> {
                 // A `replaces_id` re-show must not inherit the replaced
                 // note's deadline: clear it unconditionally, then re-arm
                 // below only if the *new* notification wants a timeout
-                // (a critical/never-expire replacement previously kept the
-                // old expiry and got auto-closed by it).
+                // (a critical/never-expire replacement would otherwise keep
+                // the replaced note's expiry and get auto-closed by it).
                 expiries.remove(&id);
                 // 0 means never expire; so does critical urgency per spec.
                 match timeout {

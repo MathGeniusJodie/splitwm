@@ -179,9 +179,8 @@ impl Wm {
                 // old discrete-click protocol. We scroll from the raw axis
                 // instead, so these carry no information for us — but until
                 // ignored here, each one forced a flush of the accumulated
-                // scroll delta, defeating the coalescing above (a burst of
-                // N scroll reports meant N clicks meant N full recomposites,
-                // which is what "piling up" actually was).
+                // scroll delta, defeating the coalescing above: a burst of
+                // N scroll reports means N clicks means N full recomposites.
                 //
                 // Exception: on a server with no smooth-scroll devices at all
                 // (`hscroll` empty — XI2 missing or too old, e.g. some Xvfb/
@@ -275,7 +274,7 @@ impl Wm {
                     || e.atom == self.atoms.net_wm_name
                     || e.atom == u32::from(x11rb::protocol::xproto::AtomEnum::WM_NAME) =>
             {
-                self.on_dock_identity_change(e.window)?;
+                self.on_dock_identity_change(e.window, e.atom)?;
             }
             // Pointer left a menu window: retire its hover highlight (the
             // main column keeps highlighting an open category so the
@@ -435,7 +434,7 @@ impl Wm {
         if self.dock.win == Some(win) {
             let wa = self.la();
             let full = self.wa();
-            let canvas_w = self.state.canvas_w.unwrap_or(wa.w);
+            let canvas_w = self.state.canvas_w(wa);
             let x = wa.x + canvas_w - self.dock_overlap() - self.state.scroll_x;
             return Some((x, full.y, self.dock.w.max(1), full.h.max(1)));
         }
@@ -701,11 +700,12 @@ impl Wm {
             Action::SpawnTerminal => self.spawn_terminal(),
             Action::SpawnLauncher => self.spawn("rofi -show drun"),
             // Same gating as the titlebar Split button (which checks
-            // `leaf_meta.can_split` and skips minimized leaves): the keyboard
-            // used to split a minimized leaf — cloning the minimized flag
-            // into `child_a`, a state the button logic considers invalid —
-            // and split frames already too small for the direction, whose
-            // windows then overhang and paint over neighbours.
+            // `leaf_meta.can_split` and skips minimized leaves): splitting
+            // a minimized leaf from the keyboard would clone the minimized
+            // flag into `child_a`, a state the button logic considers
+            // invalid, and produce split frames already too small for the
+            // direction, whose windows then overhang and paint over
+            // neighbours.
             Action::SplitH => {
                 if self.can_split_focused(Dir::H) {
                     self.state.split_focused(Dir::H);
@@ -776,21 +776,21 @@ impl Wm {
         if self.state.tree.leaf(leaf).is_some_and(|l| l.minimized) {
             return false;
         }
-        let wa = self.la();
-        let frame = self
-            .prev_frame_rect
-            .get(&leaf)
-            .copied()
-            .unwrap_or(FrameRect {
-                x: 0,
-                y: 0,
-                w: wa.w,
-                h: wa.h,
-            });
+        // An off-screen leaf (scrolled out of view) has no cached frame
+        // rect; its canvas-space geometry has the same size, so size checks
+        // work from either. A leaf in neither is unknown — deny, since
+        // splitting an unmeasured leaf is how too-small splits happen.
+        let (w, h) = match self.prev_frame_rect.get(&leaf) {
+            Some(f) => (f.w, f.h),
+            None => match self.state.compute(self.la()).get(&leaf) {
+                Some(g) => (g.w, g.h),
+                None => return false,
+            },
+        };
         let gap = theme::GAP;
         match dir {
-            Dir::H => frame.w >= 2 * theme::min_split_w() + gap,
-            Dir::V => frame.h >= 2 * theme::tb_h() + gap,
+            Dir::H => w >= 2 * theme::min_split_w() + gap,
+            Dir::V => h >= 2 * theme::tb_h() + gap,
         }
     }
 

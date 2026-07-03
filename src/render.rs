@@ -44,8 +44,8 @@ pub struct Renderer {
     /// backgrounds copy it each frame.
     wallpaper: Option<Framebuffer>,
     /// The full-screen compositing framebuffer, recycled between frames via
-    /// `take_screen_base`/`retire_frame` — allocating ~8 MB per composited
-    /// frame (60/s during animations) was pure churn.
+    /// `take_screen_base`/`retire_frame`: allocating ~8 MB per composited
+    /// frame (60/s during animations) would be pure churn.
     frame: Option<Framebuffer>,
     /// Bitmap window border; palette-swapped to each leaf's accent at draw
     /// time via `accent_swap`.
