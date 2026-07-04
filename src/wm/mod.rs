@@ -91,6 +91,23 @@ fn mask_term_signals(block: bool) {
     }
 }
 
+/// Run `f` with SIGTERM/SIGINT blocked for the calling thread across the
+/// call (see `mask_term_signals`), so any thread `f` spawns inherits the mask
+/// and those signals always land on the main thread, whose poll they must
+/// interrupt.
+fn masked<T>(f: impl FnOnce() -> T) -> T {
+    mask_term_signals(true);
+    let result = f();
+    mask_term_signals(false);
+    result
+}
+
+/// Spawn `f` as a detached OS thread with SIGTERM/SIGINT blocked across the
+/// spawn (see `mask_term_signals`).
+fn spawn_masked(f: impl FnOnce() + Send + 'static) {
+    masked(|| std::thread::spawn(f));
+}
+
 /// Block until the connection has an event or `deadline` passes: the one
 /// wait primitive behind the event loop's frame pacing, `fresh_timestamp`,
 /// and the `--replace` handover, everywhere a poll-and-nap sleep loop would
@@ -323,10 +340,8 @@ pub fn run(replace: bool) -> R<()> {
     // masked across the spawn (the thread inherits the mask) so they always
     // land on the main thread, whose poll they must interrupt.
     install_term_handler();
-    mask_term_signals(true);
     let (note_tx, note_rx) = std::sync::mpsc::channel();
-    let note_dismiss = crate::notify::spawn(note_tx);
-    mask_term_signals(false);
+    let note_dismiss = masked(|| crate::notify::spawn(note_tx));
 
     // Background theme-icon fetches (see `Wm::spawn_theme_icon_fetch`) report
     // back over this channel; `icon_tx` is cloned into each fetch thread.
@@ -408,12 +423,13 @@ fn check_root_visual(screen: &x11rb::protocol::xproto::Screen) -> R<()> {
 /// Ask the server for XKB's detectable-autorepeat mode: with it on, a held
 /// key generates consecutive KeyPress events with no intervening
 /// KeyRelease, instead of the traditional same-timestamp KeyRelease+
-/// KeyPress pair. That makes a physically-held key structurally
-/// distinguishable from two genuine presses (`Wm::on_key` tracks currently-
-/// held keycodes via KeyRelease bookkeeping, which only works once this is
-/// on). Best-effort: a server without XKB just keeps the classic pairing,
-/// which `on_key`'s held-key tracking also handles correctly since the
-/// KeyRelease still arrives before the "repeat".
+/// KeyPress pair. Either way `Wm::key_is_repeating` recognises the repeat:
+/// detectable mode leaves the keycode's `layout_key_state` entry `Held` (no
+/// release arrived), classic mode's same-timestamp release/press pair is
+/// matched via its `ReleasedAt` entry. So this call is a pure optimisation
+/// (one fewer event on the wire per repeat tick), not a correctness
+/// dependency — best-effort, a server without XKB just keeps the classic
+/// pairing.
 fn enable_detectable_autorepeat(conn: &x11rb::rust_connection::RustConnection) -> R<()> {
     use x11rb::protocol::xkb::{self, ConnectionExt as _};
     let version = conn.xkb_use_extension(1, 0)?.reply()?;
@@ -451,7 +467,7 @@ fn grab_substructure_redirect(
             x11rb::errors::ReplyError::X11Error(_) => {
                 WmError::from("another window manager is already running")
             }
-            other => other.into(),
+            other @ x11rb::errors::ReplyError::ConnectionError(_) => other.into(),
         })
 }
 

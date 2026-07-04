@@ -88,6 +88,28 @@ pub fn spawn(to_wm: Sender<NoteMsg>) -> Sender<(u32, CloseReason)> {
     dismiss_tx
 }
 
+/// Tell the WM to show the one popup this daemon ever shows on its own
+/// behalf ("notifications are dead for the session"), `ping()` so the WM's
+/// event loop picks it up promptly, then hand back `err` as this thread's
+/// exit error. Shared by the two ways `serve` gives up: the initial bus
+/// connect failing, and a live connection later losing `BUS_NAME` to another
+/// process.
+fn notify_unavailable(
+    to_wm: &Sender<NoteMsg>,
+    popup_body: String,
+    err: impl Into<Box<dyn std::error::Error>>,
+    ping: impl Fn(),
+) -> R<()> {
+    let _ = to_wm.send(NoteMsg::Show(Note {
+        id: 0,
+        summary: "Notifications unavailable".to_string(),
+        body: popup_body,
+        urgency: 2,
+    }));
+    ping();
+    Err(err.into())
+}
+
 /// Connect to the session bus and claim the notification name. The bus
 /// connection is retried with backoff: at WM startup the session bus may not
 /// be up yet (dbus-launch race), and giving up on the first attempt disables
@@ -164,16 +186,8 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, CloseReason)>) -> R
     let conn = match connect_bus() {
         Ok(c) => c,
         Err(e) => {
-            // Notifications are dead for the session; say so where the user
-            // can see it — as the one popup this daemon will ever show.
-            let _ = to_wm.send(NoteMsg::Show(Note {
-                id: 0,
-                summary: "Notifications unavailable".to_string(),
-                body: format!("splitwm could not become the notification daemon: {e}"),
-                urgency: 2,
-            }));
-            ping();
-            return Err(e);
+            let body = format!("splitwm could not become the notification daemon: {e}");
+            return notify_unavailable(to_wm, body, e, ping);
         }
     };
 
@@ -232,14 +246,12 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, CloseReason)>) -> R
             && msg.member().as_deref() == Some("NameLost")
             && msg.read1::<&str>().ok() == Some(BUS_NAME)
         {
-            let _ = to_wm.send(NoteMsg::Show(Note {
-                id: 0,
-                summary: "Notifications unavailable".to_string(),
-                body: "another process took over splitwm's notification daemon role".to_string(),
-                urgency: 2,
-            }));
-            ping();
-            return Err(format!("lost ownership of {BUS_NAME}").into());
+            return notify_unavailable(
+                to_wm,
+                "another process took over splitwm's notification daemon role".to_string(),
+                format!("lost ownership of {BUS_NAME}"),
+                ping,
+            );
         }
         if msg.msg_type() != MessageType::MethodCall {
             continue;

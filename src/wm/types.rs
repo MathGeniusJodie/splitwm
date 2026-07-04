@@ -71,7 +71,7 @@ impl From<x11rb::errors::ReplyError> for WmError {
     fn from(e: x11rb::errors::ReplyError) -> Self {
         match e {
             x11rb::errors::ReplyError::ConnectionError(c) => Self::Fatal(c),
-            other => Self::Other(other.into()),
+            other @ x11rb::errors::ReplyError::X11Error(_) => Self::Other(other.into()),
         }
     }
 }
@@ -244,6 +244,18 @@ pub struct FloatWin {
     pub label: char,
 }
 
+/// A layout-mutating keycode's (split/close/mute-toggle) autorepeat state:
+/// `Held` since its last genuine `KeyPress`, or `ReleasedAt(time)` since its
+/// last `KeyRelease` at server `time` — see `Wm::key_is_repeating`. Folding
+/// both into one enum (rather than a keycode sitting in one "held" list and
+/// a separate "last release" list) makes "held and recently-released at
+/// once" for the same keycode unrepresentable instead of merely unintended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRepeatState {
+    Held,
+    ReleasedAt(u32),
+}
+
 pub struct Wm {
     pub conn: RustConnection,
     pub root: Window,
@@ -271,21 +283,21 @@ pub struct Wm {
     /// `Wm::fresh_timestamp`) instead of passing a stale one, which the
     /// server would silently ignore if focus moved more recently.
     pub last_event_instant: std::time::Instant,
-    /// Keycodes of layout-mutating keys (split/close/mute-toggle) currently
-    /// held down — each inserted on its `KeyPress` and removed on its
-    /// `KeyRelease`. A `KeyPress` for a keycode already recorded here is
-    /// autorepeat (no release arrived in between) and is swallowed: holding
-    /// Mod4+V must not create ~20 splits a second, and holding mute must not
-    /// re-toggle it 20 times a second. A `KeyPress` for a keycode not in this
-    /// set, or for one whose release already removed it, is a genuine new
-    /// press and goes through. A `Vec` rather than a single slot because two
-    /// of these keys can be physically held at once (e.g. a split key and
-    /// mute), each tracked independently. This only distinguishes repeat
-    /// from fresh presses structurally if XKB detectable autorepeat is on (see
-    /// `enable_detectable_autorepeat`) or the classic same-timestamp
-    /// release/press pairing is in effect — both deliver the release before
-    /// the repeat, so a wall-clock heuristic is never needed.
-    pub held_layout_keys: Vec<u8>,
+    /// `KeyRepeatState` of each layout-mutating key (split/close/mute-toggle)
+    /// touched since startup. A `KeyPress` for a keycode already `Held` is
+    /// autorepeat under XKB detectable autorepeat (consecutive `KeyPress`es
+    /// with no intervening `KeyRelease`) and is swallowed: holding Mod4+V
+    /// must not create ~20 splits a second, and holding mute must not
+    /// re-toggle it 20 times a second. Under classic (non-detectable)
+    /// autorepeat the `KeyRelease` *does* arrive before each repeat
+    /// `KeyPress`, moving the keycode to `ReleasedAt(time)` — see
+    /// `Wm::key_is_repeating` (which is what callers actually use to check
+    /// "is this a repeat", not a raw lookup) for how that pairing is still
+    /// recognised. A `Vec` rather than a `HashMap` because at most a
+    /// couple of these keys are ever tracked at once (e.g. a split key and
+    /// mute, held together), each entry independent so one key's release
+    /// can't be confused for another's.
+    pub layout_key_state: Vec<(u8, KeyRepeatState)>,
     /// Wall-clock moment the last volume-adjust command (`VolumeUp`/
     /// `VolumeDown`) was actually spawned. Unlike `held_layout_keys`, volume
     /// repeats are meant to keep landing while the key is held — it's a
@@ -448,7 +460,7 @@ impl Wm {
             focused_float: None,
             last_event_time: 0,
             last_event_instant: std::time::Instant::now(),
-            held_layout_keys: Vec::new(),
+            layout_key_state: Vec::new(),
             last_volume_spawn: None,
             parents: HashMap::new(),
             pending_events: Vec::new(),

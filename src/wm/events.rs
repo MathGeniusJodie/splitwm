@@ -12,7 +12,8 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 
 use super::types::{
-    clamp_dim, rect_contains, Action, BtnKind, Drag, EdgeDrag, FloatDrag, FrameRect, Wm, MOD4, R,
+    clamp_dim, rect_contains, Action, BtnKind, Drag, EdgeDrag, FloatDrag, FrameRect,
+    KeyRepeatState, Wm, MOD4, R,
 };
 use crate::theme;
 use crate::tree::{Boundary, Dir, NodeId, Rect, Win};
@@ -500,7 +501,13 @@ impl Wm {
 
     /// Keyboard layout or modifier mapping changed at runtime: drop every
     /// key grab (they're bound to now-stale keycodes), rebuild the
-    /// keysym→keycode map, and re-grab.
+    /// keysym→keycode map, and re-grab. Also drops any in-progress
+    /// autorepeat bookkeeping: a keycode recorded in `layout_key_state`
+    /// referred to whatever action the old mapping bound it to, and the
+    /// regrab below has a window where a genuine `KeyRelease` could be
+    /// missed (no grab installed to deliver it) — either way, a stale
+    /// `Held` entry would otherwise swallow every future press of that
+    /// keycode until the process restarts, with no self-correction.
     fn on_mapping(&mut self, e: &MappingNotifyEvent) -> R<()> {
         if e.request == Mapping::POINTER {
             return Ok(());
@@ -508,6 +515,7 @@ impl Wm {
         self.conn.ungrab_key(0u8, self.root, ModMask::ANY)?; // 0 = AnyKey
         self.keymap.clear();
         self.bindings.clear();
+        self.layout_key_state.clear();
         self.build_keymap()?;
         self.grab_keys()?;
         Ok(())
@@ -667,6 +675,20 @@ impl Wm {
     /// more than half.
     const VOLUME_SPAWN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(66);
 
+    /// Spawn a volume-adjust command, rate-limited to
+    /// `VOLUME_SPAWN_INTERVAL` (see its doc) so a held Volume key doesn't
+    /// fork a process tree per autorepeat tick.
+    fn spawn_volume_throttled(&mut self, cmd: &str) {
+        let now = std::time::Instant::now();
+        let throttled = self
+            .last_volume_spawn
+            .is_some_and(|t| now.duration_since(t) < Self::VOLUME_SPAWN_INTERVAL);
+        if !throttled {
+            self.last_volume_spawn = Some(now);
+            self.spawn(cmd);
+        }
+    }
+
     fn on_key(&mut self, e: KeyPressEvent) -> R<()> {
         let Some(action) = self.lookup_action(e.state.into(), e.detail) else {
             return Ok(());
@@ -674,15 +696,13 @@ impl Wm {
         // Swallow keyboard autorepeat for the layout-mutating actions:
         // holding Mod4+V must not carve ~20 splits a second, each queueing
         // its own animation. Resize/focus actions deliberately keep
-        // repeating (holding Grow is how you resize by feel). A repeat is
-        // recognized structurally, not by timing: this keycode is already
-        // marked held (no KeyRelease has cleared it since its last press),
-        // which distinguishes a held key from a genuine fast double-tap.
-        if matches!(action, Action::SplitH | Action::SplitV | Action::Close) {
-            if self.held_layout_keys.contains(&e.detail) {
-                return Ok(());
-            }
-            self.held_layout_keys.push(e.detail);
+        // repeating (holding Grow is how you resize by feel). See
+        // `Wm::key_is_repeating` for how a repeat is told apart from a
+        // genuine fast double-tap.
+        if matches!(action, Action::SplitH | Action::SplitV | Action::Close)
+            && self.key_is_repeating(e.detail, e.time)
+        {
+            return Ok(());
         }
         // Deliberate focus movement returns the keyboard to the tree: it
         // must also clear a focused dialog's keyboard-target bookkeeping,
@@ -726,24 +746,16 @@ impl Wm {
             // Volume keys auto-repeat while held, and nothing in the layout
             // changes: skip the commit epilogue rather than recomposite ~20
             // times a second for a held key.
-            Action::VolumeUp | Action::VolumeDown => {
-                // Up/down are "resize by feel": holding the key should keep
-                // adjusting, so repeats aren't swallowed like Split/Close —
-                // just rate-limited, or holding it down would still fork a
-                // process tree per repeat tick.
-                let now = std::time::Instant::now();
-                let throttled = self
-                    .last_volume_spawn
-                    .is_some_and(|t| now.duration_since(t) < Self::VOLUME_SPAWN_INTERVAL);
-                if !throttled {
-                    self.last_volume_spawn = Some(now);
-                    let cmd = if matches!(action, Action::VolumeUp) {
-                        "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+"
-                    } else {
-                        "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"
-                    };
-                    self.spawn(cmd);
-                }
+            // Up/down are "resize by feel": holding the key should keep
+            // adjusting, so repeats aren't swallowed like Split/Close — just
+            // rate-limited, or holding it down would still fork a process
+            // tree per repeat tick.
+            Action::VolumeUp => {
+                self.spawn_volume_throttled("wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+");
+                return Ok(());
+            }
+            Action::VolumeDown => {
+                self.spawn_volume_throttled("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
                 return Ok(());
             }
             Action::VolumeMuteToggle => {
@@ -752,8 +764,7 @@ impl Wm {
                 // second while the key is held — so this reuses the
                 // Split/Close swallow-all-repeats behavior instead of a rate
                 // limit.
-                if !self.held_layout_keys.contains(&e.detail) {
-                    self.held_layout_keys.push(e.detail);
+                if !self.key_is_repeating(e.detail, e.time) {
                     self.spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
                 }
                 return Ok(());
@@ -810,12 +821,30 @@ impl Wm {
         self.commit_layout()
     }
 
-    /// Removes the physical key that just came back up from
-    /// `held_layout_keys`, so the next `KeyPress` for that keycode reads as a
-    /// genuine new press rather than autorepeat. Other keys still held (e.g.
-    /// a split key held through an interleaved mute tap) are untouched.
+    /// Moves the physical key that just came back up from `Held` to
+    /// `ReleasedAt(e.time)` in `layout_key_state`, so the next `KeyPress` for
+    /// that keycode reads as a genuine new press rather than autorepeat —
+    /// unless it turns out to be classic (non-detectable) autorepeat, whose
+    /// repeat `KeyPress` follows immediately at this same server time, see
+    /// `Wm::key_is_repeating`. Other keys' entries (e.g. a split key held
+    /// through an interleaved mute tap) are untouched.
     fn on_key_release(&mut self, e: &KeyReleaseEvent) {
-        self.held_layout_keys.retain(|&kc| kc != e.detail);
+        match self.layout_key_state.iter_mut().find(|(kc, _)| *kc == e.detail) {
+            Some((_, state)) => *state = KeyRepeatState::ReleasedAt(e.time),
+            None => self
+                .layout_key_state
+                .push((e.detail, KeyRepeatState::ReleasedAt(e.time))),
+        }
+    }
+
+    /// Whether a `KeyPress` for `detail` at server time `time` is a
+    /// continuation of an already-held layout-mutating key, per
+    /// `key_is_repeating` — see there for the two autorepeat mechanisms this
+    /// tells apart from a genuine fresh press. Either way, `detail` is left
+    /// `Held` afterward: callers don't separately record the fresh-press
+    /// case themselves.
+    fn key_is_repeating(&mut self, detail: u8, time: u32) -> bool {
+        key_is_repeating(&mut self.layout_key_state, detail, time)
     }
 
     /// Split the focused leaf in `dir` if it's eligible; otherwise cancel
@@ -1303,6 +1332,36 @@ pub(super) fn contain(r: R<()>, what: &str) -> R<()> {
     }
 }
 
+/// Whether a `KeyPress` for `detail` at server time `time` is a continuation
+/// of an already-held layout-mutating key (autorepeat), not a fresh press —
+/// and updates `state` to `Held` either way, since a fresh press starts
+/// holding the key just as much as a recognised repeat continues it. Two
+/// distinct mechanisms feed the repeat check, matching the two ways X
+/// delivers autorepeat: XKB detectable autorepeat sends consecutive
+/// `KeyPress`es with no intervening `KeyRelease` at all, so the keycode's
+/// entry is still `Held`; classic autorepeat sends a `KeyRelease`
+/// immediately before each repeat `KeyPress`, both stamped with the same
+/// server timestamp, which `Wm::on_key_release` records as
+/// `ReleasedAt(time)` — a genuine key-up followed by a fresh press never
+/// shares a timestamp, since some wall-clock time elapses even for the
+/// fastest double-tap. Keyed by keycode (not a single shared slot) so a
+/// second layout-mutating key's release in between (e.g. a split key held
+/// through an interleaved mute tap) can't clobber this one's record. Pulled
+/// out of `Wm::key_is_repeating` since the logic is pure `Vec` bookkeeping
+/// with no need for `self`.
+fn key_is_repeating(state: &mut Vec<(u8, KeyRepeatState)>, detail: u8, time: u32) -> bool {
+    let repeating = match state.iter().find(|(kc, _)| *kc == detail) {
+        Some((_, KeyRepeatState::Held)) => true,
+        Some((_, KeyRepeatState::ReleasedAt(t))) => *t == time,
+        None => false,
+    };
+    match state.iter_mut().find(|(kc, _)| *kc == detail) {
+        Some((_, s)) => *s = KeyRepeatState::Held,
+        None => state.push((detail, KeyRepeatState::Held)),
+    }
+    repeating
+}
+
 /// The `Event` variant's name, for tagging a `contain`'d error with which
 /// handler actually failed instead of the uninformative literal "event".
 fn event_kind(ev: &Event) -> &'static str {
@@ -1329,5 +1388,75 @@ fn event_kind(ev: &Event) -> &'static str {
         Event::XinputHierarchy(_) => "XinputHierarchy",
         Event::XinputRawMotion(_) => "XinputRawMotion",
         _ => "event",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_is_repeating;
+    use super::KeyRepeatState::{Held, ReleasedAt};
+
+    /// A genuine first press of a key that's never been seen isn't a repeat,
+    /// and is left `Held` for the next call.
+    #[test]
+    fn fresh_press_is_not_repeating() {
+        let mut state = vec![];
+        assert!(!key_is_repeating(&mut state, 38, 100));
+        assert_eq!(state, vec![(38, Held)]);
+    }
+
+    /// XKB detectable autorepeat: the keycode's entry is still `Held` (no
+    /// `KeyRelease` arrived between repeats) — recognised without an entry's
+    /// timestamp ever coming into it.
+    #[test]
+    fn held_keycode_is_repeating_under_detectable_autorepeat() {
+        let mut state = vec![(38, Held)];
+        assert!(key_is_repeating(&mut state, 38, 100));
+        assert_eq!(state, vec![(38, Held)]);
+    }
+
+    /// Classic (non-detectable) autorepeat: a `KeyRelease` moves the entry to
+    /// `ReleasedAt` immediately before each repeat's `KeyPress`, but the pair
+    /// share the same server timestamp — recognised as a repeat, and the
+    /// entry is restored to `Held` so the *next* repeat tick is caught too.
+    #[test]
+    fn same_timestamp_release_then_press_is_repeating() {
+        let mut state = vec![(38, ReleasedAt(100))];
+        assert!(key_is_repeating(&mut state, 38, 100));
+        assert_eq!(state, vec![(38, Held)]);
+    }
+
+    /// A genuine fast double-tap: the release and the next press always
+    /// carry distinct server timestamps (some wall-clock time elapses even
+    /// for the fastest tap), so it must not be mistaken for a repeat — but
+    /// the fresh press still leaves the entry `Held`.
+    #[test]
+    fn distinct_timestamp_release_then_press_is_not_repeating() {
+        let mut state = vec![(38, ReleasedAt(100))];
+        assert!(!key_is_repeating(&mut state, 38, 105));
+        assert_eq!(state, vec![(38, Held)]);
+    }
+
+    /// A release/press pair for a *different* keycode at the same timestamp
+    /// (e.g. two keys physically released and pressed in the same tick)
+    /// must not cross-match; each keycode has its own independent entry.
+    #[test]
+    fn same_timestamp_different_keycode_is_not_repeating() {
+        let mut state = vec![(38, ReleasedAt(100))];
+        assert!(!key_is_repeating(&mut state, 39, 100));
+        assert_eq!(state, vec![(38, ReleasedAt(100)), (39, Held)]);
+    }
+
+    /// Two layout-mutating keys held at once (e.g. a split key and mute)
+    /// under classic autorepeat: an interleaved release for the *other* key
+    /// at the same timestamp must not clobber this key's own pending match —
+    /// each keycode's entry is independent.
+    #[test]
+    fn interleaved_release_of_a_different_key_does_not_clobber_this_ones_match() {
+        let mut state = vec![(38, ReleasedAt(100)), (39, ReleasedAt(100))];
+        assert!(key_is_repeating(&mut state, 38, 100));
+        assert_eq!(state, vec![(38, Held), (39, ReleasedAt(100))]);
+        assert!(key_is_repeating(&mut state, 39, 100));
+        assert_eq!(state, vec![(38, Held), (39, Held)]);
     }
 }
