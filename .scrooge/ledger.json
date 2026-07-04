@@ -1,8 +1,15 @@
 {
   "cratchit": {
-    "completion_tokens": 185545,
-    "cost_usd": 0.47646088930000013,
-    "prompt_tokens": 14564304,
-    "shillings_saved": 45.9996261107
+    "cached_tokens": 167808,
+    "completion_tokens": 187072,
+    "cost_usd": 0.49019477170000014,
+    "prompt_tokens": 14823801,
+    "shillings_saved": 46.78728822830001
+  },
+  "scrooge": {
+    "cached_tokens": 0,
+    "completion_tokens": 881,
+    "cost_usd": 0.0086036628,
+    "prompt_tokens": 3755
   }
 }

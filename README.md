@@ -92,12 +92,12 @@ windows on the way out either way.
 
 - `SPLITWM_WALLPAPER=/path/to/image` — scaled wallpaper behind the gaps
   (PNG natively; other formats need ImageMagick installed).
-- `SPLITWM_DOCK_TITLE` (default `cozyui`) — a window with this `WM_NAME` is
-  docked off-screen past the canvas's right end, revealed by scrolling all
-  the way right.
+- `SPLITWM_DOCK_TITLE` — override the `WM_NAME` matched to dock a window
+  off-screen past the canvas's right end, revealed by scrolling all the way
+  right (default in `theme::DOCK_TITLE`).
 - `SPLITWM_DEBUG_SCROLL=1` — log scroll-device discovery and batch timings.
-- `TERMINAL`, `BROWSER`, `FILEMANAGER`, `OBSIDIAN`, `CLAUDE_DESKTOP` —
-  commands behind the taskbar's quick-launch icons.
+- Taskbar quick-launch commands are configured per entry in `theme::QUICK`
+  (each with its own env-var override); see that table for the current set.
 
 ## Build & test
 

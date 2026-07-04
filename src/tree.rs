@@ -32,8 +32,10 @@ pub struct Rect {
 impl Rect {
     /// This rect inset by `m` on every side, clamped so `w`/`h` never go
     /// negative — a gap wider than the area it insets collapses to a
-    /// zero-size rect at the original center, rather than a `Rect` no
-    /// consumer can treat as valid.
+    /// zero-size rect at `(x + m, y + m)`, rather than a `Rect` no consumer
+    /// can treat as valid. Written as `if`/`else` rather than `.max(0)`
+    /// because this is a `const fn` and `Ord::max` isn't usable in a const
+    /// context on stable Rust.
     pub const fn shrunk(self, m: i32) -> Self {
         Self {
             x: self.x + m,
