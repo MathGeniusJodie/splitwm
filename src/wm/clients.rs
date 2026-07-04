@@ -383,7 +383,14 @@ impl Wm {
             .map_or(theme::FALLBACK_ACCENT_INDEX, |l| self.leaf_color_index(l));
         let class = self.client_identity(win);
         let label = class.chars().next().map_or('?', |c| c.to_ascii_uppercase());
-        let icon = self.fetch_icon(win).or_else(|| self.theme_icon(&class));
+        // Same off-thread fallback as `manage`'s tiled path: `theme_icon` can
+        // shell out to ImageMagick and must not block the event loop, so a
+        // missing `_NET_WM_ICON` leaves `icon: None` for now, filled in by
+        // `on_icon_ping` if/when the background fetch succeeds.
+        let icon = self.fetch_icon(win);
+        if icon.is_none() {
+            self.spawn_theme_icon_fetch(win, class.clone());
+        }
 
         self.select_and_grab(win, EventMask::STRUCTURE_NOTIFY, true)?;
         // The chrome frame: our own override-redirect window, painted with
@@ -1121,19 +1128,6 @@ impl Wm {
         Some(Rc::new(icon::quantize(self.renderer.palette(), &icon)))
     }
 
-    /// Resolve `class` against the icon theme (the same lookup the taskbar
-    /// quick-launch icons use), for clients that don't provide
-    /// `_NET_WM_ICON`. Runs on the calling thread; only used by the
-    /// taskbar's quick-launch icons, which are resolved outside the event
-    /// loop's hot path. `manage`'s per-window fallback instead uses
-    /// `spawn_theme_icon_fetch`, since this can shell out to ImageMagick.
-    pub(crate) fn theme_icon(&self, class: &str) -> Option<Rc<Icon>> {
-        let path = crate::launch::find_icon_file(class)
-            .or_else(|| crate::launch::find_icon_file(&class.to_lowercase()))?;
-        let img = icon::load_image(&path)?;
-        Some(Rc::new(icon::quantize(self.renderer.palette(), &img)))
-    }
-
     /// Resolve `class`'s theme icon off the event loop: `find_icon_file` can
     /// stat an NFS-backed icon theme directory and `icon::load_image` shells
     /// out to ImageMagick and waits on it (see `icon::magick_decode_rgba`) —
@@ -1233,15 +1227,19 @@ impl Wm {
         let mut changed = false;
         while let Ok(IconResult { win, icon }) = self.icon_rx.try_recv() {
             let Some(img) = icon else { continue };
-            let Some(client) = self.clients.get_mut(&win) else {
-                continue;
-            };
             let icon = Rc::new(icon::quantize(self.renderer.palette(), &img));
-            client.icon = Some(icon);
-            client.icon_rotated = None;
-            let class = client.class.clone();
-            self.refresh_icon_rotations(&class);
-            changed = true;
+            if let Some(client) = self.clients.get_mut(&win) {
+                client.icon = Some(icon);
+                client.icon_rotated = None;
+                let class = client.class.clone();
+                self.refresh_icon_rotations(&class);
+                changed = true;
+            } else if let Some(frame) = self.floats.iter_mut().find(|f| f.win == win).map(|float| {
+                float.icon = Some(icon);
+                float.frame
+            }) {
+                self.paint_float_frame(frame)?;
+            }
         }
         if changed {
             self.arrange()?;
@@ -1453,10 +1451,7 @@ fn ping_icon_thread() {
     let ping = || -> R<()> {
         let (xc, screen) = x11rb::connect(None)?;
         let root = xc.setup().roots[screen].root;
-        let atom = xc
-            .intern_atom(false, b"SPLITWM_ICON")?
-            .reply()?
-            .atom;
+        let atom = xc.intern_atom(false, b"SPLITWM_ICON")?.reply()?.atom;
         let ev = ClientMessageEvent::new(32, root, atom, [0u32; 5]);
         xc.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT, ev)?;
         xc.flush()?;

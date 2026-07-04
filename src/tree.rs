@@ -38,8 +38,16 @@ impl Rect {
         Self {
             x: self.x + m,
             y: self.y + m,
-            w: if self.w - 2 * m > 0 { self.w - 2 * m } else { 0 },
-            h: if self.h - 2 * m > 0 { self.h - 2 * m } else { 0 },
+            w: if self.w - 2 * m > 0 {
+                self.w - 2 * m
+            } else {
+                0
+            },
+            h: if self.h - 2 * m > 0 {
+                self.h - 2 * m
+            } else {
+                0
+            },
         }
     }
 }

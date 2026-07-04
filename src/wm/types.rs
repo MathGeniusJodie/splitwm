@@ -271,21 +271,23 @@ pub struct Wm {
     /// `Wm::fresh_timestamp`) instead of passing a stale one, which the
     /// server would silently ignore if focus moved more recently.
     pub last_event_instant: std::time::Instant,
-    /// Keycode of a layout-mutating key (split/close/mute-toggle) currently
-    /// held down, if any — cleared on its `KeyRelease` and set on its
-    /// `KeyPress`. A `KeyPress` for the keycode already recorded here is
+    /// Keycodes of layout-mutating keys (split/close/mute-toggle) currently
+    /// held down — each inserted on its `KeyPress` and removed on its
+    /// `KeyRelease`. A `KeyPress` for a keycode already recorded here is
     /// autorepeat (no release arrived in between) and is swallowed: holding
     /// Mod4+V must not create ~20 splits a second, and holding mute must not
-    /// re-toggle it 20 times a second. A `KeyPress` for a different keycode,
-    /// or for this one after its release cleared the record, is a genuine
-    /// new press and goes through. This only distinguishes repeat from
-    /// fresh presses structurally if XKB detectable autorepeat is on (see
+    /// re-toggle it 20 times a second. A `KeyPress` for a keycode not in this
+    /// set, or for one whose release already removed it, is a genuine new
+    /// press and goes through. A `Vec` rather than a single slot because two
+    /// of these keys can be physically held at once (e.g. a split key and
+    /// mute), each tracked independently. This only distinguishes repeat
+    /// from fresh presses structurally if XKB detectable autorepeat is on (see
     /// `enable_detectable_autorepeat`) or the classic same-timestamp
     /// release/press pairing is in effect — both deliver the release before
     /// the repeat, so a wall-clock heuristic is never needed.
-    pub held_layout_key: Option<u8>,
+    pub held_layout_keys: Vec<u8>,
     /// Wall-clock moment the last volume-adjust command (`VolumeUp`/
-    /// `VolumeDown`) was actually spawned. Unlike `held_layout_key`, volume
+    /// `VolumeDown`) was actually spawned. Unlike `held_layout_keys`, volume
     /// repeats are meant to keep landing while the key is held — it's a
     /// "resize by feel" action, not a discrete mutation — so a repeat isn't
     /// swallowed outright, just rate-limited: a `KeyPress` less than
@@ -446,7 +448,7 @@ impl Wm {
             focused_float: None,
             last_event_time: 0,
             last_event_instant: std::time::Instant::now(),
-            held_layout_key: None,
+            held_layout_keys: Vec::new(),
             last_volume_spawn: None,
             parents: HashMap::new(),
             pending_events: Vec::new(),
@@ -525,12 +527,7 @@ impl Wm {
     /// else is left untouched. Reports whether it did, since callers use
     /// this both to clean up and to decide whether `win` held focus.
     pub(crate) fn clear_focused_float_if(&mut self, win: Win) -> bool {
-        if self.focused_float == Some(win) {
-            self.focused_float = None;
-            true
-        } else {
-            false
-        }
+        self.focused_float.take_if(|&mut w| w == win).is_some()
     }
 
     /// Advance the animation-sequence counter and return the new value —
@@ -564,12 +561,7 @@ impl Wm {
     /// whether it did, since callers use this both to clean up and to
     /// decide whether `win` was the fullscreen window at all.
     pub(crate) fn clear_fullscreen_if(&mut self, win: Win) -> bool {
-        if self.fullscreen == Some(win) {
-            self.fullscreen = None;
-            true
-        } else {
-            false
-        }
+        self.fullscreen.take_if(|&mut w| w == win).is_some()
     }
 
     /// Read-only peek at the fullscreen record, for `&self` contexts that

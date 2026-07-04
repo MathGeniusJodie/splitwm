@@ -699,5 +699,4 @@ impl Wm {
         // server attach; only the mapping remains on our side).
         Ok(unsafe { ShmSeg::new(seg, ptr.cast(), len) })
     }
-
 }

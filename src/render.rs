@@ -588,7 +588,8 @@ impl Renderer {
             self.draw_minimized_axis(fb, &swap, ox, oy, v.w, v.h, v.w < v.h);
             return;
         }
-        self.border.draw(fb, self.palette.inner(), &swap, ox, oy, v.w, v.h);
+        self.border
+            .draw(fb, self.palette.inner(), &swap, ox, oy, v.w, v.h);
         self.draw_titlebar(fb, ox, oy, v);
     }
 

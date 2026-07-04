@@ -48,6 +48,19 @@ enum Attach {
 }
 
 impl State {
+    /// `parent`'s attachment to the rest of the tree, or `None` if `parent`
+    /// is reachable from neither the root nor any branch (an orphan
+    /// subtree). `Attach` deliberately has no variant for that case.
+    fn attach_of(&self, parent: NodeId) -> Option<Attach> {
+        if parent == self.tree.root {
+            Some(Attach::Root)
+        } else {
+            self.tree
+                .find_parent(parent)
+                .map(|(grand, pidx)| Attach::Child(grand, pidx))
+        }
+    }
+
     pub fn new() -> Self {
         let tree = Tree::new();
         let root = tree.root;
@@ -464,9 +477,7 @@ impl State {
         // `parent` reachable from neither the root nor any branch) before
         // mutating anything — see the binary path's comment for why.
         if nchildren > 2 {
-            let reachable =
-                parent == self.tree.root || self.tree.find_parent(parent).is_some();
-            if !reachable {
+            if self.attach_of(parent).is_none() {
                 return false;
             }
             if !self.relocate_closed_window(parent, idx, leaf) {
@@ -484,11 +495,7 @@ impl State {
         // (still a leaf by `is_leaf`, so `focused_leaf_valid` would keep
         // returning it while `compute` never lays it out). Refuse instead —
         // `Attach` deliberately has no variant for it.
-        let attach = if parent == self.tree.root {
-            Attach::Root
-        } else if let Some((grand, pidx)) = self.tree.find_parent(parent) {
-            Attach::Child(grand, pidx)
-        } else {
+        let Some(attach) = self.attach_of(parent) else {
             return false;
         };
 
@@ -1273,7 +1280,13 @@ mod tests {
         let orphan = s.tree.make_branch(Dir::H, 0.5, a, b);
         assert_ne!(orphan, s.tree.root);
         if let Some(branch) = s.tree.branch_mut(orphan) {
-            branch.insert(2, Child { node: c, ratio: 0.25 });
+            branch.insert(
+                2,
+                Child {
+                    node: c,
+                    ratio: 0.25,
+                },
+            );
         }
         s.focused_leaf = a;
         assert!(!s.close_focused());

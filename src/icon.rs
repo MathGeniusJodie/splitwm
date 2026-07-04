@@ -60,10 +60,7 @@ const MAX_ICON_DIM: usize = 2048;
 /// files (wallpaper, theme icons), never per frame; a missing ImageMagick
 /// just means that image is skipped, with a hint on stderr. Images wider or
 /// taller than `max_dim` are rejected before their pixels are copied.
-pub(crate) fn magick_decode_rgba(
-    path: &str,
-    max_dim: usize,
-) -> Option<(usize, usize, Vec<Rgba>)> {
+pub(crate) fn magick_decode_rgba(path: &str, max_dim: usize) -> Option<(usize, usize, Vec<Rgba>)> {
     for prog in ["magick", "convert"] {
         match std::process::Command::new(prog)
             .args(["-background", "none"])
@@ -71,7 +68,15 @@ pub(crate) fn magick_decode_rgba(
             // Force RGBA at 8 bits so the PAM header below is the only
             // shape magick can emit (grayscale sources would otherwise
             // come out GRAYSCALE_ALPHA).
-            .args(["-colorspace", "sRGB", "-type", "truecoloralpha", "-depth", "8", "pam:-"])
+            .args([
+                "-colorspace",
+                "sRGB",
+                "-type",
+                "truecoloralpha",
+                "-depth",
+                "8",
+                "pam:-",
+            ])
             .output()
         {
             Ok(out) if out.status.success() => return parse_pam_rgba(&out.stdout, max_dim),
@@ -137,10 +142,7 @@ pub fn load_image(path: &std::path::Path) -> Option<Icon> {
     let argb = rgba
         .iter()
         .map(|p| {
-            (u32::from(p.a) << 24)
-                | (u32::from(p.r) << 16)
-                | (u32::from(p.g) << 8)
-                | u32::from(p.b)
+            (u32::from(p.a) << 24) | (u32::from(p.r) << 16) | (u32::from(p.g) << 8) | u32::from(p.b)
         })
         .collect();
     Some(Icon::new(w as u32, h as u32, argb))

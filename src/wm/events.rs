@@ -679,10 +679,10 @@ impl Wm {
         // marked held (no KeyRelease has cleared it since its last press),
         // which distinguishes a held key from a genuine fast double-tap.
         if matches!(action, Action::SplitH | Action::SplitV | Action::Close) {
-            if self.held_layout_key == Some(e.detail) {
+            if self.held_layout_keys.contains(&e.detail) {
                 return Ok(());
             }
-            self.held_layout_key = Some(e.detail);
+            self.held_layout_keys.push(e.detail);
         }
         // Deliberate focus movement returns the keyboard to the tree: it
         // must also clear a focused dialog's keyboard-target bookkeeping,
@@ -752,8 +752,8 @@ impl Wm {
                 // second while the key is held — so this reuses the
                 // Split/Close swallow-all-repeats behavior instead of a rate
                 // limit.
-                if self.held_layout_key != Some(e.detail) {
-                    self.held_layout_key = Some(e.detail);
+                if !self.held_layout_keys.contains(&e.detail) {
+                    self.held_layout_keys.push(e.detail);
                     self.spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
                 }
                 return Ok(());
@@ -810,13 +810,12 @@ impl Wm {
         self.commit_layout()
     }
 
-    /// Clears `held_layout_key` once the physical key it names comes back
-    /// up, so the next `KeyPress` for that keycode reads as a genuine new
-    /// press rather than autorepeat.
+    /// Removes the physical key that just came back up from
+    /// `held_layout_keys`, so the next `KeyPress` for that keycode reads as a
+    /// genuine new press rather than autorepeat. Other keys still held (e.g.
+    /// a split key held through an interleaved mute tap) are untouched.
     fn on_key_release(&mut self, e: &KeyReleaseEvent) {
-        if self.held_layout_key == Some(e.detail) {
-            self.held_layout_key = None;
-        }
+        self.held_layout_keys.retain(|&kc| kc != e.detail);
     }
 
     /// Split the focused leaf in `dir` if it's eligible; otherwise cancel
@@ -1315,6 +1314,7 @@ fn event_kind(ev: &Event) -> &'static str {
         Event::ConfigureRequest(_) => "ConfigureRequest",
         Event::DestroyNotify(_) => "DestroyNotify",
         Event::EnterNotify(_) => "EnterNotify",
+        Event::Error(_) => "Error",
         Event::Expose(_) => "Expose",
         Event::KeyPress(_) => "KeyPress",
         Event::KeyRelease(_) => "KeyRelease",
@@ -1324,7 +1324,9 @@ fn event_kind(ev: &Event) -> &'static str {
         Event::MappingNotify(_) => "MappingNotify",
         Event::MotionNotify(_) => "MotionNotify",
         Event::PropertyNotify(_) => "PropertyNotify",
+        Event::SelectionClear(_) => "SelectionClear",
         Event::UnmapNotify(_) => "UnmapNotify",
+        Event::XinputHierarchy(_) => "XinputHierarchy",
         Event::XinputRawMotion(_) => "XinputRawMotion",
         _ => "event",
     }
