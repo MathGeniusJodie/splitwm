@@ -177,7 +177,7 @@ impl Wm {
         let bsp = theme::BTN_SPACING;
         let bcy = p.target.y + tb_h / 2 + theme::BTN_Y_OFFSET;
         if p.target.w >= theme::min_split_w() {
-            let right = p.target.x + p.target.w - bw - 4;
+            let right = theme::btn_strip_right(p.target.x, p.target.w, bw);
             for (i, kind) in [BtnKind::Close, BtnKind::Split, BtnKind::Minimize]
                 .into_iter()
                 .enumerate()

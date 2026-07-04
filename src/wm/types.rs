@@ -169,6 +169,9 @@ atoms! {
 
 pub struct Client {
     pub label: char,
+    /// `_NET_WM_NAME`/`WM_NAME`, kept live by `Wm::on_title_change`; drawn in
+    /// the titlebar next to the icon.
+    pub title: Rc<str>,
     pub icon: Option<Rc<Icon>>,
     /// Hue-rotated variant of `icon` for same-app disambiguation, rendered
     /// once when a second window of the same class appears (see
@@ -242,6 +245,8 @@ pub struct FloatWin {
     /// Titlebar app icon/label, resolved once at manage time.
     pub icon: Option<Rc<Icon>>,
     pub label: char,
+    /// `_NET_WM_NAME`/`WM_NAME`, kept live by `Wm::on_title_change`.
+    pub title: Rc<str>,
 }
 
 /// A layout-mutating keycode's (split/close/mute-toggle) autorepeat state:
@@ -298,16 +303,18 @@ pub struct Wm {
     /// mute, held together), each entry independent so one key's release
     /// can't be confused for another's.
     pub layout_key_state: Vec<(u8, KeyRepeatState)>,
-    /// Wall-clock moment the last volume-adjust command (`VolumeUp`/
-    /// `VolumeDown`) was actually spawned. Unlike `held_layout_keys`, volume
-    /// repeats are meant to keep landing while the key is held — it's a
-    /// "resize by feel" action, not a discrete mutation — so a repeat isn't
-    /// swallowed outright, just rate-limited: a `KeyPress` less than
-    /// `VOLUME_SPAWN_INTERVAL` after this is skipped. That structural
-    /// distinction doesn't apply here (there's nothing to "release back to
-    /// fresh"), so this is the one place a wall-clock heuristic is the right
-    /// tool rather than the KeyRelease bookkeeping above.
-    pub last_volume_spawn: Option<std::time::Instant>,
+    /// Wall-clock moment `VolumeUp`/`VolumeDown` (index 0/1) last actually
+    /// spawned a command, tracked separately per direction so a tap of one
+    /// doesn't throttle an unrelated tap of the other. Unlike
+    /// `held_layout_keys`, volume repeats are meant to keep landing while the
+    /// key is held — it's a "resize by feel" action, not a discrete mutation
+    /// — so a repeat isn't swallowed outright, just rate-limited: a
+    /// `KeyPress` less than `VOLUME_SPAWN_INTERVAL` after this is skipped.
+    /// That structural distinction doesn't apply here (there's nothing to
+    /// "release back to fresh"), so this is the one place a wall-clock
+    /// heuristic is the right tool rather than the KeyRelease bookkeeping
+    /// above.
+    pub last_volume_spawn: [Option<std::time::Instant>; 2],
     /// Parent lookup for every node, rebuilt from one arena walk per
     /// `arrange` — per-event callers (`hover_cursor`, `click_split_button`)
     /// read this instead of paying `Tree::find_parent`'s full arena scan.
@@ -461,7 +468,7 @@ impl Wm {
             last_event_time: 0,
             last_event_instant: std::time::Instant::now(),
             layout_key_state: Vec::new(),
-            last_volume_spawn: None,
+            last_volume_spawn: [None, None],
             parents: HashMap::new(),
             pending_events: Vec::new(),
             bar_order: Vec::new(),

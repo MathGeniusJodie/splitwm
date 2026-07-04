@@ -313,6 +313,9 @@ impl Wm {
                     || e.atom == u32::from(x11rb::protocol::xproto::AtomEnum::WM_NAME) =>
             {
                 self.on_dock_identity_change(e.window, e.atom)?;
+                if e.atom != u32::from(x11rb::protocol::xproto::AtomEnum::WM_CLASS) {
+                    self.on_title_change(e.window)?;
+                }
             }
             // Keyboard layout / modifier mapping changed: rebind everything.
             Event::MappingNotify(e) => self.on_mapping(e)?,
@@ -677,14 +680,15 @@ impl Wm {
 
     /// Spawn a volume-adjust command, rate-limited to
     /// `VOLUME_SPAWN_INTERVAL` (see its doc) so a held Volume key doesn't
-    /// fork a process tree per autorepeat tick.
-    fn spawn_volume_throttled(&mut self, cmd: &str) {
+    /// fork a process tree per autorepeat tick. `up` selects which
+    /// direction's own timestamp gates this call, so a tap of one direction
+    /// never throttles a genuine tap of the other.
+    fn spawn_volume_throttled(&mut self, cmd: &str, up: bool) {
         let now = std::time::Instant::now();
-        let throttled = self
-            .last_volume_spawn
-            .is_some_and(|t| now.duration_since(t) < Self::VOLUME_SPAWN_INTERVAL);
+        let last = &mut self.last_volume_spawn[usize::from(up)];
+        let throttled = last.is_some_and(|t| now.duration_since(t) < Self::VOLUME_SPAWN_INTERVAL);
         if !throttled {
-            self.last_volume_spawn = Some(now);
+            *last = Some(now);
             self.spawn(cmd);
         }
     }
@@ -751,11 +755,14 @@ impl Wm {
             // rate-limited, or holding it down would still fork a process
             // tree per repeat tick.
             Action::VolumeUp => {
-                self.spawn_volume_throttled("wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+");
+                self.spawn_volume_throttled(
+                    "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+",
+                    true,
+                );
                 return Ok(());
             }
             Action::VolumeDown => {
-                self.spawn_volume_throttled("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
+                self.spawn_volume_throttled("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-", false);
                 return Ok(());
             }
             Action::VolumeMuteToggle => {

@@ -146,6 +146,7 @@ impl Wm {
         let label = class.chars().next().map_or('?', |c| c.to_ascii_uppercase());
         let icon = self.resolve_icon(win, &class);
         let icon_slot = self.assign_icon_slot(&class);
+        let title = self.client_title(win);
 
         // Place the client into the focused split (displacing any occupant).
         self.state.pin_client(win);
@@ -160,6 +161,7 @@ impl Wm {
             win,
             Client {
                 label,
+                title,
                 icon,
                 icon_rotated: None,
                 class: class.clone(),
@@ -376,6 +378,7 @@ impl Wm {
         let class = self.client_identity(win);
         let label = class.chars().next().map_or('?', |c| c.to_ascii_uppercase());
         let icon = self.resolve_icon(win, &class);
+        let title = self.client_title(win);
 
         self.select_and_grab(win, EventMask::STRUCTURE_NOTIFY, true)?;
         // The chrome frame: our own override-redirect window, painted with
@@ -417,6 +420,7 @@ impl Wm {
             accent,
             icon,
             label,
+            title,
         });
         self.conn.map_window(frame)?;
         self.conn.map_window(win)?;
@@ -504,8 +508,10 @@ impl Wm {
             tab: Some(crate::render::TabInfo {
                 label: f.label,
                 icon: f.icon.clone(),
+                title: f.title.clone(),
             }),
             minimized: false,
+            buttons: false,
         };
         let mut fb = pixel_graphics::Framebuffer::new(
             fw.max(1) as usize,
@@ -825,6 +831,31 @@ impl Wm {
         self.manage_dock(win)
     }
 
+    /// A managed client's or float's `_NET_WM_NAME`/`WM_NAME` changed:
+    /// refresh the cached title the titlebar draws and repaint just enough
+    /// to show it — a full `arrange()` for a tiled client (whose titlebar
+    /// lives in the shared composite) or a targeted `paint_float_frame` for
+    /// a float's own chrome window. No-ops if the text is unchanged, since
+    /// terminals retitle on every prompt.
+    pub(crate) fn on_title_change(&mut self, win: Win) -> R<()> {
+        let title = self.client_title(win);
+        if let Some(client) = self.clients.get_mut(&win) {
+            if client.title == title {
+                return Ok(());
+            }
+            client.title = title;
+            return self.arrange();
+        }
+        if let Some(f) = self.floats.iter_mut().find(|f| f.win == win) {
+            if f.title != title {
+                f.title = title;
+                let frame = f.frame;
+                return self.paint_float_frame(frame);
+            }
+        }
+        Ok(())
+    }
+
     /// Refresh `_NET_CLIENT_LIST` on the root: managed tiled windows in
     /// `bar_order` (mapping order) plus the floats and the dock — they're
     /// managed client windows too, and panels/pagers should see them.
@@ -988,8 +1019,10 @@ impl Wm {
     }
 
     /// The window's title — `_NET_WM_NAME` (UTF-8) with a latin-1 `WM_NAME`
-    /// fallback. Only consulted as the dock identity of last resort for
-    /// windows that never set `WM_CLASS` (see `matches_dock`).
+    /// fallback. Read at manage time for the titlebar (`Client::title` /
+    /// `FloatWin::title`) and kept live by `on_title_change`; also consulted
+    /// as the dock identity of last resort for windows that never set
+    /// `WM_CLASS` (see `matches_dock`).
     fn client_title(&self, win: Win) -> Rc<str> {
         let read = |atom: u32, ty: u32| -> Option<Vec<u8>> {
             let v = self

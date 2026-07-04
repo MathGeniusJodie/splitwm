@@ -98,6 +98,8 @@ pub struct TabInfo {
     /// Icon to draw, already resolved by the caller — the hue-rotated
     /// variant when same-app disambiguation applies (see `Wm::icon_for`).
     pub icon: Option<Rc<Icon>>,
+    /// `_NET_WM_NAME`/`WM_NAME`, drawn next to the icon/label when non-empty.
+    pub title: Rc<str>,
 }
 
 pub struct LeafView {
@@ -111,6 +113,12 @@ pub struct LeafView {
     pub tab: Option<TabInfo>,
     /// Collapsed to a thin restore strip; renders as `winmin.png` only.
     pub minimized: bool,
+    /// Whether split-control buttons are drawn over this titlebar afterward
+    /// (`Wm::compose`'s `widgets` flag; always false for floats, which have
+    /// no control buttons, and false for tiled splits during an animation
+    /// frame, which composes with `widgets: false`) — the title text stops
+    /// short of them only when they'll actually be drawn.
+    pub buttons: bool,
 }
 
 /// `fill_rect_paint` with signed, clipped coordinates.
@@ -682,6 +690,70 @@ impl Renderer {
         } else {
             self.draw_glyph(fb, tab.label, cx, cy, self.fg);
         }
+        self.draw_title(fb, ox, oy, v, tab, cx + isz / 2);
+    }
+
+    /// Draw the window title after the icon/label, clipped so it never runs
+    /// under the split-control buttons (drawn separately, on top, for tiled
+    /// leaves — see `v.buttons`) or past the leaf's own right edge.
+    fn draw_title(
+        &self,
+        fb: &mut Framebuffer,
+        ox: i32,
+        oy: i32,
+        v: &LeafView,
+        tab: &TabInfo,
+        icon_right: i32,
+    ) {
+        if tab.title.is_empty() {
+            return;
+        }
+        let Some(font) = &self.font else {
+            return;
+        };
+        let text_x = icon_right + TITLEBAR_ICON_PAD;
+        if v.buttons && v.w < theme::min_split_w() {
+            // Too narrow for the 3-button strip: a single Minimize button is
+            // centred instead, with no dedicated free strip for text (see
+            // `compute_btn_regions`) — skip the title.
+            return;
+        }
+        let right_limit = if v.buttons {
+            theme::btn_strip_left(ox, v.w, v.bw)
+        } else {
+            ox + v.w - v.bw
+        };
+        if right_limit <= text_x {
+            return;
+        }
+        let y = oy + (v.tb_h - font.cell_h() as i32) / 2;
+        if y < 0 {
+            return;
+        }
+        let clip_x = text_x.max(0) as usize;
+        let clip_w = (right_limit - text_x) as usize;
+        // Embossed look: a copy of the text one pixel up in the split's dark
+        // accent shade, so the real text reads as if stamped into the bar.
+        if y > 0 {
+            font.draw_text_clipped(
+                fb,
+                &tab.title,
+                text_x as isize,
+                (y - 1) as usize,
+                theme::darker_index(v.accent_index),
+                clip_x,
+                clip_w,
+            );
+        }
+        font.draw_text_clipped(
+            fb,
+            &tab.title,
+            text_x as isize,
+            y as usize,
+            self.fg,
+            clip_x,
+            clip_w,
+        );
     }
 
     /// Draw a single character centred at (cx, cy) in palette colour `color`.

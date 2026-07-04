@@ -130,7 +130,7 @@ impl Wm {
         {
             let m = &mut fb;
             for p in placed {
-                let view = self.leaf_view(p.leaf, p.target.w, p.target.h);
+                let view = self.leaf_view(p.leaf, p.target.w, p.target.h, widgets);
                 self.renderer.draw_leaf(m, p.target.x, p.target.y, &view);
                 if p.focused {
                     self.renderer
@@ -254,13 +254,14 @@ impl Wm {
             .map_or(theme::FALLBACK_ACCENT_INDEX, |l| l.color)
     }
 
-    fn leaf_view(&self, leaf: NodeId, w: i32, h: i32) -> LeafView {
+    fn leaf_view(&self, leaf: NodeId, w: i32, h: i32, buttons: bool) -> LeafView {
         let win = self.state.tree.leaf(leaf).and_then(|l| l.client);
         let client = win.and_then(|w| self.clients.get(&w));
         let accent_index = self.leaf_color_index(leaf);
         let tab = client.map(|c| TabInfo {
             label: c.label,
             icon: win.and_then(|w| self.icon_for(w)),
+            title: c.title.clone(),
         });
         LeafView {
             w,
@@ -270,6 +271,7 @@ impl Wm {
             accent_index,
             tab,
             minimized: self.state.tree.leaf(leaf).is_some_and(|l| l.minimized),
+            buttons,
         }
     }
 

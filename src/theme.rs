@@ -200,6 +200,22 @@ pub const fn min_split_w() -> i32 {
     N_SPLIT_BTNS * BTN_SIZE + (N_SPLIT_BTNS - 1) * BTN_SPACING
 }
 
+/// Right edge of the split-control button strip in a titlebar spanning
+/// `[x, x+w)` with border width `bw` — shared by `compute_btn_regions`
+/// (button placement) and `draw_title` (title-text clipping) so the two
+/// can't drift out of sync.
+pub const fn btn_strip_right(x: i32, w: i32, bw: i32) -> i32 {
+    x + w - bw - 4
+}
+
+/// Left edge of the full 3-button strip, i.e. where title text must stop.
+/// Only meaningful when `w >= min_split_w()`; below that threshold the strip
+/// collapses to a single centred button with no dedicated free strip (see
+/// `compute_btn_regions`).
+pub const fn btn_strip_left(x: i32, w: i32, bw: i32) -> i32 {
+    btn_strip_right(x, w, bw) - min_split_w()
+}
+
 /// Titlebar height: the top inset of the bitmap window border.
 pub const fn tb_h() -> i32 {
     BORDER_TOP
