@@ -256,8 +256,11 @@ pub struct Wm {
     /// The float that last took focus, if it still has it — keyboard
     /// actions that target "the focused window" (close) act on this before
     /// falling back to the focused split's client. Cleared whenever focus
-    /// moves back into the tree.
-    pub focused_float: Option<Win>,
+    /// moves back into the tree. Private: can dangle if the float it names
+    /// is removed from `floats` without this being cleared too, so all
+    /// reads/writes go through `Wm::focused_float`/`Wm::set_focused_float`/
+    /// `Wm::clear_focused_float`, which keep the two in sync.
+    focused_float: Option<Win>,
     /// Timestamp of the last user input event, used instead of
     /// `CURRENT_TIME` for `SetInputFocus`/`WM_TAKE_FOCUS` (ICCCM wants real
     /// timestamps so a slow client can't steal focus back across a race).
@@ -339,7 +342,10 @@ pub struct Wm {
     /// the main event loop, replaced or cancelled by the next `arrange`.
     pub anim: Option<LayoutAnim>,
     /// Monotonic counter stamping each `LayoutAnim` (see `LayoutAnim::seq`).
-    pub anim_seq: u64,
+    /// Private: the monotonic property only holds if every advance goes
+    /// through `Wm::bump_anim_seq`, so nothing else in the module can
+    /// reset or decrement it.
+    anim_seq: u64,
     /// MIT-SHM frame-blit segment, created on first blit and recreated when
     /// a frame outgrows it (see `ShmSeg`). MIT-SHM 1.2 is required: there
     /// is no core-protocol fallback, so a server without it can't run
@@ -371,13 +377,19 @@ pub struct Wm {
     /// we issued ourselves (layout hiding a client), so `on_unmap` can match
     /// the resulting `UnmapNotify` by sequence and swallow it; any unmap
     /// with no matching record is the client withdrawing itself (ICCCM) and
-    /// unmanages it.
-    pub ignore_unmaps: HashMap<Win, Vec<u16>>,
+    /// unmanages it. Private: the sequence-matching protocol only works if
+    /// entries are recorded and pruned exactly as `on_unmap` expects, so all
+    /// access goes through `Wm::record_ignored_unmap`/`Wm::take_ignored_unmap`/
+    /// `Wm::forget_ignored_unmaps`.
+    ignore_unmaps: HashMap<Win, Vec<u16>>,
     /// The managed client currently in EWMH fullscreen
     /// (`_NET_WM_STATE_FULLSCREEN`), if any: covers the whole workarea above
     /// every tiled client and float. Its split slot is kept, so leaving
-    /// fullscreen drops it straight back into the layout.
-    pub fullscreen: Option<Win>,
+    /// fullscreen drops it straight back into the layout. Private: can
+    /// dangle if the window it names is unmanaged without this being
+    /// cleared too, so all reads/writes go through `Wm::fullscreen`/
+    /// `Wm::set_fullscreen_win`/`Wm::clear_fullscreen`.
+    fullscreen: Option<Win>,
     /// Whether any client has `icon_stale` set, so the per-batch
     /// `Wm::flush_stale_icons` can skip its clients scan in the (usual)
     /// steady state where no icon refresh was throttled.
@@ -389,6 +401,224 @@ pub struct Wm {
     /// its result back; kept here so `manage` doesn't need its own thread
     /// plumbing at every call site.
     pub icon_tx: std::sync::mpsc::Sender<IconResult>,
+}
+
+/// Values `wm::run` has no constant default for — resolved from the X
+/// connection, config, or spawned helper threads — bundled so `Wm::assemble`
+/// can build the rest of `Wm` (including its module-private fields) as one
+/// literal without every other field of the struct needing to become
+/// nameable from outside `types.rs`.
+pub(super) struct WmInit {
+    pub conn: RustConnection,
+    pub root: Window,
+    pub depth: u8,
+    pub gc: Gcontext,
+    pub renderer: Renderer,
+    pub underlay: Window,
+    pub sel_owner: Window,
+    pub atoms: Atoms,
+    pub workarea: Rect,
+    pub debug_scroll: bool,
+    pub quick: Vec<QuickSlot>,
+    pub cursors: Cursors,
+    pub icon_rx: std::sync::mpsc::Receiver<IconResult>,
+    pub icon_tx: std::sync::mpsc::Sender<IconResult>,
+    pub note_rx: std::sync::mpsc::Receiver<crate::notify::NoteMsg>,
+    pub note_dismiss: std::sync::mpsc::Sender<(u32, crate::notify::CloseReason)>,
+}
+
+impl Wm {
+    /// Build the initial `Wm`: everything not supplied by `init` starts at
+    /// the "nothing managed/in-flight yet" value, since this only runs once
+    /// at startup before the event loop's first iteration.
+    pub(super) fn assemble(init: WmInit) -> Self {
+        Self {
+            conn: init.conn,
+            root: init.root,
+            depth: init.depth,
+            gc: init.gc,
+            keymap: HashMap::new(),
+            bindings: Vec::new(),
+            renderer: init.renderer,
+            state: State::new(),
+            clients: HashMap::new(),
+            floats: Vec::new(),
+            focused_float: None,
+            last_event_time: 0,
+            last_event_instant: std::time::Instant::now(),
+            held_layout_key: None,
+            last_volume_spawn: None,
+            parents: HashMap::new(),
+            pending_events: Vec::new(),
+            bar_order: Vec::new(),
+            dock: DockState {
+                docked: None,
+                title: std::env::var("SPLITWM_DOCK_TITLE")
+                    .unwrap_or_else(|_| crate::theme::DOCK_TITLE.to_string()),
+            },
+            notes: NoteState {
+                foreign: Vec::new(),
+                popups: Vec::new(),
+                rx: init.note_rx,
+                dismiss: init.note_dismiss,
+            },
+            underlay: init.underlay,
+            underlay_pix: 0,
+            underlay_pix_size: (0, 0),
+            sel_owner: init.sel_owner,
+            running: true,
+            atoms: init.atoms,
+            workarea: init.workarea,
+            wallpaper_path: std::env::var("SPLITWM_WALLPAPER").ok(),
+            debug_scroll: init.debug_scroll,
+            animate: false,
+            anim: None,
+            anim_seq: 0,
+            shm: None,
+            prev_frame_rect: HashMap::new(),
+            widgets: Widgets::default(),
+            quick: init.quick,
+            drags: DragState {
+                split: None,
+                float: None,
+                edge: None,
+            },
+            cursors: init.cursors,
+            hscroll: Vec::new(),
+            hscroll_frac: 0.0,
+            hscroll_gate: None,
+            ignore_unmaps: HashMap::new(),
+            fullscreen: None,
+            icons_stale: false,
+            icon_rx: init.icon_rx,
+            icon_tx: init.icon_tx,
+        }
+    }
+
+    /// The float holding keyboard focus, if it still exists — self-healing:
+    /// a `focused_float` naming a float that's since been removed from
+    /// `floats` is stale bookkeeping, not a live target, so it's cleared
+    /// here and treated as `None` rather than trusted by callers.
+    pub(crate) fn focused_float(&mut self) -> Option<Win> {
+        if self
+            .focused_float
+            .is_some_and(|w| !self.floats.iter().any(|f| f.win == w))
+        {
+            self.focused_float = None;
+        }
+        self.focused_float
+    }
+
+    /// Record `win` as the float holding keyboard focus.
+    pub(crate) fn set_focused_float(&mut self, win: Win) {
+        self.focused_float = Some(win);
+    }
+
+    /// Drop the focused-float record unconditionally (focus is moving back
+    /// into the tree, or elsewhere by deliberate action).
+    pub(crate) fn clear_focused_float(&mut self) {
+        self.focused_float = None;
+    }
+
+    /// Drop the focused-float record if it currently names `win` — used
+    /// when `win` itself is going away, so a stale record for anything
+    /// else is left untouched. Reports whether it did, since callers use
+    /// this both to clean up and to decide whether `win` held focus.
+    pub(crate) fn clear_focused_float_if(&mut self, win: Win) -> bool {
+        if self.focused_float == Some(win) {
+            self.focused_float = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Advance the animation-sequence counter and return the new value —
+    /// the only way it moves, so it can only ever increase.
+    pub(crate) fn bump_anim_seq(&mut self) -> u64 {
+        self.anim_seq += 1;
+        self.anim_seq
+    }
+
+    /// The window currently in EWMH fullscreen, if it's still managed —
+    /// self-healing: a `fullscreen` naming a window that's since been
+    /// unmanaged (neither a client nor a float) is stale, so it's cleared
+    /// here and treated as `None` rather than trusted by callers.
+    pub(crate) fn fullscreen(&mut self) -> Option<Win> {
+        if self.fullscreen.is_some_and(|w| {
+            !self.clients.contains_key(&w) && !self.floats.iter().any(|f| f.win == w)
+        }) {
+            self.fullscreen = None;
+        }
+        self.fullscreen
+    }
+
+    /// Set the fullscreen window, returning whatever window it previously
+    /// named (even if stale) so callers can clean up the window it's
+    /// replacing.
+    pub(crate) fn set_fullscreen_win(&mut self, win: Win) -> Option<Win> {
+        self.fullscreen.replace(win)
+    }
+
+    /// Drop the fullscreen record if it currently names `win`; reports
+    /// whether it did, since callers use this both to clean up and to
+    /// decide whether `win` was the fullscreen window at all.
+    pub(crate) fn clear_fullscreen_if(&mut self, win: Win) -> bool {
+        if self.fullscreen == Some(win) {
+            self.fullscreen = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Read-only peek at the fullscreen record, for `&self` contexts that
+    /// immediately re-validate it themselves (so the self-healing of
+    /// `fullscreen` isn't needed) and can't take `&mut self` to run it.
+    pub(crate) fn raw_fullscreen(&self) -> Option<Win> {
+        self.fullscreen
+    }
+
+    /// Record that an `UnmapWindow` request we issued ourselves for `win`
+    /// used sequence number `seq`, so `take_ignored_unmap` can recognise
+    /// the resulting `UnmapNotify` as self-inflicted.
+    pub(crate) fn record_ignored_unmap(&mut self, win: Win, seq: u16) {
+        self.ignore_unmaps.entry(win).or_default().push(seq);
+    }
+
+    /// Consume `win`'s ignored-unmap records against an `UnmapNotify` whose
+    /// sequence is `seq`: prunes every record at or behind `seq` (modular
+    /// u16 comparison — they've either just matched or can never arrive),
+    /// drops the entry entirely once empty, and reports whether `seq`
+    /// itself was one of the pruned records (a self-inflicted unmap to
+    /// swallow, as opposed to the client's own withdraw).
+    pub(crate) fn take_ignored_unmap(&mut self, win: Win, seq: u16) -> bool {
+        let Some(seqs) = self.ignore_unmaps.get_mut(&win) else {
+            return false;
+        };
+        let matched = seqs.contains(&seq);
+        seqs.retain(|&s| s.wrapping_sub(seq) < 0x8000 && s != seq);
+        if seqs.is_empty() {
+            self.ignore_unmaps.remove(&win);
+        }
+        matched
+    }
+
+    /// Drop every ignored-unmap record for `win` — it's being unmanaged, so
+    /// any outstanding self-inflicted-unmap bookkeeping for it is moot.
+    pub(crate) fn forget_ignored_unmaps(&mut self, win: Win) {
+        self.ignore_unmaps.remove(&win);
+    }
+
+    /// Whether `ev`'s sequence is recorded as a self-inflicted unmap of its
+    /// window, without consuming the record — used to exempt these from
+    /// cutting an in-flight animation short (see `cuts_animation`), which
+    /// must not prune entries that `on_unmap` still needs to see.
+    pub(crate) fn is_ignored_unmap(&self, win: Win, seq: u16) -> bool {
+        self.ignore_unmaps
+            .get(&win)
+            .is_some_and(|seqs| seqs.contains(&seq))
+    }
 }
 
 /// The docked-sidebar identity config and the currently docked window.

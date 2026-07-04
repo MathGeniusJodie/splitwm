@@ -95,9 +95,8 @@ impl Wm {
                     (from, *p)
                 })
                 .collect();
-            self.anim_seq += 1;
             self.anim = Some(LayoutAnim {
-                seq: self.anim_seq,
+                seq: self.bump_anim_seq(),
                 start: std::time::Instant::now(),
                 placed: placed_from,
             });
@@ -319,7 +318,7 @@ impl Wm {
     /// updates the ICCCM `WM_STATE` (Normal/Iconic).
     fn place_clients(&mut self, placed: &[Placement]) -> R<()> {
         let mut visible: std::collections::HashSet<Win> = std::collections::HashSet::new();
-        let fullscreen = self.fullscreen.filter(|w| self.clients.contains_key(w));
+        let fullscreen = self.fullscreen().filter(|w| self.clients.contains_key(w));
         for p in placed {
             let minimized = self.state.tree.leaf(p.leaf).is_some_and(|l| l.minimized);
             if let Some(c) = p.active_client {
@@ -379,10 +378,9 @@ impl Wm {
             // Record the unmap request's sequence number so `on_unmap` can
             // recognise the resulting UnmapNotify as self-inflicted.
             let cookie = self.conn.unmap_window(w)?;
-            self.ignore_unmaps
-                .entry(w)
-                .or_default()
-                .push(cookie.sequence_number() as u16);
+            let seq = cookie.sequence_number() as u16;
+            drop(cookie);
+            self.record_ignored_unmap(w, seq);
             if let Some(cl) = self.clients.get_mut(&w) {
                 cl.mapped = false;
             }
@@ -411,7 +409,7 @@ impl Wm {
     /// is re-raised last). Callers raise notifications after this,
     /// completing the stacking policy `arrange` establishes.
     pub(crate) fn raise_fullscreen(&self) -> R<()> {
-        let Some(fs) = self.fullscreen else {
+        let Some(fs) = self.raw_fullscreen() else {
             return Ok(());
         };
         if self.clients.contains_key(&fs) {

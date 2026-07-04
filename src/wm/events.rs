@@ -336,7 +336,7 @@ impl Wm {
                     let on = match d[0] {
                         0 => false,
                         1 => true,
-                        _ => self.fullscreen != Some(e.window),
+                        _ => self.fullscreen() != Some(e.window),
                     };
                     self.set_fullscreen(e.window, on)?;
                 }
@@ -456,7 +456,7 @@ impl Wm {
         if let Some(d) = self.dock.docked.filter(|d| d.win == win) {
             return Some(self.dock_geometry(d));
         }
-        if self.fullscreen == Some(win) {
+        if self.raw_fullscreen() == Some(win) {
             let full = self.wa();
             return Some((full.x, full.y, full.w.max(1), full.h.max(1)));
         }
@@ -539,12 +539,10 @@ impl Wm {
         // (split/resize/insert): re-assert its focus instead of handing it
         // to the focused split's client, so Mod4+Shift+C still closes the
         // dialog the user is looking at. Deliberate focus-moving actions
-        // (`on_key`, activation requests) clear `focused_float` first.
-        if let Some(fw) = self.focused_float {
-            if self.floats.iter().any(|f| f.win == fw) {
-                return self.focus_float(fw);
-            }
-            self.focused_float = None;
+        // (`on_key`, activation requests) clear the focused-float record
+        // first (see `Wm::clear_focused_float`).
+        if let Some(fw) = self.focused_float() {
+            return self.focus_float(fw);
         }
         let f = self.state.focused_client();
         self.focus(f)
@@ -555,7 +553,7 @@ impl Wm {
     /// behind `_NET_ACTIVE_WINDOW` activation and ICCCM deiconify
     /// MapRequests. It takes focus, so a focused dialog yields the keyboard.
     pub(crate) fn bring_into_layout(&mut self, win: u32) -> R<()> {
-        self.focused_float = None;
+        self.clear_focused_float();
         if !self.state.activate_client(win) {
             let leaf = self.state.focused_leaf_valid();
             self.state.assign_to_leaf(win, leaf);
@@ -616,27 +614,15 @@ impl Wm {
             return Ok(());
         }
         let win = e.window;
-        if let Some(seqs) = self.ignore_unmaps.get_mut(&win) {
-            // A self-inflicted UnmapNotify carries the sequence number of
-            // the UnmapWindow request that caused it, so it is matched by
-            // sequence rather than merely counted: an unmap the WM issues
-            // for a window the client has just withdrawn generates no event
-            // (already unmapped), and a bare counter would swallow the
-            // client's own withdraw notification in its place. Records with
-            // sequences at or behind this event (modular u16 comparison)
-            // are pruned — their events either just matched or will never
-            // arrive. Residual race: sequence numbers on the wire are u16,
-            // so a record could alias a withdraw issued exactly 65536
-            // requests later; pruning keeps records too short-lived for
-            // that in practice.
-            let matched = seqs.contains(&e.sequence);
-            seqs.retain(|&s| s.wrapping_sub(e.sequence) < 0x8000 && s != e.sequence);
-            if seqs.is_empty() {
-                self.ignore_unmaps.remove(&win);
-            }
-            if matched {
-                return Ok(());
-            }
+        // A self-inflicted UnmapNotify carries the sequence number of the
+        // UnmapWindow request that caused it, so it is matched by sequence
+        // rather than merely counted: an unmap the WM issues for a window
+        // the client has just withdrawn generates no event (already
+        // unmapped), and a bare counter would swallow the client's own
+        // withdraw notification in its place. See `Wm::take_ignored_unmap`
+        // for the exact matching/pruning semantics.
+        if self.take_ignored_unmap(win, e.sequence) {
+            return Ok(());
         }
         if self.dock.docked.is_some_and(|d| d.win == win) {
             self.dock.docked = None;
@@ -713,7 +699,7 @@ impl Wm {
                 | Action::MoveTabNext
                 | Action::MoveTabPrev
         ) {
-            self.focused_float = None;
+            self.clear_focused_float();
         }
         // Layout-changing actions get an animated transition.
         self.animate = matches!(
@@ -805,8 +791,8 @@ impl Wm {
                 // the user means regardless of where tree focus sits; then a
                 // focused float (dialog), then the focused split's client.
                 if let Some(c) = self
-                    .fullscreen
-                    .or(self.focused_float)
+                    .fullscreen()
+                    .or_else(|| self.focused_float())
                     .or_else(|| self.state.focused_client())
                 {
                     self.close_client(c)?;

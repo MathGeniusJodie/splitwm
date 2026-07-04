@@ -16,8 +16,6 @@ mod notes;
 mod types;
 mod widgets;
 
-use std::collections::HashMap;
-
 use x11rb::connection::Connection;
 use x11rb::protocol::render::{self, ConnectionExt as _, PictType, Pictformat};
 use x11rb::protocol::xinput::{self, ConnectionExt as _, ScrollType, XIEventMask};
@@ -35,7 +33,6 @@ const XI_ALL_DEVICES: u16 = 0;
 const XI_ALL_MASTER_DEVICES: u16 = 1;
 
 use crate::render::Renderer;
-use crate::state::State;
 use crate::theme;
 use crate::tree::Rect;
 
@@ -335,67 +332,24 @@ pub fn run(replace: bool) -> R<()> {
     // back over this channel; `icon_tx` is cloned into each fetch thread.
     let (icon_tx, icon_rx) = std::sync::mpsc::channel();
 
-    let mut wm = Wm {
-        depth: screen.root_depth,
-        gc,
-        keymap: HashMap::new(),
-        bindings: Vec::new(),
-        renderer,
-        state: State::new(),
-        clients: HashMap::new(),
-        floats: Vec::new(),
-        focused_float: None,
-        last_event_time: 0,
-        last_event_instant: std::time::Instant::now(),
-        held_layout_key: None,
-        last_volume_spawn: None,
-        parents: HashMap::new(),
-        pending_events: Vec::new(),
-        bar_order: Vec::new(),
-        dock: DockState {
-            docked: None,
-            title: std::env::var("SPLITWM_DOCK_TITLE")
-                .unwrap_or_else(|_| theme::DOCK_TITLE.to_string()),
-        },
-        notes: NoteState {
-            foreign: Vec::new(),
-            popups: Vec::new(),
-            rx: note_rx,
-            dismiss: note_dismiss,
-        },
-        underlay,
-        underlay_pix: 0,
-        underlay_pix_size: (0, 0),
-        sel_owner,
-        running: true,
-        atoms,
-        workarea,
-        wallpaper_path: std::env::var("SPLITWM_WALLPAPER").ok(),
-        debug_scroll,
-        animate: false,
-        anim: None,
-        anim_seq: 0,
-        shm: None,
-        prev_frame_rect: HashMap::new(),
-        widgets: Widgets::default(),
-        quick,
-        drags: DragState {
-            split: None,
-            float: None,
-            edge: None,
-        },
-        cursors,
-        hscroll: Vec::new(),
-        hscroll_frac: 0.0,
-        hscroll_gate: None,
-        ignore_unmaps: HashMap::new(),
-        fullscreen: None,
-        icons_stale: false,
-        icon_rx,
-        icon_tx,
+    let mut wm = Wm::assemble(WmInit {
         conn,
         root,
-    };
+        depth: screen.root_depth,
+        gc,
+        renderer,
+        underlay,
+        sel_owner,
+        atoms,
+        workarea,
+        debug_scroll,
+        quick,
+        cursors,
+        icon_rx,
+        icon_tx,
+        note_rx,
+        note_dismiss,
+    });
 
     startup_adopt_and_arrange(&mut wm, root)?;
 
@@ -796,21 +750,19 @@ fn startup_adopt_and_arrange(wm: &mut Wm, root: Window) -> R<()> {
 /// client-message) so a window appearing or dying mid-animation is handled
 /// against the final layout promptly.
 ///
-/// A self-inflicted `UnmapNotify` (the layout hiding a client, recorded in
-/// `Wm::ignore_unmaps`) is exempt: layout changes that hide a window issue
-/// the unmap in the very arrange that starts the animation, and its echo
-/// arrives on the next iteration — cutting on it would snap every
+/// A self-inflicted `UnmapNotify` (the layout hiding a client, recorded via
+/// `Wm::record_ignored_unmap`) is exempt: layout changes that hide a window
+/// issue the unmap in the very arrange that starts the animation, and its
+/// echo arrives on the next iteration — cutting on it would snap every
 /// minimize/close-to-taskbar transition after a single frame. Matched by
-/// (window, sequence) exactly like `Wm::on_unmap`, and consulted before
-/// `handle_batch` consumes the record; both delivered copies (root
+/// (window, sequence) exactly like `Wm::on_unmap`'s `Wm::take_ignored_unmap`,
+/// but via `Wm::is_ignored_unmap` so checking here doesn't itself consume
+/// the record before `handle_batch` gets to it; both delivered copies (root
 /// SubstructureNotify and the client's own StructureNotify) carry the same
 /// pair, so both are exempted.
 fn cuts_animation(wm: &Wm, ev: &Event) -> bool {
     match ev {
-        Event::UnmapNotify(e) => !wm
-            .ignore_unmaps
-            .get(&e.window)
-            .is_some_and(|seqs| seqs.contains(&e.sequence)),
+        Event::UnmapNotify(e) => !wm.is_ignored_unmap(e.window, e.sequence),
         Event::KeyPress(_)
         | Event::ButtonPress(_)
         | Event::MapRequest(_)

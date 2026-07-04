@@ -206,7 +206,7 @@ impl Wm {
             // ensure_in_view/land_scroll brings it (and the new window) back
             // into the viewport where place_clients maps it. A new window
             // takes the keyboard, so any focused dialog yields it first.
-            self.focused_float = None;
+            self.clear_focused_float();
             self.commit_layout()?;
             // The arrange has mapped it (or left it hidden); record the
             // ICCCM state.
@@ -556,7 +556,7 @@ impl Wm {
             return Ok(());
         };
         self.give_focus(win, f.focus)?;
-        self.focused_float = Some(win);
+        self.set_focused_float(win);
         self.restack_float(win)?;
         self.conn.change_property32(
             PropMode::REPLACE,
@@ -575,17 +575,14 @@ impl Wm {
             return Ok(());
         };
         let gone = self.floats.remove(idx);
-        if self.fullscreen == Some(win) {
-            self.fullscreen = None;
-        }
+        self.clear_fullscreen_if(win);
         self.conn.destroy_window(gone.frame)?;
         self.update_client_list()?;
         if self.drags.float.is_some_and(|d| d.win == win) {
             self.drags.float = None;
         }
         let parent = gone.parent;
-        if self.focused_float == Some(win) {
-            self.focused_float = None;
+        if self.clear_focused_float_if(win) {
             let back = parent
                 .filter(|p| self.state.tree.find_leaf_for_client(*p).is_some())
                 .or_else(|| self.state.focused_client());
@@ -698,11 +695,9 @@ impl Wm {
         if !known && !in_layout {
             return Ok(());
         }
-        if self.fullscreen == Some(win) {
-            self.fullscreen = None;
-        }
+        self.clear_fullscreen_if(win);
         self.bar_order.retain(|&w| w != win);
-        self.ignore_unmaps.remove(&win);
+        self.forget_ignored_unmaps(win);
         self.state.unpin_client(win);
         self.update_client_list()?;
         // Unpinning may have dropped a column; don't leave the viewport
@@ -824,10 +819,8 @@ impl Wm {
         }
         self.clients.remove(&win);
         self.bar_order.retain(|&w| w != win);
-        self.ignore_unmaps.remove(&win);
-        if self.fullscreen == Some(win) {
-            self.fullscreen = None;
-        }
+        self.forget_ignored_unmaps(win);
+        self.clear_fullscreen_if(win);
         self.state.unpin_client(win);
         self.update_client_list()?;
         // Drop the click-to-focus grab `manage` installed before
@@ -872,7 +865,7 @@ impl Wm {
             return Ok(());
         }
         if on {
-            if let Some(prev) = self.fullscreen.replace(win) {
+            if let Some(prev) = self.set_fullscreen_win(win) {
                 if prev != win {
                     self.set_net_wm_state_fullscreen(prev, false)?;
                     // If the replaced window was a fullscreen float, put its
@@ -882,10 +875,9 @@ impl Wm {
             }
             self.set_net_wm_state_fullscreen(win, true)?;
         } else {
-            if self.fullscreen != Some(win) {
+            if !self.clear_fullscreen_if(win) {
                 return Ok(());
             }
-            self.fullscreen = None;
             self.set_net_wm_state_fullscreen(win, false)?;
             if is_float {
                 self.restore_float_geometry(win)?;
@@ -1338,7 +1330,7 @@ impl Wm {
     pub(crate) fn focus(&mut self, win: Option<Win>) -> R<()> {
         match win {
             Some(w) if self.clients.contains_key(&w) => {
-                self.focused_float = None;
+                self.clear_focused_float();
                 let model = self.clients[&w].focus;
                 self.give_focus(w, model)?;
                 // Raising the focused client puts it above everything;
@@ -1349,7 +1341,7 @@ impl Wm {
                 self.set_net_active_window(w)?;
             }
             _ => {
-                self.focused_float = None;
+                self.clear_focused_float();
                 let time = self.focus_timestamp()?;
                 self.conn
                     .set_input_focus(InputFocus::POINTER_ROOT, self.root, time)?;
