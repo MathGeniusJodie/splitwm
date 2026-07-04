@@ -311,8 +311,8 @@ fn accent_swap(index: Index) -> Swap {
 }
 
 /// The `winmin.png` vertical 3-slice caps / `winmin_h.png` horizontal ones.
-const MIN_CAP_H: usize = 30;
-const MIN_CAP_W: usize = 10;
+const MIN_CAP_H: usize = 18;
+const MIN_CAP_W: usize = 18;
 
 /// Gap between the window border and the titlebar's app icon/label, in px.
 const TITLEBAR_ICON_PAD: i32 = 4;
