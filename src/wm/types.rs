@@ -71,7 +71,7 @@ impl From<x11rb::errors::ReplyError> for WmError {
     fn from(e: x11rb::errors::ReplyError) -> Self {
         match e {
             x11rb::errors::ReplyError::ConnectionError(c) => Self::Fatal(c),
-            other @ x11rb::errors::ReplyError::X11Error(_) => Self::Other(other.into()),
+            other => Self::Other(other.into()),
         }
     }
 }
@@ -499,11 +499,7 @@ impl Wm {
             prev_frame_rect: HashMap::new(),
             widgets: Widgets::default(),
             quick: init.quick,
-            drags: DragState {
-                split: None,
-                float: None,
-                edge: None,
-            },
+            drags: DragState { active: None },
             cursors: init.cursors,
             hscroll: Vec::new(),
             hscroll_frac: 0.0,
@@ -712,11 +708,20 @@ pub struct NoteState {
 
 /// In-progress gap/float/edge drags.
 pub struct DragState {
-    pub split: Option<Drag>,
+    pub active: Option<ActiveDrag>,
+}
+
+/// A gap resize, float move, or edge resize in progress. Button 1 can only
+/// ever be doing one of these at once, so they live behind a single
+/// `Option` rather than three independent ones — every caller already
+/// assumes mutual exclusion, so the type enforces what the logic requires.
+#[derive(Clone, Copy)]
+pub enum ActiveDrag {
+    Split(SplitDrag),
     /// An in-progress float move, started by pressing button 1 on a float's
     /// frame window.
-    pub float: Option<FloatDrag>,
-    pub edge: Option<EdgeDrag>,
+    Float(FloatDrag),
+    Edge(EdgeDrag),
 }
 
 /// Every hit-testable widget rect computed for the current layout: gap drag
@@ -739,7 +744,7 @@ pub struct Widgets {
     pub taskbar_regions: Vec<TaskTile>,
     pub btn_regions: Vec<(FrameRect, NodeId, BtnKind)>,
     /// Hit-regions for the outer canvas-edge resize handles (see
-    /// `Wm::compute_edge_handle_widgets`); the bool is `true` for the left
+    /// `compute_edge_handle_widgets`); the bool is `true` for the left
     /// edge, `false` for the right.
     pub edge_handle_regions: Vec<(FrameRect, bool)>,
 }
@@ -797,7 +802,7 @@ pub struct FloatDrag {
 
 /// An in-progress gap resize started by dragging a handle.
 #[derive(Clone, Copy)]
-pub struct Drag {
+pub struct SplitDrag {
     pub parent: NodeId,
     pub idx: usize,
     /// True when a horizontal gap (between stacked rows) is being dragged
@@ -855,7 +860,7 @@ pub struct QuickSlot {
 
 /// The three split-control buttons on the right of every leaf's tab bar
 /// (count mirrored by `theme::N_SPLIT_BTNS`).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BtnKind {
     Minimize,
     Split,

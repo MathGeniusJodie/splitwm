@@ -1,15 +1,22 @@
-//! Widget computation (hit-regions, tabs, buttons, taskbar) for the underlay.
+//! Widget-region computation (hit-regions, tabs, buttons, taskbar) for the
+//! underlay. Every function below reads layout/client state and writes into
+//! a `Widgets`; none touch `self.conn` or any other X11 state, so they're
+//! kept as free functions rather than `impl Wm` methods — that keeps them
+//! directly unit-testable (see the `tests` module) without a live
+//! connection, which nothing under `impl Wm` can be.
 
-use super::types::{BtnKind, FrameRect, Placement, TaskTile, Wm};
+use std::collections::HashMap;
+
+use super::types::{BtnKind, Client, FrameRect, Placement, QuickSlot, TaskTile, Widgets, Wm};
+use crate::state::State;
 use crate::theme;
-use crate::tree::{Dir, Rect};
+use crate::tree::{Dir, NodeId, Rect, Tree, Win};
 
 impl Wm {
     pub(crate) fn compute_widgets(&mut self, wa: Rect, placed: &[Placement]) {
         self.widgets.clear();
-
-        self.compute_leaf_widgets(placed);
-        self.compute_boundary_widgets(wa);
+        compute_leaf_widgets(&mut self.widgets, &self.state.tree, placed);
+        compute_boundary_widgets(&mut self.widgets, &self.state, wa);
     }
 
     /// Lay out the bottom bar's tiles: one per managed window (in stable
@@ -18,185 +25,195 @@ impl Wm {
     /// compositor needs no tree walks.
     pub(crate) fn compute_taskbar(&mut self) {
         let wa = self.wa();
-        let gap = theme::TASKBAR_GAP;
-        let isz = theme::TASKBAR_ICON;
-        let cbs = theme::TASKBAR_CLOSE;
-        // Centre the tile + close-badge group vertically in the bar; the
-        // badge overlaps the tile's bottom edge slightly.
-        let overlap = 4;
-        let pad = (theme::TASKBAR_H - (isz + cbs - overlap)) / 2;
-        let y = wa.y + wa.h - theme::TASKBAR_H + pad;
-        // Which quick-launch entries are visible right now: each entry's
-        // `ShowWhen` rule is keyed on whether a managed window's class
-        // matches it.
-        let running = |class: &str| {
-            self.clients
-                .values()
-                .any(|c| c.class.eq_ignore_ascii_case(class))
-        };
-        let visible: Vec<usize> = (0..self.quick.len())
-            .filter(|&i| match self.quick[i].show {
-                theme::ShowWhen::Always => true,
-                theme::ShowWhen::UnlessRunning(class) => !running(class),
-            })
-            .collect();
-        // Window tiles fill from the left; the quick-launch icons (in
-        // `theme::QUICK` order) follow the last tile, walled off by the
-        // separator pill. Left/right edge margins match the split gap.
-        // Tiles may claim everything up to where the quick group would be
-        // pushed against the bar's right edge: when the bar can't hold
-        // every window at full pitch, the stride compresses (tiles overlap
-        // like fanned cards, rightmost on top — draw order and the
-        // reversed hit-tests in `on_button` agree on that) instead of
-        // silently dropping tiles: a window without a tile would be
-        // unreachable by mouse entirely.
-        let bar_right = wa.x + wa.w - theme::GAP;
-        let nq = i32::try_from(visible.len()).unwrap_or(0);
-        let quick_w = (nq * (isz + gap) - gap).max(0);
-        let sep_w = 4;
-        let right = if nq > 0 {
-            bar_right - quick_w - gap - sep_w - gap
-        } else {
-            bar_right
-        };
-        let left = wa.x + theme::GAP;
-        let full_stride = isz + gap;
-        let n = i32::try_from(self.bar_order.len()).unwrap_or(i32::MAX);
-        let stride = if n > 1 {
-            let avail = right - left - isz;
-            (avail / (n - 1)).clamp(10, full_stride)
-        } else {
-            full_stride
-        };
-        // One tree walk for every tile's leaf lookup — `find_leaf_for_client`
-        // per tile is O(tiles × tree) on a per-arrange path.
-        let mut client_leaf = std::collections::HashMap::new();
-        for l in self.state.tree.collect_leaves() {
-            if let Some(c) = self.state.tree.leaf(l).and_then(|lf| lf.client) {
-                client_leaf.insert(c, l);
-            }
+        compute_taskbar(
+            &mut self.widgets,
+            &self.state.tree,
+            &self.clients,
+            &self.quick,
+            &self.bar_order,
+            wa,
+        );
+    }
+}
+
+/// Each split's persistent accent palette index, stored on the leaf so it
+/// survives splits and closes; palette-swaps the bitmap window border and
+/// colours the bottom-bar highlight. Takes `&Tree` rather than `&Wm` so this
+/// (and `Wm::leaf_color_index`, which delegates here) is reachable from the
+/// taskbar computation below without needing a live `Wm`.
+pub(crate) fn leaf_color_index(tree: &Tree, leaf: NodeId) -> crate::Index {
+    tree.leaf(leaf)
+        .map_or(theme::FALLBACK_ACCENT_INDEX, |l| l.color)
+}
+
+fn compute_taskbar(
+    widgets: &mut Widgets,
+    tree: &Tree,
+    clients: &HashMap<Win, Client>,
+    quick: &[QuickSlot],
+    bar_order: &[Win],
+    wa: Rect,
+) {
+    let gap = theme::TASKBAR_GAP;
+    let isz = theme::TASKBAR_ICON;
+    let cbs = theme::TASKBAR_CLOSE;
+    // Centre the tile + close-badge group vertically in the bar; the
+    // badge overlaps the tile's bottom edge slightly.
+    let overlap = 4;
+    let pad = (theme::TASKBAR_H - (isz + cbs - overlap)) / 2;
+    let y = wa.y + wa.h - theme::TASKBAR_H + pad;
+    // Which quick-launch entries are visible right now: each entry's
+    // `ShowWhen` rule is keyed on whether a managed window's class
+    // matches it.
+    let running = |class: &str| {
+        clients
+            .values()
+            .any(|c| c.class.eq_ignore_ascii_case(class))
+    };
+    let visible: Vec<usize> = (0..quick.len())
+        .filter(|&i| match quick[i].show {
+            theme::ShowWhen::Always => true,
+            theme::ShowWhen::UnlessRunning(class) => !running(class),
+        })
+        .collect();
+    // Window tiles fill from the left; the quick-launch icons (in
+    // `theme::QUICK` order) follow the last tile, walled off by the
+    // separator pill. Left/right edge margins match the split gap.
+    // Tiles may claim everything up to where the quick group would be
+    // pushed against the bar's right edge: when the bar can't hold
+    // every window at full pitch, the stride compresses (tiles overlap
+    // like fanned cards, rightmost on top — draw order and the
+    // reversed hit-tests in `on_button` agree on that) instead of
+    // silently dropping tiles: a window without a tile would be
+    // unreachable by mouse entirely.
+    let bar_right = wa.x + wa.w - theme::GAP;
+    let nq = i32::try_from(visible.len()).unwrap_or(0);
+    let quick_w = (nq * (isz + gap) - gap).max(0);
+    let sep_w = 4;
+    let right = if nq > 0 {
+        bar_right - quick_w - gap - sep_w - gap
+    } else {
+        bar_right
+    };
+    let left = wa.x + theme::GAP;
+    let full_stride = isz + gap;
+    let n = i32::try_from(bar_order.len()).unwrap_or(i32::MAX);
+    let stride = if n > 1 {
+        let avail = right - left - isz;
+        (avail / (n - 1)).clamp(10, full_stride)
+    } else {
+        full_stride
+    };
+    // One tree walk for every tile's leaf lookup — `find_leaf_for_client`
+    // per tile is O(tiles × tree) on a per-arrange path.
+    let mut client_leaf = HashMap::new();
+    for l in tree.collect_leaves() {
+        if let Some(c) = tree.leaf(l).and_then(|lf| lf.client) {
+            client_leaf.insert(c, l);
         }
-        let mut x = left;
-        let mut tiles = Vec::with_capacity(self.bar_order.len());
-        for &win in &self.bar_order {
-            // Even at minimum stride a pathological window count can run
-            // past the edge; pin the excess at the right rather than lose it.
-            let tx = x.min(right - isz);
-            let leaf = client_leaf.get(&win).copied();
-            tiles.push(TaskTile {
-                rect: FrameRect {
-                    x: tx,
-                    y,
-                    w: isz,
-                    h: isz,
-                },
-                // Close badge below the tile (overlapping its bottom edge),
-                // right-aligned; hit-tested before the tile so clicking it
-                // closes instead of focusing.
-                close: FrameRect {
-                    x: tx + isz - cbs,
-                    y: y + isz - overlap,
-                    w: cbs,
-                    h: cbs,
-                },
-                win,
-                accent: leaf.map_or(theme::palette_color::CREAM, |l| self.leaf_color_index(l)),
-                in_split: leaf.is_some(),
-            });
-            x += stride;
-        }
-        // Quick icons trail the last tile (or sit at the bar's left edge
-        // when there are no windows, with no pill to separate).
-        let tail = tiles.last().map(|t: &TaskTile| t.rect.x + isz);
-        self.widgets.taskbar_sep = tail.filter(|_| nq > 0).map(|t| FrameRect {
-            x: t + gap,
-            y,
-            w: sep_w,
-            h: isz,
+    }
+    let mut x = left;
+    let mut tiles = Vec::with_capacity(bar_order.len());
+    for &win in bar_order {
+        // Even at minimum stride a pathological window count can run
+        // past the edge; pin the excess at the right rather than lose it.
+        let tx = x.min(right - isz);
+        let leaf = client_leaf.get(&win).copied();
+        tiles.push(TaskTile {
+            rect: FrameRect {
+                x: tx,
+                y,
+                w: isz,
+                h: isz,
+            },
+            // Close badge below the tile (overlapping its bottom edge),
+            // right-aligned; hit-tested before the tile so clicking it
+            // closes instead of focusing.
+            close: FrameRect {
+                x: tx + isz - cbs,
+                y: y + isz - overlap,
+                w: cbs,
+                h: cbs,
+            },
+            win,
+            accent: leaf.map_or(theme::palette_color::CREAM, |l| leaf_color_index(tree, l)),
+            in_split: leaf.is_some(),
         });
-        let mut qx = match tail {
-            Some(t) => t + gap + sep_w + gap,
-            None => left,
-        };
-        self.widgets.quick_regions.clear();
-        for i in visible {
-            self.widgets.quick_regions.push((
+        x += stride;
+    }
+    // Quick icons trail the last tile (or sit at the bar's left edge
+    // when there are no windows, with no pill to separate).
+    let tail = tiles.last().map(|t: &TaskTile| t.rect.x + isz);
+    widgets.taskbar_sep = tail.filter(|_| nq > 0).map(|t| FrameRect {
+        x: t + gap,
+        y,
+        w: sep_w,
+        h: isz,
+    });
+    let mut qx = match tail {
+        Some(t) => t + gap + sep_w + gap,
+        None => left,
+    };
+    widgets.quick_regions.clear();
+    for i in visible {
+        widgets.quick_regions.push((
+            FrameRect {
+                x: qx,
+                y,
+                w: isz,
+                h: isz,
+            },
+            i,
+        ));
+        qx += isz + gap;
+    }
+    widgets.taskbar_regions = tiles;
+}
+
+/// Per-leaf titlebar hit-rects, trailing "+" new-tab buttons, and split-control buttons.
+fn compute_leaf_widgets(widgets: &mut Widgets, tree: &Tree, placed: &[Placement]) {
+    let tb_h = theme::tb_h();
+    let bw = theme::BORDER_LEFT;
+    for p in placed {
+        let leaf = tree.leaf(p.leaf);
+        let has_client = leaf.is_some_and(|l| l.client.is_some());
+        let minimized = leaf.is_some_and(|l| l.minimized);
+        if has_client && !minimized {
+            widgets.tab_regions.push((
                 FrameRect {
-                    x: qx,
-                    y,
-                    w: isz,
-                    h: isz,
+                    x: p.target.x + bw,
+                    y: p.target.y,
+                    w: (p.target.w - 2 * bw).max(0),
+                    h: tb_h,
                 },
-                i,
+                p.leaf,
             ));
-            qx += isz + gap;
         }
-        self.widgets.taskbar_regions = tiles;
+        compute_btn_regions(widgets, p, tb_h, bw, minimized);
     }
+}
 
-    /// Per-leaf titlebar hit-rects, trailing "+" new-tab buttons, and split-control buttons.
-    pub(crate) fn compute_leaf_widgets(&mut self, placed: &[Placement]) {
-        let tb_h = theme::tb_h();
-        let bw = theme::BORDER_LEFT;
-        for p in placed {
-            let leaf = self.state.tree.leaf(p.leaf);
-            let has_client = leaf.is_some_and(|l| l.client.is_some());
-            let minimized = leaf.is_some_and(|l| l.minimized);
-            if has_client && !minimized {
-                self.widgets.tab_regions.push((
-                    FrameRect {
-                        x: p.target.x + bw,
-                        y: p.target.y,
-                        w: (p.target.w - 2 * bw).max(0),
-                        h: tb_h,
-                    },
-                    p.leaf,
-                ));
-            }
-            self.compute_btn_regions(p, tb_h, bw, minimized);
-        }
+/// Split-control buttons on the right of a leaf's titlebar; a minimized
+/// leaf instead gets one full-frame region (the whole bitmap is the
+/// restore button, drawn by `draw_leaf`).
+fn compute_btn_regions(widgets: &mut Widgets, p: &Placement, tb_h: i32, bw: i32, minimized: bool) {
+    if minimized {
+        widgets
+            .btn_regions
+            .push((p.target, p.leaf, BtnKind::Minimize));
+        return;
     }
-
-    /// Split-control buttons on the right of a leaf's titlebar; a minimized
-    /// leaf instead gets one full-frame region (the whole bitmap is the
-    /// restore button, drawn by `draw_leaf`).
-    pub(crate) fn compute_btn_regions(
-        &mut self,
-        p: &Placement,
-        tb_h: i32,
-        bw: i32,
-        minimized: bool,
-    ) {
-        if minimized {
-            self.widgets
-                .btn_regions
-                .push((p.target, p.leaf, BtnKind::Minimize));
-            return;
-        }
-        let bsz = theme::BTN_SIZE;
-        let bsp = theme::BTN_SPACING;
-        let bcy = p.target.y + tb_h / 2 + theme::BTN_Y_OFFSET;
-        if p.target.w >= theme::min_split_w() {
-            let right = theme::btn_strip_right(p.target.x, p.target.w, bw);
-            for (i, kind) in [BtnKind::Close, BtnKind::Split, BtnKind::Minimize]
-                .into_iter()
-                .enumerate()
-            {
-                let bcx = right - bsz / 2 - i32::try_from(i).unwrap_or(0) * (bsz + bsp);
-                self.widgets.btn_regions.push((
-                    FrameRect {
-                        x: bcx - bsz / 2,
-                        y: bcy - bsz / 2,
-                        w: bsz,
-                        h: bsz,
-                    },
-                    p.leaf,
-                    kind,
-                ));
-            }
-        } else {
-            let bcx = p.target.x + p.target.w / 2;
-            self.widgets.btn_regions.push((
+    let bsz = theme::BTN_SIZE;
+    let bsp = theme::BTN_SPACING;
+    let bcy = p.target.y + tb_h / 2 + theme::BTN_Y_OFFSET;
+    if p.target.w >= theme::min_split_w() {
+        let right = theme::btn_strip_right(p.target.x, p.target.w, bw);
+        for (i, kind) in [BtnKind::Close, BtnKind::Split, BtnKind::Minimize]
+            .into_iter()
+            .enumerate()
+        {
+            let bcx = right - bsz / 2 - i32::try_from(i).unwrap_or(0) * (bsz + bsp);
+            widgets.btn_regions.push((
                 FrameRect {
                     x: bcx - bsz / 2,
                     y: bcy - bsz / 2,
@@ -204,113 +221,303 @@ impl Wm {
                     h: bsz,
                 },
                 p.leaf,
-                BtnKind::Minimize,
+                kind,
             ));
         }
+    } else {
+        let bcx = p.target.x + p.target.w / 2;
+        widgets.btn_regions.push((
+            FrameRect {
+                x: bcx - bsz / 2,
+                y: bcy - bsz / 2,
+                w: bsz,
+                h: bsz,
+            },
+            p.leaf,
+            BtnKind::Minimize,
+        ));
     }
+}
 
-    /// Gap resize handles, boundary "+" buttons, and edge insert buttons.
-    pub(crate) fn compute_boundary_widgets(&mut self, wa: Rect) {
-        let gap = theme::GAP;
-        let hw = (gap - Self::HANDLE_INSET).max(4);
-        let scroll_x = self.state.scroll_x();
-        let canvas_w = self.state.canvas_w(wa);
-        for b in self.state.boundaries(wa) {
-            let rect = if b.dir == Dir::H {
-                // Vertical gap between columns: a full-height pill dragged
-                // along x (scrolls with the canvas).
-                let vis_x = b.pos - scroll_x;
-                if vis_x + hw / 2 <= wa.x || vis_x - hw / 2 >= wa.x + wa.w {
-                    continue;
-                }
-                FrameRect {
-                    x: vis_x - hw / 2,
-                    y: b.cross,
-                    w: hw,
-                    h: b.cross_len.max(1),
-                }
-            } else {
-                // Horizontal gap between stacked rows: a full-width strip
-                // dragged along y.
-                let vis_x = b.cross - scroll_x;
-                if vis_x + b.cross_len <= wa.x || vis_x >= wa.x + wa.w {
-                    continue;
-                }
-                FrameRect {
-                    x: vis_x,
-                    y: b.pos - hw / 2,
-                    w: b.cross_len.max(1),
-                    h: hw,
-                }
-            };
-            self.widgets.handle_regions.push((rect, b));
-            if b.root && b.dir == Dir::H {
-                let py = b.cross + (b.cross_len - Self::PLUS_SZ) / 2;
-                self.widgets
-                    .plus_regions
-                    .push((Self::plus_rect(b.pos - scroll_x, py), b.idx + 1));
-            }
-        }
-        self.compute_edge_plus_buttons(wa, scroll_x, canvas_w, gap);
-        self.compute_edge_handle_widgets(wa);
-    }
-
-    /// Drag handles at the outer left/right canvas margins, letting the
-    /// leftmost/rightmost column grow or shrink into its own margin — the
-    /// edge-of-canvas analogue of the internal boundary handles above.
-    /// Only present once there are at least two root-level columns (see
-    /// `State::edge_span`); nothing to grab otherwise.
-    pub(crate) fn compute_edge_handle_widgets(&mut self, wa: Rect) {
-        let gap = theme::GAP;
-        let scroll_x = self.state.scroll_x();
-        let span_h = (wa.h - 2 * gap).max(1);
-        for left in [true, false] {
-            let Some((start_x, w)) = self.state.edge_span(wa, left) else {
-                continue;
-            };
-            // The whole gap-wide margin strip *outside* the column is the
-            // hit region — not a narrow pill centred on the column's edge:
-            // half of such a pill sits under the client window (which
-            // swallows clicks), leaving only a few workable pixels next to
-            // the split.
-            let col_edge = (if left { start_x } else { start_x + w }) - scroll_x;
-            let x = if left { col_edge - gap } else { col_edge };
-            if x + gap <= wa.x || x >= wa.x + wa.w {
+/// Gap resize handles, boundary "+" buttons, and edge insert buttons.
+fn compute_boundary_widgets(widgets: &mut Widgets, state: &State, wa: Rect) {
+    let gap = theme::GAP;
+    let hw = (gap - Wm::HANDLE_INSET).max(4);
+    let scroll_x = state.scroll_x();
+    let canvas_w = state.canvas_w(wa);
+    for b in state.boundaries(wa) {
+        let rect = if b.dir == Dir::H {
+            // Vertical gap between columns: a full-height pill dragged
+            // along x (scrolls with the canvas).
+            let vis_x = b.pos - scroll_x;
+            if vis_x + hw / 2 <= wa.x || vis_x - hw / 2 >= wa.x + wa.w {
                 continue;
             }
-            self.widgets.edge_handle_regions.push((
-                FrameRect {
-                    x,
-                    y: wa.y + gap,
-                    w: gap,
-                    h: span_h,
-                },
-                left,
-            ));
-        }
-    }
-
-    /// Edge "+" buttons at the far left / far right of the canvas.
-    pub(crate) fn compute_edge_plus_buttons(
-        &mut self,
-        wa: Rect,
-        scroll_x: i32,
-        canvas_w: i32,
-        gap: i32,
-    ) {
-        let span_h = (wa.h - 2 * gap).max(Self::PLUS_SZ);
-        let edge_cy = wa.y + gap + (span_h - Self::PLUS_SZ) / 2;
-        for (canvas_x, at) in [
-            (wa.x + gap / 2, 0usize),
-            (wa.x + canvas_w - gap / 2, usize::MAX),
-        ] {
-            let vis_x = canvas_x - scroll_x;
-            if vis_x < wa.x || vis_x > wa.x + wa.w {
+            FrameRect {
+                x: vis_x - hw / 2,
+                y: b.cross,
+                w: hw,
+                h: b.cross_len.max(1),
+            }
+        } else {
+            // Horizontal gap between stacked rows: a full-width strip
+            // dragged along y.
+            let vis_x = b.cross - scroll_x;
+            if vis_x + b.cross_len <= wa.x || vis_x >= wa.x + wa.w {
                 continue;
             }
-            self.widgets
+            FrameRect {
+                x: vis_x,
+                y: b.pos - hw / 2,
+                w: b.cross_len.max(1),
+                h: hw,
+            }
+        };
+        widgets.handle_regions.push((rect, b));
+        if b.root && b.dir == Dir::H {
+            let py = b.cross + (b.cross_len - Wm::PLUS_SZ) / 2;
+            widgets
                 .plus_regions
-                .push((Self::plus_rect(vis_x, edge_cy), at));
+                .push((Wm::plus_rect(b.pos - scroll_x, py), b.idx + 1));
         }
+    }
+    compute_edge_plus_buttons(widgets, wa, scroll_x, canvas_w, gap);
+    compute_edge_handle_widgets(widgets, state, wa);
+}
+
+/// Drag handles at the outer left/right canvas margins, letting the
+/// leftmost/rightmost column grow or shrink into its own margin — the
+/// edge-of-canvas analogue of the internal boundary handles above. Present
+/// even with a single root-level leaf (see `State::edge_span`, whose left
+/// and right span then coincide): resizing "the only column" still moves
+/// its edge against the wallpaper margin.
+fn compute_edge_handle_widgets(widgets: &mut Widgets, state: &State, wa: Rect) {
+    let gap = theme::GAP;
+    let scroll_x = state.scroll_x();
+    let span_h = (wa.h - 2 * gap).max(1);
+    for left in [true, false] {
+        let Some((start_x, w)) = state.edge_span(wa, left) else {
+            continue;
+        };
+        // The whole gap-wide margin strip *outside* the column is the
+        // hit region — not a narrow pill centred on the column's edge:
+        // half of such a pill sits under the client window (which
+        // swallows clicks), leaving only a few workable pixels next to
+        // the split.
+        let col_edge = (if left { start_x } else { start_x + w }) - scroll_x;
+        let x = if left { col_edge - gap } else { col_edge };
+        if x + gap <= wa.x || x >= wa.x + wa.w {
+            continue;
+        }
+        widgets.edge_handle_regions.push((
+            FrameRect {
+                x,
+                y: wa.y + gap,
+                w: gap,
+                h: span_h,
+            },
+            left,
+        ));
+    }
+}
+
+/// Edge "+" buttons at the far left / far right of the canvas.
+fn compute_edge_plus_buttons(
+    widgets: &mut Widgets,
+    wa: Rect,
+    scroll_x: i32,
+    canvas_w: i32,
+    gap: i32,
+) {
+    let span_h = (wa.h - 2 * gap).max(Wm::PLUS_SZ);
+    let edge_cy = wa.y + gap + (span_h - Wm::PLUS_SZ) / 2;
+    for (canvas_x, at) in [
+        (wa.x + gap / 2, 0usize),
+        (wa.x + canvas_w - gap / 2, usize::MAX),
+    ] {
+        let vis_x = canvas_x - scroll_x;
+        if vis_x < wa.x || vis_x > wa.x + wa.w {
+            continue;
+        }
+        widgets
+            .plus_regions
+            .push((Wm::plus_rect(vis_x, edge_cy), at));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tree::Dir;
+
+    const WA: Rect = Rect {
+        x: 0,
+        y: 0,
+        w: 1280,
+        h: 800,
+    };
+
+    fn placement(state: &State, wa: Rect) -> Vec<Placement> {
+        let leaves = state.tree.collect_leaves();
+        let geos = state.compute(wa);
+        let focused = state.focused_leaf_valid();
+        leaves
+            .iter()
+            .filter_map(|&leaf| {
+                let geo = geos.get(&leaf).copied()?;
+                Some(Placement {
+                    leaf,
+                    target: FrameRect {
+                        x: geo.x,
+                        y: geo.y,
+                        w: geo.w.max(1),
+                        h: geo.h.max(1),
+                    },
+                    active_client: state.tree.leaf(leaf).and_then(|l| l.client),
+                    focused: focused == leaf,
+                })
+            })
+            .collect()
+    }
+
+    fn test_client(class: &str) -> Client {
+        Client {
+            label: 'A',
+            title: std::rc::Rc::from(""),
+            icon: None,
+            icon_rotated: None,
+            class: std::rc::Rc::from(class),
+            icon_slot: None,
+            mapped: true,
+            min_size: (0, 0),
+            focus: super::super::types::FocusModel {
+                input: true,
+                take_focus: false,
+            },
+            icon_fetched: std::time::Instant::now(),
+            icon_stale: false,
+        }
+    }
+
+    /// A single leaf still spans the whole row (see `State::edge_span`), so
+    /// its left/right margins are still both draggable — edge handles are
+    /// not gated on having 2+ root-level columns.
+    #[test]
+    fn edge_handles_present_even_with_a_single_root_leaf() {
+        let s = State::new();
+        let mut widgets = Widgets::default();
+        compute_boundary_widgets(&mut widgets, &s, WA);
+        assert_eq!(widgets.edge_handle_regions.len(), 2, "left and right edge");
+        let lefts: Vec<bool> = widgets
+            .edge_handle_regions
+            .iter()
+            .map(|&(_, l)| l)
+            .collect();
+        assert!(lefts.contains(&true) && lefts.contains(&false));
+    }
+
+    /// Regardless of how many root-level columns exist, there are always
+    /// exactly two edge handles (left margin, right margin) — not one per
+    /// column.
+    #[test]
+    fn edge_handles_stay_at_exactly_two_with_more_columns() {
+        let mut s = State::new();
+        s.split_focused(Dir::H);
+        s.insert_at_root(1);
+        let mut widgets = Widgets::default();
+        compute_boundary_widgets(&mut widgets, &s, WA);
+        assert_eq!(widgets.edge_handle_regions.len(), 2);
+    }
+
+    #[test]
+    fn one_boundary_handle_per_gap_between_columns() {
+        let mut s = State::new();
+        s.split_focused(Dir::H); // 2 columns -> 1 gap
+        s.insert_at_root(1); // 3 columns -> 2 gaps
+        let mut widgets = Widgets::default();
+        compute_boundary_widgets(&mut widgets, &s, WA);
+        assert_eq!(widgets.handle_regions.len(), 2);
+    }
+
+    #[test]
+    fn taskbar_stride_never_overlaps_within_available_width() {
+        let tree = crate::tree::Tree::new();
+        let clients: HashMap<Win, Client> = HashMap::new();
+        // A pathological number of windows: the stride must compress
+        // (clamped at a floor of 10px) rather than run tiles off-screen or
+        // silently drop any of them.
+        let bar_order: Vec<Win> = (0..200).collect();
+        let mut widgets = Widgets::default();
+        compute_taskbar(&mut widgets, &tree, &clients, &[], &bar_order, WA);
+        assert_eq!(
+            widgets.taskbar_regions.len(),
+            200,
+            "every window gets a tile"
+        );
+        for t in &widgets.taskbar_regions {
+            assert!(t.rect.x >= WA.x, "tile must not start left of the bar");
+            assert!(
+                t.rect.x + t.rect.w <= WA.x + WA.w,
+                "tile must not run off the right edge"
+            );
+        }
+    }
+
+    #[test]
+    fn quick_launch_hidden_when_its_class_is_running() {
+        let tree = crate::tree::Tree::new();
+        let mut clients = HashMap::new();
+        clients.insert(1 as Win, test_client("Firefox"));
+        let quick = [QuickSlot {
+            cmd: "firefox".into(),
+            icon: None,
+            label: 'F',
+            show: theme::ShowWhen::UnlessRunning("firefox"),
+        }];
+        let mut widgets = Widgets::default();
+        compute_taskbar(&mut widgets, &tree, &clients, &quick, &[], WA);
+        assert!(
+            widgets.quick_regions.is_empty(),
+            "quick-launch entry must hide once its class is already running"
+        );
+    }
+
+    #[test]
+    fn quick_launch_shown_when_its_class_is_not_running() {
+        let tree = crate::tree::Tree::new();
+        let clients: HashMap<Win, Client> = HashMap::new();
+        let quick = [QuickSlot {
+            cmd: "firefox".into(),
+            icon: None,
+            label: 'F',
+            show: theme::ShowWhen::UnlessRunning("firefox"),
+        }];
+        let mut widgets = Widgets::default();
+        compute_taskbar(&mut widgets, &tree, &clients, &quick, &[], WA);
+        assert_eq!(widgets.quick_regions.len(), 1);
+    }
+
+    #[test]
+    fn minimized_leaf_gets_one_full_frame_restore_button() {
+        let mut s = State::new();
+        s.split_focused(Dir::H); // a lone root leaf can't be minimized
+        let minimized_leaf = s.tree.first_leaf(s.tree.root);
+        assert!(s.toggle_minimize(minimized_leaf));
+        let placed = placement(&s, WA);
+        let mut widgets = Widgets::default();
+        compute_leaf_widgets(&mut widgets, &s.tree, &placed);
+        let target = placed
+            .iter()
+            .find(|p| p.leaf == minimized_leaf)
+            .unwrap()
+            .target;
+        let btns: Vec<_> = widgets
+            .btn_regions
+            .iter()
+            .filter(|(_, l, _)| *l == minimized_leaf)
+            .collect();
+        assert_eq!(btns.len(), 1, "one region, not the usual three");
+        assert_eq!(btns[0].2, BtnKind::Minimize);
+        assert_eq!(btns[0].0, target, "whole frame is the restore button");
     }
 }

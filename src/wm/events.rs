@@ -12,8 +12,8 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 
 use super::types::{
-    clamp_dim, rect_contains, Action, BtnKind, Drag, EdgeDrag, FloatDrag, FrameRect,
-    KeyRepeatState, Wm, MOD4, R,
+    clamp_dim, rect_contains, Action, ActiveDrag, BtnKind, EdgeDrag, FloatDrag, FrameRect,
+    KeyRepeatState, SplitDrag, Wm, MOD4, R,
 };
 use crate::theme;
 use crate::tree::{Boundary, Dir, NodeId, Rect, Win};
@@ -302,20 +302,25 @@ impl Wm {
             Event::PropertyNotify(e) if e.atom == self.atoms.net_wm_icon => {
                 self.on_icon_change(e.window)?;
             }
-            // A managed client (re)set its WM_CLASS or title. The dock is
-            // identified by class with a title fallback for classless
-            // windows (see `Wm::matches_dock`), and some toolkits set these
-            // only after mapping — a late-identified dock would otherwise
-            // tile as a normal window forever.
+            // A managed client (re)set its WM_CLASS. The dock is identified
+            // by class with a title fallback for classless windows (see
+            // `Wm::matches_dock`), and some toolkits set this only after
+            // mapping — a late-identified dock would otherwise tile as a
+            // normal window forever.
             Event::PropertyNotify(e)
-                if e.atom == u32::from(x11rb::protocol::xproto::AtomEnum::WM_CLASS)
-                    || e.atom == self.atoms.net_wm_name
+                if e.atom == u32::from(x11rb::protocol::xproto::AtomEnum::WM_CLASS) =>
+            {
+                self.on_dock_identity_change(e.window, e.atom)?;
+            }
+            // A managed client (re)set its title: refresh the cached title
+            // and, for a still-unidentified dock, retry the classless
+            // title-fallback match (see `Wm::matches_dock`).
+            Event::PropertyNotify(e)
+                if e.atom == self.atoms.net_wm_name
                     || e.atom == u32::from(x11rb::protocol::xproto::AtomEnum::WM_NAME) =>
             {
                 self.on_dock_identity_change(e.window, e.atom)?;
-                if e.atom != u32::from(x11rb::protocol::xproto::AtomEnum::WM_CLASS) {
-                    self.on_title_change(e.window)?;
-                }
+                self.on_title_change(e.window)?;
             }
             // Keyboard layout / modifier mapping changed: rebind everything.
             Event::MappingNotify(e) => self.on_mapping(e)?,
@@ -533,8 +538,10 @@ impl Wm {
         // shifted child slot, and further motion would silently resize the
         // wrong boundary. (Float drags don't reference the tree; they keep
         // going.)
-        self.drags.split = None;
-        self.drags.edge = None;
+        match self.drags.active {
+            Some(ActiveDrag::Float(_)) | None => {}
+            Some(ActiveDrag::Split(_) | ActiveDrag::Edge(_)) => self.drags.active = None,
+        }
         // Re-clamp before ensure_in_view: the mutation may have shrunk the
         // scroll range (closed column), and ensure_in_view must judge
         // visibility from an in-range scroll.
@@ -836,7 +843,11 @@ impl Wm {
     /// `Wm::key_is_repeating`. Other keys' entries (e.g. a split key held
     /// through an interleaved mute tap) are untouched.
     fn on_key_release(&mut self, e: &KeyReleaseEvent) {
-        match self.layout_key_state.iter_mut().find(|(kc, _)| *kc == e.detail) {
+        match self
+            .layout_key_state
+            .iter_mut()
+            .find(|(kc, _)| *kc == e.detail)
+        {
             Some((_, state)) => *state = KeyRepeatState::ReleasedAt(e.time),
             None => self
                 .layout_key_state
@@ -959,11 +970,11 @@ impl Wm {
         if e.detail == 1 {
             if let Some(f) = self.floats.iter().find(|f| f.frame == e.event) {
                 let (win, fx, fy) = (f.win, f.x, f.y);
-                self.drags.float = Some(FloatDrag {
+                self.drags.active = Some(ActiveDrag::Float(FloatDrag {
                     win,
                     dx: i32::from(e.root_x) - fx,
                     dy: i32::from(e.root_y) - fy,
-                });
+                }));
                 self.focus_float(win)?;
                 self.raise_notifications()?;
                 return Ok(());
@@ -1028,14 +1039,14 @@ impl Wm {
                     // A gap next to a minimized leaf can't be dragged (its
                     // pixel size is pinned); ignore the press.
                     if b.resizable {
-                        self.drags.split = Some(Drag {
+                        self.drags.active = Some(ActiveDrag::Split(SplitDrag {
                             parent: b.parent,
                             idx: b.idx,
                             vertical: b.dir == Dir::V,
                             start: b.start,
                             combined: b.first + b.second,
                             gap: theme::GAP,
-                        });
+                        }));
                     }
                 }
                 // Outer canvas-edge resize handles: the screen-space x of
@@ -1045,7 +1056,7 @@ impl Wm {
                     if let Some((start_x, w)) = self.state.edge_span(wa, left) {
                         let canvas_anchor = if left { start_x + w } else { start_x };
                         let anchor_x = canvas_anchor - self.state.scroll_x();
-                        self.drags.edge = Some(EdgeDrag { left, anchor_x });
+                        self.drags.active = Some(ActiveDrag::Edge(EdgeDrag { left, anchor_x }));
                     }
                 }
                 Hit::Miss => {}
@@ -1088,59 +1099,60 @@ impl Wm {
     }
 
     fn on_motion(&mut self, e: &MotionNotifyEvent) -> R<()> {
-        if let Some(fd) = self.drags.float {
-            self.move_float(
-                fd.win,
-                i32::from(e.root_x) - fd.dx,
-                i32::from(e.root_y) - fd.dy,
-            )?;
-            self.conn.flush()?;
-            return Ok(());
-        }
-        if let Some(ed) = self.drags.edge {
-            let wa = self.la();
-            let mouse_x = i32::from(e.root_x);
-            // Screen-space width: `anchor_x` is the fixed far edge, so the
-            // gap to the mouse *is* the target width, no scroll conversion
-            // needed — width is scroll-invariant, only position isn't.
-            let target_w = if ed.left {
-                ed.anchor_x - mouse_x
-            } else {
-                mouse_x - ed.anchor_x
-            };
-            let applied = self.state.resize_edge(wa, ed.left, target_w);
-            // Growing the left column shifts every later column's
-            // canvas-space x right by `applied` (`Tree::compute` always
-            // lays out left-to-right from a fixed origin); scroll by the
-            // same amount so they stay put on screen and only the dragged
-            // edge visibly moves.
-            if ed.left && applied != 0 {
-                self.state.shift_scroll(applied);
+        match self.drags.active {
+            Some(ActiveDrag::Float(fd)) => {
+                self.move_float(
+                    fd.win,
+                    i32::from(e.root_x) - fd.dx,
+                    i32::from(e.root_y) - fd.dy,
+                )?;
+                self.conn.flush()?;
             }
-            self.arrange()?;
-            return Ok(());
-        }
-        let Some(d) = self.drags.split else {
-            // Not dragging: hover feedback only.
-            if e.event == self.underlay {
-                let cur = self.hover_cursor(i32::from(e.event_x), i32::from(e.event_y));
-                self.set_underlay_cursor(cur)?;
+            Some(ActiveDrag::Edge(ed)) => {
+                let wa = self.la();
+                let mouse_x = i32::from(e.root_x);
+                // Screen-space width: `anchor_x` is the fixed far edge, so the
+                // gap to the mouse *is* the target width, no scroll conversion
+                // needed — width is scroll-invariant, only position isn't.
+                let target_w = if ed.left {
+                    ed.anchor_x - mouse_x
+                } else {
+                    mouse_x - ed.anchor_x
+                };
+                let applied = self.state.resize_edge(wa, ed.left, target_w);
+                // Growing the left column shifts every later column's
+                // canvas-space x right by `applied` (`Tree::compute` always
+                // lays out left-to-right from a fixed origin); scroll by the
+                // same amount so they stay put on screen and only the dragged
+                // edge visibly moves.
+                if ed.left && applied != 0 {
+                    self.state.shift_scroll(applied);
+                }
+                self.arrange()?;
             }
-            return Ok(());
-        };
-        if d.combined <= 0 {
-            return Ok(());
+            Some(ActiveDrag::Split(d)) => {
+                if d.combined <= 0 {
+                    return Ok(());
+                }
+                // Only x scrolls; a vertical (row-boundary) drag reads y directly.
+                let canvas_pos = if d.vertical {
+                    i32::from(e.root_y)
+                } else {
+                    i32::from(e.root_x) + self.state.scroll_x()
+                };
+                let new_first = canvas_pos - d.start - d.gap / 2;
+                let frac = f64::from(new_first) / f64::from(d.combined);
+                self.state.resize_boundary(d.parent, d.idx, frac);
+                self.arrange()?;
+            }
+            None => {
+                // Not dragging: hover feedback only.
+                if e.event == self.underlay {
+                    let cur = self.hover_cursor(i32::from(e.event_x), i32::from(e.event_y));
+                    self.set_underlay_cursor(cur)?;
+                }
+            }
         }
-        // Only x scrolls; a vertical (row-boundary) drag reads y directly.
-        let canvas_pos = if d.vertical {
-            i32::from(e.root_y)
-        } else {
-            i32::from(e.root_x) + self.state.scroll_x()
-        };
-        let new_first = canvas_pos - d.start - d.gap / 2;
-        let frac = f64::from(new_first) / f64::from(d.combined);
-        self.state.resize_boundary(d.parent, d.idx, frac);
-        self.arrange()?;
         Ok(())
     }
 
@@ -1303,10 +1315,12 @@ impl Wm {
         if e.detail != 1 {
             return Ok(());
         }
-        self.drags.float = None;
-        let dragged = self.drags.split.take().is_some();
-        let edge_dragged = self.drags.edge.take().is_some();
-        if dragged || edge_dragged {
+        let needs_arrange = match self.drags.active {
+            Some(ActiveDrag::Split(_) | ActiveDrag::Edge(_)) => true,
+            Some(ActiveDrag::Float(_)) | None => false,
+        };
+        self.drags.active = None;
+        if needs_arrange {
             self.arrange()?;
         }
         Ok(())
@@ -1357,16 +1371,20 @@ pub(super) fn contain(r: R<()>, what: &str) -> R<()> {
 /// out of `Wm::key_is_repeating` since the logic is pure `Vec` bookkeeping
 /// with no need for `self`.
 fn key_is_repeating(state: &mut Vec<(u8, KeyRepeatState)>, detail: u8, time: u32) -> bool {
-    let repeating = match state.iter().find(|(kc, _)| *kc == detail) {
-        Some((_, KeyRepeatState::Held)) => true,
-        Some((_, KeyRepeatState::ReleasedAt(t))) => *t == time,
-        None => false,
-    };
     match state.iter_mut().find(|(kc, _)| *kc == detail) {
-        Some((_, s)) => *s = KeyRepeatState::Held,
-        None => state.push((detail, KeyRepeatState::Held)),
+        Some((_, s)) => {
+            let repeating = match *s {
+                KeyRepeatState::Held => true,
+                KeyRepeatState::ReleasedAt(t) => t == time,
+            };
+            *s = KeyRepeatState::Held;
+            repeating
+        }
+        None => {
+            state.push((detail, KeyRepeatState::Held));
+            false
+        }
     }
-    repeating
 }
 
 /// The `Event` variant's name, for tagging a `contain`'d error with which

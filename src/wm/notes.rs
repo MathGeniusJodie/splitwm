@@ -14,6 +14,7 @@ use x11rb::protocol::xproto::{
 use super::types::{NotePopup, Wm, R};
 use crate::notify::{Note, NoteMsg};
 use crate::theme;
+use crate::tree::Rect;
 
 /// Cap on live popup windows; aliased directly to `notify::MAX_NOTES` (the
 /// daemon thread's own outstanding-notification cap) so the two can't drift
@@ -169,29 +170,29 @@ impl Wm {
 
     /// Stack a pile of `(window, w, h)` bottom-up from `bottom`,
     /// right-aligned to the screen edge (split-gap margin), each raised to
-    /// the top of the stacking order. Clamped to the top of the workarea: a
-    /// deep enough pile would otherwise place the overflow at negative y —
-    /// visible nowhere and (click-to-dismiss being the only dismissal)
-    /// undismissable; overflowing bubbles overlap at the top edge instead.
-    /// Returns the pile's new top edge.
+    /// the top of the stacking order. Returns the pile's new top edge.
     pub(crate) fn stack_note_pile(
         &self,
         items: impl Iterator<Item = (Window, i32, i32)>,
-        mut bottom: i32,
+        bottom: i32,
     ) -> R<i32> {
-        let wa = self.wa();
-        let gap = theme::GAP;
-        for (win, w, h) in items {
-            bottom = (bottom - gap - h).max(wa.y);
+        let items: Vec<(Window, i32, i32)> = items.collect();
+        let (positions, new_bottom) = pile_positions(
+            items.iter().map(|&(_, w, h)| (w, h)),
+            bottom,
+            self.wa(),
+            theme::GAP,
+        );
+        for (&(win, ..), (x, y)) in items.iter().zip(positions) {
             self.conn.configure_window(
                 win,
                 &ConfigureWindowAux::new()
-                    .x(wa.x + wa.w - gap - w)
-                    .y(bottom)
+                    .x(x)
+                    .y(y)
                     .stack_mode(StackMode::ABOVE),
             )?;
         }
-        Ok(bottom)
+        Ok(new_bottom)
     }
 
     /// Stack the popups bottom-right, oldest nearest the corner, continuing
@@ -221,5 +222,71 @@ impl Wm {
         self.place_note_popups()?;
         self.conn.flush()?;
         Ok(true)
+    }
+}
+
+/// Bottom-up, right-aligned (screen-edge minus `gap`) stacked positions for
+/// a pile of `(w, h)` boxes, continuing upward from `bottom` in order.
+/// Clamped to the top of the workarea: a deep enough pile would otherwise
+/// place the overflow at negative y — visible nowhere and (click-to-dismiss
+/// being the only dismissal) undismissable; overflowing boxes overlap at
+/// the top edge instead. Returns each box's `(x, y)` alongside the pile's
+/// new top edge, kept free of `Wm`/X11 so the stacking math is directly
+/// testable.
+fn pile_positions(
+    sizes: impl Iterator<Item = (i32, i32)>,
+    mut bottom: i32,
+    wa: Rect,
+    gap: i32,
+) -> (Vec<(i32, i32)>, i32) {
+    let mut positions = Vec::new();
+    for (w, h) in sizes {
+        bottom = (bottom - gap - h).max(wa.y);
+        positions.push((wa.x + wa.w - gap - w, bottom));
+    }
+    (positions, bottom)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const WA: Rect = Rect {
+        x: 0,
+        y: 0,
+        w: 1280,
+        h: 800,
+    };
+
+    #[test]
+    fn stacks_bottom_up_right_aligned_with_gaps() {
+        let (positions, new_bottom) =
+            pile_positions([(100, 20), (140, 30)].into_iter(), 800, WA, 8);
+        assert_eq!(
+            positions,
+            vec![
+                (1280 - 8 - 100, 800 - 8 - 20),
+                (1280 - 8 - 140, 800 - 8 - 20 - 8 - 30),
+            ]
+        );
+        assert_eq!(new_bottom, 800 - 8 - 20 - 8 - 30);
+    }
+
+    #[test]
+    fn a_deep_pile_clamps_at_the_workarea_top_instead_of_going_negative() {
+        let sizes = std::iter::repeat_n((100, 50), 100);
+        let (positions, new_bottom) = pile_positions(sizes, 800, WA, 8);
+        assert_eq!(new_bottom, WA.y, "pile stops climbing at the workarea top");
+        assert!(
+            positions.iter().all(|&(_, y)| y >= WA.y),
+            "no box is placed above the workarea, however deep the pile"
+        );
+    }
+
+    #[test]
+    fn empty_pile_is_a_no_op() {
+        let (positions, new_bottom) = pile_positions(std::iter::empty(), 500, WA, 8);
+        assert!(positions.is_empty());
+        assert_eq!(new_bottom, 500);
     }
 }

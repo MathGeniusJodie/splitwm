@@ -13,7 +13,7 @@ use x11rb::protocol::xproto::{
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::CURRENT_TIME;
 
-use super::types::{clamp_dim, Client, FloatWin, FocusModel, IconResult, Wm, R};
+use super::types::{clamp_dim, ActiveDrag, Client, FloatWin, FocusModel, IconResult, Wm, R};
 
 /// Minimum spacing between `_NET_WM_ICON` fetches per window (see
 /// `Wm::on_icon_change`). Long enough to blunt a rewrite loop, short
@@ -576,9 +576,9 @@ impl Wm {
         self.clear_fullscreen_if(win);
         self.conn.destroy_window(gone.frame)?;
         self.update_client_list()?;
-        if self.drags.float.is_some_and(|d| d.win == win) {
-            self.drags.float = None;
-        }
+        self.drags
+            .active
+            .take_if(|d| matches!(d, ActiveDrag::Float(fd) if fd.win == win));
         let parent = gone.parent;
         if self.clear_focused_float_if(win) {
             let back = parent

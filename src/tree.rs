@@ -21,7 +21,7 @@ pub enum Dir {
     V,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
     pub y: i32,
@@ -33,23 +33,22 @@ impl Rect {
     /// This rect inset by `m` on every side, clamped so `w`/`h` never go
     /// negative — a gap wider than the area it insets collapses to a
     /// zero-size rect at `(x + m, y + m)`, rather than a `Rect` no consumer
-    /// can treat as valid. Written as `if`/`else` rather than `.max(0)`
+    /// can treat as valid. Uses a local `if`/`else` rather than `.max(0)`
     /// because this is a `const fn` and `Ord::max` isn't usable in a const
     /// context on stable Rust.
     pub const fn shrunk(self, m: i32) -> Self {
+        const fn non_neg(v: i32) -> i32 {
+            if v > 0 {
+                v
+            } else {
+                0
+            }
+        }
         Self {
             x: self.x + m,
             y: self.y + m,
-            w: if self.w - 2 * m > 0 {
-                self.w - 2 * m
-            } else {
-                0
-            },
-            h: if self.h - 2 * m > 0 {
-                self.h - 2 * m
-            } else {
-                0
-            },
+            w: non_neg(self.w - 2 * m),
+            h: non_neg(self.h - 2 * m),
         }
     }
 }

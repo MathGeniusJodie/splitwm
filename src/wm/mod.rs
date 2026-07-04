@@ -467,7 +467,7 @@ fn grab_substructure_redirect(
             x11rb::errors::ReplyError::X11Error(_) => {
                 WmError::from("another window manager is already running")
             }
-            other @ x11rb::errors::ReplyError::ConnectionError(_) => other.into(),
+            other => other.into(),
         })
 }
 
@@ -847,8 +847,7 @@ fn event_loop(wm: &mut Wm) -> R<()> {
         // in the batch so an idle drag (button held, hand still) keeps
         // blocking on the socket instead of spinning at 60 Hz.
         let drag_motion =
-            (wm.drags.split.is_some() || wm.drags.edge.is_some() || wm.drags.float.is_some())
-                && batch.iter().any(|e| matches!(e, Event::MotionNotify(_)));
+            wm.drags.active.is_some() && batch.iter().any(|e| matches!(e, Event::MotionNotify(_)));
         // Skip while animating: the loop is already frame-paced below.
         if wm.anim.is_none() && (drag_motion || (has_scroll && wm.hscroll_allowed()?)) {
             let deadline = frame_start + FRAME;

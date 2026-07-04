@@ -244,14 +244,10 @@ impl Wm {
         Ok(())
     }
 
-    /// Each split's persistent accent palette index, stored on the leaf so it
-    /// survives splits and closes; palette-swaps the bitmap window border and
-    /// colours the bottom-bar highlight.
+    /// Each split's persistent accent palette index (see
+    /// `widgets::leaf_color_index`, which this delegates to).
     pub(crate) fn leaf_color_index(&self, leaf: NodeId) -> crate::Index {
-        self.state
-            .tree
-            .leaf(leaf)
-            .map_or(theme::FALLBACK_ACCENT_INDEX, |l| l.color)
+        super::widgets::leaf_color_index(&self.state.tree, leaf)
     }
 
     fn leaf_view(&self, leaf: NodeId, w: i32, h: i32, buttons: bool) -> LeafView {
