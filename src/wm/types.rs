@@ -596,8 +596,7 @@ impl Wm {
         let Some(seqs) = self.ignore_unmaps.get_mut(&win) else {
             return false;
         };
-        let matched = seqs.contains(&seq);
-        seqs.retain(|&s| s.wrapping_sub(seq) < 0x8000 && s != seq);
+        let matched = prune_and_match_unmap_seq(seqs, seq);
         if seqs.is_empty() {
             self.ignore_unmaps.remove(&win);
         }
@@ -619,6 +618,17 @@ impl Wm {
             .get(&win)
             .is_some_and(|seqs| seqs.contains(&seq))
     }
+}
+
+/// Prune every recorded sequence at or behind `seq` (modular u16 comparison
+/// — they've either just matched or can never arrive, since sequences only
+/// increase), and report whether `seq` itself was one of the pruned records.
+/// Pulled out of `Wm::take_ignored_unmap` since the matching/pruning is pure
+/// `Vec` bookkeeping with no need for `self`.
+fn prune_and_match_unmap_seq(seqs: &mut Vec<u16>, seq: u16) -> bool {
+    let matched = seqs.contains(&seq);
+    seqs.retain(|&s| s.wrapping_sub(seq) < 0x8000 && s != seq);
+    matched
 }
 
 /// The docked-sidebar identity config and the currently docked window.
@@ -1004,5 +1014,67 @@ impl Drop for ShmSeg {
         unsafe {
             libc::munmap(self.ptr.cast(), self.len);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prune_and_match_unmap_seq;
+
+    /// A sequence that was never recorded matches nothing and leaves every
+    /// outstanding record in place.
+    #[test]
+    fn unmatched_sequence_retains_all_and_reports_no_match() {
+        let mut seqs = vec![10, 20, 30];
+        assert!(!prune_and_match_unmap_seq(&mut seqs, 5));
+        assert_eq!(seqs, vec![10, 20, 30]);
+    }
+
+    /// The exact recorded sequence matches and is itself removed.
+    #[test]
+    fn exact_match_is_consumed() {
+        let mut seqs = vec![42];
+        assert!(prune_and_match_unmap_seq(&mut seqs, 42));
+        assert!(seqs.is_empty());
+    }
+
+    /// Sequences only ever increase, so a record numerically behind `seq`
+    /// (within half the u16 space, per the wraparound comparison) can never
+    /// arrive as its own UnmapNotify and is pruned as stale even though it
+    /// isn't an exact match.
+    #[test]
+    fn stale_record_behind_current_seq_is_pruned_without_matching() {
+        let mut seqs = vec![5];
+        assert!(!prune_and_match_unmap_seq(&mut seqs, 10));
+        assert!(seqs.is_empty());
+    }
+
+    /// A record numerically *ahead* of `seq` (an unmap we issued but whose
+    /// notify hasn't arrived yet) is still outstanding and must survive.
+    #[test]
+    fn record_ahead_of_current_seq_survives() {
+        let mut seqs = vec![20];
+        assert!(!prune_and_match_unmap_seq(&mut seqs, 10));
+        assert_eq!(seqs, vec![20]);
+    }
+
+    /// u16 sequence numbers wrap; a record just behind `seq` across the
+    /// wraparound point must still be recognised as stale, not mistaken for
+    /// one far in the future.
+    #[test]
+    fn wraparound_stale_record_is_pruned() {
+        let mut seqs = vec![u16::MAX - 2];
+        assert!(!prune_and_match_unmap_seq(&mut seqs, 3));
+        assert!(seqs.is_empty());
+    }
+
+    /// With multiple outstanding sequences, only the one matching `seq` is
+    /// reported as matched, and only stale ones (including the match itself)
+    /// are pruned — an unrelated still-outstanding sequence survives.
+    #[test]
+    fn multiple_outstanding_only_one_matches() {
+        let mut seqs = vec![10, 15, 25];
+        assert!(prune_and_match_unmap_seq(&mut seqs, 15));
+        assert_eq!(seqs, vec![25]);
     }
 }
