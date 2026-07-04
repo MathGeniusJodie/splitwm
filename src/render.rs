@@ -17,11 +17,12 @@ use std::rc::Rc;
 
 use pixel_fonts::{BitmapFont, FUSION_PIXEL_12_SPEC};
 use pixel_graphics::{
-    decode_png_bytes, Framebuffer, Paint as PgPaint, Palette as PgPalette, PresentLut,
-    Rect as PgRect, Rgb as PgRgb, Rgba, Sprite, Swap,
+    Framebuffer, Paint as PgPaint, Palette as PgPalette, PresentLut, Rect as PgRect, Rgb as PgRgb,
+    Rgba, Sprite, Swap,
 };
 
 use crate::icon::Icon;
+use crate::oklch::OklabPalette;
 use crate::theme::{self, palette_color};
 use crate::Index;
 
@@ -34,15 +35,17 @@ pub struct Renderer {
     /// `None` when the pixel-fonts atlases can't be read; text drawing
     /// degrades to a no-op instead of refusing to start the WM.
     font: Option<BitmapFont>,
-    /// The na16 palette all art/indices resolve through.
-    palette: PgPalette,
+    /// The na16 palette all art/indices resolve through, paired with its
+    /// precomputed OKLab coordinates for perceptual nearest-colour snapping.
+    palette: OklabPalette,
     /// Index -> BGRX output table used by `present`.
     lut: Box<PresentLut>,
     /// Palette index used for foreground text/glyph strokes.
     fg: Index,
-    /// Screen-sized scaled wallpaper (quantized to the palette); frame
-    /// backgrounds copy it each frame.
-    wallpaper: Option<Framebuffer>,
+    /// Screen-sized scaled wallpaper (quantized to the palette), tagged
+    /// with the (path, w, h) it was loaded for; frame backgrounds copy it
+    /// each frame.
+    wallpaper: Option<Wallpaper>,
     /// The full-screen compositing framebuffer, recycled between frames via
     /// `take_screen_base`/`retire_frame`: allocating ~8 MB per composited
     /// frame (60/s during animations) would be pure churn.
@@ -70,6 +73,14 @@ pub struct Renderer {
     /// so the whole map is cleared once it exceeds `ICON_CACHE_CAP`.
     /// `Rc` payloads so a cache hit is a refcount bump, not a buffer copy.
     icon_idx_cache: IconCache<u8>,
+}
+
+/// A loaded wallpaper together with the (path, w, h) it was produced from,
+/// so `set_wallpaper` can recognise a repeat request (e.g. a same-size root
+/// ConfigureNotify) and skip the decode+dither pass.
+struct Wallpaper {
+    src: (String, i32, i32),
+    fb: Framebuffer,
 }
 
 /// A per-(icon id, size) render cache; `Rc` payloads make a hit a refcount
@@ -308,7 +319,7 @@ const TITLEBAR_ICON_PAD: i32 = 4;
 
 impl Renderer {
     pub fn new() -> Self {
-        let palette = crate::assets::palette();
+        let palette = OklabPalette::new(crate::assets::palette());
         let font = match BitmapFont::load(&FUSION_PIXEL_12_SPEC) {
             Ok(f) => Some(f),
             Err(e) => {
@@ -316,8 +327,8 @@ impl Renderer {
                 None
             }
         };
-        let lut = palette.present_lut();
-        let fg = palette.closest_to_white_index();
+        let lut = palette.inner().present_lut();
+        let fg = palette.inner().closest_to_white_index();
         Self {
             font,
             lut,
@@ -377,27 +388,84 @@ impl Renderer {
     }
 
     /// Load+scale a PNG wallpaper to cover `w`x`h`, quantized onto the na16
-    /// palette. Returns whether it loaded.
+    /// palette. Returns whether it loaded. No-op when the same wallpaper is
+    /// already loaded at this size (e.g. a same-size root ConfigureNotify).
     pub fn set_wallpaper(&mut self, path: &str, w: i32, h: i32) -> bool {
-        self.wallpaper = self.load_wallpaper(path, w, h);
+        let src = (path.to_string(), w, h);
+        if self.wallpaper.as_ref().is_some_and(|wp| wp.src == src) {
+            return true;
+        }
+        self.wallpaper = self
+            .load_wallpaper(path, w, h)
+            .map(|fb| Wallpaper { src, fb });
         self.wallpaper.is_some()
     }
 
     fn load_wallpaper(&self, path: &str, w: i32, h: i32) -> Option<Framebuffer> {
+        let (dw, dh) = (w.max(1) as usize, h.max(1) as usize);
+        // The quantized result is cached on disk: the decode+dither pass
+        // costs noticeable startup time on a full-screen image, and its
+        // output only changes when the source file, target size or palette
+        // does — exactly what the cache header records.
+        let header = self.wallpaper_cache_header(path, dw, dh);
+        let cache = wallpaper_cache_path();
+        if let (Some(header), Some(cache)) = (header.as_deref(), cache.as_deref()) {
+            if let Some(indices) = load_cached_wallpaper(cache, header, dw, dh) {
+                return Some(fb_from_indices(dw, dh, &indices));
+            }
+        }
+        let indices = self.dither_wallpaper(path, dw, dh)?;
+        if let (Some(header), Some(cache)) = (header, cache) {
+            // Best-effort: a failed write just means the next startup
+            // re-dithers.
+            let _ = store_cached_wallpaper(&cache, &header, &indices);
+        }
+        Some(fb_from_indices(dw, dh, &indices))
+    }
+
+    /// The validation header a cached quantization of `path` at `dw`x`dh`
+    /// with the current palette must carry. `None` when the source file
+    /// can't be stat'ed (it won't decode either).
+    fn wallpaper_cache_header(&self, path: &str, dw: usize, dh: usize) -> Option<Vec<u8>> {
+        let meta = std::fs::metadata(path).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        let mut h = b"splitwm-wallpaper-v1\n".to_vec();
+        h.extend((dw as u64).to_le_bytes());
+        h.extend((dh as u64).to_le_bytes());
+        h.extend(meta.len().to_le_bytes());
+        h.extend(mtime.as_secs().to_le_bytes());
+        h.extend(mtime.subsec_nanos().to_le_bytes());
+        h.extend((path.len() as u64).to_le_bytes());
+        h.extend(path.as_bytes());
+        h.push(self.palette.inner().len() as u8);
+        for i in 0..self.palette.inner().len() {
+            let c = self.palette.inner().color(i as Index);
+            h.extend([c.r, c.g, c.b]);
+        }
+        Some(h)
+    }
+
+    /// Decode `path` and scale-to-cover `dw`x`dh`, quantized onto the
+    /// palette — the expensive pass behind the disk cache. Returns the
+    /// row-major palette indices (the form the cache stores).
+    fn dither_wallpaper(&self, path: &str, dw: usize, dh: usize) -> Option<Vec<Index>> {
         let (sw, sh, pixels) = Self::decode_image(path)?;
         // Belt-and-braces: a malformed/truncated wallpaper file must never
         // reach the sampling loop below, which indexes `pixels` unchecked.
         if sw == 0 || sh == 0 || pixels.len() < sw * sh {
             return None;
         }
-        let (dw, dh) = (w.max(1) as usize, h.max(1) as usize);
         // Scale-to-cover with nearest-neighbour sampling, then quantize to
         // the palette with serpentine Floyd-Steinberg error diffusion so the
         // 16-colour result reads as smooth gradients instead of hard bands.
         let scale = (dw as f32 / sw as f32).max(dh as f32 / sh as f32);
         let ox = (sw as f32).mul_add(-scale, dw as f32) / 2.0;
         let oy = (sh as f32).mul_add(-scale, dh as f32) / 2.0;
-        let mut fb = Framebuffer::new(dw, dh, palette_color::BLACK);
+        let mut indices = vec![palette_color::BLACK; dw * dh];
         // Two rows of per-channel accumulated error: current and next.
         let mut err_cur = vec![[0.0f32; 3]; dw];
         let mut err_next = vec![[0.0f32; 3]; dw];
@@ -420,8 +488,8 @@ impl Renderer {
                     g: want[1] as u8,
                     b: want[2] as u8,
                 });
-                fb.set_pixel(x, y, index);
-                let got = self.palette.color(index);
+                indices[y * dw + x] = index;
+                let got = self.palette.inner().color(index);
                 let err = [
                     want[0] - f32::from(got.r),
                     want[1] - f32::from(got.g),
@@ -446,32 +514,17 @@ impl Renderer {
             std::mem::swap(&mut err_cur, &mut err_next);
             err_next.fill([0.0; 3]);
         }
-        Some(fb)
+        Some(indices)
     }
 
-    /// Decode a wallpaper image into RGBA pixels. PNGs decode natively via
-    /// pixel-graphics; anything else (JPEG, WebP, …) is converted to PNG
-    /// bytes by ImageMagick first, then fed through the same size-checked
-    /// native decode. Format is sniffed from the file's magic bytes, not
-    /// its extension.
+    /// Decode a wallpaper image (any format ImageMagick reads) into RGBA
+    /// pixels via `icon::magick_decode_rgba`.
     fn decode_image(path: &str) -> Option<(usize, usize, Vec<Rgba>)> {
-        const PNG_SIG: [u8; 4] = [0x89, b'P', b'N', b'G'];
-        let bytes = std::fs::read(path).ok()?;
-        let bytes = if bytes.starts_with(&PNG_SIG) {
-            bytes
-        } else {
-            crate::icon::magick_to_png(path)?
-        };
-        // Widest wallpaper dimension worth decoding; a hostile header can
-        // otherwise demand a multi-gigabyte allocation (and an O(w*h)
-        // dither pass) before the size is ever looked at. Checked on the
-        // PNG's declared dimensions, before the decoder allocates.
+        // Widest wallpaper dimension worth keeping: caps the pixel buffer
+        // and the O(w*h) dither pass below (decode itself happens in the
+        // magick process, under its own resource limits).
         const MAX_DIM: usize = 16_384;
-        let (dw, dh) = crate::icon::png_declared_dims(&bytes)?;
-        if dw as usize > MAX_DIM || dh as usize > MAX_DIM {
-            return None;
-        }
-        decode_png_bytes(&bytes).ok()
+        crate::icon::magick_decode_rgba(path, MAX_DIM)
     }
 
     /// A screen-sized framebuffer initialised with the wallpaper (or the
@@ -489,7 +542,7 @@ impl Renderer {
         let covered = self
             .wallpaper
             .as_ref()
-            .is_some_and(|wp| wp.width >= w && wp.height >= h);
+            .is_some_and(|wp| wp.fb.width >= w && wp.fb.height >= h);
         if !covered {
             fb.fill_rect_paint(0, 0, w, h, PgPaint::Solid(palette_color::BLACK));
         }
@@ -499,7 +552,7 @@ impl Renderer {
             // this is a full-screen blit on every composited frame —
             // `blit_from`'s per-pixel transparency test would be ~8M
             // pointless branches per 4K frame.
-            fb.copy_from(wp, 0, 0);
+            fb.copy_from(&wp.fb, 0, 0);
         }
         fb
     }
@@ -532,7 +585,7 @@ impl Renderer {
             self.draw_minimized_axis(fb, &swap, ox, oy, v.w, v.h, v.w < v.h);
             return;
         }
-        self.border.draw(fb, &self.palette, &swap, ox, oy, v.w, v.h);
+        self.border.draw(fb, self.palette.inner(), &swap, ox, oy, v.w, v.h);
         self.draw_titlebar(fb, ox, oy, v);
     }
 
@@ -607,7 +660,7 @@ impl Renderer {
             ]
         };
         for (src, x, y, dw, dh) in parts {
-            tile_swapped(fb, s, src, x, y, dw, dh, &self.palette, swap);
+            tile_swapped(fb, s, src, x, y, dw, dh, self.palette.inner(), swap);
         }
     }
 
@@ -719,7 +772,7 @@ impl Renderer {
 
     /// The na16 palette all art/indices resolve through, for callers running
     /// the `icon` colour pipeline.
-    pub fn palette(&self) -> &PgPalette {
+    pub fn palette(&self) -> &OklabPalette {
         &self.palette
     }
 
@@ -807,6 +860,65 @@ impl Renderer {
 /// Palette index is a valid `Index` for every real colour, so a distinct
 /// out-of-band value marks "no pixel here" in the icon index cache.
 const TRANSPARENT_INDEX: Index = Index::MAX;
+
+/// Where the quantized wallpaper cache lives:
+/// `$XDG_CACHE_HOME/splitwm/wallpaper` (default `~/.cache`). `None` when
+/// neither `XDG_CACHE_HOME` nor `HOME` is set.
+fn wallpaper_cache_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|home| std::path::PathBuf::from(home).join(".cache"))
+        })?;
+    Some(base.join("splitwm").join("wallpaper"))
+}
+
+/// Read a cached quantized wallpaper: `header` followed by exactly `dw*dh`
+/// palette indices. Any mismatch (stale source, different size/palette,
+/// truncation) is a miss. Index *values* aren't validated — presenting runs
+/// every index through a full 256-entry LUT, so corrupt bytes can only
+/// render as wrong colours, never break memory safety.
+fn load_cached_wallpaper(
+    cache: &std::path::Path,
+    header: &[u8],
+    dw: usize,
+    dh: usize,
+) -> Option<Vec<Index>> {
+    let mut bytes = std::fs::read(cache).ok()?;
+    if !bytes.starts_with(header) || bytes.len() - header.len() != dw * dh {
+        return None;
+    }
+    // Reuse the read buffer instead of copying the multi-megabyte body.
+    Some(bytes.split_off(header.len()))
+}
+
+fn store_cached_wallpaper(
+    cache: &std::path::Path,
+    header: &[u8],
+    indices: &[Index],
+) -> std::io::Result<()> {
+    if let Some(dir) = cache.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut bytes = Vec::with_capacity(header.len() + indices.len());
+    bytes.extend_from_slice(header);
+    bytes.extend_from_slice(indices);
+    std::fs::write(cache, bytes)
+}
+
+/// A `dw`x`dh` framebuffer holding `indices` (row-major, `dw*dh` entries).
+fn fb_from_indices(dw: usize, dh: usize, indices: &[Index]) -> Framebuffer {
+    let mut fb = Framebuffer::new(dw, dh, palette_color::BLACK);
+    for y in 0..dh {
+        for x in 0..dw {
+            fb.set_pixel(x, y, indices[y * dw + x]);
+        }
+    }
+    fb
+}
 
 /// Entry cap on the icon render caches. Entries for dropped icons are never
 /// individually evicted (nothing tracks icon lifetimes here), so the maps
@@ -1004,7 +1116,7 @@ impl Renderer {
             sprite,
             (cx - sprite.width as i32 / 2) as isize,
             (cy - sprite.height as i32 / 2) as isize,
-            &self.palette,
+            self.palette.inner(),
             &swap,
         );
     }
@@ -1127,5 +1239,31 @@ impl Renderer {
             }
         }
         fb
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wallpaper_cache_round_trips_and_rejects_stale_headers() {
+        let dir = std::env::temp_dir().join(format!("splitwm-wp-test-{}", std::process::id()));
+        let cache = dir.join("wallpaper");
+        let indices: Vec<Index> = vec![0, 1, 2, 3, 4, 5];
+        let header = b"splitwm-wallpaper-v1\ntest-header".to_vec();
+
+        store_cached_wallpaper(&cache, &header, &indices).unwrap();
+        assert_eq!(
+            load_cached_wallpaper(&cache, &header, 3, 2).as_deref(),
+            Some(indices.as_slice())
+        );
+
+        // Any header mismatch (stale mtime/size/palette/...) is a miss, as
+        // is a body of the wrong length for the requested dimensions.
+        assert!(load_cached_wallpaper(&cache, b"splitwm-wallpaper-v1\nother", 3, 2).is_none());
+        assert!(load_cached_wallpaper(&cache, &header, 4, 2).is_none());
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
