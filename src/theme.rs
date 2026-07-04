@@ -380,13 +380,6 @@ pub const QUICK: &[Quick] = &[
         icon: "obsidian",
         show: ShowWhen::UnlessRunning("obsidian"),
     },
-    Quick {
-        label: "Claude",
-        env: "CLAUDE_DESKTOP",
-        default: "claude-desktop",
-        icon: "claude-desktop",
-        show: ShowWhen::UnlessRunning("claude"),
-    },
 ];
 
 #[cfg(test)]
