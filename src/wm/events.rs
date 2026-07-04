@@ -6,8 +6,8 @@ use x11rb::protocol::xinput;
 use x11rb::protocol::xproto::{
     Allow, ButtonPressEvent, ButtonReleaseEvent, ChangeWindowAttributesAux, ConfigWindow,
     ConfigureNotifyEvent, ConfigureRequestEvent, ConfigureWindowAux, ConnectionExt, EventMask,
-    ExposeEvent, InputFocus, KeyPressEvent, MapRequestEvent, Mapping, MappingNotifyEvent, ModMask,
-    MotionNotifyEvent, UnmapNotifyEvent,
+    ExposeEvent, InputFocus, KeyPressEvent, KeyReleaseEvent, MapRequestEvent, Mapping,
+    MappingNotifyEvent, ModMask, MotionNotifyEvent, UnmapNotifyEvent,
 };
 use x11rb::protocol::Event;
 
@@ -288,6 +288,7 @@ impl Wm {
             // The root's own ConfigureNotify is a screen resize (RandR).
             Event::ConfigureNotify(e) if e.window == self.root => self.on_root_resize(e)?,
             Event::KeyPress(e) => self.on_key(*e)?,
+            Event::KeyRelease(e) => self.on_key_release(e),
             Event::ButtonPress(e) => self.on_button(*e)?,
             Event::ButtonRelease(e) => self.on_button_release(e)?,
             Event::MotionNotify(e) => self.on_motion(e)?,
@@ -316,6 +317,10 @@ impl Wm {
             // The notification-daemon thread pinged us: drain its channel.
             Event::ClientMessage(e) if e.type_ == self.atoms.splitwm_note => {
                 self.on_note_ping()?;
+            }
+            // A background theme-icon fetch finished: drain its channel.
+            Event::ClientMessage(e) if e.type_ == self.atoms.splitwm_icon => {
+                self.on_icon_ping()?;
             }
             // EWMH fullscreen request (data32: [action, prop1, prop2, ..]).
             // The spec mandates format 32; a malformed 8/16-format message
@@ -671,19 +676,18 @@ impl Wm {
         let Some(action) = self.lookup_action(e.state.into(), e.detail) else {
             return Ok(());
         };
-        // Swallow keyboard auto-repeat for the layout-mutating actions:
+        // Swallow keyboard autorepeat for the layout-mutating actions:
         // holding Mod4+V must not carve ~20 splits a second, each queueing
         // its own animation. Resize/focus actions deliberately keep
-        // repeating (holding Grow is how you resize by feel).
+        // repeating (holding Grow is how you resize by feel). A repeat is
+        // recognized structurally, not by timing: this keycode is already
+        // marked held (no KeyRelease has cleared it since its last press),
+        // which distinguishes a held key from a genuine fast double-tap.
         if matches!(action, Action::SplitH | Action::SplitV | Action::Close) {
-            let now = std::time::Instant::now();
-            if self.last_layout_key.is_some_and(|(kc, at)| {
-                kc == e.detail && now.duration_since(at) < std::time::Duration::from_millis(200)
-            }) {
-                self.last_layout_key = Some((e.detail, now));
+            if self.held_layout_key == Some(e.detail) {
                 return Ok(());
             }
-            self.last_layout_key = Some((e.detail, now));
+            self.held_layout_key = Some(e.detail);
         }
         // Deliberate focus movement returns the keyboard to the tree: it
         // must also clear a focused dialog's keyboard-target bookkeeping,
@@ -789,6 +793,15 @@ impl Wm {
                 .insert(self.state.focused_leaf_valid(), rect);
         }
         self.commit_layout()
+    }
+
+    /// Clears `held_layout_key` once the physical key it names comes back
+    /// up, so the next `KeyPress` for that keycode reads as a genuine new
+    /// press rather than autorepeat.
+    fn on_key_release(&mut self, e: &KeyReleaseEvent) {
+        if self.held_layout_key == Some(e.detail) {
+            self.held_layout_key = None;
+        }
     }
 
     /// Split the focused leaf in `dir` if it's eligible; otherwise cancel

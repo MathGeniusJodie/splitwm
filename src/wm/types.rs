@@ -162,6 +162,9 @@ atoms! {
     /// Wakeup ClientMessage type from the notification-daemon thread (see
     /// `crate::notify`): "drain the note channel and update popups".
     splitwm_note => crate::notify::PING_ATOM.as_bytes(),
+    /// Wakeup ClientMessage type from a background theme-icon fetch thread
+    /// (see `Wm::spawn_theme_icon_fetch`): "drain the icon-result channel".
+    splitwm_icon => b"SPLITWM_ICON",
 }
 
 pub struct Client {
@@ -265,10 +268,18 @@ pub struct Wm {
     /// `Wm::fresh_timestamp`) instead of passing a stale one, which the
     /// server would silently ignore if focus moved more recently.
     pub last_event_instant: std::time::Instant,
-    /// `(keycode, when)` of the last layout-mutating keypress, used to
-    /// swallow keyboard auto-repeat for the destructive actions (split/
-    /// close): holding Mod4+V must not create ~20 splits a second.
-    pub last_layout_key: Option<(u8, std::time::Instant)>,
+    /// Keycode of a layout-mutating key (split/close) currently held down,
+    /// if any — cleared on its `KeyRelease` and set on its `KeyPress`. A
+    /// `KeyPress` for the keycode already recorded here is autorepeat (no
+    /// release arrived in between) and is swallowed: holding Mod4+V must
+    /// not create ~20 splits a second. A `KeyPress` for a different keycode,
+    /// or for this one after its release cleared the record, is a genuine
+    /// new press and goes through. This only distinguishes repeat from
+    /// fresh presses structurally if XKB detectable autorepeat is on (see
+    /// `enable_detectable_autorepeat`) or the classic same-timestamp
+    /// release/press pairing is in effect — both deliver the release before
+    /// the repeat, so a wall-clock heuristic is never needed.
+    pub held_layout_key: Option<u8>,
     /// Parent lookup for every node, rebuilt from one arena walk per
     /// `arrange` — per-event callers (`hover_cursor`, `click_split_button`)
     /// read this instead of paying `Tree::find_parent`'s full arena scan.
@@ -360,6 +371,13 @@ pub struct Wm {
     /// `Wm::flush_stale_icons` can skip its clients scan in the (usual)
     /// steady state where no icon refresh was throttled.
     pub icons_stale: bool,
+    /// Results from background theme-icon fetches (see
+    /// `Wm::spawn_theme_icon_fetch`), drained by `Wm::on_icon_ping`.
+    pub icon_rx: std::sync::mpsc::Receiver<IconResult>,
+    /// Cloned into each background theme-icon fetch thread so it can report
+    /// its result back; kept here so `manage` doesn't need its own thread
+    /// plumbing at every call site.
+    pub icon_tx: std::sync::mpsc::Sender<IconResult>,
 }
 
 /// The docked-sidebar identity config and the currently docked window.
@@ -392,6 +410,18 @@ impl Dock {
     pub fn overlap(self) -> i32 {
         crate::theme::DOCK_OVERLAP.min(self.w)
     }
+}
+
+/// Result of a background theme-icon fetch (see
+/// `Wm::spawn_theme_icon_fetch`), tagged with the window it was resolved
+/// for. By the time this arrives `win` may already be unmanaged — the
+/// receiver must check before applying it, same as `Wm::on_icon_change`
+/// already does for its own late-arriving fetch.
+pub struct IconResult {
+    pub win: Win,
+    /// `None` when the theme lookup/decode failed — nothing to apply, but
+    /// still worth draining so the channel doesn't grow unbounded.
+    pub icon: Option<Icon>,
 }
 
 /// Foreign notification windows and our own served-notification popups.

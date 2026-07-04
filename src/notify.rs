@@ -219,6 +219,28 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, CloseReason)>) -> R
         let Some(msg) = conn.channel().blocking_pop_message(wait)? else {
             continue;
         };
+        // The bus daemon addresses `NameLost` directly to the connection
+        // that lost the name (no match rule needed: unlike broadcast
+        // signals, this unicast delivery doesn't depend on subscription) —
+        // it means another process out-replaced us on BUS_NAME the same way
+        // `connect_bus` out-replaces a lingering daemon. From then on every
+        // Notify call actually reaches the new owner, not us: continuing to
+        // run would make this thread a dead letterbox forever, silently
+        // doing nothing while the WM still believes notifications work.
+        if msg.msg_type() == MessageType::Signal
+            && msg.interface().as_deref() == Some("org.freedesktop.DBus")
+            && msg.member().as_deref() == Some("NameLost")
+            && msg.read1::<&str>().ok() == Some(BUS_NAME)
+        {
+            let _ = to_wm.send(NoteMsg::Show(Note {
+                id: 0,
+                summary: "Notifications unavailable".to_string(),
+                body: "another process took over splitwm's notification daemon role".to_string(),
+                urgency: 2,
+            }));
+            ping();
+            return Err(format!("lost ownership of {BUS_NAME}").into());
+        }
         if msg.msg_type() != MessageType::MethodCall {
             continue;
         }

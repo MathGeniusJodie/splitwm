@@ -459,7 +459,16 @@ impl State {
         // Focus always moves to the nearest surviving neighbour: the closed
         // leaf *was* the focused one (node ids are never reused, so it can't
         // still be found anywhere in the tree after removal).
+        //
+        // Both paths below refuse to close inside an orphan subtree (a
+        // `parent` reachable from neither the root nor any branch) before
+        // mutating anything — see the binary path's comment for why.
         if nchildren > 2 {
+            let reachable =
+                parent == self.tree.root || self.tree.find_parent(parent).is_some();
+            if !reachable {
+                return false;
+            }
             if !self.relocate_closed_window(parent, idx, leaf) {
                 return false;
             }
@@ -1249,6 +1258,27 @@ mod tests {
         assert!(!s.close_focused());
         // Both orphan leaves survive; focus resolution stays inside leaves.
         assert!(s.tree.is_leaf(a) && s.tree.is_leaf(b));
+    }
+
+    /// Same refusal as `close_focused_refuses_orphan_subtree`, but for the
+    /// n-ary path (`nchildren > 2`), which must enforce the same
+    /// reachability check as the binary path even though it never collapses
+    /// `parent` itself.
+    #[test]
+    fn close_focused_refuses_orphan_nary_subtree() {
+        let mut s = State::new();
+        let a = s.tree.make_leaf();
+        let b = s.tree.make_leaf();
+        let c = s.tree.make_leaf();
+        let orphan = s.tree.make_branch(Dir::H, 0.5, a, b);
+        assert_ne!(orphan, s.tree.root);
+        if let Some(branch) = s.tree.branch_mut(orphan) {
+            branch.insert(2, Child { node: c, ratio: 0.25 });
+        }
+        s.focused_leaf = a;
+        assert!(!s.close_focused());
+        // All three orphan leaves survive; focus resolution stays inside leaves.
+        assert!(s.tree.is_leaf(a) && s.tree.is_leaf(b) && s.tree.is_leaf(c));
     }
 
     /// A minimized sibling promoted to root by a binary collapse must be

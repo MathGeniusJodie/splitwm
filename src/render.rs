@@ -406,9 +406,12 @@ impl Renderer {
         // The quantized result is cached on disk: the decode+dither pass
         // costs noticeable startup time on a full-screen image, and its
         // output only changes when the source file, target size or palette
-        // does — exactly what the cache header records.
+        // does — exactly what the cache header records. Each distinct header
+        // gets its own cache file (named from a hash of the header), so
+        // multiple (path, size, palette) combinations coexist on disk
+        // instead of thrashing a single shared slot.
         let header = self.wallpaper_cache_header(path, dw, dh);
-        let cache = wallpaper_cache_path();
+        let cache = header.as_deref().and_then(wallpaper_cache_path);
         if let (Some(header), Some(cache)) = (header.as_deref(), cache.as_deref()) {
             if let Some(indices) = load_cached_wallpaper(cache, header, dw, dh) {
                 return Some(fb_from_indices(dw, dh, &indices));
@@ -861,10 +864,13 @@ impl Renderer {
 /// out-of-band value marks "no pixel here" in the icon index cache.
 const TRANSPARENT_INDEX: Index = Index::MAX;
 
-/// Where the quantized wallpaper cache lives:
-/// `$XDG_CACHE_HOME/splitwm/wallpaper` (default `~/.cache`). `None` when
-/// neither `XDG_CACHE_HOME` nor `HOME` is set.
-fn wallpaper_cache_path() -> Option<std::path::PathBuf> {
+/// Where the quantized wallpaper cache for a given `header` lives:
+/// `$XDG_CACHE_HOME/splitwm/wallpaper-<hash>` (default `~/.cache`), where
+/// `<hash>` is derived from the header's identity (source path, target size,
+/// palette). Distinct headers land in distinct files, so switching between
+/// wallpapers — or resizing a monitor — never evicts another entry's cache.
+/// `None` when neither `XDG_CACHE_HOME` nor `HOME` is set.
+fn wallpaper_cache_path(header: &[u8]) -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .filter(|v| !v.is_empty())
         .map(std::path::PathBuf::from)
@@ -873,7 +879,13 @@ fn wallpaper_cache_path() -> Option<std::path::PathBuf> {
                 .filter(|v| !v.is_empty())
                 .map(|home| std::path::PathBuf::from(home).join(".cache"))
         })?;
-    Some(base.join("splitwm").join("wallpaper"))
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    header.hash(&mut hasher);
+    Some(
+        base.join("splitwm")
+            .join(format!("wallpaper-{:016x}", hasher.finish())),
+    )
 }
 
 /// Read a cached quantized wallpaper: `header` followed by exactly `dw*dh`
@@ -1265,5 +1277,21 @@ mod tests {
         assert!(load_cached_wallpaper(&cache, &header, 4, 2).is_none());
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn wallpaper_cache_path_varies_with_header() {
+        // Two different (path, size, palette) identities must land in two
+        // different cache files, so switching wallpapers (or resizing a
+        // monitor) never evicts the other's cached entry.
+        let a = wallpaper_cache_path(b"splitwm-wallpaper-v1\nfoo.png-100x100").unwrap();
+        let b = wallpaper_cache_path(b"splitwm-wallpaper-v1\nbar.png-200x200").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(a.parent(), b.parent());
+
+        // Same header, same path — deterministic, so a second lookup of the
+        // same wallpaper actually hits its own cache file.
+        let a2 = wallpaper_cache_path(b"splitwm-wallpaper-v1\nfoo.png-100x100").unwrap();
+        assert_eq!(a, a2);
     }
 }

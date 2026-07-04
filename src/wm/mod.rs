@@ -293,6 +293,12 @@ pub fn run(replace: bool) -> R<()> {
 
     check_root_visual(&screen)?;
 
+    // Best-effort: without it, held keys still work (see `Wm::on_key`'s
+    // held-key tracking), just via the classic release/press pairing.
+    if let Err(e) = enable_detectable_autorepeat(&conn) {
+        eprintln!("splitwm: XKB detectable autorepeat unavailable ({e}); using KeyRelease pairing");
+    }
+
     let sel_owner = claim_manager_selection(&conn, screen_num, root, &screen, replace)?;
 
     grab_substructure_redirect(&conn, root)?;
@@ -325,6 +331,10 @@ pub fn run(replace: bool) -> R<()> {
     let note_dismiss = crate::notify::spawn(note_tx);
     mask_term_signals(false);
 
+    // Background theme-icon fetches (see `Wm::spawn_theme_icon_fetch`) report
+    // back over this channel; `icon_tx` is cloned into each fetch thread.
+    let (icon_tx, icon_rx) = std::sync::mpsc::channel();
+
     let mut wm = Wm {
         depth: screen.root_depth,
         gc,
@@ -337,7 +347,7 @@ pub fn run(replace: bool) -> R<()> {
         focused_float: None,
         last_event_time: 0,
         last_event_instant: std::time::Instant::now(),
-        last_layout_key: None,
+        held_layout_key: None,
         parents: HashMap::new(),
         pending_events: Vec::new(),
         bar_order: Vec::new(),
@@ -380,6 +390,8 @@ pub fn run(replace: bool) -> R<()> {
         ignore_unmaps: HashMap::new(),
         fullscreen: None,
         icons_stale: false,
+        icon_rx,
+        icon_tx,
         conn,
         root,
     };
@@ -434,6 +446,32 @@ fn check_root_visual(screen: &x11rb::protocol::xproto::Screen) -> R<()> {
             depth, v.class, v.red_mask, v.green_mask, v.blue_mask
         )
         .into());
+    }
+    Ok(())
+}
+
+/// Ask the server for XKB's detectable-autorepeat mode: with it on, a held
+/// key generates consecutive KeyPress events with no intervening
+/// KeyRelease, instead of the traditional same-timestamp KeyRelease+
+/// KeyPress pair. That makes a physically-held key structurally
+/// distinguishable from two genuine presses (`Wm::on_key` tracks currently-
+/// held keycodes via KeyRelease bookkeeping, which only works once this is
+/// on). Best-effort: a server without XKB just keeps the classic pairing,
+/// which `on_key`'s held-key tracking also handles correctly since the
+/// KeyRelease still arrives before the "repeat".
+fn enable_detectable_autorepeat(conn: &x11rb::rust_connection::RustConnection) -> R<()> {
+    use x11rb::protocol::xkb::{self, ConnectionExt as _};
+    let version = conn.xkb_use_extension(1, 0)?.reply()?;
+    if version.supported {
+        conn.xkb_per_client_flags(
+            xkb::ID::USE_CORE_KBD.into(),
+            xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT,
+            xkb::PerClientFlag::DETECTABLE_AUTO_REPEAT,
+            0u32.into(),
+            0u32.into(),
+            0u32.into(),
+        )?
+        .reply()?;
     }
     Ok(())
 }

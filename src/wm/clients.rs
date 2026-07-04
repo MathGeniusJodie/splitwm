@@ -13,7 +13,7 @@ use x11rb::protocol::xproto::{
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::CURRENT_TIME;
 
-use super::types::{clamp_dim, Client, FloatWin, FocusModel, Wm, R};
+use super::types::{clamp_dim, Client, FloatWin, FocusModel, IconResult, Wm, R};
 
 /// Minimum spacing between `_NET_WM_ICON` fetches per window (see
 /// `Wm::on_icon_change`). Long enough to blunt a rewrite loop, short
@@ -142,10 +142,17 @@ impl Wm {
 
         // Class -> label; app icon from _NET_WM_ICON, falling back to the
         // icon theme (some apps, e.g. Electron ones, set the property late
-        // or not at all — see `on_icon_change` for the late case).
+        // or not at all — see `on_icon_change` for the late case). The theme
+        // lookup can shell out to ImageMagick to decode the theme file,
+        // which must not block the event loop (see `spawn_theme_icon_fetch`)
+        // — so a missing `_NET_WM_ICON` leaves `icon: None` for now, filled
+        // in later by `on_icon_ping` if/when the background fetch succeeds.
         let class = self.client_identity(win);
         let label = class.chars().next().map_or('?', |c| c.to_ascii_uppercase());
-        let icon = self.fetch_icon(win).or_else(|| self.theme_icon(&class));
+        let icon = self.fetch_icon(win);
+        if icon.is_none() {
+            self.spawn_theme_icon_fetch(win, class.clone());
+        }
         let icon_slot = self.assign_icon_slot(&class);
 
         // Place the client into the focused split (displacing any occupant).
@@ -1124,12 +1131,44 @@ impl Wm {
 
     /// Resolve `class` against the icon theme (the same lookup the taskbar
     /// quick-launch icons use), for clients that don't provide
-    /// `_NET_WM_ICON`.
-    fn theme_icon(&self, class: &str) -> Option<Rc<Icon>> {
+    /// `_NET_WM_ICON`. Runs on the calling thread; only used by the
+    /// taskbar's quick-launch icons, which are resolved outside the event
+    /// loop's hot path. `manage`'s per-window fallback instead uses
+    /// `spawn_theme_icon_fetch`, since this can shell out to ImageMagick.
+    pub(crate) fn theme_icon(&self, class: &str) -> Option<Rc<Icon>> {
         let path = crate::launch::find_icon_file(class)
             .or_else(|| crate::launch::find_icon_file(&class.to_lowercase()))?;
         let img = icon::load_image(&path)?;
         Some(Rc::new(icon::quantize(self.renderer.palette(), &img)))
+    }
+
+    /// Resolve `class`'s theme icon off the event loop: `find_icon_file` can
+    /// stat an NFS-backed icon theme directory and `icon::load_image` shells
+    /// out to ImageMagick and waits on it (see `icon::magick_decode_rgba`) —
+    /// both slow enough that running them inline in `manage` would stall
+    /// every window map and all input handling for as long as they take.
+    /// Mirrors `theme_icon` exactly, just off-thread; the quantize step
+    /// stays on the main thread since it needs `self.renderer.palette()`
+    /// (a borrow, not `Send`).
+    fn spawn_theme_icon_fetch(&self, win: Win, class: Rc<str>) {
+        let tx = self.icon_tx.clone();
+        // `Rc<str>` isn't `Send`; the thread only needs the string data, not
+        // this window's handle to it.
+        let class = class.to_string();
+        // Masked across the spawn (see `Wm::spawn`/`mask_term_signals`) so
+        // SIGTERM/SIGINT always land on the main thread, whose poll they
+        // must interrupt.
+        super::mask_term_signals(true);
+        std::thread::spawn(move || {
+            let icon = crate::launch::find_icon_file(&class)
+                .or_else(|| crate::launch::find_icon_file(&class.to_lowercase()))
+                .and_then(|path| icon::load_image(&path));
+            // A send failure just means the WM is shutting down (the
+            // receiver dropped with it); nothing to report.
+            let _ = tx.send(IconResult { win, icon });
+            ping_icon_thread();
+        });
+        super::mask_term_signals(false);
     }
 
     /// `_NET_WM_ICON` changed on a managed window: refetch and redraw. Apps
@@ -1189,6 +1228,32 @@ impl Wm {
             self.on_icon_change(win)?;
         }
         self.icons_stale = self.clients.values().any(|c| c.icon_stale);
+        Ok(())
+    }
+
+    /// A background theme-icon fetch (`spawn_theme_icon_fetch`) pinged us:
+    /// drain its channel and apply whatever results are ready. Mirrors
+    /// `on_icon_change`'s "icon arrived late, apply it and redraw" handling;
+    /// a window can easily be unmanaged by the time its fetch resolves
+    /// (closed right after mapping), so results for it are just dropped,
+    /// same as `on_note_ping`'s guard against a since-vanished popup.
+    pub(crate) fn on_icon_ping(&mut self) -> R<()> {
+        let mut changed = false;
+        while let Ok(IconResult { win, icon }) = self.icon_rx.try_recv() {
+            let Some(img) = icon else { continue };
+            let Some(client) = self.clients.get_mut(&win) else {
+                continue;
+            };
+            let icon = Rc::new(icon::quantize(self.renderer.palette(), &img));
+            client.icon = Some(icon);
+            client.icon_rotated = None;
+            let class = client.class.clone();
+            self.refresh_icon_rotations(&class);
+            changed = true;
+        }
+        if changed {
+            self.arrange()?;
+        }
         Ok(())
     }
 
@@ -1353,10 +1418,14 @@ impl Wm {
             Ok(mut sh) => {
                 // Reap the short-lived `sh` off-thread: it exits as soon as
                 // it has forked, but even that wait doesn't belong on the
-                // event loop.
+                // event loop. Termination signals are masked across the
+                // spawn (see `mask_term_signals`) so they always land on the
+                // main thread, whose poll they must interrupt.
+                super::mask_term_signals(true);
                 std::thread::spawn(move || {
                     let _ = sh.wait();
                 });
+                super::mask_term_signals(false);
             }
             Err(e) => eprintln!("splitwm: failed to spawn '{cmd}': {e}"),
         }
@@ -1376,6 +1445,33 @@ impl Wm {
                 .status()
                 .is_ok_and(|s| s.success())
         })
+    }
+}
+
+/// Wake the WM's blocking event loop from a background theme-icon fetch
+/// thread (`Wm::spawn_theme_icon_fetch`), by sending a `SPLITWM_ICON`
+/// ClientMessage to root — same mechanism `notify.rs`'s daemon thread uses
+/// to wake the WM after a `NoteMsg`. A short-lived helper thread opens its
+/// own X connection purely for this send (mirroring `notify::serve`) rather
+/// than sharing the WM's own connection, which isn't safe to touch off the
+/// main thread. Best-effort: a failed ping only delays the result being
+/// applied until the WM's next natural wakeup, never loses it (the result
+/// itself already sat down in the mpsc channel before this runs).
+fn ping_icon_thread() {
+    let ping = || -> R<()> {
+        let (xc, screen) = x11rb::connect(None)?;
+        let root = xc.setup().roots[screen].root;
+        let atom = xc
+            .intern_atom(false, b"SPLITWM_ICON")?
+            .reply()?
+            .atom;
+        let ev = ClientMessageEvent::new(32, root, atom, [0u32; 5]);
+        xc.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT, ev)?;
+        xc.flush()?;
+        Ok(())
+    };
+    if let Err(e) = ping() {
+        eprintln!("splitwm: failed to ping the WM event loop for an icon fetch: {e}");
     }
 }
 
