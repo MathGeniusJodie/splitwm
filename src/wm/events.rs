@@ -358,11 +358,9 @@ impl Wm {
 
     fn on_configure_request(&mut self, e: &ConfigureRequestEvent) -> R<()> {
         // Honour requests for windows we don't (yet) manage; managed clients
-        // are positioned by arrange(). ICCCM 4.1.5: a WM that doesn't grant
-        // a ConfigureRequest must still answer with a synthetic
-        // ConfigureNotify carrying the actual geometry — clients that
-        // resize themselves and block waiting for the echo (xterm's
-        // `resize`) hang without it.
+        // are positioned by arrange() and just get the synthetic echo
+        // ICCCM 4.1.5 requires for a denied request (see
+        // `send_synthetic_configure`).
         if self.clients.contains_key(&e.window) {
             self.send_synthetic_configure(e.window)?;
             return Ok(());
@@ -382,8 +380,7 @@ impl Wm {
             self.paint_float_frame(frame)?;
             // The position (and any denied field) stayed ours, so the
             // request may have been a complete no-op — X emits no
-            // ConfigureNotify for one, and ICCCM 4.1.5 requires the
-            // synthetic echo so a client blocking on it doesn't hang.
+            // ConfigureNotify for one, so it still needs the echo below.
             return self.send_synthetic_configure(e.window);
         }
         // The dock's geometry is ours (set once in manage_dock and reasserted
