@@ -268,11 +268,12 @@ pub struct Wm {
     /// `Wm::fresh_timestamp`) instead of passing a stale one, which the
     /// server would silently ignore if focus moved more recently.
     pub last_event_instant: std::time::Instant,
-    /// Keycode of a layout-mutating key (split/close) currently held down,
-    /// if any — cleared on its `KeyRelease` and set on its `KeyPress`. A
-    /// `KeyPress` for the keycode already recorded here is autorepeat (no
-    /// release arrived in between) and is swallowed: holding Mod4+V must
-    /// not create ~20 splits a second. A `KeyPress` for a different keycode,
+    /// Keycode of a layout-mutating key (split/close/mute-toggle) currently
+    /// held down, if any — cleared on its `KeyRelease` and set on its
+    /// `KeyPress`. A `KeyPress` for the keycode already recorded here is
+    /// autorepeat (no release arrived in between) and is swallowed: holding
+    /// Mod4+V must not create ~20 splits a second, and holding mute must not
+    /// re-toggle it 20 times a second. A `KeyPress` for a different keycode,
     /// or for this one after its release cleared the record, is a genuine
     /// new press and goes through. This only distinguishes repeat from
     /// fresh presses structurally if XKB detectable autorepeat is on (see
@@ -280,6 +281,16 @@ pub struct Wm {
     /// release/press pairing is in effect — both deliver the release before
     /// the repeat, so a wall-clock heuristic is never needed.
     pub held_layout_key: Option<u8>,
+    /// Wall-clock moment the last volume-adjust command (`VolumeUp`/
+    /// `VolumeDown`) was actually spawned. Unlike `held_layout_key`, volume
+    /// repeats are meant to keep landing while the key is held — it's a
+    /// "resize by feel" action, not a discrete mutation — so a repeat isn't
+    /// swallowed outright, just rate-limited: a `KeyPress` less than
+    /// `VOLUME_SPAWN_INTERVAL` after this is skipped. That structural
+    /// distinction doesn't apply here (there's nothing to "release back to
+    /// fresh"), so this is the one place a wall-clock heuristic is the right
+    /// tool rather than the KeyRelease bookkeeping above.
+    pub last_volume_spawn: Option<std::time::Instant>,
     /// Parent lookup for every node, rebuilt from one arena walk per
     /// `arrange` — per-event callers (`hover_cursor`, `click_split_button`)
     /// read this instead of paying `Tree::find_parent`'s full arena scan.

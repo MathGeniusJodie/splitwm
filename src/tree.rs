@@ -30,13 +30,16 @@ pub struct Rect {
 }
 
 impl Rect {
-    /// This rect inset by `m` on every side.
+    /// This rect inset by `m` on every side, clamped so `w`/`h` never go
+    /// negative — a gap wider than the area it insets collapses to a
+    /// zero-size rect at the original center, rather than a `Rect` no
+    /// consumer can treat as valid.
     pub const fn shrunk(self, m: i32) -> Self {
         Self {
             x: self.x + m,
             y: self.y + m,
-            w: self.w - 2 * m,
-            h: self.h - 2 * m,
+            w: if self.w - 2 * m > 0 { self.w - 2 * m } else { 0 },
+            h: if self.h - 2 * m > 0 { self.h - 2 * m } else { 0 },
         }
     }
 }

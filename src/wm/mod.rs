@@ -348,6 +348,7 @@ pub fn run(replace: bool) -> R<()> {
         last_event_time: 0,
         last_event_instant: std::time::Instant::now(),
         held_layout_key: None,
+        last_volume_spawn: None,
         parents: HashMap::new(),
         pending_events: Vec::new(),
         bar_order: Vec::new(),

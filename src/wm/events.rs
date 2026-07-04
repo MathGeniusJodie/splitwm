@@ -116,10 +116,13 @@ impl Wm {
     /// often would itself be a source of per-event round-trip latency, so
     /// the answer is cached for a short window — long enough to absorb a
     /// whole burst, short enough that moving the pointer under/off a window
-    /// mid-swipe is still honoured almost immediately.
+    /// mid-swipe is still honoured almost immediately. Raw XI2 motion events
+    /// carry no modifier state of their own (unlike core events), so this
+    /// poll is the only way to read Mod4 — 12ms keeps releasing it mid-swipe
+    /// from panning for more than a couple of scroll batches.
     pub(crate) fn hscroll_allowed(&mut self) -> R<bool> {
         if let Some((last, allowed)) = self.hscroll_gate {
-            if last.elapsed() < std::time::Duration::from_millis(30) {
+            if last.elapsed() < std::time::Duration::from_millis(12) {
                 return Ok(allowed);
             }
         }
@@ -225,11 +228,11 @@ impl Wm {
                 // changes the workarea every motion handler computes
                 // against, so it still flushes below.
                 Event::PropertyNotify(_) | Event::Expose(_) | Event::ConfigureRequest(_) => {
-                    contain(self.handle_event(&ev), "event")?;
+                    contain(self.handle_event(&ev), event_kind(&ev))?;
                     continue;
                 }
                 Event::ConfigureNotify(e) if e.window != self.root => {
-                    contain(self.handle_event(&ev), "event")?;
+                    contain(self.handle_event(&ev), event_kind(&ev))?;
                     continue;
                 }
                 _ => {}
@@ -237,7 +240,7 @@ impl Wm {
             // Flush pending motion/scroll before any other event so ordering
             // (e.g. a button release ending a drag) is preserved.
             for m in pending_motion.drain(..) {
-                contain(self.on_motion(&m), "event")?;
+                contain(self.on_motion(&m), "MotionNotify")?;
             }
             if pending_hscroll != 0.0 {
                 if self.debug_scroll {
@@ -245,16 +248,16 @@ impl Wm {
                 }
                 contain(
                     self.apply_hscroll(std::mem::take(&mut pending_hscroll)),
-                    "event",
+                    "XinputRawMotion",
                 )?;
             }
-            contain(self.handle_event(&ev), "event")?;
+            contain(self.handle_event(&ev), event_kind(&ev))?;
         }
         for m in pending_motion {
-            contain(self.on_motion(&m), "event")?;
+            contain(self.on_motion(&m), "MotionNotify")?;
         }
         if pending_hscroll != 0.0 {
-            contain(self.apply_hscroll(pending_hscroll), "event")?;
+            contain(self.apply_hscroll(pending_hscroll), "XinputRawMotion")?;
         }
         Ok(())
     }
@@ -672,6 +675,15 @@ impl Wm {
         Ok(())
     }
 
+    /// Minimum spacing enforced between spawned `VolumeUp`/`VolumeDown`
+    /// commands while the key autorepeats. X autorepeat lands ~20 `KeyPress`
+    /// events/sec; forking `sh -> systemd-run -> wpctl` for every single one
+    /// is a fork storm for no perceptible benefit. 66ms (~15 spawns/sec cap,
+    /// i.e. every 3rd-ish repeat tick let through) still tracks a held key
+    /// closely enough to resize "by feel" while cutting the fork rate by
+    /// more than half.
+    const VOLUME_SPAWN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(66);
+
     fn on_key(&mut self, e: KeyPressEvent) -> R<()> {
         let Some(action) = self.lookup_action(e.state.into(), e.detail) else {
             return Ok(());
@@ -731,16 +743,36 @@ impl Wm {
             // Volume keys auto-repeat while held, and nothing in the layout
             // changes: skip the commit epilogue rather than recomposite ~20
             // times a second for a held key.
-            Action::VolumeUp => {
-                self.spawn("wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+");
-                return Ok(());
-            }
-            Action::VolumeDown => {
-                self.spawn("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-");
+            Action::VolumeUp | Action::VolumeDown => {
+                // Up/down are "resize by feel": holding the key should keep
+                // adjusting, so repeats aren't swallowed like Split/Close —
+                // just rate-limited, or holding it down would still fork a
+                // process tree per repeat tick.
+                let now = std::time::Instant::now();
+                let throttled = self
+                    .last_volume_spawn
+                    .is_some_and(|t| now.duration_since(t) < Self::VOLUME_SPAWN_INTERVAL);
+                if !throttled {
+                    self.last_volume_spawn = Some(now);
+                    let cmd = if matches!(action, Action::VolumeUp) {
+                        "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+"
+                    } else {
+                        "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-"
+                    };
+                    self.spawn(cmd);
+                }
                 return Ok(());
             }
             Action::VolumeMuteToggle => {
-                self.spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+                // Unlike up/down, toggling mute isn't a "by feel" action —
+                // there's no useful meaning to re-toggling it 20 times a
+                // second while the key is held — so this reuses the
+                // Split/Close swallow-all-repeats behavior instead of a rate
+                // limit.
+                if self.held_layout_key != Some(e.detail) {
+                    self.held_layout_key = Some(e.detail);
+                    self.spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+                }
                 return Ok(());
             }
             Action::SpawnTerminal => self.spawn_terminal(),
@@ -1286,5 +1318,31 @@ pub(super) fn contain(r: R<()>, what: &str) -> R<()> {
             Ok(())
         }
         other => other,
+    }
+}
+
+/// The `Event` variant's name, for tagging a `contain`'d error with which
+/// handler actually failed instead of the uninformative literal "event".
+fn event_kind(ev: &Event) -> &'static str {
+    match ev {
+        Event::ButtonPress(_) => "ButtonPress",
+        Event::ButtonRelease(_) => "ButtonRelease",
+        Event::ClientMessage(_) => "ClientMessage",
+        Event::ConfigureNotify(_) => "ConfigureNotify",
+        Event::ConfigureRequest(_) => "ConfigureRequest",
+        Event::DestroyNotify(_) => "DestroyNotify",
+        Event::EnterNotify(_) => "EnterNotify",
+        Event::Expose(_) => "Expose",
+        Event::KeyPress(_) => "KeyPress",
+        Event::KeyRelease(_) => "KeyRelease",
+        Event::LeaveNotify(_) => "LeaveNotify",
+        Event::MapNotify(_) => "MapNotify",
+        Event::MapRequest(_) => "MapRequest",
+        Event::MappingNotify(_) => "MappingNotify",
+        Event::MotionNotify(_) => "MotionNotify",
+        Event::PropertyNotify(_) => "PropertyNotify",
+        Event::UnmapNotify(_) => "UnmapNotify",
+        Event::XinputRawMotion(_) => "XinputRawMotion",
+        _ => "event",
     }
 }
