@@ -7,7 +7,7 @@ use std::rc::Rc;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{Atom, AtomEnum, ClientMessageEvent, ConnectionExt, EventMask};
 
-use super::types::{Wm, WindowKind, R};
+use super::types::{WindowKind, Wm, R};
 use crate::icon::{self, Icon};
 use crate::theme;
 use crate::tree::Win;
@@ -78,7 +78,7 @@ impl Wm {
     // or reusing a hue, so windows past the step count share an icon look.
     pub(crate) fn assign_icon_slot(&self, class: &str) -> Option<usize> {
         let used: std::collections::HashSet<usize> = self
-            .clients
+            .clients_ref()
             .values()
             .filter(|c| c.class.as_ref() == class)
             .filter_map(|c| c.icon_slot)
@@ -92,7 +92,7 @@ impl Wm {
     /// are kept (the slot is persistent for the window's lifetime).
     pub(crate) fn refresh_icon_rotations(&mut self, class: &Rc<str>) {
         let wins: Vec<Win> = self
-            .clients
+            .clients_ref()
             .iter()
             .filter(|(_, c)| c.class == *class)
             .map(|(&w, _)| w)
@@ -101,7 +101,7 @@ impl Wm {
             return;
         }
         for win in wins {
-            let (slot, icon) = match self.clients.get(&win) {
+            let (slot, icon) = match self.clients_ref().get(&win) {
                 Some(c) if c.icon_rotated.is_none() => (c.icon_slot, c.icon.clone()),
                 _ => continue,
             };
@@ -116,7 +116,7 @@ impl Wm {
                 &icon,
                 theme::icon_hue_rotation(slot),
             ));
-            if let Some(c) = self.clients.get_mut(&win) {
+            if let Some(c) = self.client_mut(win) {
                 c.icon_rotated = Some(rotated);
             }
         }
@@ -126,9 +126,9 @@ impl Wm {
     /// while another window of the same app class is open (same-app
     /// disambiguation), the plain icon otherwise.
     pub(crate) fn icon_for(&self, win: Win) -> Option<Rc<Icon>> {
-        let client = self.clients.get(&win)?;
+        let client = self.clients_ref().get(&win)?;
         let siblings = self
-            .clients
+            .clients_ref()
             .values()
             .filter(|c| c.class == client.class)
             .count();
@@ -218,7 +218,7 @@ impl Wm {
     /// otherwise keep whatever `manage` resolved at map time.
     pub(crate) fn on_icon_change(&mut self, win: Win) -> R<()> {
         let now = std::time::Instant::now();
-        let Some(client) = self.clients.get_mut(&win) else {
+        let Some(client) = self.client_mut(win) else {
             return Ok(());
         };
         // Rate-limit: the fetch below moves up to 16 MiB of client-
@@ -239,8 +239,7 @@ impl Wm {
             return Ok(());
         };
         let client = self
-            .clients
-            .get_mut(&win)
+            .client_mut(win)
             .expect("present above; fetch_icon doesn't unmanage");
         client.icon = Some(icon);
         client.icon_rotated = None;
@@ -259,7 +258,7 @@ impl Wm {
         }
         let now = std::time::Instant::now();
         let due: Vec<Win> = self
-            .clients
+            .clients_ref()
             .iter()
             .filter(|(_, c)| {
                 c.icon_stale && now.duration_since(c.icon_fetched) >= ICON_FETCH_COOLDOWN
@@ -269,7 +268,7 @@ impl Wm {
         for win in due {
             self.on_icon_change(win)?;
         }
-        self.icons_stale = self.clients.values().any(|c| c.icon_stale);
+        self.icons_stale = self.clients_ref().values().any(|c| c.icon_stale);
         Ok(())
     }
 
@@ -297,7 +296,7 @@ impl Wm {
             let icon = Rc::new(icon::quantize(self.renderer.palette(), &img));
             match self.kind_of(win) {
                 Some(WindowKind::Tiled) => {
-                    let Some(client) = self.clients.get_mut(&win) else {
+                    let Some(client) = self.client_mut(win) else {
                         continue;
                     };
                     if client.icon.is_none() {
@@ -309,16 +308,14 @@ impl Wm {
                     }
                 }
                 Some(WindowKind::Float) => {
-                    let Some(float) = self.floats.iter_mut().find(|f| f.win == win) else {
+                    let Some(float) = self.floats_iter_mut().find(|f| f.win == win) else {
                         continue;
                     };
                     if float.icon.is_none() {
                         float.icon = Some(icon);
                         let frame = float.frame;
                         if let Err(e) = self.paint_float_frame(frame) {
-                            eprintln!(
-                                "splitwm: failed to paint float frame after icon fetch: {e}"
-                            );
+                            eprintln!("splitwm: failed to paint float frame after icon fetch: {e}");
                         }
                     }
                 }

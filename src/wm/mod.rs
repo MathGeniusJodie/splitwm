@@ -1075,7 +1075,6 @@ impl Wm {
         }
         Ok(())
     }
-
 }
 
 /// The server's ARGB32 pict format, or `None` when RENDER cursors (>= 0.5)

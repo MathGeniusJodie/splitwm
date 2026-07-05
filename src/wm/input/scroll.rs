@@ -6,7 +6,7 @@
 use x11rb::protocol::xinput;
 use x11rb::protocol::xproto::ConnectionExt as _;
 
-use super::super::types::{Wm, WindowKind, MOD4, R};
+use super::super::types::{WindowKind, Wm, MOD4, R};
 
 /// A device's horizontal scroll axis: which valuator carries it and how many
 /// valuator units make up one wheel "click" (for scaling into pixels).

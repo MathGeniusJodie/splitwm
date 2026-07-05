@@ -104,14 +104,8 @@ impl Wm {
     /// compositor needs no tree walks.
     pub(crate) fn compute_taskbar(&mut self) {
         let wa = self.wa();
-        compute_taskbar(
-            &mut self.widgets,
-            &self.state.tree,
-            &self.clients,
-            &self.quick,
-            &self.bar_order,
-            wa,
-        );
+        let (widgets, tree, clients, quick, bar_order) = self.taskbar_compute_parts();
+        compute_taskbar(widgets, tree, clients, quick, bar_order, wa);
     }
 }
 

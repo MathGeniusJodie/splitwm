@@ -11,7 +11,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 
 use super::input::ActiveDrag;
-use super::types::{clamp_dim, Wm, WindowKind, R};
+use super::types::{clamp_dim, WindowKind, Wm, R};
 use crate::tree::{Rect, Win};
 
 impl Wm {
@@ -244,10 +244,9 @@ impl Wm {
             // (the frame is the move handle); resize + repaint the frame to
             // match.
             Some(WindowKind::Float) => {
-                let Some(i) = self.floats.iter().position(|f| f.win == e.window) else {
+                let Some(f) = self.floats_iter_mut().find(|f| f.win == e.window) else {
                     return Ok(());
                 };
-                let f = &mut self.floats[i];
                 if u16::from(e.value_mask) & u16::from(ConfigWindow::WIDTH) != 0 {
                     f.w = i32::from(e.width).max(1);
                 }
@@ -350,14 +349,14 @@ impl Wm {
         // the tiled-tree lookup below rather than returning `None` outright
         // if `win` isn't actually in `floats` (a `kind_of`/`floats` desync).
         if kind == Some(WindowKind::Float) {
-            if let Some(f) = self.floats.iter().find(|f| f.win == win) {
+            if let Some(f) = self.floats_ref().iter().find(|f| f.win == win) {
                 return Some((f.x, f.y, f.w.max(1), f.h.max(1)));
             }
         }
         let leaf = self.state.tree.find_leaf_for_client(win)?;
         // A hidden window (minimized, or its split scrolled off-screen) was
         // never configured to its slot; answer from the server instead.
-        let client = self.clients.get(&win);
+        let client = self.clients_ref().get(&win);
         if self.state.tree.leaf(leaf).is_some_and(|l| l.minimized)
             || !client.is_some_and(|c| c.mapped)
         {
@@ -559,7 +558,7 @@ impl Wm {
     fn on_expose(&mut self, e: ExposeEvent) -> R<()> {
         // The underlay needs no handling here: its composited image is its
         // `background_pixmap`, so the server repaints exposed areas itself.
-        if self.floats.iter().any(|f| f.frame == e.window) {
+        if self.floats_ref().iter().any(|f| f.frame == e.window) {
             self.paint_float_frame(e.window)?;
         } else {
             self.paint_note_win(e.window)?;

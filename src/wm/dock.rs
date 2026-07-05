@@ -11,7 +11,7 @@ use x11rb::protocol::xproto::{
 };
 
 use super::clients::WmState;
-use super::types::{clamp_dim, Wm, WindowKind, R};
+use super::types::{clamp_dim, WindowKind, Wm, R};
 use crate::tree::Win;
 
 /// The docked-sidebar identity config and the currently docked window.
@@ -58,7 +58,9 @@ impl Wm {
     pub(crate) fn matches_dock(&self, win: Win) -> bool {
         let parts = self.wm_class_parts(win);
         if !parts.is_empty() {
-            return parts.iter().any(|part| part.as_slice() == self.dock.title.as_bytes());
+            return parts
+                .iter()
+                .any(|part| part.as_slice() == self.dock.title.as_bytes());
         }
         self.client_title(win).as_ref() == self.dock.title
     }
@@ -99,7 +101,7 @@ impl Wm {
         if self.dock.docked.is_some() {
             return Ok(());
         }
-        let Some(client) = self.clients.get(&win) else {
+        let Some(client) = self.clients_ref().get(&win) else {
             return Ok(());
         };
         // Title changes are frequent (terminals retitle per prompt) and can
@@ -113,8 +115,7 @@ impl Wm {
         if !self.matches_dock(win) {
             return Ok(());
         }
-        self.clients.remove(&win);
-        self.unregister_kind(win);
+        self.remove_client(win);
         self.forget_client_tracking(win)?;
         // Drop the click-to-focus grab `manage` installed before
         // `manage_dock` re-issues the identical passive grab. Re-grabbing

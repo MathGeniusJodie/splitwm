@@ -10,7 +10,7 @@ use x11rb::protocol::xproto::{
     InputFocus, MotionNotifyEvent,
 };
 
-use super::super::types::{rect_contains, Wm, WindowKind, R};
+use super::super::types::{rect_contains, WindowKind, Wm, R};
 use super::super::widgets::BtnKind;
 use crate::theme;
 use crate::tree::{Boundary, Dir, NodeId, Win};
@@ -125,7 +125,7 @@ impl Wm {
         let wa = self.la();
         // Button 1 on a float's frame: focus the float and start moving it.
         if e.detail == 1 {
-            if let Some(f) = self.floats.iter().find(|f| f.frame == e.event) {
+            if let Some(f) = self.floats_ref().iter().find(|f| f.frame == e.event) {
                 let (win, fx, fy) = (f.win, f.x, f.y);
                 self.drags.active = Some(ActiveDrag::Float(FloatDrag {
                     win,

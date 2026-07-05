@@ -16,7 +16,7 @@ use x11rb::protocol::xproto::{
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::CURRENT_TIME;
 
-use super::types::{Client, FocusModel, Wm, WindowKind, R};
+use super::types::{Client, FocusModel, WindowKind, Wm, R};
 
 use crate::launch::shell_quote;
 use crate::tree::Win;
@@ -70,7 +70,7 @@ impl Wm {
         self.arrange()?;
         let f = self.state.focused_client();
         self.focus(f)?;
-        let adopted: Vec<Win> = self.clients.keys().copied().collect();
+        let adopted: Vec<Win> = self.clients_ref().keys().copied().collect();
         for win in adopted {
             self.sync_wm_state(win)?;
         }
@@ -80,7 +80,7 @@ impl Wm {
     /// Record the ICCCM `WM_STATE` matching whether we currently have the
     /// window mapped (Normal) or hidden (Iconic).
     fn sync_wm_state(&self, win: Win) -> R<()> {
-        let mapped = self.clients.get(&win).is_some_and(|c| c.mapped);
+        let mapped = self.clients_ref().get(&win).is_some_and(|c| c.mapped);
         self.set_wm_state(
             win,
             if mapped {
@@ -154,7 +154,7 @@ impl Wm {
             true,
         )?;
 
-        self.clients.insert(
+        self.insert_client(
             win,
             Client {
                 label,
@@ -182,7 +182,6 @@ impl Wm {
                 icon_stale: false,
             },
         );
-        self.register_kind(win, WindowKind::Tiled);
         self.refresh_icon_rotations(&class);
         if !self.bar_order.contains(&win) {
             self.bar_order.push(win);
@@ -264,8 +263,7 @@ impl Wm {
     /// Stop managing `win` (destroyed or withdrawn): drop all bookkeeping,
     /// re-tile, and keep focus inside the leaf the window lived in.
     pub(crate) fn forget_client(&mut self, win: Win) -> R<()> {
-        let known = self.clients.remove(&win).is_some();
-        self.unregister_kind(win);
+        let known = self.remove_client(win).is_some();
         // A window can occupy a leaf/taskbar slot without an entry in
         // `clients` if `manage` errored out partway (it pins into the tree
         // before its X requests); clean the layout up regardless, or the
@@ -328,7 +326,7 @@ impl Wm {
     /// windows unmapped strands them — the next WM only adopts viewable
     /// windows.
     pub(crate) fn restore_clients(&mut self) -> R<()> {
-        let wins: Vec<Win> = self.clients.keys().copied().collect();
+        let wins: Vec<Win> = self.clients_ref().keys().copied().collect();
         for win in wins {
             self.conn.map_window(win)?;
             self.set_wm_state(win, WmState::Normal)?;
@@ -336,7 +334,7 @@ impl Wm {
         if let Some(d) = self.dock.docked {
             self.conn.map_window(d.win)?;
         }
-        for f in &self.floats {
+        for f in self.floats_ref() {
             self.conn.map_window(f.win)?;
         }
         // A plain flush is not enough right before process exit: the server
@@ -395,7 +393,7 @@ impl Wm {
         let title = self.client_title(win);
         match self.kind_of(win) {
             Some(WindowKind::Tiled) => {
-                let Some(client) = self.clients.get_mut(&win) else {
+                let Some(client) = self.client_mut(win) else {
                     return Ok(());
                 };
                 if client.title == title {
@@ -405,7 +403,7 @@ impl Wm {
                 self.arrange()
             }
             Some(WindowKind::Float) => {
-                let Some(f) = self.floats.iter_mut().find(|f| f.win == win) else {
+                let Some(f) = self.floats_iter_mut().find(|f| f.win == win) else {
                     return Ok(());
                 };
                 if f.title == title {
@@ -424,7 +422,7 @@ impl Wm {
     /// managed client windows too, and panels/pagers should see them.
     pub(crate) fn update_client_list(&self) -> R<()> {
         let mut list = self.bar_order.clone();
-        list.extend(self.floats.iter().map(|f| f.win));
+        list.extend(self.floats_ref().iter().map(|f| f.win));
         list.extend(self.dock.docked.map(|d| d.win));
         self.conn.change_property32(
             PropMode::REPLACE,
@@ -481,7 +479,7 @@ impl Wm {
             self.arrange()?;
             if on {
                 // Hide the chrome frame; the client alone covers the screen.
-                if let Some(f) = self.floats.iter().find(|f| f.win == win) {
+                if let Some(f) = self.floats_ref().iter().find(|f| f.win == win) {
                     self.conn.unmap_window(f.frame)?;
                 }
             }
@@ -493,7 +491,7 @@ impl Wm {
     /// Re-show a float's chrome frame and restore its remembered geometry
     /// after leaving fullscreen. No-op for windows that aren't floats.
     fn restore_float_geometry(&mut self, win: Win) -> R<()> {
-        let Some(f) = self.floats.iter().find(|f| f.win == win) else {
+        let Some(f) = self.floats_ref().iter().find(|f| f.win == win) else {
             return Ok(());
         };
         let (frame, x, y, w, h) = (f.frame, f.x, f.y, f.w, f.h);
@@ -637,9 +635,9 @@ impl Wm {
 
     pub(crate) fn focus(&mut self, win: Option<Win>) -> R<()> {
         match win {
-            Some(w) if self.clients.contains_key(&w) => {
+            Some(w) if self.clients_ref().contains_key(&w) => {
                 self.clear_focused_float();
-                let model = self.clients[&w].focus;
+                let model = self.clients_ref()[&w].focus;
                 self.give_focus(w, model)?;
                 // Raising the focused client puts it above everything;
                 // re-apply the shared stacking policy above it.
@@ -743,4 +741,3 @@ impl Wm {
         })
     }
 }
-

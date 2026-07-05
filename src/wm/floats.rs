@@ -11,7 +11,7 @@ use x11rb::protocol::xproto::{
 };
 
 use super::input::ActiveDrag;
-use super::types::{clamp_dim, FocusModel, Wm, WindowKind, R};
+use super::types::{clamp_dim, FocusModel, Wm, R};
 use crate::icon::Icon;
 use crate::theme;
 use crate::tree::Win;
@@ -163,7 +163,7 @@ impl Wm {
         )?;
         self.configure_float_frame(win, frame, x, y, w, h)?;
         let focus = self.focus_model(win);
-        self.floats.push(FloatWin {
+        self.add_float(FloatWin {
             win,
             frame,
             parent,
@@ -177,7 +177,6 @@ impl Wm {
             label,
             title,
         });
-        self.register_kind(win, WindowKind::Float);
         self.conn.map_window(frame)?;
         self.conn.map_window(win)?;
         self.update_client_list()?;
@@ -230,7 +229,7 @@ impl Wm {
 
     /// Raise a float as a unit: frame to the top, client just above it.
     pub(crate) fn restack_float(&self, win: Win) -> R<()> {
-        let Some(f) = self.floats.iter().find(|f| f.win == win) else {
+        let Some(f) = self.floats_ref().iter().find(|f| f.win == win) else {
             return Ok(());
         };
         self.conn.configure_window(
@@ -250,7 +249,7 @@ impl Wm {
     /// titlebar icon via `draw_leaf` (control buttons are drawn separately
     /// for splits, so none appear here), shaped to the opaque pixels.
     pub(crate) fn paint_float_frame(&mut self, frame: Win) -> R<()> {
-        let Some(f) = self.floats.iter().find(|f| f.frame == frame) else {
+        let Some(f) = self.floats_ref().iter().find(|f| f.frame == frame) else {
             return Ok(());
         };
         let (bw, tb) = Self::float_insets();
@@ -284,7 +283,7 @@ impl Wm {
     pub(crate) fn move_float(&mut self, win: Win, x: i32, y: i32) -> R<()> {
         let (bw, tb) = Self::float_insets();
         let wa = self.wa();
-        let Some(f) = self.floats.iter_mut().find(|f| f.win == win) else {
+        let Some(f) = self.floats_iter_mut().find(|f| f.win == win) else {
             return Ok(());
         };
         // Clamp so the titlebar can't leave the screen (the frame is the
@@ -306,7 +305,7 @@ impl Wm {
 
     /// Give input focus to a float and remember it as the keyboard target.
     pub(crate) fn focus_float(&mut self, win: Win) -> R<()> {
-        let Some(f) = self.floats.iter().find(|f| f.win == win) else {
+        let Some(f) = self.floats_ref().iter().find(|f| f.win == win) else {
             return Ok(());
         };
         self.give_focus(win, f.focus)?;
@@ -318,11 +317,9 @@ impl Wm {
     /// A float went away: drop it and hand focus back to its transient
     /// parent (if tiled and visible) or the focused split.
     pub(crate) fn forget_float(&mut self, win: Win) -> R<()> {
-        let Some(idx) = self.floats.iter().position(|f| f.win == win) else {
+        let Some(gone) = self.remove_float(win) else {
             return Ok(());
         };
-        let gone = self.floats.remove(idx);
-        self.unregister_kind(win);
         self.clear_fullscreen_if(win);
         self.conn.destroy_window(gone.frame)?;
         self.update_client_list()?;
@@ -346,7 +343,7 @@ impl Wm {
     /// (arrange raises tiled windows; floats must stay above them, below
     /// notifications).
     pub(crate) fn raise_floats(&self) -> R<()> {
-        for f in &self.floats {
+        for f in self.floats_ref() {
             self.restack_float(f.win)?;
         }
         Ok(())

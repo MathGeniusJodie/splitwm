@@ -11,7 +11,7 @@ use x11rb::protocol::xproto::{
 };
 
 use super::clients::WmState;
-use super::types::{clamp_dim, FrameRect, Wm, WindowKind, R};
+use super::types::{clamp_dim, FrameRect, WindowKind, Wm, R};
 use super::widgets::BtnKind;
 use crate::render::{LeafView, TabInfo};
 use crate::theme;
@@ -246,7 +246,7 @@ impl Wm {
                     m,
                     t.rect,
                     icon.as_deref(),
-                    self.clients.get(&t.win).map_or('?', |c| c.label),
+                    self.clients_ref().get(&t.win).map_or('?', |c| c.label),
                     t.accent,
                     t.in_split,
                 );
@@ -304,7 +304,7 @@ impl Wm {
 
     fn leaf_view(&self, leaf: NodeId, w: i32, h: i32, buttons: bool) -> LeafView {
         let win = self.state.tree.leaf(leaf).and_then(|l| l.client);
-        let client = win.and_then(|w| self.clients.get(&w));
+        let client = win.and_then(|w| self.clients_ref().get(&w));
         let accent_index = self.leaf_color_index(leaf);
         let tab = client.map(|c| TabInfo {
             label: c.label,
@@ -383,7 +383,7 @@ impl Wm {
                 // WM_NORMAL_HINTS minimum (see `client_rect_in_frame`)
                 // overhangs the frame and paints over the neighbouring
                 // split until the column is widened again.
-                let min_size = self.clients.get(&c).map_or((1, 1), |cl| cl.min_size);
+                let min_size = self.clients_ref().get(&c).map_or((1, 1), |cl| cl.min_size);
                 let (cx, cy, cw, ch) = super::types::client_rect_in_frame(p.target, min_size);
                 self.conn.configure_window(
                     c,
@@ -421,7 +421,7 @@ impl Wm {
             self.note_mapped(fs)?;
         }
         let to_hide: Vec<Win> = self
-            .clients
+            .clients_ref()
             .iter()
             .filter(|(w, cl)| cl.mapped && !visible.contains(w))
             .map(|(&w, _)| w)
@@ -433,7 +433,7 @@ impl Wm {
             let seq = cookie.sequence_number() as u16;
             drop(cookie);
             self.record_ignored_unmap(w, seq);
-            if let Some(cl) = self.clients.get_mut(&w) {
+            if let Some(cl) = self.client_mut(w) {
                 cl.mapped = false;
             }
             self.set_wm_state(w, WmState::Iconic)?;
@@ -445,8 +445,7 @@ impl Wm {
     /// on the unmapped -> mapped edge (per-transition, not per-arrange).
     fn note_mapped(&mut self, win: Win) -> R<()> {
         let newly_mapped = self
-            .clients
-            .get_mut(&win)
+            .client_mut(win)
             .is_some_and(|cl| !std::mem::replace(&mut cl.mapped, true));
         if newly_mapped {
             self.set_wm_state(win, WmState::Normal)?;
@@ -566,5 +565,4 @@ impl Wm {
         }
         self.anim_frame(t)
     }
-
 }

@@ -7,7 +7,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConnectionExt, EventMask};
 
 use super::super::clients::WmState;
-use super::super::types::{Wm, WindowKind, R};
+use super::super::types::{WindowKind, Wm, R};
 use crate::tree::Win;
 
 /// A foreign notification window (`_NET_WM_WINDOW_TYPE_NOTIFICATION`) and

@@ -21,7 +21,7 @@ use x11rb::rust_connection::RustConnection;
 use crate::icon::Icon;
 use crate::render::Renderer;
 use crate::state::State;
-use crate::tree::{NodeId, Rect, Win};
+use crate::tree::{NodeId, Rect, Tree, Win};
 
 use super::arrange::LayoutAnim;
 use super::dock::DockState;
@@ -253,7 +253,9 @@ pub struct Wm {
     pub root: Window,
     pub depth: u8,
     pub state: State,
-    pub clients: HashMap<Win, Client>,
+    /// Tiled clients, keyed by window. Private: see `clients_ref`/
+    /// `client_mut`/`insert_client`/`remove_client`.
+    clients: HashMap<Win, Client>,
     /// Single source of truth for which container (this one, `floats`,
     /// `dock.docked`, `notes.foreign`) a managed window belongs to. Private:
     /// the only way to add or remove an entry is `register_kind`/
@@ -262,8 +264,9 @@ pub struct Wm {
     /// apart.
     window_kind: HashMap<Win, WindowKind>,
     /// Floating dialogs/transients/fixed-size windows, in mapping order
-    /// (see `FloatWin`). Kept above tiled clients by every arrange.
-    pub floats: Vec<FloatWin>,
+    /// (see `FloatWin`). Kept above tiled clients by every arrange. Private:
+    /// see `floats_ref`/`floats_iter_mut`/`add_float`/`remove_float`.
+    floats: Vec<FloatWin>,
     /// The float that last took focus, if it still has it — keyboard
     /// actions that target "the focused window" (close) act on this before
     /// falling back to the focused split's client. Cleared whenever focus
@@ -555,7 +558,10 @@ impl Wm {
     /// than trusting every call site to pair register/unregister correctly.
     pub(crate) fn register_kind(&mut self, win: Win, kind: WindowKind) {
         if let Some(prev) = self.window_kind.insert(win, kind) {
-            assert_eq!(prev, kind, "{win:#x} re-registered as a different WindowKind");
+            assert_eq!(
+                prev, kind,
+                "{win:#x} re-registered as a different WindowKind"
+            );
         }
     }
 
@@ -563,6 +569,88 @@ impl Wm {
     /// that kind's own container. A no-op if it was never registered.
     pub(crate) fn unregister_kind(&mut self, win: Win) {
         self.window_kind.remove(&win);
+    }
+
+    /// Disjoint borrows `widgets::compute_taskbar` needs at once: a `&mut
+    /// Widgets` alongside `&self.clients`/`&self.quick`/`&self.bar_order`.
+    /// Direct field projections here (rather than routing the read-only
+    /// fields through their own accessor methods) are what let the borrow
+    /// checker see the mutable `widgets` borrow and the rest as disjoint —
+    /// a method call for each would look like a whole-`self` borrow from
+    /// the caller's side and collide with it.
+    pub(crate) fn taskbar_compute_parts(
+        &mut self,
+    ) -> (
+        &mut Widgets,
+        &Tree,
+        &HashMap<Win, Client>,
+        &[QuickSlot],
+        &[Win],
+    ) {
+        (
+            &mut self.widgets,
+            &self.state.tree,
+            &self.clients,
+            &self.quick,
+            &self.bar_order,
+        )
+    }
+
+    /// Read-only view of every tiled client. `clients` is private so the
+    /// only ways to change its membership are `insert_client`/
+    /// `remove_client` below, which keep `window_kind` paired with it by
+    /// construction instead of by every call site remembering to.
+    pub(crate) fn clients_ref(&self) -> &HashMap<Win, Client> {
+        &self.clients
+    }
+
+    /// Mutable access to an existing client's fields. Doesn't expose the
+    /// map itself, so it can't be used to insert or remove an entry —
+    /// `insert_client`/`remove_client` are still the only way to do that.
+    pub(crate) fn client_mut(&mut self, win: Win) -> Option<&mut Client> {
+        self.clients.get_mut(&win)
+    }
+
+    /// Register `win` as a tiled client with `client`'s payload.
+    pub(crate) fn insert_client(&mut self, win: Win, client: Client) {
+        self.clients.insert(win, client);
+        self.register_kind(win, WindowKind::Tiled);
+    }
+
+    /// Unregister `win` as a tiled client, returning its payload if it had
+    /// one.
+    pub(crate) fn remove_client(&mut self, win: Win) -> Option<Client> {
+        let removed = self.clients.remove(&win);
+        self.unregister_kind(win);
+        removed
+    }
+
+    /// Read-only view of every float, in mapping order. `floats` is private
+    /// for the same reason `clients` is: `add_float`/`remove_float`/
+    /// `floats_iter_mut` below are the only ways to touch it.
+    pub(crate) fn floats_ref(&self) -> &[FloatWin] {
+        &self.floats
+    }
+
+    /// Mutable iteration over floats' fields in place — can't insert or
+    /// remove an entry through it.
+    pub(crate) fn floats_iter_mut(&mut self) -> std::slice::IterMut<'_, FloatWin> {
+        self.floats.iter_mut()
+    }
+
+    /// Register `float.win` as a float with `float`'s payload.
+    pub(crate) fn add_float(&mut self, float: FloatWin) {
+        let win = float.win;
+        self.floats.push(float);
+        self.register_kind(win, WindowKind::Float);
+    }
+
+    /// Unregister `win` as a float, returning its payload if it had one.
+    pub(crate) fn remove_float(&mut self, win: Win) -> Option<FloatWin> {
+        let idx = self.floats.iter().position(|f| f.win == win)?;
+        let removed = self.floats.remove(idx);
+        self.unregister_kind(win);
+        Some(removed)
     }
 
     /// `win`'s current geometry, or `None` on any request/reply failure —
