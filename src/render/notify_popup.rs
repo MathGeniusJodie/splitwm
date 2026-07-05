@@ -106,7 +106,7 @@ impl Renderer {
                     );
                 let idx = bubble.at(sx, sy);
                 if idx != pixel_graphics::TRANSPARENT {
-                    fb.set_pixel(dx, dy, idx);
+                    fb.set_pixel(dx as isize, dy as isize, idx);
                 }
             }
         }
@@ -114,10 +114,22 @@ impl Renderer {
         if let Some(font) = &self.font {
             let mut y = NOTE_PAD_TOP;
             for (line, bold) in &lines {
-                font.draw_text(&mut fb, line, NOTE_PAD_LEFT, y, palette_color::BLACK);
+                font.draw_text(
+                    &mut fb,
+                    line,
+                    NOTE_PAD_LEFT as isize,
+                    y as isize,
+                    palette_color::BLACK,
+                );
                 if *bold {
                     // Faux bold: restrike one pixel right.
-                    font.draw_text(&mut fb, line, NOTE_PAD_LEFT + 1, y, palette_color::BLACK);
+                    font.draw_text(
+                        &mut fb,
+                        line,
+                        (NOTE_PAD_LEFT + 1) as isize,
+                        y as isize,
+                        palette_color::BLACK,
+                    );
                 }
                 y += line_h;
             }

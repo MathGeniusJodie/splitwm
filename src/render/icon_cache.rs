@@ -40,7 +40,9 @@ impl Renderer {
         dy: i32,
         size: i32,
     ) {
-        self.for_each_icon_pixel(img, dx, dy, size, |px, py, i| fb.set_pixel(px, py, i));
+        self.for_each_icon_pixel(img, dx, dy, size, |px, py, i| {
+            fb.set_pixel(px as isize, py as isize, i);
+        });
     }
 
     /// Walk `img`'s cached `size`x`size` nearest-scaled index buffer

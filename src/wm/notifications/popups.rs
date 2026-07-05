@@ -145,7 +145,7 @@ impl Wm {
     pub(crate) fn shape_to_opaque(&self, win: Window, fb: &Framebuffer) -> R<()> {
         let mut rects = Vec::new();
         for y in 0..fb.height {
-            let row = fb.row(y);
+            let row = fb.row(y as isize);
             let mut x = 0;
             while x < fb.width {
                 if row[x] == TRANSPARENT {

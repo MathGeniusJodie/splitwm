@@ -3,7 +3,7 @@
 //! icons, the close badge on each tile, and the "+" insert button drawn
 //! between columns.
 
-use pixel_graphics::{Framebuffer, Paint as PgPaint};
+use pixel_graphics::{Framebuffer, Paint as PgPaint, PaletteIndex};
 
 use crate::icon::Icon;
 use crate::theme::palette_color;
@@ -14,7 +14,10 @@ use super::{fill, fill_paint, Renderer};
 /// Dithered "translucent" chrome background: a checker of black and gunmetal
 /// stands in for a 50%-alpha black fill, keeping everything on the 16-colour
 /// palette.
-const CHROME_BG: PgPaint = PgPaint::Checker(palette_color::BLACK, palette_color::GUNMETAL);
+const CHROME_BG: PgPaint = PgPaint::Checker(
+    PaletteIndex::new(palette_color::BLACK),
+    PaletteIndex::new(palette_color::GUNMETAL),
+);
 
 /// Pixel offset (down and right) of a taskbar icon's drop shadow from the
 /// icon itself.
@@ -84,7 +87,7 @@ impl Renderer {
             dx + SHADOW_OFFSET,
             dy + SHADOW_OFFSET,
             size,
-            |px, py, _| fb.set_pixel(px, py, SHADOW_COLOR),
+            |px, py, _| fb.set_pixel(px as isize, py as isize, SHADOW_COLOR),
         );
     }
 }
@@ -94,7 +97,7 @@ impl Renderer {
 /// the chrome. Used to mark a taskbar icon as currently shown in a split.
 fn draw_rounded_box(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, color: Index) {
     let t = ICON_BOX_THICKNESS;
-    let paint = PgPaint::Solid(color);
+    let paint = PgPaint::Solid(PaletteIndex::new(color));
     fill_paint(fb, x + 2, y, w - 4, t, paint); // top
     fill_paint(fb, x + 2, y + h - t, w - 4, t, paint); // bottom
     fill_paint(fb, x, y + 2, t, h - 4, paint); // left
@@ -145,7 +148,7 @@ pub fn draw_close_badge(fb: &mut Framebuffer, x: i32, y: i32, sz: i32) {
         y,
         sz - 2,
         sz,
-        PgPaint::Solid(palette_color::BLACK),
+        PgPaint::Solid(PaletteIndex::new(palette_color::BLACK)),
     );
     fill_paint(
         fb,
@@ -153,7 +156,7 @@ pub fn draw_close_badge(fb: &mut Framebuffer, x: i32, y: i32, sz: i32) {
         y + 1,
         1,
         sz - 2,
-        PgPaint::Solid(palette_color::BLACK),
+        PgPaint::Solid(PaletteIndex::new(palette_color::BLACK)),
     );
     fill_paint(
         fb,
@@ -161,7 +164,7 @@ pub fn draw_close_badge(fb: &mut Framebuffer, x: i32, y: i32, sz: i32) {
         y + 1,
         1,
         sz - 2,
-        PgPaint::Solid(palette_color::BLACK),
+        PgPaint::Solid(PaletteIndex::new(palette_color::BLACK)),
     );
 
     // 2px-thick diagonal cross.
@@ -173,10 +176,10 @@ pub fn draw_close_badge(fb: &mut Framebuffer, x: i32, y: i32, sz: i32) {
             let ny = y + inset + i + t; // "\" stroke
             let sy = y + sz - 1 - inset - i + t; // "/" stroke
             if px >= 0 && ny >= 0 {
-                fb.set_pixel(px as usize, ny as usize, palette_color::CREAM);
+                fb.set_pixel(px as isize, ny as isize, palette_color::CREAM);
             }
             if px >= 0 && sy >= 0 {
-                fb.set_pixel(px as usize, sy as usize, palette_color::CREAM);
+                fb.set_pixel(px as isize, sy as isize, palette_color::CREAM);
             }
         }
     }

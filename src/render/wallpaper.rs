@@ -2,7 +2,7 @@
 //! and a disk cache keyed on the source file's identity so a full-screen
 //! image only pays the decode+dither pass once per (path, size, palette).
 
-use pixel_graphics::{Framebuffer, Rgb as PgRgb, Rgba};
+use pixel_graphics::{magick_decode_rgba, Framebuffer, Rgb as PgRgb, Rgba};
 
 use crate::theme::palette_color;
 use crate::Index;
@@ -152,13 +152,13 @@ impl Renderer {
     }
 
     /// Decode a wallpaper image (any format ImageMagick reads) into RGBA
-    /// pixels via `icon::magick_decode_rgba`.
+    /// pixels via `pixel_graphics::magick_decode_rgba`.
     fn decode_image(path: &str) -> Option<(usize, usize, Vec<Rgba>)> {
         // Widest wallpaper dimension worth keeping: caps the pixel buffer
         // and the O(w*h) dither pass below (decode itself happens in the
         // magick process, under its own resource limits).
         const MAX_DIM: usize = 16_384;
-        crate::icon::magick_decode_rgba(path, MAX_DIM)
+        magick_decode_rgba(path, MAX_DIM)
     }
 }
 
@@ -224,7 +224,7 @@ fn fb_from_indices(dw: usize, dh: usize, indices: &[Index]) -> Framebuffer {
     let mut fb = Framebuffer::new(dw, dh, palette_color::BLACK);
     for y in 0..dh {
         for x in 0..dw {
-            fb.set_pixel(x, y, indices[y * dw + x]);
+            fb.set_pixel(x as isize, y as isize, indices[y * dw + x]);
         }
     }
     fb

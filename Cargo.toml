@@ -11,11 +11,12 @@ libc = "0.2"
 # Session-bus server for org.freedesktop.Notifications (the WM doubles as the
 # notification daemon); binds the system libdbus, driven from its own thread.
 dbus = "0.9"
-# Chrome art is baked by build.rs; png-loading stays on for decoding user
-# wallpapers and theme icons at runtime (non-PNG images — JPEG wallpapers,
-# SVG icons — are converted to PNG by shelling out to ImageMagick).
+# Chrome art is baked by build.rs; user wallpapers and theme icons are
+# decoded at runtime via pixel_graphics::magick_decode_rgba, which shells
+# out to ImageMagick (also handling non-PNG sources — JPEG wallpapers, SVG
+# icons — directly, with no separate conversion step needed).
 pixel-graphics = { path = "../pixel-graphics" }
-pixel-fonts = { path = "../pixel-fonts", default-features = false, features = ["baked"] }
+pixel-fonts = { path = "../pixel-fonts" }
 # Freedesktop icon-theme lookup and .desktop parsing (taskbar icons, dock
 # autostart) — spec-following code not worth maintaining by hand.
 freedesktop-icons = { version = "0.4.0", default-features = false }

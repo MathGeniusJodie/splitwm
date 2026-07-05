@@ -68,8 +68,8 @@ fn tile_swapped(
         return;
     }
     let clip = PgRect::new(
-        cx0 as usize,
-        cy0 as usize,
+        cx0 as isize,
+        cy0 as isize,
         (cx1 - cx0) as usize,
         (cy1 - cy0) as usize,
     );
@@ -163,33 +163,57 @@ impl NineSlice {
             tile_swapped(fb, &self.sprite, src, x, y, dw, dh, palette, swap);
         };
         part(PgRect::new(0, 0, lu, tu), ox, oy, l, t);
-        part(PgRect::new(sw - ru, 0, ru, tu), ox + w - r, oy, r, t);
-        part(PgRect::new(0, sh - bu, lu, bu), ox, oy + h - b, l, b);
         part(
-            PgRect::new(sw - ru, sh - bu, ru, bu),
+            PgRect::new((sw - ru) as isize, 0, ru, tu),
+            ox + w - r,
+            oy,
+            r,
+            t,
+        );
+        part(
+            PgRect::new(0, (sh - bu) as isize, lu, bu),
+            ox,
+            oy + h - b,
+            l,
+            b,
+        );
+        part(
+            PgRect::new((sw - ru) as isize, (sh - bu) as isize, ru, bu),
             ox + w - r,
             oy + h - b,
             r,
             b,
         );
-        part(PgRect::new(edge_x, 0, edge_w, tu), ox + l, oy, mid_w, t);
         part(
-            PgRect::new(edge_x, sh - bu, edge_w, bu),
+            PgRect::new(edge_x as isize, 0, edge_w, tu),
+            ox + l,
+            oy,
+            mid_w,
+            t,
+        );
+        part(
+            PgRect::new(edge_x as isize, (sh - bu) as isize, edge_w, bu),
             ox + l,
             oy + h - b,
             mid_w,
             b,
         );
-        part(PgRect::new(0, tu, lu, mid_h_src), ox, oy + t, l, mid_h);
         part(
-            PgRect::new(sw - ru, tu, ru, mid_h_src),
+            PgRect::new(0, tu as isize, lu, mid_h_src),
+            ox,
+            oy + t,
+            l,
+            mid_h,
+        );
+        part(
+            PgRect::new((sw - ru) as isize, tu as isize, ru, mid_h_src),
             ox + w - r,
             oy + t,
             r,
             mid_h,
         );
         part(
-            PgRect::new(edge_x, tu, edge_w, mid_h_src),
+            PgRect::new(edge_x as isize, tu as isize, edge_w, mid_h_src),
             ox + l,
             oy + t,
             mid_w,
@@ -258,14 +282,14 @@ impl Renderer {
             [
                 (PgRect::new(0, 0, sw, cap), cx, oy, sw as i32, cap_i),
                 (
-                    PgRect::new(0, sh - cap, sw, cap),
+                    PgRect::new(0, (sh - cap) as isize, sw, cap),
                     cx,
                     oy + h - cap_i,
                     sw as i32,
                     cap_i,
                 ),
                 (
-                    PgRect::new(0, cap, sw, sh - 2 * cap),
+                    PgRect::new(0, cap as isize, sw, sh - 2 * cap),
                     cx,
                     oy + cap_i,
                     sw as i32,
@@ -278,14 +302,14 @@ impl Renderer {
             [
                 (PgRect::new(0, 0, cap, sh), ox, cy, cap_i, sh as i32),
                 (
-                    PgRect::new(sw - cap, 0, cap, sh),
+                    PgRect::new((sw - cap) as isize, 0, cap, sh),
                     ox + w - cap_i,
                     cy,
                     cap_i,
                     sh as i32,
                 ),
                 (
-                    PgRect::new(cap, 0, sw - 2 * cap, sh),
+                    PgRect::new(cap as isize, 0, sw - 2 * cap, sh),
                     ox + cap_i,
                     cy,
                     mid_w,
@@ -352,7 +376,7 @@ impl Renderer {
         if y < 0 {
             return;
         }
-        let clip_x = text_x.max(0) as usize;
+        let clip_x = text_x.max(0) as isize;
         let clip_w = (right_limit - text_x) as usize;
         // Embossed look: a copy of the text one pixel up in the split's dark
         // accent shade, so the real text reads as if stamped into the bar.
@@ -361,7 +385,7 @@ impl Renderer {
                 fb,
                 &tab.title,
                 text_x as isize,
-                (y - 1) as usize,
+                (y - 1) as isize,
                 theme::darker_index(v.accent_index),
                 clip_x,
                 clip_w,
@@ -371,7 +395,7 @@ impl Renderer {
             fb,
             &tab.title,
             text_x as isize,
-            y as usize,
+            y as isize,
             self.fg,
             clip_x,
             clip_w,

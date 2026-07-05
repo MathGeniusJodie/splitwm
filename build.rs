@@ -1,8 +1,9 @@
 //! Bakes the chrome art PNGs (crate root, alongside Cargo.toml) into
 //! palette-indexed binaries at compile time, so the binary embeds raw index
 //! data instead of PNGs and does no decoding or quantization at startup.
-//! The runtime `png` dependency remains only for user wallpapers, which are
-//! arbitrary files decoded at runtime.
+//! Decoded via ImageMagick (`pixel_graphics::magick_decode_rgba`), the same
+//! path `src/icon.rs` uses at runtime for user wallpapers and theme icons —
+//! this crate has no Rust PNG decoder of its own.
 //!
 //! Outputs in OUT_DIR:
 //! - `palette.bin`: RGB triples of the na16 palette
@@ -12,9 +13,13 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use pixel_graphics::{Palette, Sprite};
+use pixel_graphics::{magick_decode_rgba, Palette, Sprite};
 
 const PALETTE_PNG: &str = "assets/na16-1x.png";
+
+/// Widest asset dimension worth keeping; these are known local assets, so
+/// this is just a sanity bound, not a hostile-input defense.
+const MAX_DIM: usize = 16_384;
 
 fn main() {
     // A directory path makes cargo watch every file under it, so this one
@@ -22,8 +27,9 @@ fn main() {
     println!("cargo::rerun-if-changed=assets");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let palette = Palette::load(PALETTE_PNG)
-        .unwrap_or_else(|e| panic!("failed to load palette {PALETTE_PNG}: {e}"));
+    let (_, _, palette_pixels) = magick_decode_rgba(PALETTE_PNG, MAX_DIM)
+        .unwrap_or_else(|| panic!("failed to load palette {PALETTE_PNG}"));
+    let palette = Palette::from_rgba(&palette_pixels);
     let mut out = String::new();
 
     let palette_bytes: Vec<u8> = (0..palette.len())
@@ -57,8 +63,9 @@ fn main() {
 
 fn bake_sprite(path: &Path, palette: &Palette, out_dir: &Path, out: &mut String) {
     let path_str = path.to_str().unwrap();
-    let sprite = Sprite::load_native(path_str, palette)
-        .unwrap_or_else(|e| panic!("failed to load sprite {path_str}: {e}"));
+    let (width, height, pixels) = magick_decode_rgba(path_str, MAX_DIM)
+        .unwrap_or_else(|| panic!("failed to load sprite {path_str}"));
+    let sprite = Sprite::native_from_rgba(width, height, &pixels, palette);
     let name = path.file_stem().unwrap().to_str().unwrap();
 
     let sprite = &sprite;

@@ -33,7 +33,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use pixel_fonts::{BitmapFont, FUSION_PIXEL_12_SPEC};
-use pixel_graphics::{Framebuffer, Paint as PgPaint, PresentLut, Swap};
+use pixel_graphics::{Framebuffer, Paint as PgPaint, PaletteIndex, PresentLut, Swap};
 
 use crate::oklch::OklabPalette;
 use crate::theme::{self, palette_color};
@@ -98,8 +98,8 @@ fn fill_paint(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, paint: PgPai
         return;
     }
     fb.fill_rect_paint(
-        x0 as usize,
-        y0 as usize,
+        x0 as isize,
+        y0 as isize,
         (x1 - x0) as usize,
         (y1 - y0) as usize,
         paint,
@@ -107,7 +107,7 @@ fn fill_paint(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, paint: PgPai
 }
 
 fn fill(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, index: Index) {
-    fill_paint(fb, x, y, w, h, PgPaint::Solid(index));
+    fill_paint(fb, x, y, w, h, PgPaint::Solid(PaletteIndex::new(index)));
 }
 
 /// The accent remap shared by the border and its titlebar buttons: the
@@ -117,14 +117,17 @@ fn fill(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, index: Index) {
 /// counterpart (`theme::LIGHTER_INDEX`).
 fn accent_swap(index: Index) -> Swap {
     Swap::identity()
-        .set(palette_color::LAVENDER, PgPaint::Solid(index))
+        .set(
+            palette_color::LAVENDER,
+            PgPaint::Solid(PaletteIndex::new(index)),
+        )
         .set(
             palette_color::PURPLE,
-            PgPaint::Solid(theme::darker_index(index)),
+            PgPaint::Solid(PaletteIndex::new(theme::darker_index(index))),
         )
         .set(
             palette_color::CREAM,
-            PgPaint::Solid(theme::lighter_index(index)),
+            PgPaint::Solid(PaletteIndex::new(theme::lighter_index(index))),
         )
 }
 
@@ -215,7 +218,13 @@ impl Renderer {
             .as_ref()
             .is_some_and(|wp| wp.fb.width >= w && wp.fb.height >= h);
         if !covered {
-            fb.fill_rect_paint(0, 0, w, h, PgPaint::Solid(palette_color::BLACK));
+            fb.fill_rect_paint(
+                0,
+                0,
+                w,
+                h,
+                PgPaint::Solid(PaletteIndex::new(palette_color::BLACK)),
+            );
         }
         if let Some(wp) = &self.wallpaper {
             // `copy_from`, not `blit_from`: the quantized wallpaper only
@@ -255,13 +264,13 @@ impl Renderer {
         let h = font.cell_h() as i32;
         let x = cx - w / 2;
         let y = cy - h / 2;
-        // The font API's y origin is unsigned; a glyph poking past the top
-        // edge is dropped (callers never place labels there). Negative x is
-        // real (taskbar tiles fanning off the left edge) and clips instead.
+        // A glyph poking past the top edge is dropped (callers never place
+        // labels there). Negative x is real (taskbar tiles fanning off the
+        // left edge) and clips instead.
         if y < 0 {
             return;
         }
-        font.draw_text_clipped(fb, s, x as isize, y as usize, color, 0, fb.width);
+        font.draw_text_clipped(fb, s, x as isize, y as isize, color, 0, fb.width);
     }
 
     /// The na16 palette all art/indices resolve through, for callers running

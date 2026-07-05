@@ -1,7 +1,7 @@
 //! The split-control buttons (close/minimize/split) drawn over a leaf's
 //! titlebar, on top of the chrome from `chrome`.
 
-use pixel_graphics::{Framebuffer, Paint as PgPaint, Sprite};
+use pixel_graphics::{Framebuffer, Paint as PgPaint, PaletteIndex, Sprite};
 
 use crate::theme::palette_color;
 use crate::Index;
@@ -66,8 +66,10 @@ impl Renderer {
         let (sprite, swap) = if disabled {
             (
                 &art.disabled,
-                accent_swap(accent_index)
-                    .set(palette_color::LIME, PgPaint::Solid(palette_color::LAVENDER)),
+                accent_swap(accent_index).set(
+                    palette_color::LIME,
+                    PgPaint::Solid(PaletteIndex::new(palette_color::LAVENDER)),
+                ),
             )
         } else {
             (&art.normal, accent_swap(accent_index))

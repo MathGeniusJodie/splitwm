@@ -6,7 +6,7 @@
 
 #![allow(clippy::cast_possible_truncation)]
 
-use pixel_graphics::{Rgb, Rgba};
+use pixel_graphics::{magick_decode_rgba, Rgb};
 
 use crate::oklch::OklabPalette;
 
@@ -50,89 +50,6 @@ impl Icon {
 /// Widest icon dimension worth keeping: anything larger than this is not a
 /// plausible app icon.
 const MAX_ICON_DIM: usize = 2048;
-
-/// Decode any image file (PNG, SVG, JPEG, WebP, …) to straight
-/// (non-premultiplied) 8-bit RGBA with ImageMagick (`magick`, falling back
-/// to the IM6 `convert` name) — image decoding deliberately lives in the
-/// magick process, not this binary, whose own resource limits also bound
-/// what a hostile file can demand. `-background none` keeps SVG/transparent
-/// sources' alpha instead of flattening onto white. Runs on user-chosen
-/// files (wallpaper, theme icons), never per frame; a missing ImageMagick
-/// just means that image is skipped, with a hint on stderr. Images wider or
-/// taller than `max_dim` are rejected before their pixels are copied.
-pub(crate) fn magick_decode_rgba(path: &str, max_dim: usize) -> Option<(usize, usize, Vec<Rgba>)> {
-    for prog in ["magick", "convert"] {
-        match std::process::Command::new(prog)
-            .args(["-background", "none"])
-            .arg(path)
-            // Force RGBA at 8 bits so the PAM header below is the only
-            // shape magick can emit (grayscale sources would otherwise
-            // come out GRAYSCALE_ALPHA).
-            .args([
-                "-colorspace",
-                "sRGB",
-                "-type",
-                "truecoloralpha",
-                "-depth",
-                "8",
-                "pam:-",
-            ])
-            .output()
-        {
-            Ok(out) if out.status.success() => return parse_pam_rgba(&out.stdout, max_dim),
-            Ok(out) => {
-                eprintln!(
-                    "splitwm: {prog} failed on {path}: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                );
-                return None;
-            }
-            // Not installed under this name; try the next.
-            Err(_) => {}
-        }
-    }
-    eprintln!("splitwm: decoding {path} needs ImageMagick (magick/convert) installed");
-    None
-}
-
-/// Parse a PAM (P7) image as produced by `magick ... pam:-`: an ASCII
-/// header of `KEY value` lines up to `ENDHDR`, then raw samples. Hand-rolled
-/// rather than a decoder dependency because the binary intentionally has no
-/// image decoding — this header is a handful of ASCII lines, and the RGBA
-/// shape is forced by the magick invocation, so anything else is rejected.
-/// The `max_dim` cap is enforced here, on the declared WIDTH/HEIGHT, so an
-/// implausibly large image never gets its pixel buffer copied at all.
-fn parse_pam_rgba(bytes: &[u8], max_dim: usize) -> Option<(usize, usize, Vec<Rgba>)> {
-    let mut rest = bytes.strip_prefix(b"P7\n")?;
-    let (mut w, mut h) = (None, None);
-    loop {
-        let nl = rest.iter().position(|&b| b == b'\n')?;
-        let line = std::str::from_utf8(&rest[..nl]).ok()?;
-        rest = &rest[nl + 1..];
-        match line.split_once(' ') {
-            _ if line == "ENDHDR" => break,
-            Some(("WIDTH", v)) => w = v.trim().parse::<usize>().ok(),
-            Some(("HEIGHT", v)) => h = v.trim().parse::<usize>().ok(),
-            Some(("DEPTH", "4") | ("MAXVAL", "255") | ("TUPLTYPE", "RGB_ALPHA")) => {}
-            Some(("DEPTH" | "MAXVAL" | "TUPLTYPE", _)) => return None,
-            _ => {}
-        }
-    }
-    let (w, h) = (w?, h?);
-    if w == 0 || h == 0 || w > max_dim || h > max_dim || rest.len() < w * h * 4 {
-        return None;
-    }
-    let pixels = rest[..w * h * 4]
-        .chunks_exact(4)
-        .map(|p| Rgba {
-            r: p[0],
-            g: p[1],
-            b: p[2],
-            a: p[3],
-        })
-        .collect();
-    Some((w, h, pixels))
-}
 
 /// Decode an icon image file (e.g. a launcher icon resolved from the icon
 /// theme, found on disk via `.desktop` `Icon=` entries rather than trusted)
@@ -179,47 +96,4 @@ fn quantize_argb(palette: &OklabPalette, px: u32) -> u32 {
     };
     let snapped = palette.inner().color(palette.nearest_index(rgb));
     (a << 24) | (u32::from(snapped.r) << 16) | (u32::from(snapped.g) << 8) | u32::from(snapped.b)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_pam_rgba;
-
-    fn pam(header: &str, pixels: &[u8]) -> Vec<u8> {
-        let mut bytes = header.as_bytes().to_vec();
-        bytes.extend_from_slice(pixels);
-        bytes
-    }
-
-    #[test]
-    fn pam_parses_the_shape_magick_emits() {
-        let bytes = pam(
-            "P7\nWIDTH 2\nHEIGHT 1\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n",
-            &[1, 2, 3, 4, 5, 6, 7, 8],
-        );
-        let px = |r, g, b, a| pixel_graphics::Rgba { r, g, b, a };
-        assert_eq!(
-            parse_pam_rgba(&bytes, 2048),
-            Some((2, 1, vec![px(1, 2, 3, 4), px(5, 6, 7, 8)]))
-        );
-    }
-
-    #[test]
-    fn pam_rejects_non_rgba_truncated_oversized_and_non_pam_input() {
-        // Wrong tuple type / depth / maxval.
-        for hdr in [
-            "P7\nWIDTH 1\nHEIGHT 1\nDEPTH 2\nMAXVAL 255\nTUPLTYPE GRAYSCALE_ALPHA\nENDHDR\n",
-            "P7\nWIDTH 1\nHEIGHT 1\nDEPTH 4\nMAXVAL 65535\nTUPLTYPE RGB_ALPHA\nENDHDR\n",
-        ] {
-            assert_eq!(parse_pam_rgba(&pam(hdr, &[0; 8]), 2048), None);
-        }
-        // Fewer samples than WIDTH*HEIGHT*4 claims.
-        let hdr = "P7\nWIDTH 2\nHEIGHT 2\nDEPTH 4\nMAXVAL 255\nTUPLTYPE RGB_ALPHA\nENDHDR\n";
-        assert_eq!(parse_pam_rgba(&pam(hdr, &[0; 15]), 2048), None);
-        // Declared dimensions above the cap are rejected before any copy.
-        assert_eq!(parse_pam_rgba(&pam(hdr, &[0; 16]), 1), None);
-        // Arbitrary non-PAM bytes.
-        assert_eq!(parse_pam_rgba(b"JFIF-not-a-pam", 2048), None);
-        assert_eq!(parse_pam_rgba(&[0u8; 64], 2048), None);
-    }
 }
