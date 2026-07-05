@@ -17,15 +17,15 @@ use super::types::{Wm, WmError, R};
 /// to serialise reuse (see `Wm::blit_fb`).
 pub struct ShmSeg {
     /// Server-side segment id (XID).
-    pub seg: u32,
+    seg: u32,
     ptr: *mut u8,
-    pub len: usize,
+    len: usize,
     /// Which half the next frame is written into.
-    pub half: usize,
+    half: usize,
     /// Per-half: whether an unconfirmed `ShmPutImage` reading that half is
     /// (potentially) still in flight. Set on put, cleared by the round trip
     /// `Wm::blit_fb` performs before overwriting a pending half.
-    pub pending: [bool; 2],
+    pending: [bool; 2],
 }
 
 impl ShmSeg {
@@ -33,7 +33,7 @@ impl ShmSeg {
     /// `ptr` must be the start of a live `MAP_SHARED` mapping of at least
     /// `len` bytes that this `ShmSeg` uniquely owns: `slice()` will hand out
     /// `&mut [u8]` views of it and `Drop` will `munmap(ptr, len)`.
-    pub unsafe fn new(seg: u32, ptr: *mut u8, len: usize) -> Self {
+    unsafe fn new(seg: u32, ptr: *mut u8, len: usize) -> Self {
         Self {
             seg,
             ptr,
@@ -44,18 +44,18 @@ impl ShmSeg {
     }
 
     /// Byte capacity of one half (a frame must fit in this).
-    pub fn half_len(&self) -> usize {
+    fn half_len(&self) -> usize {
         self.len / 2
     }
 
     /// Byte offset of the current half within the segment.
-    pub fn offset(&self) -> usize {
+    fn offset(&self) -> usize {
         self.half * self.half_len()
     }
 
     /// The first `len` bytes of the *current half* of the mapping (callers
     /// size frames to fit; see `half_len`).
-    pub fn slice(&mut self, len: usize) -> &mut [u8] {
+    fn slice(&mut self, len: usize) -> &mut [u8] {
         assert!(len <= self.half_len());
         // SAFETY: ptr/len describe a live MAP_SHARED mapping owned by self,
         // and offset + len stays within it.

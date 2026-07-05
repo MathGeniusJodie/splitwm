@@ -332,7 +332,8 @@ impl Wm {
     /// `place_clients` applies, min-size clamp included), or the dock's
     /// pinned column. `None` for anything else (hidden clients, unknowns).
     fn tracked_geometry(&self, win: Win) -> Option<(i32, i32, i32, i32)> {
-        if self.kind_of(win) == Some(WindowKind::Dock) {
+        let kind = self.kind_of(win);
+        if kind == Some(WindowKind::Dock) {
             let d = self.dock.docked?;
             return Some(self.dock_geometry(d));
         }
@@ -345,10 +346,13 @@ impl Wm {
             return Some((full.x, full.y, full.w.max(1), full.h.max(1)));
         }
         // Floats: `f.x`/`f.y` are the client window's root coordinates (the
-        // frame is a sibling underneath, not a reparent).
-        if self.kind_of(win) == Some(WindowKind::Float) {
-            let f = self.floats.iter().find(|f| f.win == win)?;
-            return Some((f.x, f.y, f.w.max(1), f.h.max(1)));
+        // frame is a sibling underneath, not a reparent). Falls through to
+        // the tiled-tree lookup below rather than returning `None` outright
+        // if `win` isn't actually in `floats` (a `kind_of`/`floats` desync).
+        if kind == Some(WindowKind::Float) {
+            if let Some(f) = self.floats.iter().find(|f| f.win == win) {
+                return Some((f.x, f.y, f.w.max(1), f.h.max(1)));
+            }
         }
         let leaf = self.state.tree.find_leaf_for_client(win)?;
         // A hidden window (minimized, or its split scrolled off-screen) was
@@ -518,14 +522,7 @@ impl Wm {
             return Ok(());
         }
         match self.kind_of(win) {
-            Some(WindowKind::Dock) => {
-                self.dock.docked = None;
-                self.unregister_kind(win);
-                // The dock's scroll headroom is gone; don't leave the
-                // viewport parked in it.
-                self.clamp_scroll();
-                self.arrange()
-            }
+            Some(WindowKind::Dock) => self.forget_dock(win),
             Some(WindowKind::Notification) => self.forget_notification(win),
             Some(WindowKind::Float) => {
                 self.withdraw_wm_state(win)?;
@@ -546,12 +543,7 @@ impl Wm {
 
     fn on_destroy(&mut self, win: u32) -> R<()> {
         match self.kind_of(win) {
-            Some(WindowKind::Dock) => {
-                self.dock.docked = None;
-                self.unregister_kind(win);
-                self.clamp_scroll();
-                self.arrange()
-            }
+            Some(WindowKind::Dock) => self.forget_dock(win),
             Some(WindowKind::Notification) => self.forget_notification(win),
             Some(WindowKind::Float) => self.forget_float(win),
             // Unlike `on_unmap`, an unrecognised window still goes through

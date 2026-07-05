@@ -548,13 +548,14 @@ impl Wm {
     }
 
     /// Record `win` as `kind`, called at the same point it's inserted into
-    /// that kind's own container. Debug-asserts against silently
-    /// re-registering a window under a *different* kind without
-    /// unregistering it first — two containers claiming the same window is
-    /// exactly the drift this map exists to rule out.
+    /// that kind's own container. Panics on silently re-registering a window
+    /// under a *different* kind without unregistering it first — two
+    /// containers claiming the same window is exactly the drift this map
+    /// exists to rule out, so this is checked in release builds too rather
+    /// than trusting every call site to pair register/unregister correctly.
     pub(crate) fn register_kind(&mut self, win: Win, kind: WindowKind) {
         if let Some(prev) = self.window_kind.insert(win, kind) {
-            debug_assert_eq!(prev, kind, "{win:#x} re-registered as a different WindowKind");
+            assert_eq!(prev, kind, "{win:#x} re-registered as a different WindowKind");
         }
     }
 
@@ -577,7 +578,7 @@ impl Wm {
     /// here and treated as `None` rather than trusted by callers.
     pub(crate) fn fullscreen(&mut self) -> Option<Win> {
         if self.fullscreen.is_some_and(|w| {
-            !self.clients.contains_key(&w) && !self.floats.iter().any(|f| f.win == w)
+            !matches!(self.kind_of(w), Some(WindowKind::Tiled | WindowKind::Float))
         }) {
             self.fullscreen = None;
         }

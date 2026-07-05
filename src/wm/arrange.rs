@@ -11,7 +11,7 @@ use x11rb::protocol::xproto::{
 };
 
 use super::clients::WmState;
-use super::types::{clamp_dim, FrameRect, Wm, R};
+use super::types::{clamp_dim, FrameRect, Wm, WindowKind, R};
 use super::widgets::BtnKind;
 use crate::render::{LeafView, TabInfo};
 use crate::theme;
@@ -462,20 +462,26 @@ impl Wm {
         let Some(fs) = self.raw_fullscreen() else {
             return Ok(());
         };
-        if self.clients.contains_key(&fs) {
-            self.conn
-                .configure_window(fs, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
-        } else if self.floats.iter().any(|f| f.win == fs) {
-            let full = self.wa();
-            self.conn.configure_window(
-                fs,
-                &ConfigureWindowAux::new()
-                    .x(full.x)
-                    .y(full.y)
-                    .width(clamp_dim(full.w.max(1)))
-                    .height(clamp_dim(full.h.max(1)))
-                    .stack_mode(StackMode::ABOVE),
-            )?;
+        match self.kind_of(fs) {
+            Some(WindowKind::Tiled) => {
+                self.conn.configure_window(
+                    fs,
+                    &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
+                )?;
+            }
+            Some(WindowKind::Float) => {
+                let full = self.wa();
+                self.conn.configure_window(
+                    fs,
+                    &ConfigureWindowAux::new()
+                        .x(full.x)
+                        .y(full.y)
+                        .width(clamp_dim(full.w.max(1)))
+                        .height(clamp_dim(full.h.max(1)))
+                        .stack_mode(StackMode::ABOVE),
+                )?;
+            }
+            Some(WindowKind::Dock | WindowKind::Notification) | None => {}
         }
         Ok(())
     }

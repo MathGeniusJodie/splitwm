@@ -34,8 +34,8 @@ pub const PING_ATOM: &str = "SPLITWM_NOTE";
 /// `expire_timeout: -1` ("server decides") becomes this.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Cap on outstanding notifications; also aliased by `wm::notes` as its own
-/// popup cap (its private `MAX_NOTE_POPUPS`), since this daemon's
+/// Cap on outstanding notifications; also aliased by `wm::notifications::popups`
+/// as its own popup cap (its private `MAX_NOTE_POPUPS`), since this daemon's
 /// `Show`/`Close` traffic ultimately drives that popup pile and the two must
 /// stay coherent.
 pub const MAX_NOTES: usize = 8;

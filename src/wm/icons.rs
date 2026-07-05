@@ -7,7 +7,7 @@ use std::rc::Rc;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{Atom, AtomEnum, ClientMessageEvent, ConnectionExt, EventMask};
 
-use super::types::{Wm, R};
+use super::types::{Wm, WindowKind, R};
 use crate::icon::{self, Icon};
 use crate::theme;
 use crate::tree::Win;
@@ -30,23 +30,32 @@ pub struct IconResult {
 }
 
 impl Wm {
-    /// WM_CLASS's class string (second of the "instance\0class\0" pair),
-    /// used both as the taskbar label's source letter and to group windows
-    /// of the same app for icon color-rotation (`assign_icon_slot`).
-    pub(crate) fn client_identity(&self, win: Win) -> Rc<str> {
-        let class = self
-            .conn
+    /// The non-empty, nul-separated parts of `win`'s `WM_CLASS` property
+    /// ("instance\0class\0"), or empty if it has none set. Shared by every
+    /// `WM_CLASS` consumer (`client_identity`, `Wm::matches_dock`) so the
+    /// property fetch and its truncation cap live in exactly one place.
+    pub(crate) fn wm_class_parts(&self, win: Win) -> Vec<Vec<u8>> {
+        self.conn
             .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
             .ok()
             .and_then(|c| c.reply().ok())
             .map(|r| r.value)
-            .unwrap_or_default();
-        let parts: Vec<&[u8]> = class.split(|&b| b == 0).filter(|s| !s.is_empty()).collect();
+            .unwrap_or_default()
+            .split(|&b| b == 0)
+            .filter(|p| !p.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect()
+    }
+
+    /// WM_CLASS's class string (second of the "instance\0class\0" pair),
+    /// used both as the taskbar label's source letter and to group windows
+    /// of the same app for icon color-rotation (`assign_icon_slot`).
+    pub(crate) fn client_identity(&self, win: Win) -> Rc<str> {
+        let parts = self.wm_class_parts(win);
         let name = parts
             .get(1)
             .or_else(|| parts.first())
-            .copied()
-            .unwrap_or(b"?");
+            .map_or(&b"?"[..], |p| p.as_slice());
         Rc::from(String::from_utf8_lossy(name).as_ref())
     }
 
@@ -278,22 +287,34 @@ impl Wm {
         while let Ok(IconResult { win, icon }) = self.icon_rx.try_recv() {
             let Some(img) = icon else { continue };
             let icon = Rc::new(icon::quantize(self.renderer.palette(), &img));
-            if let Some(client) = self.clients.get_mut(&win) {
-                if client.icon.is_none() {
-                    client.icon = Some(icon);
-                    client.icon_rotated = None;
-                    let class = client.class.clone();
-                    self.refresh_icon_rotations(&class);
-                    changed = true;
-                }
-            } else if let Some(float) = self.floats.iter_mut().find(|f| f.win == win) {
-                if float.icon.is_none() {
-                    float.icon = Some(icon);
-                    let frame = float.frame;
-                    if let Err(e) = self.paint_float_frame(frame) {
-                        eprintln!("splitwm: failed to paint float frame after icon fetch: {e}");
+            match self.kind_of(win) {
+                Some(WindowKind::Tiled) => {
+                    let Some(client) = self.clients.get_mut(&win) else {
+                        continue;
+                    };
+                    if client.icon.is_none() {
+                        client.icon = Some(icon);
+                        client.icon_rotated = None;
+                        let class = client.class.clone();
+                        self.refresh_icon_rotations(&class);
+                        changed = true;
                     }
                 }
+                Some(WindowKind::Float) => {
+                    let Some(float) = self.floats.iter_mut().find(|f| f.win == win) else {
+                        continue;
+                    };
+                    if float.icon.is_none() {
+                        float.icon = Some(icon);
+                        let frame = float.frame;
+                        if let Err(e) = self.paint_float_frame(frame) {
+                            eprintln!(
+                                "splitwm: failed to paint float frame after icon fetch: {e}"
+                            );
+                        }
+                    }
+                }
+                Some(WindowKind::Dock | WindowKind::Notification) | None => {}
             }
         }
         if changed {

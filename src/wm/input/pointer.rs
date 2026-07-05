@@ -10,7 +10,7 @@ use x11rb::protocol::xproto::{
     InputFocus, MotionNotifyEvent,
 };
 
-use super::super::types::{rect_contains, Wm, R};
+use super::super::types::{rect_contains, Wm, WindowKind, R};
 use super::super::widgets::BtnKind;
 use crate::theme;
 use crate::tree::{Boundary, Dir, NodeId, Win};
@@ -231,25 +231,30 @@ impl Wm {
             // CURRENT_TIME can release a *later* grab than the one this
             // press froze.
             self.conn.allow_events(Allow::REPLAY_POINTER, e.time)?;
-            if self.clients.contains_key(&e.event) {
-                self.state.activate_client(e.event);
-                self.arrange()?;
-                self.focus(Some(e.event))?;
-            } else if self.floats.iter().any(|f| f.win == e.event) {
-                self.focus_float(e.event)?;
-                self.raise_notifications()?;
-            } else if self.dock.docked.is_some_and(|d| d.win == e.event) {
-                // Outside the tree/`clients`, so `focus()` (which only knows
-                // tiled windows) can't take it; set input focus directly.
-                // The press's own timestamp, not CURRENT_TIME — same race
-                // `give_focus` guards against.
-                self.conn
-                    .set_input_focus(InputFocus::POINTER_ROOT, e.event, e.time)?;
-                // Keep `_NET_ACTIVE_WINDOW` in step with the keyboard like
-                // every other focus path — pagers otherwise show the
-                // previous window as active while the user types into the
-                // dock.
-                self.set_net_active_window(e.event)?;
+            match self.kind_of(e.event) {
+                Some(WindowKind::Tiled) => {
+                    self.state.activate_client(e.event);
+                    self.arrange()?;
+                    self.focus(Some(e.event))?;
+                }
+                Some(WindowKind::Float) => {
+                    self.focus_float(e.event)?;
+                    self.raise_notifications()?;
+                }
+                Some(WindowKind::Dock) => {
+                    // Outside the tree/`clients`, so `focus()` (which only
+                    // knows tiled windows) can't take it; set input focus
+                    // directly. The press's own timestamp, not CURRENT_TIME
+                    // — same race `give_focus` guards against.
+                    self.conn
+                        .set_input_focus(InputFocus::POINTER_ROOT, e.event, e.time)?;
+                    // Keep `_NET_ACTIVE_WINDOW` in step with the keyboard
+                    // like every other focus path — pagers otherwise show
+                    // the previous window as active while the user types
+                    // into the dock.
+                    self.set_net_active_window(e.event)?;
+                }
+                Some(WindowKind::Notification) | None => {}
             }
         }
         Ok(())

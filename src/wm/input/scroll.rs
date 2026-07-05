@@ -6,7 +6,7 @@
 use x11rb::protocol::xinput;
 use x11rb::protocol::xproto::ConnectionExt as _;
 
-use super::super::types::{Wm, MOD4, R};
+use super::super::types::{Wm, WindowKind, MOD4, R};
 
 /// A device's horizontal scroll axis: which valuator carries it and how many
 /// valuator units make up one wheel "click" (for scaling into pixels).
@@ -127,7 +127,7 @@ impl Wm {
         let p = self.conn.query_pointer(self.root)?.reply()?;
         let allowed = if p.child == x11rb::NONE
             || p.child == self.underlay
-            || self.dock.docked.is_some_and(|d| d.win == p.child)
+            || self.kind_of(p.child) == Some(WindowKind::Dock)
         {
             true
         } else {

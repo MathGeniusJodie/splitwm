@@ -382,21 +382,30 @@ impl Wm {
     /// terminals retitle on every prompt.
     pub(crate) fn on_title_change(&mut self, win: Win) -> R<()> {
         let title = self.client_title(win);
-        if let Some(client) = self.clients.get_mut(&win) {
-            if client.title == title {
-                return Ok(());
+        match self.kind_of(win) {
+            Some(WindowKind::Tiled) => {
+                let Some(client) = self.clients.get_mut(&win) else {
+                    return Ok(());
+                };
+                if client.title == title {
+                    return Ok(());
+                }
+                client.title = title;
+                self.arrange()
             }
-            client.title = title;
-            return self.arrange();
-        }
-        if let Some(f) = self.floats.iter_mut().find(|f| f.win == win) {
-            if f.title != title {
+            Some(WindowKind::Float) => {
+                let Some(f) = self.floats.iter_mut().find(|f| f.win == win) else {
+                    return Ok(());
+                };
+                if f.title == title {
+                    return Ok(());
+                }
                 f.title = title;
                 let frame = f.frame;
-                return self.paint_float_frame(frame);
+                self.paint_float_frame(frame)
             }
+            Some(WindowKind::Dock | WindowKind::Notification) | None => Ok(()),
         }
-        Ok(())
     }
 
     /// Refresh `_NET_CLIENT_LIST` on the root: managed tiled windows in

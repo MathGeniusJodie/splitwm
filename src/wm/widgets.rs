@@ -41,7 +41,7 @@ pub struct Widgets {
 
 impl Widgets {
     /// Drop every region (and stale rect) from the previous layout.
-    pub fn clear(&mut self) {
+    fn clear(&mut self) {
         self.handle_regions.clear();
         self.plus_regions.clear();
         self.quick_regions.clear();

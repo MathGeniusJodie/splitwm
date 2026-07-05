@@ -56,19 +56,9 @@ impl Wm {
     /// out of tiling and pinned as the dock; a window that *does* declare a
     /// class must match on that alone.
     pub(crate) fn matches_dock(&self, win: Win) -> bool {
-        let class = self
-            .conn
-            .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 256)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .map(|r| r.value)
-            .unwrap_or_default();
-        let mut parts = class
-            .split(|&b| b == 0)
-            .filter(|p| !p.is_empty())
-            .peekable();
-        if parts.peek().is_some() {
-            return parts.any(|part| part == self.dock.title.as_bytes());
+        let parts = self.wm_class_parts(win);
+        if !parts.is_empty() {
+            return parts.iter().any(|part| part.as_slice() == self.dock.title.as_bytes());
         }
         self.client_title(win).as_ref() == self.dock.title
     }
@@ -170,6 +160,15 @@ impl Wm {
         let canvas_w = self.state.canvas_w(wa);
         let x = wa.x + canvas_w - d.overlap() - self.state.scroll_x();
         (x, full.y, d.w.max(1), full.h.max(1))
+    }
+
+    /// The dock went away: drop its record and re-tile now that the scroll
+    /// headroom it needed is gone.
+    pub(crate) fn forget_dock(&mut self, win: Win) -> R<()> {
+        self.dock.docked = None;
+        self.unregister_kind(win);
+        self.clamp_scroll();
+        self.arrange()
     }
 
     pub(crate) fn place_dock(&self) -> R<()> {
