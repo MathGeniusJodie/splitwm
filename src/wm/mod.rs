@@ -722,7 +722,7 @@ fn quick_slots(renderer: &Renderer) -> Vec<QuickSlot> {
             QuickSlot {
                 cmd: q.cmd,
                 icon,
-                label: q.label.chars().next().unwrap_or('?'),
+                label: Wm::label_from_class(q.label),
                 show: q.show,
             }
         })

@@ -59,6 +59,14 @@ impl Wm {
         Rc::from(String::from_utf8_lossy(name).as_ref())
     }
 
+    /// The taskbar/titlebar fallback glyph for a `client_identity` class
+    /// string: its first character, uppercased, or `?` when the class is
+    /// empty. Shared by every chrome that labels a window by its class
+    /// (`Wm::manage`, `Wm::manage_float`).
+    pub(crate) fn label_from_class(class: &str) -> char {
+        class.chars().next().map_or('?', |c| c.to_ascii_uppercase())
+    }
+
     /// First hue-rotation slot (see `theme::icon_hue_rotation`) not already
     /// held by another open window of `class`, so windows of one app stay
     /// distinguishable while a free slot remains. Freeing is implicit: once

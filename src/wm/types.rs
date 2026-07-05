@@ -565,6 +565,14 @@ impl Wm {
         self.window_kind.remove(&win);
     }
 
+    /// `win`'s current geometry, or `None` on any request/reply failure —
+    /// the shared cookie-to-option idiom behind every manage-time size probe
+    /// (`Wm::manage_dock`, `Wm::manage_float`, `Wm::manage_notification`),
+    /// each of which picks its own fallback for the `None` case.
+    pub(crate) fn geometry(&self, win: Win) -> Option<x11rb::protocol::xproto::GetGeometryReply> {
+        self.conn.get_geometry(win).ok()?.reply().ok()
+    }
+
     /// Advance the animation-sequence counter and return the new value —
     /// the only way it moves, so it can only ever increase.
     pub(crate) fn bump_anim_seq(&mut self) -> u64 {

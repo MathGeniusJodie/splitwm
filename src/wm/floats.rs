@@ -7,10 +7,8 @@ use std::rc::Rc;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{
-    AtomEnum, ConfigureWindowAux, ConnectionExt, EventMask, PropMode, StackMode, Window,
-    WindowClass,
+    AtomEnum, ConfigureWindowAux, ConnectionExt, EventMask, StackMode, Window, WindowClass,
 };
-use x11rb::wrapper::ConnectionExt as _;
 
 use super::input::ActiveDrag;
 use super::types::{clamp_dim, FocusModel, Wm, WindowKind, R};
@@ -104,12 +102,7 @@ impl Wm {
     /// It takes focus immediately (a dialog exists to be answered).
     pub(crate) fn manage_float(&mut self, win: Win) -> R<()> {
         let parent = self.transient_for(win);
-        let geo = self
-            .conn
-            .get_geometry(win)
-            .ok()
-            .and_then(|c| c.reply().ok());
-        let (mut w, mut h) = geo.map_or((400, 300), |g| {
+        let (mut w, mut h) = self.geometry(win).map_or((400, 300), |g| {
             (i32::from(g.width).max(1), i32::from(g.height).max(1))
         });
         // An adopted window a previous WM stretched into a split can be
@@ -138,7 +131,7 @@ impl Wm {
             .and_then(|p| self.state.tree.find_leaf_for_client(p))
             .map_or(theme::FALLBACK_ACCENT_INDEX, |l| self.leaf_color_index(l));
         let class = self.client_identity(win);
-        let label = class.chars().next().map_or('?', |c| c.to_ascii_uppercase());
+        let label = Self::label_from_class(&class);
         let icon = self.resolve_icon(win, &class);
         let title = self.client_title(win);
 
@@ -319,14 +312,7 @@ impl Wm {
         self.give_focus(win, f.focus)?;
         self.set_focused_float(win);
         self.restack_float(win)?;
-        self.conn.change_property32(
-            PropMode::REPLACE,
-            self.root,
-            self.atoms.net_active_window,
-            AtomEnum::WINDOW,
-            &[win],
-        )?;
-        Ok(())
+        self.set_net_active_window(win)
     }
 
     /// A float went away: drop it and hand focus back to its transient

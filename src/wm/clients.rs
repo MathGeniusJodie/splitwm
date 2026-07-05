@@ -140,7 +140,7 @@ impl Wm {
         // Class -> label; app icon from _NET_WM_ICON, falling back (off
         // event loop) to the icon theme — see `resolve_icon`.
         let class = self.client_identity(win);
-        let label = class.chars().next().map_or('?', |c| c.to_ascii_uppercase());
+        let label = Self::label_from_class(&class);
         let icon = self.resolve_icon(win, &class);
         let icon_slot = self.assign_icon_slot(&class);
         let title = self.client_title(win);
@@ -275,11 +275,7 @@ impl Wm {
         if !known && !in_layout {
             return Ok(());
         }
-        self.clear_fullscreen_if(win);
-        self.bar_order.retain(|&w| w != win);
-        self.forget_ignored_unmaps(win);
-        self.state.unpin_client(win);
-        self.update_client_list()?;
+        self.forget_client_tracking(win)?;
         // Unpinning may have dropped a column; don't leave the viewport
         // scrolled past the narrower canvas.
         self.clamp_scroll();
@@ -287,6 +283,21 @@ impl Wm {
         let next = self.state.focused_client();
         self.focus(next)?;
         Ok(())
+    }
+
+    /// The bookkeeping `forget_client` and `on_dock_identity_change` both
+    /// need to drop `win` from every tracking structure outside `clients`
+    /// itself (bar order, fullscreen state, ignored-unmap suppression,
+    /// pins, `_NET_CLIENT_LIST`). Callers that immediately reclassify `win`
+    /// into a different `WindowKind` run this instead of `forget_client` so
+    /// they can finish with their own placement rather than a dead
+    /// scroll/arrange/focus pass for a window that's about to be re-managed.
+    pub(crate) fn forget_client_tracking(&mut self, win: Win) -> R<()> {
+        self.clear_fullscreen_if(win);
+        self.bar_order.retain(|&w| w != win);
+        self.forget_ignored_unmaps(win);
+        self.state.unpin_client(win);
+        self.update_client_list()
     }
 
     /// Ask `win` to close via `WM_DELETE_WINDOW` when it participates in

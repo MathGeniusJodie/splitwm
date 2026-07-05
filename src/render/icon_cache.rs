@@ -40,6 +40,23 @@ impl Renderer {
         dy: i32,
         size: i32,
     ) {
+        self.for_each_icon_pixel(img, dx, dy, size, |px, py, i| fb.set_pixel(px, py, i));
+    }
+
+    /// Walk `img`'s cached `size`x`size` nearest-scaled index buffer
+    /// (`cached_icon_indices`), invoking `paint` at each opaque pixel's
+    /// destination `(px, py)` and palette index — the scale/clip/
+    /// skip-transparent logic shared by `draw_icon` (paints the icon) and
+    /// `taskbar::draw_icon_shadow` (paints an offset, flattened silhouette)
+    /// so it's written once for both.
+    pub(super) fn for_each_icon_pixel(
+        &self,
+        img: &Icon,
+        dx: i32,
+        dy: i32,
+        size: i32,
+        mut paint: impl FnMut(usize, usize, Index),
+    ) {
         if img.w == 0 || img.h == 0 || size < 1 {
             return;
         }
@@ -59,7 +76,7 @@ impl Renderer {
                 if i == TRANSPARENT_INDEX {
                     continue;
                 }
-                fb.set_pixel(px as usize, py as usize, i);
+                paint(px as usize, py as usize, i);
             }
         }
     }

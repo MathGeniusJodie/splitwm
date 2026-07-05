@@ -368,7 +368,9 @@ impl Wm {
     /// updates the ICCCM `WM_STATE` (Normal/Iconic).
     fn place_clients(&mut self, placed: &[Placement]) -> R<()> {
         let mut visible: std::collections::HashSet<Win> = std::collections::HashSet::new();
-        let fullscreen = self.fullscreen().filter(|w| self.clients.contains_key(w));
+        let fullscreen = self
+            .fullscreen()
+            .filter(|&w| matches!(self.kind_of(w), Some(WindowKind::Tiled)));
         for p in placed {
             let minimized = self.state.tree.leaf(p.leaf).is_some_and(|l| l.minimized);
             if let Some(c) = p.active_client {

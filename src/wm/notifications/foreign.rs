@@ -37,10 +37,7 @@ impl Wm {
             // One geometry query at manage time; size updates thereafter
             // come from the window's own ConfigureRequests.
             let (w, h) = self
-                .conn
-                .get_geometry(win)
-                .ok()
-                .and_then(|c| c.reply().ok())
+                .geometry(win)
                 .map_or((1, 1), |g| (i32::from(g.width), i32::from(g.height)));
             self.notes.foreign.push(ForeignNote { win, w, h });
             self.register_kind(win, WindowKind::Notification);

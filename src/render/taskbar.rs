@@ -9,7 +9,6 @@ use crate::icon::Icon;
 use crate::theme::palette_color;
 use crate::Index;
 
-use super::icon_cache::TRANSPARENT_INDEX;
 use super::{fill, fill_paint, Renderer};
 
 /// Dithered "translucent" chrome background: a checker of black and gunmetal
@@ -80,27 +79,13 @@ impl Renderer {
     /// costs one extra store per opaque icon pixel instead of a second scale
     /// pass.
     fn draw_icon_shadow(&self, fb: &mut Framebuffer, img: &Icon, dx: i32, dy: i32, size: i32) {
-        if img.w == 0 || img.h == 0 || size < 1 {
-            return;
-        }
-        let sz = size as usize;
-        let idx = self.cached_icon_indices(img, size);
-        for ty in 0..size {
-            let py = dy + SHADOW_OFFSET + ty;
-            if py < 0 {
-                continue;
-            }
-            for tx in 0..size {
-                let px = dx + SHADOW_OFFSET + tx;
-                if px < 0 {
-                    continue;
-                }
-                if idx[ty as usize * sz + tx as usize] == TRANSPARENT_INDEX {
-                    continue;
-                }
-                fb.set_pixel(px as usize, py as usize, SHADOW_COLOR);
-            }
-        }
+        self.for_each_icon_pixel(
+            img,
+            dx + SHADOW_OFFSET,
+            dy + SHADOW_OFFSET,
+            size,
+            |px, py, _| fb.set_pixel(px, py, SHADOW_COLOR),
+        );
     }
 }
 

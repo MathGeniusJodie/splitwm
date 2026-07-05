@@ -71,12 +71,7 @@ impl Wm {
     /// size is whatever it asked for at creation time, kept fixed for the
     /// rest of the session.
     pub(crate) fn manage_dock(&mut self, win: Win) -> R<()> {
-        let width = self
-            .conn
-            .get_geometry(win)
-            .ok()
-            .and_then(|c| c.reply().ok())
-            .map_or(240, |g| i32::from(g.width));
+        let width = self.geometry(win).map_or(240, |g| i32::from(g.width));
         self.dock.docked = Some(Dock {
             win,
             w: width.max(1),
@@ -120,11 +115,7 @@ impl Wm {
         }
         self.clients.remove(&win);
         self.unregister_kind(win);
-        self.bar_order.retain(|&w| w != win);
-        self.forget_ignored_unmaps(win);
-        self.clear_fullscreen_if(win);
-        self.state.unpin_client(win);
-        self.update_client_list()?;
+        self.forget_client_tracking(win)?;
         // Drop the click-to-focus grab `manage` installed before
         // `manage_dock` re-issues the identical passive grab. Re-grabbing
         // one's own combination is actually allowed (BadAccess is only for
