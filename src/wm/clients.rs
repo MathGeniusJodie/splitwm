@@ -448,7 +448,7 @@ impl Wm {
         let is_client = match self.kind_of(win) {
             Some(WindowKind::Tiled) => true,
             Some(WindowKind::Float) => false,
-            _ => return Ok(()),
+            Some(WindowKind::Dock | WindowKind::Notification) | None => return Ok(()),
         };
         if on {
             if let Some(prev) = self.set_fullscreen_win(win) {

@@ -468,7 +468,7 @@ impl Wm {
                 self.focus_float(win)?;
                 self.raise_notifications()
             }
-            _ => Ok(()),
+            Some(WindowKind::Dock | WindowKind::Notification) | None => Ok(()),
         }
     }
 
