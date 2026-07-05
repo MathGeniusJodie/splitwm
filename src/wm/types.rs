@@ -231,12 +231,36 @@ pub struct FocusModel {
     pub take_focus: bool,
 }
 
+/// Which of the four ways a managed window is handled — the single fact
+/// `Wm::kind_of` answers instead of every event-dispatch site probing
+/// `clients`/`floats`/`dock.docked`/`notes.foreign` in turn (previously
+/// duplicated across `on_map_request`, `on_unmap`, `on_destroy`,
+/// `on_configure_request`, `on_activate_request` and `tracked_geometry`).
+/// Payload stays in each kind's own container; this only says which one, so
+/// a window can't be registered under two kinds at once, and an exhaustive
+/// match over it won't compile once a fifth kind exists until every site is
+/// updated to handle it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowKind {
+    Tiled,
+    Float,
+    Dock,
+    Notification,
+}
+
 pub struct Wm {
     pub conn: RustConnection,
     pub root: Window,
     pub depth: u8,
     pub state: State,
     pub clients: HashMap<Win, Client>,
+    /// Single source of truth for which container (this one, `floats`,
+    /// `dock.docked`, `notes.foreign`) a managed window belongs to. Private:
+    /// the only way to add or remove an entry is `register_kind`/
+    /// `unregister_kind`, called at the same point the window is inserted
+    /// into or removed from its payload container, so the two can't drift
+    /// apart.
+    window_kind: HashMap<Win, WindowKind>,
     /// Floating dialogs/transients/fixed-size windows, in mapping order
     /// (see `FloatWin`). Kept above tiled clients by every arrange.
     pub floats: Vec<FloatWin>,
@@ -433,6 +457,7 @@ impl Wm {
             renderer: init.renderer,
             state: State::new(),
             clients: HashMap::new(),
+            window_kind: HashMap::new(),
             floats: Vec::new(),
             focused_float: None,
             last_event_time: 0,
@@ -513,6 +538,30 @@ impl Wm {
     /// this both to clean up and to decide whether `win` held focus.
     pub(crate) fn clear_focused_float_if(&mut self, win: Win) -> bool {
         self.focused_float.take_if(|&mut w| w == win).is_some()
+    }
+
+    /// Which kind of managed window `win` is, if any — the single lookup
+    /// behind every event-dispatch cascade that used to test
+    /// `clients`/`floats`/`dock.docked`/`notes.foreign` in sequence.
+    pub(crate) fn kind_of(&self, win: Win) -> Option<WindowKind> {
+        self.window_kind.get(&win).copied()
+    }
+
+    /// Record `win` as `kind`, called at the same point it's inserted into
+    /// that kind's own container. Debug-asserts against silently
+    /// re-registering a window under a *different* kind without
+    /// unregistering it first — two containers claiming the same window is
+    /// exactly the drift this map exists to rule out.
+    pub(crate) fn register_kind(&mut self, win: Win, kind: WindowKind) {
+        if let Some(prev) = self.window_kind.insert(win, kind) {
+            debug_assert_eq!(prev, kind, "{win:#x} re-registered as a different WindowKind");
+        }
+    }
+
+    /// Drop `win`'s kind record, called at the same point it's removed from
+    /// that kind's own container. A no-op if it was never registered.
+    pub(crate) fn unregister_kind(&mut self, win: Win) {
+        self.window_kind.remove(&win);
     }
 
     /// Advance the animation-sequence counter and return the new value —

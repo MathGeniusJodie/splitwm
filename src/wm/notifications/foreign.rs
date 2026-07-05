@@ -7,7 +7,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConnectionExt, EventMask};
 
 use super::super::clients::WmState;
-use super::super::types::{Wm, R};
+use super::super::types::{Wm, WindowKind, R};
 use crate::tree::Win;
 
 /// A foreign notification window (`_NET_WM_WINDOW_TYPE_NOTIFICATION`) and
@@ -43,6 +43,7 @@ impl Wm {
                 .and_then(|c| c.reply().ok())
                 .map_or((1, 1), |g| (i32::from(g.width), i32::from(g.height)));
             self.notes.foreign.push(ForeignNote { win, w, h });
+            self.register_kind(win, WindowKind::Notification);
         }
         self.place_notifications()?;
         self.conn.map_window(win)?;
@@ -56,6 +57,7 @@ impl Wm {
     /// Stop tracking a closed notification and re-stack the survivors.
     pub(crate) fn forget_notification(&mut self, win: Win) -> R<()> {
         self.notes.foreign.retain(|n| n.win != win);
+        self.unregister_kind(win);
         self.place_notifications()?;
         Ok(())
     }

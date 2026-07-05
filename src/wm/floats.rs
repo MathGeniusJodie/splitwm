@@ -13,7 +13,7 @@ use x11rb::protocol::xproto::{
 use x11rb::wrapper::ConnectionExt as _;
 
 use super::input::ActiveDrag;
-use super::types::{clamp_dim, FocusModel, Wm, R};
+use super::types::{clamp_dim, FocusModel, Wm, WindowKind, R};
 use crate::icon::Icon;
 use crate::theme;
 use crate::tree::Win;
@@ -184,6 +184,7 @@ impl Wm {
             label,
             title,
         });
+        self.register_kind(win, WindowKind::Float);
         self.conn.map_window(frame)?;
         self.conn.map_window(win)?;
         self.update_client_list()?;
@@ -335,6 +336,7 @@ impl Wm {
             return Ok(());
         };
         let gone = self.floats.remove(idx);
+        self.unregister_kind(win);
         self.clear_fullscreen_if(win);
         self.conn.destroy_window(gone.frame)?;
         self.update_client_list()?;

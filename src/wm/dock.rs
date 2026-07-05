@@ -11,7 +11,7 @@ use x11rb::protocol::xproto::{
 };
 
 use super::clients::WmState;
-use super::types::{clamp_dim, Wm, R};
+use super::types::{clamp_dim, Wm, WindowKind, R};
 use crate::tree::Win;
 
 /// The docked-sidebar identity config and the currently docked window.
@@ -91,6 +91,7 @@ impl Wm {
             win,
             w: width.max(1),
         });
+        self.register_kind(win, WindowKind::Dock);
 
         self.select_and_grab(win, EventMask::STRUCTURE_NOTIFY, true)?;
         // The dock is a mapped managed client too: give it the ICCCM
@@ -128,6 +129,7 @@ impl Wm {
             return Ok(());
         }
         self.clients.remove(&win);
+        self.unregister_kind(win);
         self.bar_order.retain(|&w| w != win);
         self.forget_ignored_unmaps(win);
         self.clear_fullscreen_if(win);

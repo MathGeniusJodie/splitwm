@@ -11,7 +11,7 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 
 use super::input::ActiveDrag;
-use super::types::{clamp_dim, Wm, R};
+use super::types::{clamp_dim, Wm, WindowKind, R};
 use crate::tree::{Rect, Win};
 
 impl Wm {
@@ -235,37 +235,41 @@ impl Wm {
     }
 
     fn on_configure_request(&mut self, e: &ConfigureRequestEvent) -> R<()> {
-        // Honour requests for windows we don't (yet) manage; managed clients
-        // are positioned by arrange() and just get the synthetic echo
-        // ICCCM 4.1.5 requires for a denied request (see
-        // `send_synthetic_configure`).
-        if self.clients.contains_key(&e.window) {
-            self.send_synthetic_configure(e.window)?;
-            return Ok(());
-        }
-        // A float resizing itself keeps its new size but our position (the
-        // frame is the move handle); resize + repaint the frame to match.
-        if let Some(i) = self.floats.iter().position(|f| f.win == e.window) {
-            let f = &mut self.floats[i];
-            if u16::from(e.value_mask) & u16::from(ConfigWindow::WIDTH) != 0 {
-                f.w = i32::from(e.width).max(1);
+        match self.kind_of(e.window) {
+            // Managed clients are positioned by arrange() and just get the
+            // synthetic echo ICCCM 4.1.5 requires for a denied request (see
+            // `send_synthetic_configure`).
+            Some(WindowKind::Tiled) => return self.send_synthetic_configure(e.window),
+            // A float resizing itself keeps its new size but our position
+            // (the frame is the move handle); resize + repaint the frame to
+            // match.
+            Some(WindowKind::Float) => {
+                let Some(i) = self.floats.iter().position(|f| f.win == e.window) else {
+                    return Ok(());
+                };
+                let f = &mut self.floats[i];
+                if u16::from(e.value_mask) & u16::from(ConfigWindow::WIDTH) != 0 {
+                    f.w = i32::from(e.width).max(1);
+                }
+                if u16::from(e.value_mask) & u16::from(ConfigWindow::HEIGHT) != 0 {
+                    f.h = i32::from(e.height).max(1);
+                }
+                let (frame, w, h, x, y) = (f.frame, f.w, f.h, f.x, f.y);
+                self.configure_float_frame(e.window, frame, x, y, w, h)?;
+                self.paint_float_frame(frame)?;
+                // The position (and any denied field) stayed ours, so the
+                // request may have been a complete no-op — X emits no
+                // ConfigureNotify for one, so it still needs the echo below.
+                return self.send_synthetic_configure(e.window);
             }
-            if u16::from(e.value_mask) & u16::from(ConfigWindow::HEIGHT) != 0 {
-                f.h = i32::from(e.height).max(1);
-            }
-            let (frame, w, h, x, y) = (f.frame, f.w, f.h, f.x, f.y);
-            self.configure_float_frame(e.window, frame, x, y, w, h)?;
-            self.paint_float_frame(frame)?;
-            // The position (and any denied field) stayed ours, so the
-            // request may have been a complete no-op — X emits no
-            // ConfigureNotify for one, so it still needs the echo below.
-            return self.send_synthetic_configure(e.window);
-        }
-        // The dock's geometry is ours (set once in manage_dock and reasserted
-        // by every place_dock): granting its request would let it drift for
-        // one frame and then snap back. Deny + echo, like tiled clients.
-        if self.dock.docked.is_some_and(|d| d.win == e.window) {
-            return self.send_synthetic_configure(e.window);
+            // The dock's geometry is ours (set once in manage_dock and
+            // reasserted by every place_dock): granting its request would
+            // let it drift for one frame and then snap back. Deny + echo,
+            // like tiled clients.
+            Some(WindowKind::Dock) => return self.send_synthetic_configure(e.window),
+            // Notifications and not-yet-managed windows fall through and
+            // have their request honoured outright, below.
+            Some(WindowKind::Notification) | None => {}
         }
         let aux = ConfigureWindowAux::from_configure_request(e);
         self.conn.configure_window(e.window, &aux)?;
@@ -328,16 +332,22 @@ impl Wm {
     /// `place_clients` applies, min-size clamp included), or the dock's
     /// pinned column. `None` for anything else (hidden clients, unknowns).
     fn tracked_geometry(&self, win: Win) -> Option<(i32, i32, i32, i32)> {
-        if let Some(d) = self.dock.docked.filter(|d| d.win == win) {
+        if self.kind_of(win) == Some(WindowKind::Dock) {
+            let d = self.dock.docked?;
             return Some(self.dock_geometry(d));
         }
+        // Checked before the float branch below: a fullscreen float must
+        // answer with the full-workarea rect `arrange` actually configured
+        // it to, not the pre-fullscreen geometry `move_float`/manage_float
+        // tracked on the `FloatWin` itself.
         if self.raw_fullscreen() == Some(win) {
             let full = self.wa();
             return Some((full.x, full.y, full.w.max(1), full.h.max(1)));
         }
         // Floats: `f.x`/`f.y` are the client window's root coordinates (the
         // frame is a sibling underneath, not a reparent).
-        if let Some(f) = self.floats.iter().find(|f| f.win == win) {
+        if self.kind_of(win) == Some(WindowKind::Float) {
+            let f = self.floats.iter().find(|f| f.win == win)?;
             return Some((f.x, f.y, f.w.max(1), f.h.max(1)));
         }
         let leaf = self.state.tree.find_leaf_for_client(win)?;
@@ -448,41 +458,40 @@ impl Wm {
     /// `_NET_ACTIVE_WINDOW` ClientMessage: bring the window into view and
     /// focus it (see `bring_into_layout`); floats just take focus.
     fn on_activate_request(&mut self, win: u32) -> R<()> {
-        if self.clients.contains_key(&win) {
-            return self.bring_into_layout(win);
+        match self.kind_of(win) {
+            Some(WindowKind::Tiled) => self.bring_into_layout(win),
+            Some(WindowKind::Float) => {
+                self.focus_float(win)?;
+                self.raise_notifications()
+            }
+            _ => Ok(()),
         }
-        if self.floats.iter().any(|f| f.win == win) {
-            self.focus_float(win)?;
-            self.raise_notifications()?;
-        }
-        Ok(())
     }
 
     fn on_map_request(&mut self, e: MapRequestEvent) -> R<()> {
-        // A float re-requesting a map (some toolkits unmap/remap on hide)
-        // must not be managed again: just show and re-focus it.
-        if self.floats.iter().any(|f| f.win == e.window) {
-            self.conn.map_window(e.window)?;
-            self.focus_float(e.window)?;
-            self.raise_notifications()?;
-            return Ok(());
-        }
-        if self.clients.contains_key(&e.window) {
+        match self.kind_of(e.window) {
+            // A float re-requesting a map (some toolkits unmap/remap on
+            // hide) must not be managed again: just show and re-focus it.
+            Some(WindowKind::Float) => {
+                self.conn.map_window(e.window)?;
+                self.focus_float(e.window)?;
+                self.raise_notifications()
+            }
             // A map request for a window we manage but have hidden is the
             // ICCCM deiconify request (Iconic -> Normal): bring it into a
             // split rather than blindly mapping it over the layout.
-            return self.bring_into_layout(e.window);
+            Some(WindowKind::Tiled) => self.bring_into_layout(e.window),
+            // The dock re-requesting a map must not fall through to
+            // manage(): matches_dock would see this same window already
+            // docked, misread it as a second dock, and tile it while
+            // place_dock still manages it — a permanently leaked,
+            // geometry-fighting duplicate.
+            Some(WindowKind::Dock) => {
+                self.conn.map_window(e.window)?;
+                Ok(())
+            }
+            Some(WindowKind::Notification) | None => self.manage(e.window, false),
         }
-        // The dock re-requesting a map must not fall through to manage():
-        // matches_dock would see this same window already docked, misread
-        // it as a second dock, and tile it while place_dock still manages
-        // it — a permanently leaked, geometry-fighting duplicate.
-        if self.dock.docked.is_some_and(|d| d.win == e.window) {
-            self.conn.map_window(e.window)?;
-            return Ok(());
-        }
-        self.manage(e.window, false)?;
-        Ok(())
     }
 
     /// A window was unmapped. Layout hiding accounts for its own unmaps in
@@ -508,41 +517,51 @@ impl Wm {
         if self.take_ignored_unmap(win, e.sequence) {
             return Ok(());
         }
-        if self.dock.docked.is_some_and(|d| d.win == win) {
-            self.dock.docked = None;
-            // The dock's scroll headroom is gone; don't leave the viewport
-            // parked in it.
-            self.clamp_scroll();
-            return self.arrange();
+        match self.kind_of(win) {
+            Some(WindowKind::Dock) => {
+                self.dock.docked = None;
+                self.unregister_kind(win);
+                // The dock's scroll headroom is gone; don't leave the
+                // viewport parked in it.
+                self.clamp_scroll();
+                self.arrange()
+            }
+            Some(WindowKind::Notification) => self.forget_notification(win),
+            Some(WindowKind::Float) => {
+                self.withdraw_wm_state(win)?;
+                self.forget_float(win)
+            }
+            Some(WindowKind::Tiled) => {
+                self.withdraw_wm_state(win)?;
+                self.forget_client(win)
+            }
+            // Not a window we know as any kind — including one `manage`
+            // pinned into the split tree before failing partway through
+            // (see `forget_client`'s own fallback for that case), which is
+            // exactly why this arm must not call it: on_destroy's fallback
+            // below does, on_unmap's never has.
+            None => Ok(()),
         }
-        if self.notes.foreign.iter().any(|n| n.win == win) {
-            return self.forget_notification(win);
-        }
-        if self.floats.iter().any(|f| f.win == win) {
-            self.withdraw_wm_state(win)?;
-            return self.forget_float(win);
-        }
-        if self.clients.contains_key(&win) {
-            self.withdraw_wm_state(win)?;
-            self.forget_client(win)?;
-        }
-        Ok(())
     }
 
     fn on_destroy(&mut self, win: u32) -> R<()> {
-        if self.dock.docked.is_some_and(|d| d.win == win) {
-            self.dock.docked = None;
-            self.clamp_scroll();
-            return self.arrange();
+        match self.kind_of(win) {
+            Some(WindowKind::Dock) => {
+                self.dock.docked = None;
+                self.unregister_kind(win);
+                self.clamp_scroll();
+                self.arrange()
+            }
+            Some(WindowKind::Notification) => self.forget_notification(win),
+            Some(WindowKind::Float) => self.forget_float(win),
+            // Unlike `on_unmap`, an unrecognised window still goes through
+            // `forget_client`: it's a no-op for a truly unknown window, but
+            // catches the one case a `DestroyNotify` can see that `kind_of`
+            // can't — `manage` pinning a window into the split tree/taskbar
+            // before failing partway through (before `register_kind` runs).
+            // Without this, such a window would be a phantom tile forever.
+            Some(WindowKind::Tiled) | None => self.forget_client(win),
         }
-        if self.notes.foreign.iter().any(|n| n.win == win) {
-            return self.forget_notification(win);
-        }
-        if self.floats.iter().any(|f| f.win == win) {
-            return self.forget_float(win);
-        }
-        self.forget_client(win)?;
-        Ok(())
     }
 
     fn on_expose(&mut self, e: ExposeEvent) -> R<()> {

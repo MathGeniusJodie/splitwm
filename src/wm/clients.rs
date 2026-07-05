@@ -16,7 +16,7 @@ use x11rb::protocol::xproto::{
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::CURRENT_TIME;
 
-use super::types::{Client, FocusModel, Wm, R};
+use super::types::{Client, FocusModel, Wm, WindowKind, R};
 
 use crate::launch::shell_quote;
 use crate::tree::Win;
@@ -182,6 +182,7 @@ impl Wm {
                 icon_stale: false,
             },
         );
+        self.register_kind(win, WindowKind::Tiled);
         self.refresh_icon_rotations(&class);
         if !self.bar_order.contains(&win) {
             self.bar_order.push(win);
@@ -264,6 +265,7 @@ impl Wm {
     /// re-tile, and keep focus inside the leaf the window lived in.
     pub(crate) fn forget_client(&mut self, win: Win) -> R<()> {
         let known = self.clients.remove(&win).is_some();
+        self.unregister_kind(win);
         // A window can occupy a leaf/taskbar slot without an entry in
         // `clients` if `manage` errored out partway (it pins into the tree
         // before its X requests); clean the layout up regardless, or the
@@ -423,11 +425,11 @@ impl Wm {
     /// second request replaces the first (its property is cleared so it
     /// doesn't believe it's still fullscreen).
     pub(crate) fn set_fullscreen(&mut self, win: Win, on: bool) -> R<()> {
-        let is_client = self.clients.contains_key(&win);
-        let is_float = self.floats.iter().any(|f| f.win == win);
-        if !is_client && !is_float {
-            return Ok(());
-        }
+        let is_client = match self.kind_of(win) {
+            Some(WindowKind::Tiled) => true,
+            Some(WindowKind::Float) => false,
+            _ => return Ok(()),
+        };
         if on {
             if let Some(prev) = self.set_fullscreen_win(win) {
                 if prev != win {
@@ -443,7 +445,7 @@ impl Wm {
                 return Ok(());
             }
             self.set_net_wm_state_fullscreen(win, false)?;
-            if is_float {
+            if !is_client {
                 self.restore_float_geometry(win)?;
             }
         }
