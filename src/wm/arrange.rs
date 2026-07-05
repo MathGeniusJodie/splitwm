@@ -119,7 +119,7 @@ impl Wm {
 
         // Drag-handle / "+" / tab hit-regions for the current layout.
         self.compute_widgets(wa, &placed);
-        self.compute_taskbar();
+        self.compute_taskbar(&leaves);
 
         // Layout-changing actions animate: capture start rects and hand the
         // transition to the main event loop (`step_animation`), which steps
@@ -200,7 +200,7 @@ impl Wm {
                 // rather than a full-arena `find_parent` scan per leaf.
                 let metas = self.leaf_metas(placed);
                 for (r, leaf, kind) in &self.widgets.btn_regions {
-                    let Some(&meta) = metas.get(leaf) else {
+                    let Some(&(_, meta)) = metas.iter().find(|(l, _)| l == leaf) else {
                         continue;
                     };
                     // A minimized leaf's region is the whole frame (a single
@@ -331,8 +331,10 @@ impl Wm {
         self.leaf_meta_inner(leaf, frame, self.parents.get(&leaf).copied())
     }
 
-    /// `leaf_meta` for every placement at once.
-    fn leaf_metas(&self, placed: &[Placement]) -> HashMap<NodeId, LeafMeta> {
+    /// `leaf_meta` for every placement at once. A `Vec` scanned linearly
+    /// rather than a `HashMap`: `placed` numbers in the single digits, so
+    /// hashing would cost more than it saves.
+    fn leaf_metas(&self, placed: &[Placement]) -> Vec<(NodeId, LeafMeta)> {
         placed
             .iter()
             .map(|p| {

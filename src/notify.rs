@@ -551,9 +551,10 @@ fn decode_entities(s: &str) -> String {
                 .iter()
                 .take(MAX_ENTITY_LEN - 1)
                 .position(|&b| b == b';');
-            if let Some(ch) = semi.and_then(|e| entity_char(&rest[1..1 + e])) {
+            if let Some((e, ch)) = semi.and_then(|e| entity_char(&rest[1..1 + e]).map(|ch| (e, ch)))
+            {
                 out.push(ch);
-                i += 1 + semi.expect("checked by and_then") + 1;
+                i += 1 + e + 1;
                 continue;
             }
         }

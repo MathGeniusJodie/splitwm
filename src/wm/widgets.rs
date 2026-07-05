@@ -102,10 +102,10 @@ impl Wm {
     /// `bar_order`) across the full screen width. Each tile's accent colour and
     /// on-screen flag are resolved here, once per arrange, so the per-frame
     /// compositor needs no tree walks.
-    pub(crate) fn compute_taskbar(&mut self) {
+    pub(crate) fn compute_taskbar(&mut self, leaves: &[NodeId]) {
         let wa = self.wa();
         let (widgets, tree, clients, quick, bar_order) = self.taskbar_compute_parts();
-        compute_taskbar(widgets, tree, clients, quick, bar_order, wa);
+        compute_taskbar(widgets, tree, clients, quick, bar_order, wa, leaves);
     }
 }
 
@@ -126,6 +126,7 @@ fn compute_taskbar(
     quick: &[QuickSlot],
     bar_order: &[Win],
     wa: Rect,
+    leaves: &[NodeId],
 ) {
     let gap = theme::TASKBAR_GAP;
     let isz = theme::TASKBAR_ICON;
@@ -177,10 +178,12 @@ fn compute_taskbar(
     } else {
         full_stride
     };
-    // One tree walk for every tile's leaf lookup — `find_leaf_for_client`
-    // per tile is O(tiles × tree) on a per-arrange path.
+    // One pass over the caller's already-collected leaves for every tile's
+    // leaf lookup, rather than a second `collect_leaves` tree walk here —
+    // `find_leaf_for_client` per tile would be O(tiles × tree) on a
+    // per-arrange path.
     let mut client_leaf = HashMap::new();
-    for l in tree.collect_leaves() {
+    for &l in leaves {
         if let Some(c) = tree.leaf(l).and_then(|lf| lf.client) {
             client_leaf.insert(c, l);
         }
@@ -521,7 +524,7 @@ mod tests {
         // silently drop any of them.
         let bar_order: Vec<Win> = (0..200).collect();
         let mut widgets = Widgets::default();
-        compute_taskbar(&mut widgets, &tree, &clients, &[], &bar_order, WA);
+        compute_taskbar(&mut widgets, &tree, &clients, &[], &bar_order, WA, &[]);
         assert_eq!(
             widgets.taskbar_regions.len(),
             200,
@@ -548,7 +551,7 @@ mod tests {
             show: theme::ShowWhen::UnlessRunning("firefox"),
         }];
         let mut widgets = Widgets::default();
-        compute_taskbar(&mut widgets, &tree, &clients, &quick, &[], WA);
+        compute_taskbar(&mut widgets, &tree, &clients, &quick, &[], WA, &[]);
         assert!(
             widgets.quick_regions.is_empty(),
             "quick-launch entry must hide once its class is already running"
@@ -566,7 +569,7 @@ mod tests {
             show: theme::ShowWhen::UnlessRunning("firefox"),
         }];
         let mut widgets = Widgets::default();
-        compute_taskbar(&mut widgets, &tree, &clients, &quick, &[], WA);
+        compute_taskbar(&mut widgets, &tree, &clients, &quick, &[], WA, &[]);
         assert_eq!(widgets.quick_regions.len(), 1);
     }
 
