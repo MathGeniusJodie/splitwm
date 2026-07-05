@@ -1,6 +1,11 @@
 //! X11 window-manager core: claim the manager selection, become the WM, set
-//! up input/EWMH plumbing, and run the event loop. Client lifecycle lives in
-//! `clients`, event handling in `events`, layout/compositing in `arrange`.
+//! up input/EWMH plumbing, and run the event loop. Each subsystem owns its
+//! own module: tiled-client lifecycle in `clients`, floating windows in
+//! `floats`, the docked sidebar in `dock`, notifications in
+//! `notifications`, the app-icon cache in `icons`, layout/compositing in
+//! `arrange`, presenting frames to the server in `present`, hit-region
+//! computation in `widgets`, and keyboard/pointer/scroll input in `input`.
+//! `events` dispatches raw X11 events to all of the above.
 
 #![allow(
     clippy::cast_precision_loss,
@@ -11,14 +16,19 @@
 
 mod arrange;
 mod clients;
+mod dock;
 mod events;
-mod notes;
+mod floats;
+mod icons;
+mod input;
+mod notifications;
+mod present;
 mod types;
 mod widgets;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::render::{self, ConnectionExt as _, PictType, Pictformat};
-use x11rb::protocol::xinput::{self, ConnectionExt as _, ScrollType, XIEventMask};
+use x11rb::protocol::xinput::{self, ConnectionExt as _, XIEventMask};
 use x11rb::protocol::xproto::{
     AtomEnum, ButtonIndex, ChangeWindowAttributesAux, ClientMessageEvent, ConfigureWindowAux,
     ConnectionExt, CreateGCAux, CreateWindowAux, EventMask, GrabMode, ImageFormat, ImageOrder,
@@ -26,6 +36,9 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::protocol::Event;
 use x11rb::wrapper::ConnectionExt as _;
+
+use input::Cursors;
+use widgets::QuickSlot;
 
 /// Pseudo-device IDs accepted by `XISelectEvents`/`XIQueryDevice` meaning
 /// "every device" and "every master (logical) pointer/keyboard pair".
@@ -1063,42 +1076,6 @@ impl Wm {
         Ok(())
     }
 
-    // --- trackpad / horizontal-scroll device discovery ---
-
-    /// Rescan every input device for a horizontal scroll valuator. Run once
-    /// at startup and again on every `XI_HierarchyChanged` (device
-    /// plug/unplug).
-    pub(crate) fn build_hscroll_map(&mut self) -> R<()> {
-        let reply = self.conn.xinput_xi_query_device(XI_ALL_DEVICES)?.reply()?;
-        self.hscroll.clear();
-        for info in &reply.infos {
-            for class in &info.classes {
-                let xinput::DeviceClassData::Scroll(s) = &class.data else {
-                    continue;
-                };
-                if s.scroll_type != ScrollType::HORIZONTAL {
-                    continue;
-                }
-                let incr = fp3232_to_f64(s.increment);
-                self.hscroll.push(HScroll {
-                    dev: class.sourceid,
-                    valuator: s.number,
-                    incr: if incr == 0.0 { 120.0 } else { incr },
-                });
-            }
-        }
-        if self.debug_scroll {
-            eprintln!(
-                "splitwm: hscroll map rebuilt, {} device(s): {:?}",
-                self.hscroll.len(),
-                self.hscroll
-                    .iter()
-                    .map(|h| (h.dev, h.valuator, h.incr))
-                    .collect::<Vec<_>>()
-            );
-        }
-        Ok(())
-    }
 }
 
 /// The server's ARGB32 pict format, or `None` when RENDER cursors (>= 0.5)

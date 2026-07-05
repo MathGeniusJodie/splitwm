@@ -11,7 +11,7 @@ use x11rb::protocol::xproto::{
     StackMode, Window, WindowClass,
 };
 
-use super::types::{NotePopup, Wm, R};
+use super::super::types::{Wm, R};
 use crate::notify::{Note, NoteMsg};
 use crate::theme;
 use crate::tree::Rect;
@@ -22,6 +22,14 @@ use crate::tree::Rect;
 /// is mostly a backstop for popups that reached us before an eviction
 /// round-trips.
 const MAX_NOTE_POPUPS: usize = crate::notify::MAX_NOTES;
+
+/// One on-screen speech-bubble notification popup and the note it shows.
+pub struct NotePopup {
+    pub win: Window,
+    pub note: crate::notify::Note,
+    pub w: i32,
+    pub h: i32,
+}
 
 impl Wm {
     /// The daemon thread's ClientMessage wakeup: drain the channel and

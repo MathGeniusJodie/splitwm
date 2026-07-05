@@ -6,11 +6,90 @@
 //! connection, which nothing under `impl Wm` can be.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
-use super::types::{BtnKind, Client, FrameRect, Placement, QuickSlot, TaskTile, Widgets, Wm};
+use super::arrange::Placement;
+use super::types::{Client, FrameRect, Wm};
 use crate::state::State;
 use crate::theme;
-use crate::tree::{Dir, NodeId, Rect, Tree, Win};
+use crate::tree::{Boundary, Dir, NodeId, Rect, Tree, Win};
+
+/// Every hit-testable widget rect computed for the current layout: gap drag
+/// handles, "+" insert buttons, tab titles, split-control buttons, taskbar
+/// tiles, the quick-launch icons, and the canvas-edge resize handles.
+/// Grouped so the whole set is rebuilt (and cleared) as one unit by
+/// `Wm::compute_widgets` — the caches must always describe the same arrange.
+#[derive(Default)]
+pub struct Widgets {
+    pub handle_regions: Vec<(FrameRect, Boundary)>,
+    pub plus_regions: Vec<(FrameRect, usize)>,
+    /// Quick-launch icons in the bottom taskbar (after the window tiles),
+    /// paired with their `Wm::quick` index; entries hidden by their
+    /// `ShowWhen` rule get no region.
+    pub quick_regions: Vec<(FrameRect, usize)>,
+    /// The pill separating window tiles from the quick-launch icons; only
+    /// present when both groups are (an unpaired separator is just clutter).
+    pub taskbar_sep: Option<FrameRect>,
+    pub tab_regions: Vec<(FrameRect, NodeId)>,
+    pub taskbar_regions: Vec<TaskTile>,
+    pub btn_regions: Vec<(FrameRect, NodeId, BtnKind)>,
+    /// Hit-regions for the outer canvas-edge resize handles (see
+    /// `compute_edge_handle_widgets`); the bool is `true` for the left
+    /// edge, `false` for the right.
+    pub edge_handle_regions: Vec<(FrameRect, bool)>,
+}
+
+impl Widgets {
+    /// Drop every region (and stale rect) from the previous layout.
+    pub fn clear(&mut self) {
+        self.handle_regions.clear();
+        self.plus_regions.clear();
+        self.quick_regions.clear();
+        self.taskbar_sep = None;
+        self.tab_regions.clear();
+        self.btn_regions.clear();
+        self.taskbar_regions.clear();
+        self.edge_handle_regions.clear();
+    }
+}
+
+/// One taskbar quick-launch entry: the command it spawns and its icon,
+/// resolved once at startup (see `crate::launch::quick_launches`).
+pub struct QuickSlot {
+    pub cmd: String,
+    /// Decoded, palette-quantized icon; `None` falls back to the label glyph.
+    pub icon: Option<Rc<crate::icon::Icon>>,
+    /// First letter of the entry's label, the no-icon fallback glyph.
+    pub label: char,
+    /// Visibility rule, re-evaluated against the managed clients each
+    /// arrange (see `compute_taskbar`).
+    pub show: crate::theme::ShowWhen,
+}
+
+/// The three split-control buttons on the right of every leaf's tab bar
+/// (count mirrored by `theme::N_SPLIT_BTNS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BtnKind {
+    Minimize,
+    Split,
+    Close,
+}
+
+/// A bottom-bar tile with its window and accent/visibility resolved once at
+/// compute time, so per-frame compositing needs no tree walks.
+#[derive(Clone, Copy)]
+pub struct TaskTile {
+    pub rect: FrameRect,
+    /// The close ("x") badge in the tile's bottom-right corner; hit-tested
+    /// before `rect` so it wins the click.
+    pub close: FrameRect,
+    pub win: Win,
+    pub accent: crate::Index,
+    /// Whether the window occupies a split (drives the accent highlight).
+    /// Deliberately not "on screen": a split scrolled out of the viewport
+    /// still counts.
+    pub in_split: bool,
+}
 
 impl Wm {
     pub(crate) fn compute_widgets(&mut self, wa: Rect, placed: &[Placement]) {

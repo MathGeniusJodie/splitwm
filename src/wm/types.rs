@@ -1,4 +1,9 @@
-//! Shared types, helpers and constants for the X11 window-manager core.
+//! The `Wm` struct itself (assembly, its self-healing-record accessors),
+//! the error type, interned atoms, and the small set of geometry helpers
+//! genuinely shared across every subsystem. Each subsystem's own types live
+//! next to the code that defines them (see `dock`, `floats`, `icons`,
+//! `input`, `notifications`, `present`, `widgets`) and are re-exported here
+//! only where `Wm`'s own fields need to name them.
 
 #![allow(
     clippy::cast_precision_loss,
@@ -16,7 +21,16 @@ use x11rb::rust_connection::RustConnection;
 use crate::icon::Icon;
 use crate::render::Renderer;
 use crate::state::State;
-use crate::tree::{Boundary, Dir, NodeId, Rect, Win};
+use crate::tree::{NodeId, Rect, Win};
+
+use super::arrange::LayoutAnim;
+use super::dock::DockState;
+use super::floats::FloatWin;
+use super::icons::IconResult;
+use super::input::{Cursors, DragState, HScroll, KeyRepeatState};
+use super::notifications::NoteState;
+use super::present::ShmSeg;
+use super::widgets::{QuickSlot, Widgets};
 
 pub type R<T> = Result<T, WmError>;
 
@@ -215,50 +229,6 @@ pub struct Client {
 pub struct FocusModel {
     pub input: bool,
     pub take_focus: bool,
-}
-
-/// A floating window: a dialog/transient (`WM_TRANSIENT_FOR` or
-/// `_NET_WM_WINDOW_TYPE_DIALOG`) or a fixed-size client (min == max in
-/// `WM_NORMAL_HINTS`). Never in `clients`/the split tree/taskbar: shown at
-/// its requested size, centered over its parent's split (or the workarea),
-/// stacked above every tiled client, focused on map and click but not part
-/// of Mod4+Tab cycling.
-pub struct FloatWin {
-    pub win: Win,
-    /// Our own chrome window stacked just below `win`: the split border art
-    /// (border + titlebar, no control buttons), draggable to move the float.
-    pub frame: Window,
-    /// `WM_TRANSIENT_FOR` target, used for centering and for handing focus
-    /// back when the float goes away.
-    pub parent: Option<Win>,
-    pub focus: FocusModel,
-    /// Client-window screen geometry (the frame extends `BORDER_LEFT` /
-    /// `tb_h` around it), tracked so drags and repaints don't need a
-    /// `GetGeometry` round trip.
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
-    /// Accent palette index for the chrome — the transient parent's split
-    /// colour when it has one, so the dialog visibly belongs to it.
-    pub accent: crate::Index,
-    /// Titlebar app icon/label, resolved once at manage time.
-    pub icon: Option<Rc<Icon>>,
-    pub label: char,
-    /// `_NET_WM_NAME`/`WM_NAME`, kept live by `Wm::on_title_change`.
-    pub title: Rc<str>,
-}
-
-/// A layout-mutating keycode's (split/close/mute-toggle) autorepeat state:
-/// `Held` since its last genuine `KeyPress`, or `ReleasedAt(time)` since its
-/// last `KeyRelease` at server `time` — see `Wm::key_is_repeating`. Folding
-/// both into one enum (rather than a keycode sitting in one "held" list and
-/// a separate "last release" list) makes "held and recently-released at
-/// once" for the same keycode unrepresentable instead of merely unintended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyRepeatState {
-    Held,
-    ReleasedAt(u32),
 }
 
 pub struct Wm {
@@ -638,280 +608,9 @@ fn prune_and_match_unmap_seq(seqs: &mut Vec<u16>, seq: u16) -> bool {
     matched
 }
 
-/// The docked-sidebar identity config and the currently docked window.
-pub struct DockState {
-    /// The window pinned past the right end of the scrolling canvas, only
-    /// revealed by scrolling all the way right (see `DockState::title`),
-    /// if one is currently mapped. It lives outside `clients`/the split
-    /// tree/`bar_order` entirely: no chrome, no taskbar entry, not part of
-    /// focus cycling, and normal tiled columns never lay out under it.
-    pub docked: Option<Dock>,
-    /// Identity that marks the dock window — matched against either half of
-    /// its `WM_CLASS` (`SPLITWM_DOCK_TITLE`, default `theme::DOCK_TITLE`);
-    /// also the desktop id used to autostart it.
-    pub title: String,
-}
-
-/// A docked window and the width captured from its own requested geometry
-/// when it was first managed — the width only exists while something is
-/// docked, so the pair travels as one value.
-#[derive(Clone, Copy)]
-pub struct Dock {
-    pub win: Win,
-    pub w: i32,
-}
-
-impl Dock {
-    /// `theme::DOCK_OVERLAP` clamped to the dock's own width — an overlap
-    /// wider than the dock would otherwise shove its right edge permanently
-    /// away from the screen edge (fully tucked is the useful maximum).
-    pub fn overlap(self) -> i32 {
-        crate::theme::DOCK_OVERLAP.min(self.w)
-    }
-}
-
-/// Result of a background theme-icon fetch (see
-/// `Wm::spawn_theme_icon_fetch`), tagged with the window it was resolved
-/// for. By the time this arrives `win` may already be unmanaged — the
-/// receiver must check before applying it, same as `Wm::on_icon_change`
-/// already does for its own late-arriving fetch.
-pub struct IconResult {
-    pub win: Win,
-    /// `None` when the theme lookup/decode failed — nothing to apply, but
-    /// still worth draining so the channel doesn't grow unbounded.
-    pub icon: Option<Icon>,
-}
-
-/// Foreign notification windows and our own served-notification popups.
-pub struct NoteState {
-    /// Notification windows (`_NET_WM_WINDOW_TYPE_NOTIFICATION`), in mapping
-    /// order. Like the dock window, they live outside `clients`/the split
-    /// tree/`bar_order`: no chrome, no taskbar entry, no focus cycling.
-    /// They stack above everything at the bottom-right of the screen
-    /// (see `Wm::place_notifications`), at whatever size they requested —
-    /// tracked here (updated on ConfigureRequest) so restacking the pile
-    /// doesn't cost a `GetGeometry` round trip per window.
-    pub foreign: Vec<ForeignNote>,
-    /// Speech-bubble popups for notifications *we* serve as the session's
-    /// `org.freedesktop.Notifications` daemon (see `crate::notify` and
-    /// `Wm::on_note_ping`). Own override-redirect windows, drawn by the
-    /// renderer, stacked bottom-right above the `foreign` pile.
-    pub popups: Vec<NotePopup>,
-    /// Incoming notification events from the daemon thread.
-    pub rx: std::sync::mpsc::Receiver<crate::notify::NoteMsg>,
-    /// `(id, close reason)` of popups the WM closed itself — user click
-    /// (`CloseReason::Dismissed`) or popup-cap eviction
-    /// (`CloseReason::Undefined`) — reported back to the daemon thread so
-    /// it emits the matching `NotificationClosed` signal.
-    pub dismiss: std::sync::mpsc::Sender<(u32, crate::notify::CloseReason)>,
-}
-
-/// In-progress gap/float/edge drags.
-pub struct DragState {
-    pub active: Option<ActiveDrag>,
-}
-
-/// A gap resize, float move, or edge resize in progress. Button 1 can only
-/// ever be doing one of these at once, so they live behind a single
-/// `Option` rather than three independent ones — every caller already
-/// assumes mutual exclusion, so the type enforces what the logic requires.
-#[derive(Clone, Copy)]
-pub enum ActiveDrag {
-    Split(SplitDrag),
-    /// An in-progress float move, started by pressing button 1 on a float's
-    /// frame window.
-    Float(FloatDrag),
-    Edge(EdgeDrag),
-}
-
-/// Every hit-testable widget rect computed for the current layout: gap drag
-/// handles, "+" insert buttons, tab titles, split-control buttons, taskbar
-/// tiles, the quick-launch icons, and the canvas-edge resize handles.
-/// Grouped so the whole set is rebuilt (and cleared) as one unit by
-/// `Wm::compute_widgets` — the caches must always describe the same arrange.
-#[derive(Default)]
-pub struct Widgets {
-    pub handle_regions: Vec<(FrameRect, Boundary)>,
-    pub plus_regions: Vec<(FrameRect, usize)>,
-    /// Quick-launch icons in the bottom taskbar (after the window tiles),
-    /// paired with their `Wm::quick` index; entries hidden by their
-    /// `ShowWhen` rule get no region.
-    pub quick_regions: Vec<(FrameRect, usize)>,
-    /// The pill separating window tiles from the quick-launch icons; only
-    /// present when both groups are (an unpaired separator is just clutter).
-    pub taskbar_sep: Option<FrameRect>,
-    pub tab_regions: Vec<(FrameRect, NodeId)>,
-    pub taskbar_regions: Vec<TaskTile>,
-    pub btn_regions: Vec<(FrameRect, NodeId, BtnKind)>,
-    /// Hit-regions for the outer canvas-edge resize handles (see
-    /// `compute_edge_handle_widgets`); the bool is `true` for the left
-    /// edge, `false` for the right.
-    pub edge_handle_regions: Vec<(FrameRect, bool)>,
-}
-
-impl Widgets {
-    /// Drop every region (and stale rect) from the previous layout.
-    pub fn clear(&mut self) {
-        self.handle_regions.clear();
-        self.plus_regions.clear();
-        self.quick_regions.clear();
-        self.taskbar_sep = None;
-        self.tab_regions.clear();
-        self.btn_regions.clear();
-        self.taskbar_regions.clear();
-        self.edge_handle_regions.clear();
-    }
-}
-
-/// A foreign notification window (`_NET_WM_WINDOW_TYPE_NOTIFICATION`) and
-/// its last-known size, so the bottom-right pile can be restacked without
-/// re-querying geometry.
-#[derive(Clone, Copy)]
-pub struct ForeignNote {
-    pub win: Win,
-    pub w: i32,
-    pub h: i32,
-}
-
-/// One on-screen speech-bubble notification popup and the note it shows.
-pub struct NotePopup {
-    pub win: Window,
-    pub note: crate::notify::Note,
-    pub w: i32,
-    pub h: i32,
-}
-
-/// A device's horizontal scroll axis: which valuator carries it and how many
-/// valuator units make up one wheel "click" (for scaling into pixels).
-#[derive(Clone, Copy)]
-pub struct HScroll {
-    pub dev: u16,
-    pub valuator: u16,
-    pub incr: f64,
-}
-
-/// An in-progress float move: dragging a float's frame repositions the
-/// frame + client pair. `dx`/`dy` are the pointer's offset from the client
-/// window's origin at press time, so the window tracks the grab point.
-#[derive(Clone, Copy)]
-pub struct FloatDrag {
-    pub win: Win,
-    pub dx: i32,
-    pub dy: i32,
-}
-
-/// An in-progress gap resize started by dragging a handle.
-#[derive(Clone, Copy)]
-pub struct SplitDrag {
-    pub parent: NodeId,
-    pub idx: usize,
-    /// True when a horizontal gap (between stacked rows) is being dragged
-    /// along y; false for a vertical gap dragged along x.
-    pub vertical: bool,
-    /// First (left/top) child's start along the drag axis, canvas-space.
-    pub start: i32,
-    pub combined: i32,
-    pub gap: i32,
-}
-
-/// The pointer cursors the WM ever shows, created once at startup, plus the
-/// one currently set on the underlay (so hover motion only issues a
-/// `ChangeWindowAttributes` when it actually changes).
-#[derive(Clone, Copy)]
-pub struct Cursors {
-    pub arrow: u32,
-    /// Left/right double arrow, over vertical-gap and canvas-edge handles.
-    pub h_resize: u32,
-    /// Up/down double arrow, over horizontal-gap handles.
-    pub v_resize: u32,
-    /// Shown over disabled titlebar buttons (the hand-drawn circled-X
-    /// sprite; `XC_X_cursor` when the server lacks RENDER cursors).
-    pub disabled: u32,
-    /// Pointing hand over clickable things: live titlebar buttons, boundary
-    /// "+" buttons, and the taskbar (`XC_hand2` fallback).
-    pub hand: u32,
-    pub current: u32,
-}
-
-/// An in-progress edge-of-canvas resize, started by dragging the handle at
-/// the canvas's outer left/right margin (see `State::resize_edge`).
-#[derive(Clone, Copy)]
-pub struct EdgeDrag {
-    pub left: bool,
-    /// Screen-space x of the resized column's *far* edge (the one not
-    /// being dragged), fixed for the whole gesture — the mouse's distance
-    /// from it is the column's new width directly, no scroll conversion
-    /// needed.
-    pub anchor_x: i32,
-}
-
-/// One taskbar quick-launch entry: the command it spawns and its icon,
-/// resolved once at startup (see `crate::launch::quick_launches`).
-pub struct QuickSlot {
-    pub cmd: String,
-    /// Decoded, palette-quantized icon; `None` falls back to the label glyph.
-    pub icon: Option<Rc<crate::icon::Icon>>,
-    /// First letter of the entry's label, the no-icon fallback glyph.
-    pub label: char,
-    /// Visibility rule, re-evaluated against the managed clients each
-    /// arrange (see `compute_taskbar`).
-    pub show: crate::theme::ShowWhen,
-}
-
-/// The three split-control buttons on the right of every leaf's tab bar
-/// (count mirrored by `theme::N_SPLIT_BTNS`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BtnKind {
-    Minimize,
-    Split,
-    Close,
-}
-
 /// Screen-space rect; the same shape as canvas-space `tree::Rect`, aliased
 /// so signatures can still say which space they mean.
 pub type FrameRect = Rect;
-
-/// A bottom-bar tile with its window and accent/visibility resolved once at
-/// compute time, so per-frame compositing needs no tree walks.
-#[derive(Clone, Copy)]
-pub struct TaskTile {
-    pub rect: FrameRect,
-    /// The close ("x") badge in the tile's bottom-right corner; hit-tested
-    /// before `rect` so it wins the click.
-    pub close: FrameRect,
-    pub win: Win,
-    pub accent: crate::Index,
-    /// Whether the window occupies a split (drives the accent highlight).
-    /// Deliberately not "on screen": a split scrolled out of the viewport
-    /// still counts.
-    pub in_split: bool,
-}
-
-/// Per-leaf state driving the split-control buttons' icons/enabled state.
-#[derive(Clone, Copy)]
-pub struct LeafMeta {
-    pub parent_dir: Option<Dir>,
-    pub wider: bool,
-    pub can_split: bool,
-    pub minimized: bool,
-}
-
-/// A leaf placed during an arrange, retained so the animator can move it.
-#[derive(Clone, Copy)]
-pub struct Placement {
-    pub leaf: NodeId,
-    pub target: FrameRect,
-    pub active_client: Option<Win>,
-    pub focused: bool,
-}
-
-/// ease-out-back: slight overshoot past the target, then settle.
-pub fn ease_out_back(t: f32) -> f32 {
-    let c = 1.1_f32;
-    let t = t - 1.0;
-    let inner = (c + 1.0).mul_add(t, c);
-    (t * t).mul_add(inner, 1.0)
-}
 
 /// Clamp a signed window dimension (width/height) to the `u32` X11 wire
 /// type, floored at 1px (X rejects zero-size windows). A negative input
@@ -940,97 +639,6 @@ pub fn client_rect_in_frame(r: FrameRect, (min_w, min_h): (i32, i32)) -> (i32, i
 
 pub const fn rect_contains(r: FrameRect, x: i32, y: i32) -> bool {
     x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
-}
-
-pub fn lerp_rect(a: FrameRect, b: FrameRect, p: f32) -> FrameRect {
-    let l = |s: i32, e: i32| s + ((e - s) as f32 * p) as i32;
-    FrameRect {
-        x: l(a.x, b.x),
-        y: l(a.y, b.y),
-        w: l(a.w, b.w).max(1),
-        h: l(a.h, b.h).max(1),
-    }
-}
-
-/// An in-flight layout animation, stepped by the main event loop (one frame
-/// per loop iteration, ~60 Hz) rather than a blocking render loop inside
-/// `arrange` — so events keep flowing while chrome slides. Client windows
-/// are already at their final rects (placed by the arrange that started
-/// this); only the composited chrome interpolates.
-pub struct LayoutAnim {
-    /// Distinguishes this animation from one started while handling the
-    /// same event batch, so a batch's cut-short signal can't kill the very
-    /// animation it triggered.
-    pub seq: u64,
-    pub start: std::time::Instant,
-    /// Each animated leaf's start rect paired with its target placement —
-    /// one entry per leaf, so start and target can't desync.
-    pub placed: Vec<(FrameRect, Placement)>,
-}
-
-/// A memfd-backed shared memory segment attached to the server via
-/// `ShmAttachFd`. The fd is handed to the server at attach time; the local
-/// mapping outlives it.
-///
-/// The mapping is split into two halves used as alternating frame buffers:
-/// the blit path writes frame N+1 into one half while the server may still
-/// be reading frame N from the other, so no per-frame round trip is needed
-/// to serialise reuse (see `Wm::blit_fb`).
-pub struct ShmSeg {
-    /// Server-side segment id (XID).
-    pub seg: u32,
-    ptr: *mut u8,
-    pub len: usize,
-    /// Which half the next frame is written into.
-    pub half: usize,
-    /// Per-half: whether an unconfirmed `ShmPutImage` reading that half is
-    /// (potentially) still in flight. Set on put, cleared by the round trip
-    /// `Wm::blit_fb` performs before overwriting a pending half.
-    pub pending: [bool; 2],
-}
-
-impl ShmSeg {
-    /// # Safety
-    /// `ptr` must be the start of a live `MAP_SHARED` mapping of at least
-    /// `len` bytes that this `ShmSeg` uniquely owns: `slice()` will hand out
-    /// `&mut [u8]` views of it and `Drop` will `munmap(ptr, len)`.
-    pub unsafe fn new(seg: u32, ptr: *mut u8, len: usize) -> Self {
-        Self {
-            seg,
-            ptr,
-            len,
-            half: 0,
-            pending: [false; 2],
-        }
-    }
-
-    /// Byte capacity of one half (a frame must fit in this).
-    pub fn half_len(&self) -> usize {
-        self.len / 2
-    }
-
-    /// Byte offset of the current half within the segment.
-    pub fn offset(&self) -> usize {
-        self.half * self.half_len()
-    }
-
-    /// The first `len` bytes of the *current half* of the mapping (callers
-    /// size frames to fit; see `half_len`).
-    pub fn slice(&mut self, len: usize) -> &mut [u8] {
-        assert!(len <= self.half_len());
-        // SAFETY: ptr/len describe a live MAP_SHARED mapping owned by self,
-        // and offset + len stays within it.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr.add(self.offset()), len) }
-    }
-}
-
-impl Drop for ShmSeg {
-    fn drop(&mut self) {
-        // SAFETY: mapping was created by mmap with this exact ptr/len.
-        unsafe {
-            libc::munmap(self.ptr.cast(), self.len);
-        }
-    }
 }
 
 #[cfg(test)]
