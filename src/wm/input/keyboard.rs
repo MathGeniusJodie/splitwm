@@ -142,7 +142,7 @@ impl Wm {
                 return Ok(());
             }
             Action::SpawnTerminal => self.spawn_terminal(),
-            Action::SpawnLauncher => self.spawn("rofi -show drun"),
+            Action::SpawnLauncher => self.spawn("rofi -show combi"),
             Action::SplitH => self.try_split(Dir::H),
             Action::SplitV => self.try_split(Dir::V),
             Action::Close => self.animate &= self.state.close_focused(),

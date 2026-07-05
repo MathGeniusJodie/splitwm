@@ -296,7 +296,7 @@ pub enum Action {
     Grow,
     Shrink,
     SpawnTerminal,
-    /// Launch rofi in desktop-application (drun) mode.
+    /// Launch rofi in combi mode (drun + run + window).
     SpawnLauncher,
     /// Ask the focused window to close via `WM_DELETE_WINDOW`, falling back
     /// to disconnecting its client if it doesn't speak the protocol.
