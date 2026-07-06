@@ -4,12 +4,23 @@
 use crate::theme;
 use crate::tree::{Boundary, Child, Dir, Node, NodeId, Rect, Tree, Win};
 
+/// Where a "+" insert button adds a new root-level column.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum InsertAt {
+    /// Before the root child at this index.
+    Index(usize),
+    /// After the last root child (the right-edge button).
+    End,
+}
+
 pub struct State {
     pub tree: Tree,
-    /// Private so every write goes through `focus_leaf` (which accepts only
-    /// live leaf ids) and every read through `focused_leaf_valid` (the
-    /// focused leaf can still be *removed* by a later mutation, so reads
-    /// re-validate) — a dangling focus is never handed out.
+    /// Private so every write outside `#[cfg(test)]` goes through
+    /// `focus_leaf` (which accepts only live leaf ids) and every read
+    /// through `focused_leaf_valid` (the focused leaf can still be
+    /// *removed* by a later mutation, so reads re-validate) — a dangling
+    /// focus is never handed out. Tests assign the field directly to set up
+    /// states.
     focused_leaf: NodeId,
     /// Current and target scroll offsets. Private so every mutation goes
     /// through the clamping/landing methods below — `update_canvas`
@@ -155,7 +166,7 @@ impl State {
                 l.prev = displaced;
             }
         }
-        self.focused_leaf = dst;
+        self.focus_leaf(dst);
     }
 
     /// Remove a client entirely (window gone): clear it from its split/taskbar.
@@ -197,7 +208,7 @@ impl State {
             if let Some(l) = self.tree.leaf_mut(lid) {
                 l.minimized = false;
             }
-            self.focused_leaf = lid;
+            self.focus_leaf(lid);
             return true;
         }
         false
@@ -262,7 +273,7 @@ impl State {
 
     pub fn focus_direction(&mut self, next: bool) -> bool {
         if let Some(l) = self.adjacent_leaf(self.focused_leaf_valid(), next) {
-            self.focused_leaf = l;
+            self.focus_leaf(l);
             true
         } else {
             false
@@ -351,7 +362,7 @@ impl State {
         self.split_node(leaf, dir, child_a, child_b);
         // `leaf` is now detached from the tree; drop it.
         self.tree.remove_node(leaf);
-        self.focused_leaf = child_a;
+        self.focus_leaf(child_a);
     }
 
     /// Relocate `leaf`'s window: into the adjacent sibling's first leaf if it
@@ -413,7 +424,8 @@ impl State {
         let fb = idx.min(b.children().len() - 1);
         let new_focus = b.children()[fb].node;
         self.tree.remove_node(leaf);
-        self.focused_leaf = self.tree.first_leaf(new_focus);
+        let new_focus = self.tree.first_leaf(new_focus);
+        self.focus_leaf(new_focus);
     }
 
     /// Binary close path: collapse `parent`, the surviving sibling (at index
@@ -454,7 +466,7 @@ impl State {
                 self.tree.flatten_same_dir(grand, pidx);
             }
         }
-        self.focused_leaf = new_focus;
+        self.focus_leaf(new_focus);
     }
 
     /// Close the focused leaf. Its window moves into the adjacent sibling if
@@ -798,7 +810,7 @@ impl State {
     /// Insert a new empty leaf column at root-children index `at`, making the
     /// root an H-branch if it isn't one. The new leaf becomes focused.
     #[allow(clippy::cast_precision_loss)]
-    pub fn insert_at_root(&mut self, at: usize) -> NodeId {
+    pub fn insert_at_root(&mut self, at: InsertAt) -> NodeId {
         let new = self.tree.make_leaf();
         let root = self.tree.root;
         let is_h = self.tree.branch(root).is_some_and(|b| b.dir == Dir::H);
@@ -806,7 +818,10 @@ impl State {
             if let Some(b) = self.tree.branch_mut(root) {
                 let n = b.children().len();
                 let avg = b.children().iter().map(|c| c.ratio).sum::<f64>() / n as f64;
-                let i = at.min(n);
+                let i = match at {
+                    InsertAt::Index(i) => i.min(n),
+                    InsertAt::End => n,
+                };
                 b.insert(
                     i,
                     Child {
@@ -824,7 +839,7 @@ impl State {
             // whichever side it lands; building the branch in its final
             // order (rather than swapping children afterwards) keeps the
             // ratios paired with the right children by construction.
-            let branch = if at == 0 {
+            let branch = if at == InsertAt::Index(0) {
                 self.tree
                     .make_branch(Dir::H, 1.0 - theme::SPLIT_RATIO, new, root)
             } else {
@@ -832,7 +847,7 @@ impl State {
             };
             self.tree.root = branch;
         }
-        self.focused_leaf = new;
+        self.focus_leaf(new);
         new
     }
 
@@ -884,7 +899,7 @@ mod tests {
         let mut s = State::new();
         s.split_focused(Dir::H); // root H-branch, 2 columns
         assert_eq!(s.tree.collect_leaves().len(), 2);
-        s.insert_at_root(1); // insert between
+        s.insert_at_root(InsertAt::Index(1)); // insert between
         assert_eq!(s.tree.collect_leaves().len(), 3);
         // The inserted leaf is focused and empty.
         assert!(s.focused_client().is_none());
@@ -896,7 +911,7 @@ mod tests {
     #[test]
     fn insert_at_root_wraps_single_leaf() {
         let mut s = State::new();
-        s.insert_at_root(0); // root is a lone leaf -> wrap into H-branch
+        s.insert_at_root(InsertAt::Index(0)); // root is a lone leaf -> wrap into H-branch
         assert_eq!(s.tree.collect_leaves().len(), 2);
         assert!(s.tree.branch(s.tree.root).is_some_and(|b| b.dir == Dir::H));
     }
@@ -907,7 +922,7 @@ mod tests {
     /// the empty column the bigger share on a left-edge insert.
     #[test]
     fn insert_at_root_keeps_existing_content_share_on_both_sides() {
-        for (at, existing_idx) in [(0usize, 1usize), (usize::MAX, 0usize)] {
+        for (at, existing_idx) in [(InsertAt::Index(0), 1usize), (InsertAt::End, 0usize)] {
             let mut s = State::new();
             let existing = s.tree.first_leaf(s.tree.root);
             s.insert_at_root(at);
@@ -917,10 +932,10 @@ mod tests {
                 .expect("root not a branch")
                 .children()
                 .to_vec();
-            assert_eq!(children[existing_idx].node, existing, "at={at}");
+            assert_eq!(children[existing_idx].node, existing, "at={at:?}");
             assert!(
                 (children[existing_idx].ratio - theme::SPLIT_RATIO).abs() < 1e-9,
-                "at={at}: existing content got ratio {}",
+                "at={at:?}: existing content got ratio {}",
                 children[existing_idx].ratio
             );
         }
@@ -945,7 +960,7 @@ mod tests {
         s.update_canvas(WA, 0);
         // One gap between two columns.
         assert_eq!(s.boundaries(WA).len(), 1);
-        s.insert_at_root(1);
+        s.insert_at_root(InsertAt::Index(1));
         s.update_canvas(WA, 0);
         assert_eq!(s.boundaries(WA).len(), 2);
     }
@@ -1334,7 +1349,7 @@ mod tests {
     fn resize_focused_conserves_ratio_sum() {
         let mut s = State::new();
         s.split_focused(Dir::H);
-        s.insert_at_root(2); // three columns
+        s.insert_at_root(InsertAt::Index(2)); // three columns
         s.focused_leaf = s.tree.collect_leaves()[0];
         let sum_before: f64 = root_ratios(&s).iter().sum();
         for _ in 0..100 {
@@ -1405,7 +1420,7 @@ mod tests {
     fn close_focused_moves_focus_to_neighbour() {
         let mut s = State::new();
         s.split_focused(Dir::H); // two columns, focus left
-        s.insert_at_root(1); // middle column, focused
+        s.insert_at_root(InsertAt::Index(1)); // middle column, focused
         assert_eq!(s.tree.collect_leaves().len(), 3);
         assert!(s.close_focused());
         let leaves = s.tree.collect_leaves();
@@ -1434,7 +1449,7 @@ mod tests {
         let mut s = State::new();
         s.split_focused(Dir::H);
         s.split_focused(Dir::V);
-        s.insert_at_root(0);
+        s.insert_at_root(InsertAt::Index(0));
         let map = s.tree.parent_map();
         for leaf in s.tree.collect_leaves() {
             assert_eq!(map.get(&leaf).copied(), s.tree.find_parent(leaf));
@@ -1449,7 +1464,7 @@ mod tests {
     fn resize_edge_leaves_minimized_ratio_alone() {
         let mut s = State::new();
         s.split_focused(Dir::H);
-        s.insert_at_root(2); // three columns
+        s.insert_at_root(InsertAt::Index(2)); // three columns
         s.update_canvas(WA, 0);
         let leaves = s.tree.collect_leaves();
         s.toggle_minimize(leaves[1]); // middle column pinned to `gap` px

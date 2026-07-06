@@ -244,6 +244,14 @@ impl Wm {
             // (the frame is the move handle); resize + repaint the frame to
             // match.
             Some(WindowKind::Float) => {
+                // A fullscreen float's geometry is the WM's, same as a tiled
+                // client's: deny the request outright, re-pin the
+                // full-workarea rect (its chrome frame stays unmapped), and
+                // fall through to the echo below.
+                if self.raw_fullscreen() == Some(e.window) {
+                    self.raise_fullscreen()?;
+                    return self.send_synthetic_configure(e.window);
+                }
                 let Some(f) = self.floats_iter_mut().find(|f| f.win == e.window) else {
                     return Ok(());
                 };

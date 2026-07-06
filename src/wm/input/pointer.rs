@@ -12,6 +12,7 @@ use x11rb::protocol::xproto::{
 
 use super::super::types::{rect_contains, WindowKind, Wm, R};
 use super::super::widgets::BtnKind;
+use crate::state::InsertAt;
 use crate::theme;
 use crate::tree::{Boundary, Dir, NodeId, Win};
 
@@ -104,8 +105,8 @@ enum Hit {
     QuickLaunch(usize),
     /// A leaf's titlebar tab.
     Tab(NodeId),
-    /// A boundary/edge "+" insert button (root-children insert index).
-    Plus(usize),
+    /// A boundary/edge "+" insert button (root-children insert position).
+    Plus(InsertAt),
     /// A gap drag handle.
     Handle(Boundary),
     /// An outer canvas-edge resize handle (`true` = left edge).
@@ -150,16 +151,12 @@ impl Wm {
             }
             let (mx, my) = (i32::from(e.event_x), i32::from(e.event_y));
             let hit = self.hit_test(mx, my);
-            // Split-control buttons take left and right click (right picks
-            // the opposite split direction); everything else is left only.
-            if let Hit::Btn(leaf, kind) = hit {
-                return self.click_split_button(leaf, kind, e.detail == 3);
-            }
-            if e.detail != 1 {
-                return Ok(());
-            }
             match hit {
-                Hit::Btn(..) => {} // handled above
+                // Split-control buttons take left and right click (right
+                // picks the opposite split direction); everything else is
+                // left only.
+                Hit::Btn(leaf, kind) => return self.click_split_button(leaf, kind, e.detail == 3),
+                _ if e.detail != 1 => return Ok(()),
                 // The corner "x" badge on a bottom-bar tile: politely close
                 // that window.
                 Hit::TaskbarClose(win) => return self.close_client(win),
@@ -246,6 +243,9 @@ impl Wm {
                     // knows tiled windows) can't take it; set input focus
                     // directly. The press's own timestamp, not CURRENT_TIME
                     // — same race `give_focus` guards against.
+                    // Focus deliberately moved off any float, so it no
+                    // longer holds keyboard focus.
+                    self.clear_focused_float();
                     self.conn
                         .set_input_focus(InputFocus::POINTER_ROOT, e.event, e.time)?;
                     // Keep `_NET_ACTIVE_WINDOW` in step with the keyboard

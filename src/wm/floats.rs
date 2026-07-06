@@ -292,8 +292,13 @@ impl Wm {
         // happens to equal the titlebar height, but is used here as a
         // general leftover-strip size, not as a titlebar measurement.
         let on_screen_strip = theme::tb_h();
-        let x = x.clamp(wa.x - f.w + on_screen_strip, wa.x + wa.w - on_screen_strip);
-        let y = y.clamp(wa.y + tb, wa.y + wa.h - on_screen_strip);
+        // min/max, not clamp(): clamp panics if min > max, which a degenerate
+        // workarea (narrower/shorter than the strip the float needs) can
+        // trigger. max() is applied first and min() last, so on a crossed
+        // range the upper bound wins and the origin is pulled back from the
+        // far edge rather than left past the near one.
+        let x = (x.max(wa.x - f.w + on_screen_strip)).min(wa.x + wa.w - on_screen_strip);
+        let y = (y.max(wa.y + tb)).min(wa.y + wa.h - on_screen_strip);
         (f.x, f.y) = (x, y);
         let frame = f.frame;
         self.conn

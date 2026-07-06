@@ -80,37 +80,7 @@ impl Wm {
         self.state.update_canvas(wa, self.dock_extra());
 
         let leaves = self.state.tree.collect_leaves();
-        let geos = self.state.compute(wa);
-        let scroll_x = self.state.scroll_x();
-        let focused = self.state.focused_leaf_valid();
-
-        // Screen-space chrome rect for every on-screen leaf. `frame_rects`
-        // keeps every leaf's rect, on-screen or not, so a leaf scrolled out
-        // of view keeps a sane animation start / hit rect when it returns.
-        let mut placed: Vec<Placement> = Vec::new();
-        let mut frame_rects: HashMap<NodeId, FrameRect> = HashMap::new();
-        for &leaf in &leaves {
-            let Some(geo) = geos.get(&leaf).copied() else {
-                continue;
-            };
-            let target = FrameRect {
-                x: geo.x - scroll_x,
-                y: geo.y,
-                w: geo.w.max(1),
-                h: geo.h.max(1),
-            };
-            frame_rects.insert(leaf, target);
-            if target.x + target.w <= wa.x || target.x >= wa.x + wa.w {
-                continue;
-            }
-            let active_client = self.state.tree.leaf(leaf).and_then(|l| l.client);
-            placed.push(Placement {
-                leaf,
-                target,
-                active_client,
-                focused: focused == leaf,
-            });
-        }
+        let (placed, frame_rects) = self.compute_placements(wa);
 
         // Parent lookups for this layout, from one arena walk — per-event
         // consumers (`hover_cursor`, `click_split_button`) read this rather
@@ -156,7 +126,7 @@ impl Wm {
             self.anim_frame(0.0)?;
         } else {
             self.anim = None;
-            self.compose(wa, &placed, true)?;
+            self.compose(&placed, true)?;
         }
         self.place_clients(&placed)?;
         self.place_dock()?;
@@ -170,9 +140,71 @@ impl Wm {
         Ok(())
     }
 
+    /// Screen-space chrome rect for every leaf in the current layout, from
+    /// `State::compute` plus the scroll offset and focused leaf. `frame_rects`
+    /// keeps every leaf's rect, on-screen or not, so a leaf scrolled out of
+    /// view keeps a sane animation start / hit rect when it returns; `placed`
+    /// holds only the on-screen leaves, in the form `compose`/`place_clients`
+    /// consume. Shared by `arrange` and `repaint_chrome` so both ever use the
+    /// same placement geometry for a given layout.
+    fn compute_placements(&self, wa: Rect) -> (Vec<Placement>, HashMap<NodeId, FrameRect>) {
+        let leaves = self.state.tree.collect_leaves();
+        let geos = self.state.compute(wa);
+        let scroll_x = self.state.scroll_x();
+        let focused = self.state.focused_leaf_valid();
+
+        let mut placed: Vec<Placement> = Vec::new();
+        let mut frame_rects: HashMap<NodeId, FrameRect> = HashMap::new();
+        for &leaf in &leaves {
+            let Some(geo) = geos.get(&leaf).copied() else {
+                continue;
+            };
+            let target = FrameRect {
+                x: geo.x - scroll_x,
+                y: geo.y,
+                w: geo.w.max(1),
+                h: geo.h.max(1),
+            };
+            frame_rects.insert(leaf, target);
+            if target.x + target.w <= wa.x || target.x >= wa.x + wa.w {
+                continue;
+            }
+            let active_client = self.state.tree.leaf(leaf).and_then(|l| l.client);
+            placed.push(Placement {
+                leaf,
+                target,
+                active_client,
+                focused: focused == leaf,
+            });
+        }
+        (placed, frame_rects)
+    }
+
+    /// Recomposite the underlay for the current, unchanged layout — for a
+    /// chrome-only change (a title or icon updating) that alters what a
+    /// leaf's chrome shows but not where anything is. Skips `update_canvas`,
+    /// `compute_widgets`, `parent_map`, `place_clients`, `place_dock`,
+    /// `apply_stacking`, and leaves `prev_frame_rect` untouched, since the
+    /// layout itself hasn't changed and none of those depend on chrome
+    /// content. Not valid for a change that moves, resizes, or restacks
+    /// anything — use `arrange` for that. If a layout animation is already
+    /// in flight, does nothing: it recomposes every frame anyway and reads
+    /// titles/icons fresh each time, so the change lands within a frame
+    /// without help.
+    pub(crate) fn repaint_chrome(&mut self) -> R<()> {
+        if self.anim.is_some() {
+            return Ok(());
+        }
+        let wa = self.la();
+        let (placed, _frame_rects) = self.compute_placements(wa);
+        self.compose(&placed, true)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
     /// Composite the wallpaper, every placed leaf's chrome, and (optionally)
     /// the drag handles / "+" buttons onto the single underlay window.
-    fn compose(&mut self, _layout: Rect, placed: &[Placement], widgets: bool) -> R<()> {
+    fn compose(&mut self, placed: &[Placement], widgets: bool) -> R<()> {
         use crate::render::BtnIcon as I;
         // The underlay (and base pixmap) always cover the full screen, even
         // though the split layout only uses the area above the taskbar.
@@ -537,8 +569,7 @@ impl Wm {
                 ..p
             })
             .collect();
-        let wa = self.la();
-        self.compose(wa, &interp, false)?;
+        self.compose(&interp, false)?;
         self.conn.flush()?;
         Ok(())
     }
@@ -559,9 +590,8 @@ impl Wm {
         };
         if t >= 1.0 {
             let anim = self.anim.take().expect("checked above");
-            let wa = self.la();
             let finals: Vec<Placement> = anim.placed.iter().map(|&(_, p)| p).collect();
-            self.compose(wa, &finals, true)?;
+            self.compose(&finals, true)?;
             self.conn.flush()?;
             return Ok(());
         }

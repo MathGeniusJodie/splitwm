@@ -253,7 +253,7 @@ pub const LEAF_PALETTE: [Index; 8] = [
 pub const FALLBACK_ACCENT_INDEX: Index = palette_color::CRIMSON;
 
 /// A stable accent palette index for a leaf, picked from `LEAF_PALETTE` by id.
-pub const fn leaf_color_index(id: u32) -> Index {
+pub const fn cycled_leaf_color(id: u32) -> Index {
     LEAF_PALETTE[(id as usize) % LEAF_PALETTE.len()]
 }
 
@@ -296,7 +296,7 @@ pub enum Action {
     Grow,
     Shrink,
     SpawnTerminal,
-    /// Launch rofi in combi mode (drun + run + window).
+    /// Launch the app launcher (see `LAUNCHER_CMD`).
     SpawnLauncher,
     /// Ask the focused window to close via `WM_DELETE_WINDOW`, falling back
     /// to disconnecting its client if it doesn't speak the protocol.
@@ -310,6 +310,16 @@ pub enum Action {
 pub const MOD4: u16 = 0x40; // ModMask::M4
 pub const MOD1: u16 = 0x08; // ModMask::M1 (Alt)
 pub const SHIFT: u16 = 0x01; // ModMask::SHIFT
+
+/// Command `Action::SpawnLauncher` spawns: rofi in combi mode (drun + run +
+/// window).
+pub const LAUNCHER_CMD: &str = "rofi -show combi";
+/// Command `Action::VolumeUp` spawns to raise the default sink's volume.
+pub const VOLUME_UP_CMD: &str = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+";
+/// Command `Action::VolumeDown` spawns to lower the default sink's volume.
+pub const VOLUME_DOWN_CMD: &str = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-";
+/// Command `Action::VolumeMuteToggle` spawns to toggle the default sink's mute.
+pub const VOLUME_MUTE_CMD: &str = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle";
 
 /// The key bindings `Wm::grab_keys` installs: (modifier mask, keysym, action).
 /// Keys are named for the divider the user sees, actions for the branch

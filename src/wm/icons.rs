@@ -244,7 +244,7 @@ impl Wm {
         client.icon = Some(icon);
         client.icon_rotated = None;
         self.refresh_icon_rotations(&class);
-        self.arrange()
+        self.repaint_chrome()
     }
 
     /// Re-fetch icons whose refresh was deferred by `on_icon_change`'s
@@ -323,7 +323,7 @@ impl Wm {
             }
         }
         if changed {
-            self.arrange()?;
+            self.repaint_chrome()?;
         }
         Ok(())
     }

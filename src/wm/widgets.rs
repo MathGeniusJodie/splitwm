@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use super::arrange::Placement;
 use super::types::{Client, FrameRect, Wm};
-use crate::state::State;
+use crate::state::{InsertAt, State};
 use crate::theme;
 use crate::tree::{Boundary, Dir, NodeId, Rect, Tree, Win};
 
@@ -22,7 +22,7 @@ use crate::tree::{Boundary, Dir, NodeId, Rect, Tree, Win};
 #[derive(Default)]
 pub struct Widgets {
     pub handle_regions: Vec<(FrameRect, Boundary)>,
-    pub plus_regions: Vec<(FrameRect, usize)>,
+    pub plus_regions: Vec<(FrameRect, InsertAt)>,
     /// Quick-launch icons in the bottom taskbar (after the window tiles),
     /// paired with their `Wm::quick` index; entries hidden by their
     /// `ShowWhen` rule get no region.
@@ -352,9 +352,10 @@ fn compute_boundary_widgets(widgets: &mut Widgets, state: &State, wa: Rect) {
         widgets.handle_regions.push((rect, b));
         if b.root && b.dir == Dir::H {
             let py = b.cross + (b.cross_len - Wm::PLUS_SZ) / 2;
-            widgets
-                .plus_regions
-                .push((Wm::plus_rect(b.pos - scroll_x, py), b.idx + 1));
+            widgets.plus_regions.push((
+                Wm::plus_rect(b.pos - scroll_x, py),
+                InsertAt::Index(b.idx + 1),
+            ));
         }
     }
     compute_edge_plus_buttons(widgets, wa, scroll_x, canvas_w, gap);
@@ -408,8 +409,8 @@ fn compute_edge_plus_buttons(
     let span_h = (wa.h - 2 * gap).max(Wm::PLUS_SZ);
     let edge_cy = wa.y + gap + (span_h - Wm::PLUS_SZ) / 2;
     for (canvas_x, at) in [
-        (wa.x + gap / 2, 0usize),
-        (wa.x + canvas_w - gap / 2, usize::MAX),
+        (wa.x + gap / 2, InsertAt::Index(0)),
+        (wa.x + canvas_w - gap / 2, InsertAt::End),
     ] {
         let vis_x = canvas_x - scroll_x;
         if vis_x < wa.x || vis_x > wa.x + wa.w {
@@ -499,7 +500,7 @@ mod tests {
     fn edge_handles_stay_at_exactly_two_with_more_columns() {
         let mut s = State::new();
         s.split_focused(Dir::H);
-        s.insert_at_root(1);
+        s.insert_at_root(InsertAt::Index(1));
         let mut widgets = Widgets::default();
         compute_boundary_widgets(&mut widgets, &s, WA);
         assert_eq!(widgets.edge_handle_regions.len(), 2);
@@ -509,7 +510,7 @@ mod tests {
     fn one_boundary_handle_per_gap_between_columns() {
         let mut s = State::new();
         s.split_focused(Dir::H); // 2 columns -> 1 gap
-        s.insert_at_root(1); // 3 columns -> 2 gaps
+        s.insert_at_root(InsertAt::Index(1)); // 3 columns -> 2 gaps
         let mut widgets = Widgets::default();
         compute_boundary_widgets(&mut widgets, &s, WA);
         assert_eq!(widgets.handle_regions.len(), 2);

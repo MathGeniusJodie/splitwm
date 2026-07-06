@@ -120,14 +120,11 @@ impl Wm {
             // rate-limited, or holding it down would still fork a process
             // tree per repeat tick.
             Action::VolumeUp => {
-                self.spawn_volume_throttled(
-                    "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+",
-                    true,
-                );
+                self.spawn_volume_throttled(theme::VOLUME_UP_CMD, true);
                 return Ok(());
             }
             Action::VolumeDown => {
-                self.spawn_volume_throttled("wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-", false);
+                self.spawn_volume_throttled(theme::VOLUME_DOWN_CMD, false);
                 return Ok(());
             }
             Action::VolumeMuteToggle => {
@@ -137,12 +134,12 @@ impl Wm {
                 // Split/Close swallow-all-repeats behavior instead of a rate
                 // limit.
                 if !self.key_is_repeating(e.detail, e.time) {
-                    self.spawn("wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle");
+                    self.spawn(theme::VOLUME_MUTE_CMD);
                 }
                 return Ok(());
             }
             Action::SpawnTerminal => self.spawn_terminal(),
-            Action::SpawnLauncher => self.spawn("rofi -show combi"),
+            Action::SpawnLauncher => self.spawn(theme::LAUNCHER_CMD),
             Action::SplitH => self.try_split(Dir::H),
             Action::SplitV => self.try_split(Dir::V),
             Action::Close => self.animate &= self.state.close_focused(),

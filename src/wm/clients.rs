@@ -385,10 +385,11 @@ impl Wm {
 
     /// A managed client's or float's `_NET_WM_NAME`/`WM_NAME` changed:
     /// refresh the cached title the titlebar draws and repaint just enough
-    /// to show it — a full `arrange()` for a tiled client (whose titlebar
-    /// lives in the shared composite) or a targeted `paint_float_frame` for
-    /// a float's own chrome window. No-ops if the text is unchanged, since
-    /// terminals retitle on every prompt.
+    /// to show it — `repaint_chrome` for a tiled client (whose titlebar
+    /// lives in the shared composite and reads the title fresh, so the
+    /// layout itself doesn't need recomputing) or a targeted
+    /// `paint_float_frame` for a float's own chrome window. No-ops if the
+    /// text is unchanged, since terminals retitle on every prompt.
     pub(crate) fn on_title_change(&mut self, win: Win) -> R<()> {
         let title = self.client_title(win);
         match self.kind_of(win) {
@@ -400,7 +401,7 @@ impl Wm {
                     return Ok(());
                 }
                 client.title = title;
-                self.arrange()
+                self.repaint_chrome()
             }
             Some(WindowKind::Float) => {
                 let Some(f) = self.floats_iter_mut().find(|f| f.win == win) else {

@@ -82,41 +82,54 @@ fn install_term_handler() {
     }
 }
 
-/// Block or unblock SIGTERM/SIGINT for the *calling* thread. Blocked around
-/// the notification-daemon thread's spawn (masks are inherited), so the
-/// signal is always delivered to the main thread — delivery to the daemon
-/// thread would set the flag but interrupt nobody's `poll`, leaving an idle
-/// event loop asleep until the next X event.
-fn mask_term_signals(block: bool) {
+/// Block SIGTERM/SIGINT for the *calling* thread and return the mask that
+/// was in effect before, so the caller can restore it exactly (rather than
+/// unconditionally unblocking, which would also affect an enclosing masked
+/// region). Blocked around the notification-daemon thread's spawn (masks are
+/// inherited), so the signal is always delivered to the main thread —
+/// delivery to the daemon thread would set the flag but interrupt nobody's
+/// `poll`, leaving an idle event loop asleep until the next X event.
+fn block_term_signals() -> libc::sigset_t {
     // SAFETY: builds a two-signal set on the stack and applies it to this
-    // thread only.
+    // thread only; `old` is populated by `pthread_sigmask` before use.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
         libc::sigemptyset(&mut set);
         libc::sigaddset(&mut set, libc::SIGTERM);
         libc::sigaddset(&mut set, libc::SIGINT);
-        let how = if block {
-            libc::SIG_BLOCK
-        } else {
-            libc::SIG_UNBLOCK
-        };
-        libc::pthread_sigmask(how, &set, std::ptr::null_mut());
+        let mut old: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        old
+    }
+}
+
+/// Restores a saved signal mask (from `block_term_signals`) on the calling
+/// thread when dropped, including on unwind — so a panic inside `masked`
+/// can't leave SIGTERM/SIGINT permanently blocked on that thread.
+struct RestoreSigmask(libc::sigset_t);
+
+impl Drop for RestoreSigmask {
+    fn drop(&mut self) {
+        // SAFETY: restores a previously-captured valid sigset_t for this
+        // thread only.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut());
+        }
     }
 }
 
 /// Run `f` with SIGTERM/SIGINT blocked for the calling thread across the
-/// call (see `mask_term_signals`), so any thread `f` spawns inherits the mask
-/// and those signals always land on the main thread, whose poll they must
-/// interrupt.
+/// call (see `block_term_signals`), so any thread `f` spawns inherits the
+/// mask and those signals always land on the main thread, whose poll they
+/// must interrupt. The previous mask is restored when `f` returns *or*
+/// panics, so an unwind can't leave the signals blocked forever.
 fn masked<T>(f: impl FnOnce() -> T) -> T {
-    mask_term_signals(true);
-    let result = f();
-    mask_term_signals(false);
-    result
+    let _restore = RestoreSigmask(block_term_signals());
+    f()
 }
 
 /// Spawn `f` as a detached OS thread with SIGTERM/SIGINT blocked across the
-/// spawn (see `mask_term_signals`).
+/// spawn (see `masked`).
 fn spawn_masked(f: impl FnOnce() + Send + 'static) {
     masked(|| std::thread::spawn(f));
 }

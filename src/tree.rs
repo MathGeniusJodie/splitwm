@@ -164,7 +164,7 @@ impl Tree {
         nodes.insert(
             NodeId(1),
             Node::Leaf(Leaf {
-                color: crate::theme::leaf_color_index(1),
+                color: crate::theme::cycled_leaf_color(1),
                 ..Leaf::default()
             }),
         );
@@ -211,7 +211,7 @@ impl Tree {
         crate::theme::LEAF_PALETTE
             .into_iter()
             .find(|c| !used.contains(c))
-            .unwrap_or_else(|| crate::theme::leaf_color_index(id.0))
+            .unwrap_or_else(|| crate::theme::cycled_leaf_color(id.0))
     }
 
     pub fn make_branch(&mut self, dir: Dir, ratio: f64, a: NodeId, b: NodeId) -> NodeId {

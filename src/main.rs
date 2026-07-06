@@ -25,7 +25,7 @@ fn main() {
         }
     }
     if let Err(e) = wm::run(replace) {
-        eprintln!("splitwm: fatal: {e:?}");
+        eprintln!("splitwm: fatal: {e}");
         std::process::exit(1);
     }
 }
