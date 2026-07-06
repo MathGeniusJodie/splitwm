@@ -57,11 +57,11 @@ impl Rect {
 pub struct Leaf {
     /// The single window shown in this split, if any.
     pub client: Option<Win>,
-    /// The window that was last displaced from this split to the taskbar
+    /// The window that was last displaced from this split to the stash
     /// (e.g. by a popup stealing the slot). If the current occupant's window
-    /// is destroyed, this one is pulled back from the taskbar — so closing a
+    /// is destroyed, this one is pulled back from the stash — so closing a
     /// popup restores what you were working on. Single slot, no history:
-    /// consumed on restore, ignored if the window has left the taskbar.
+    /// consumed on restore, ignored if the window has left the stash.
     pub prev: Option<Win>,
     pub minimized: bool,
     /// Persistent accent palette index for this split (kept across

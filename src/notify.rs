@@ -91,9 +91,9 @@ pub fn spawn(to_wm: Sender<NoteMsg>) -> Sender<(u32, CloseReason)> {
 /// Tell the WM to show the one popup this daemon ever shows on its own
 /// behalf ("notifications are dead for the session"), `ping()` so the WM's
 /// event loop picks it up promptly, then hand back `err` as this thread's
-/// exit error. Shared by the two ways `serve` gives up: the initial bus
-/// connect failing, and a live connection later losing `BUS_NAME` to another
-/// process.
+/// exit error. Shared by every way `serve` gives up on a live bus: the
+/// initial connect failing, and a connection later dying mid-session (lost
+/// `BUS_NAME`, a bus call erroring out, ...).
 fn notify_unavailable(
     to_wm: &Sender<NoteMsg>,
     popup_body: String,
@@ -110,12 +110,31 @@ fn notify_unavailable(
     Err(err.into())
 }
 
+/// Marker error for a failed `to_wm.send`: the WM thread itself is gone, so
+/// there is no channel left to show a popup through and no event loop left
+/// to `ping()` — unlike every other `serve_loop` error, this one is not
+/// routed through `notify_unavailable`.
+#[derive(Debug)]
+struct WmGone;
+
+impl std::fmt::Display for WmGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("wm channel closed")
+    }
+}
+
+impl std::error::Error for WmGone {}
+
 /// Connect to the session bus and claim the notification name. The bus
 /// connection is retried with backoff: at WM startup the session bus may not
 /// be up yet (dbus-launch race), and giving up on the first attempt disables
-/// notifications for the whole session. A name refusal is not retried — the
-/// request already asks to replace the owner, so a refusal means the owner
-/// forbids replacement and that won't change.
+/// notifications for the whole session. The same retry covers a transient
+/// `request_name` transport error (e.g. the bus accepted the connection but
+/// hiccuped on the call) — it's indistinguishable in kind from a
+/// `new_session` failure. A name *refusal* (the call succeeds but reports
+/// non-`PrimaryOwner`) is not retried: the request already asks to replace
+/// the owner, so a refusal means the owner forbids replacement and that
+/// won't change.
 fn connect_bus() -> R<Connection> {
     let mut last_err: Box<dyn std::error::Error> = "no attempt".into();
     for attempt in 0..10 {
@@ -127,14 +146,18 @@ fn connect_bus() -> R<Connection> {
                 // Take over from a lingering daemon (e.g. xfce4-notifyd) but
                 // never queue behind one: without the name we'd just be a
                 // dead letterbox.
-                let granted = conn.request_name(BUS_NAME, false, true, true)?;
-                if !matches!(
-                    granted,
-                    dbus::blocking::stdintf::org_freedesktop_dbus::RequestNameReply::PrimaryOwner
-                ) {
-                    return Err(format!("{BUS_NAME} is owned by another daemon").into());
+                match conn.request_name(BUS_NAME, false, true, true) {
+                    Ok(granted) => {
+                        if !matches!(
+                            granted,
+                            dbus::blocking::stdintf::org_freedesktop_dbus::RequestNameReply::PrimaryOwner
+                        ) {
+                            return Err(format!("{BUS_NAME} is owned by another daemon").into());
+                        }
+                        return Ok(conn);
+                    }
+                    Err(e) => last_err = e.into(),
                 }
-                return Ok(conn);
             }
             Err(e) => last_err = e.into(),
         }
@@ -191,6 +214,31 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, CloseReason)>) -> R
         }
     };
 
+    match serve_loop(&conn, to_wm, dismissed, &ping) {
+        Ok(()) => Ok(()),
+        // The WM is gone: no channel to show a popup through, nothing left
+        // to ping. Just exit; `spawn`'s caller already logs the error.
+        Err(e) if e.downcast_ref::<WmGone>().is_some() => Err(e),
+        // Any other bus-side failure mid-session (lost BUS_NAME, a dead bus
+        // connection surfacing at `blocking_pop_message`, ...) leaves the WM
+        // still believing notifications work unless told otherwise.
+        Err(e) => {
+            let body = format!("splitwm lost its connection to the notification bus: {e}");
+            notify_unavailable(to_wm, body, e, ping)
+        }
+    }
+}
+
+/// The daemon's main loop: services D-Bus `Notify`/`CloseNotification` calls,
+/// expires timed-out notes, and relays WM-reported dismissals back onto the
+/// bus. Returns on any unrecoverable bus error (including losing `BUS_NAME`)
+/// or once the WM's channel is gone (`WmGone`, distinguished by the caller).
+fn serve_loop(
+    conn: &Connection,
+    to_wm: &Sender<NoteMsg>,
+    dismissed: &Receiver<(u32, CloseReason)>,
+    ping: &dyn Fn(),
+) -> R<()> {
     let mut next_id: u32 = 1;
     // Outstanding notifications, oldest first — the order `MAX_NOTES`
     // eviction consumes.
@@ -216,7 +264,7 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, CloseReason)>) -> R
         for id in expired {
             to_wm
                 .send(NoteMsg::Close(id))
-                .map_err(|_| "wm channel closed")?;
+                .map_err(|_| WmGone)?;
             emit_closed(conn.channel(), id, CloseReason::Expired);
             ping();
         }
@@ -246,12 +294,9 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, CloseReason)>) -> R
             && msg.member().as_deref() == Some("NameLost")
             && msg.read1::<&str>().ok() == Some(BUS_NAME)
         {
-            return notify_unavailable(
-                to_wm,
-                "another process took over splitwm's notification daemon role".to_string(),
-                format!("lost ownership of {BUS_NAME}"),
-                ping,
-            );
+            // The caller (`serve`) turns this into the `notify_unavailable`
+            // popup, same as any other error out of this loop.
+            return Err(format!("lost ownership of {BUS_NAME}").into());
         }
         if msg.msg_type() != MessageType::MethodCall {
             continue;
@@ -303,14 +348,14 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, CloseReason)>) -> R
                     let evict = notes.remove(0);
                     to_wm
                         .send(NoteMsg::Close(evict.id))
-                        .map_err(|_| "wm channel closed")?;
+                        .map_err(|_| WmGone)?;
                     // No spec reason fits "evicted for space" exactly;
                     // undefined/reserved is the closest fit.
                     emit_closed(conn.channel(), evict.id, CloseReason::Undefined);
                 }
                 to_wm
                     .send(NoteMsg::Show(note))
-                    .map_err(|_| "wm channel closed")?;
+                    .map_err(|_| WmGone)?;
                 ping();
                 reply(conn.channel(), msg.method_return().append1(id))?;
             }
@@ -323,7 +368,7 @@ fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, CloseReason)>) -> R
                         notes.retain(|n| n.id != id);
                         to_wm
                             .send(NoteMsg::Close(id))
-                            .map_err(|_| "wm channel closed")?;
+                            .map_err(|_| WmGone)?;
                         emit_closed(conn.channel(), id, CloseReason::Closed);
                         ping();
                         reply(conn.channel(), msg.method_return())?;

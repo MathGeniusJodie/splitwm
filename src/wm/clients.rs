@@ -264,12 +264,12 @@ impl Wm {
     /// re-tile, and keep focus inside the leaf the window lived in.
     pub(crate) fn forget_client(&mut self, win: Win) -> R<()> {
         let known = self.remove_client(win).is_some();
-        // A window can occupy a leaf/taskbar slot without an entry in
+        // A window can occupy a leaf/stash slot without an entry in
         // `clients` if `manage` errored out partway (it pins into the tree
         // before its X requests); clean the layout up regardless, or the
         // split shows a phantom occupant forever.
         let in_layout = self.state.tree.find_leaf_for_client(win).is_some()
-            || self.state.taskbar().contains(&win);
+            || self.state.stash().contains(&win);
         if !known && !in_layout {
             return Ok(());
         }
@@ -473,7 +473,7 @@ impl Wm {
             // fullscreen in a split that was since scrolled out of view must
             // scroll it back in before focusing, or the focus would target a
             // window `place_clients` keeps unmapped.
-            self.bring_into_layout(win)?;
+            self.bring_into_layout(win, false)?;
         } else {
             // Float: `arrange`'s fullscreen block applies/keeps the
             // full-workarea geometry while it's active.
@@ -635,10 +635,9 @@ impl Wm {
     }
 
     pub(crate) fn focus(&mut self, win: Option<Win>) -> R<()> {
-        match win {
-            Some(w) if self.clients_ref().contains_key(&w) => {
+        match win.and_then(|w| self.clients_ref().get(&w).map(|c| (w, c.focus))) {
+            Some((w, model)) => {
                 self.clear_focused_float();
-                let model = self.clients_ref()[&w].focus;
                 self.give_focus(w, model)?;
                 // Raising the focused client puts it above everything;
                 // re-apply the shared stacking policy above it.

@@ -55,7 +55,7 @@ pub use types::*;
 /// wakeup so `run` can remap hidden windows before the process ends —
 /// there is no quit keybinding, so a signal (or a `--replace` handover) is
 /// how a session is asked to stop, and a default-action kill would strand
-/// every taskbar'd window unmapped.
+/// every stashed window unmapped.
 static TERM_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 extern "C" fn on_term_signal(_: libc::c_int) {
@@ -395,7 +395,7 @@ pub fn run(replace: bool) -> R<()> {
     startup_adopt_and_arrange(&mut wm, root)?;
 
     // Run the loop with a panic guard: layout hiding uses plain unmaps, and
-    // exiting without remapping strands taskbar'd windows invisible for the
+    // exiting without remapping strands stashed windows invisible for the
     // next WM (which only adopts viewable windows). Restore on *every* exit
     // path — clean quit, handling error, or panic. When the connection
     // itself died the restore fails too, but then the server is resetting
@@ -725,13 +725,38 @@ fn create_underlay(
 /// plus its icon, decoded and quantized onto the chrome palette once here
 /// (startup) rather than per frame. A missing icon falls back to the
 /// entry's first label letter, like a taskbar tile with no `_NET_WM_ICON`.
+///
+/// Each entry's lookup (a filesystem walk) and decode (an ImageMagick
+/// subprocess round trip) is independent of the others, so they run on
+/// their own scoped thread rather than one after another on the startup
+/// path. `find_icon_file` and `load_image` only touch the filesystem and
+/// spawn child processes, so they're fine off the main thread; this runs
+/// before `install_term_handler` (see `run`), so plain scoped threads need
+/// no signal-mask hygiene. The quantized `Icon` holds an `Rc`, which isn't
+/// `Send`, so quantizing stays on the main thread: threads hand back plain
+/// (`Send`) decoded images, and the main thread quantizes and wraps each
+/// one afterward.
 fn quick_slots(renderer: &Renderer) -> Vec<QuickSlot> {
-    crate::launch::quick_launches()
+    let quicks = crate::launch::quick_launches();
+    let images: Vec<Option<crate::icon::Icon>> = std::thread::scope(|scope| {
+        quicks
+            .iter()
+            .map(|q| {
+                scope.spawn(|| {
+                    crate::launch::find_icon_file(q.icon).and_then(|p| crate::icon::load_image(&p))
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| h.join().unwrap_or(None))
+            .collect()
+    });
+
+    quicks
         .into_iter()
-        .map(|q| {
-            let icon = crate::launch::find_icon_file(q.icon)
-                .and_then(|p| crate::icon::load_image(&p))
-                .map(|img| std::rc::Rc::new(crate::icon::quantize(renderer.palette(), &img)));
+        .zip(images)
+        .map(|(q, img)| {
+            let icon = img.map(|img| std::rc::Rc::new(crate::icon::quantize(renderer.palette(), &img)));
             QuickSlot {
                 cmd: q.cmd,
                 icon,
@@ -911,7 +936,15 @@ fn event_loop(wm: &mut Wm) -> R<()> {
                     return Err(e);
                 }
                 eprintln!("splitwm: error stepping layout animation: {e}");
+                // Every animation, error or not, must end with a full-widget
+                // recomposite — the happy path's final `step_animation` call
+                // does this itself, but bailing out early here would
+                // otherwise leave the mid-slide, widget-less chrome frame on
+                // screen until some unrelated arrange happens to repaint it.
+                // `anim` must be cleared first: `repaint_chrome` early-returns
+                // while an animation is in flight.
                 wm.anim = None;
+                events::contain(wm.repaint_chrome(), "post-animation-error repaint")?;
             }
             // Pace only while a next frame is still owed — but wait out the
             // remainder on the socket, not asleep: input arriving mid-frame

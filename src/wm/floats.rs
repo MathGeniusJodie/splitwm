@@ -41,11 +41,21 @@ pub struct FloatWin {
     /// Accent palette index for the chrome — the transient parent's split
     /// colour when it has one, so the dialog visibly belongs to it.
     pub accent: crate::Index,
-    /// Titlebar app icon/label, resolved once at manage time.
+    /// Titlebar app icon, resolved at manage time and kept live by
+    /// `Wm::on_icon_change` (a late or changed `_NET_WM_ICON`).
     pub icon: Option<Rc<Icon>>,
     pub label: char,
     /// `_NET_WM_NAME`/`WM_NAME`, kept live by `Wm::on_title_change`.
     pub title: Rc<str>,
+    /// When `_NET_WM_ICON` was last fetched for this float; mirrors
+    /// `Client::icon_fetched` so `Wm::on_icon_change`'s rate limit applies
+    /// here too (`fetch_icon` can move up to 16 MiB of client-controlled
+    /// data per call, and a float is no less able to rewrite its icon in a
+    /// loop than a tiled client is).
+    pub icon_fetched: std::time::Instant,
+    /// An icon PropertyNotify arrived inside the cooldown window; the fetch
+    /// is deferred to `Wm::flush_stale_icons`, same as `Client::icon_stale`.
+    pub icon_stale: bool,
 }
 
 impl Wm {
@@ -135,7 +145,11 @@ impl Wm {
         let icon = self.resolve_icon(win, &class);
         let title = self.client_title(win);
 
-        self.select_and_grab(win, EventMask::STRUCTURE_NOTIFY, true)?;
+        self.select_and_grab(
+            win,
+            EventMask::PROPERTY_CHANGE | EventMask::STRUCTURE_NOTIFY,
+            true,
+        )?;
         // The chrome frame: our own override-redirect window, painted with
         // the split border art and shaped so its rounded corners are
         // click-through. Button events on it start a move drag.
@@ -176,6 +190,8 @@ impl Wm {
             icon,
             label,
             title,
+            icon_fetched: std::time::Instant::now(),
+            icon_stale: false,
         });
         self.conn.map_window(frame)?;
         self.conn.map_window(win)?;

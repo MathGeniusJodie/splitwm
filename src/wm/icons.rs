@@ -6,6 +6,7 @@ use std::rc::Rc;
 
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{Atom, AtomEnum, ClientMessageEvent, ConnectionExt, EventMask};
+use x11rb::rust_connection::RustConnection;
 
 use super::types::{WindowKind, Wm, R};
 use crate::icon::{self, Icon};
@@ -215,8 +216,19 @@ impl Wm {
 
     /// `_NET_WM_ICON` changed on a managed window: refetch and redraw. Apps
     /// that set the property only after mapping (Electron, notably) would
-    /// otherwise keep whatever `manage` resolved at map time.
+    /// otherwise keep whatever `manage`/`manage_float` resolved at map time.
+    /// Dispatches on `kind_of` since tiled clients and floats keep their
+    /// rate-limit bookkeeping (`icon_fetched`/`icon_stale`) and repaint
+    /// (`repaint_chrome` vs. `paint_float_frame`) in different places.
     pub(crate) fn on_icon_change(&mut self, win: Win) -> R<()> {
+        match self.kind_of(win) {
+            Some(WindowKind::Tiled) => self.on_icon_change_tiled(win),
+            Some(WindowKind::Float) => self.on_icon_change_float(win),
+            Some(WindowKind::Dock | WindowKind::Notification) | None => Ok(()),
+        }
+    }
+
+    fn on_icon_change_tiled(&mut self, win: Win) -> R<()> {
         let now = std::time::Instant::now();
         let Some(client) = self.client_mut(win) else {
             return Ok(());
@@ -247,11 +259,38 @@ impl Wm {
         self.repaint_chrome()
     }
 
+    /// Float counterpart of `on_icon_change_tiled`: same cooldown/stale
+    /// mechanics on `FloatWin`'s own fields, but repaints just this float's
+    /// chrome frame instead of the shared tiled composite.
+    fn on_icon_change_float(&mut self, win: Win) -> R<()> {
+        let now = std::time::Instant::now();
+        let Some(float) = self.floats_iter_mut().find(|f| f.win == win) else {
+            return Ok(());
+        };
+        if now.duration_since(float.icon_fetched) < ICON_FETCH_COOLDOWN {
+            float.icon_stale = true;
+            self.icons_stale = true;
+            return Ok(());
+        }
+        float.icon_fetched = now;
+        float.icon_stale = false;
+        let Some(icon) = self.fetch_icon(win) else {
+            return Ok(());
+        };
+        let Some(float) = self.floats_iter_mut().find(|f| f.win == win) else {
+            return Ok(());
+        };
+        float.icon = Some(icon);
+        let frame = float.frame;
+        self.paint_float_frame(frame)
+    }
+
     /// Re-fetch icons whose refresh was deferred by `on_icon_change`'s
-    /// rate limit. Runs once per event batch (the WM has no timers, so
-    /// "after the cooldown" means the first batch that arrives past it — a
-    /// pointer motion at the latest); the `icons_stale` flag keeps the
-    /// usual no-stale-icons batch from paying for a clients scan.
+    /// rate limit, across both tiled clients and floats. Runs once per
+    /// event batch (the WM has no timers, so "after the cooldown" means the
+    /// first batch that arrives past it — a pointer motion at the latest);
+    /// the `icons_stale` flag keeps the usual no-stale-icons batch from
+    /// paying for a clients-and-floats scan.
     pub(crate) fn flush_stale_icons(&mut self) -> R<()> {
         if !self.icons_stale {
             return Ok(());
@@ -264,11 +303,16 @@ impl Wm {
                 c.icon_stale && now.duration_since(c.icon_fetched) >= ICON_FETCH_COOLDOWN
             })
             .map(|(&w, _)| w)
+            .chain(self.floats_ref().iter().filter_map(|f| {
+                (f.icon_stale && now.duration_since(f.icon_fetched) >= ICON_FETCH_COOLDOWN)
+                    .then_some(f.win)
+            }))
             .collect();
         for win in due {
             self.on_icon_change(win)?;
         }
-        self.icons_stale = self.clients_ref().values().any(|c| c.icon_stale);
+        self.icons_stale = self.clients_ref().values().any(|c| c.icon_stale)
+            || self.floats_ref().iter().any(|f| f.icon_stale);
         Ok(())
     }
 
@@ -280,12 +324,9 @@ impl Wm {
     /// same as `on_note_ping`'s guard against a since-vanished popup. A
     /// client or float whose real `_NET_WM_ICON` arrived while this fetch was
     /// in flight already has `icon: Some(_)`, so the fallback is skipped
-    /// rather than clobbering it with the generic theme icon (today only
-    /// `on_icon_change` races this way, and it only ever touches
-    /// `self.clients` — but the same guard is applied to floats too, so
-    /// wiring up a live icon refresh for floats later doesn't silently
-    /// reopen this clobber). Per-item errors are contained (not
-    /// `?`-propagated) for the same
+    /// rather than clobbering it with the generic theme icon — both
+    /// `on_icon_change` and this ping race that way, for clients and floats
+    /// alike. Per-item errors are contained (not `?`-propagated) for the same
     /// reason `on_note_ping` contains its own: this channel has no other
     /// wakeup, so an early return here would strand every result still
     /// queued behind the failed one.
@@ -329,28 +370,59 @@ impl Wm {
     }
 }
 
+/// The connection a background theme-icon fetch thread pings the WM's event
+/// loop over, plus the root window `send_event` targets it at.
+struct PingConn {
+    xc: RustConnection,
+    root: u32,
+}
+
+/// Shared across every `spawn_theme_icon_fetch` thread for the lifetime of
+/// the process. `RustConnection` is `Send + Sync` (its I/O is internally
+/// synchronized), so unlike `self.conn` — the WM's own connection, not safe
+/// to touch off the main thread — this one is fine to share. `None` means an
+/// earlier connect attempt failed; that's cached rather than retried, since a
+/// missing ping only delays a result already sitting in the mpsc channel
+/// until the WM's next natural wakeup, never loses it, so paying a fresh
+/// connect-and-auth handshake per fetch for no better outcome isn't worth it.
+static PING: std::sync::OnceLock<Option<PingConn>> = std::sync::OnceLock::new();
+
 /// Wake the WM's blocking event loop from a background theme-icon fetch
 /// thread (`Wm::spawn_theme_icon_fetch`), by sending a `SPLITWM_ICON`
 /// ClientMessage to root — same mechanism `notify.rs`'s daemon thread uses
-/// to wake the WM after a `NoteMsg`. A short-lived helper thread opens its
-/// own X connection purely for this send (mirroring `notify::serve`) rather
-/// than sharing the WM's own connection, which isn't safe to touch off the
-/// main thread. Best-effort: a failed ping only delays the result being
-/// applied until the WM's next natural wakeup, never loses it (the result
-/// itself already sat down in the mpsc channel before this runs). Takes the
-/// already-interned `atom` (atoms are server-global, so the caller's value
-/// is valid on this thread's separate connection too) rather than paying an
-/// extra round trip to re-intern it here on every fetch.
+/// to wake the WM after a `NoteMsg`. Reuses one lazily-connected `PING`
+/// connection across every fetch thread rather than paying a fresh
+/// connect/auth handshake per ping. Best-effort: a failed ping (whether the
+/// initial connect or this send) only delays the result being applied until
+/// the WM's next natural wakeup, never loses it (the result itself already
+/// sat down in the mpsc channel before this runs); a `send_event` failure on
+/// an already-live connection is logged and otherwise ignored rather than
+/// tearing down and reconnecting, since the WM will pick the result up on
+/// its own soon enough anyway. Takes the already-interned `atom` (atoms are
+/// server-global, so the caller's value is valid on this shared connection
+/// too) rather than paying an extra round trip to re-intern it here on every
+/// fetch.
 fn ping_icon_thread(atom: Atom) {
-    let ping = || -> R<()> {
-        let (xc, screen) = x11rb::connect(None)?;
-        let root = xc.setup().roots[screen].root;
-        let ev = ClientMessageEvent::new(32, root, atom, [0u32; 5]);
-        xc.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT, ev)?;
+    let ping = PING.get_or_init(|| match x11rb::connect(None) {
+        Ok((xc, screen)) => {
+            let root = xc.setup().roots[screen].root;
+            Some(PingConn { xc, root })
+        }
+        Err(e) => {
+            eprintln!("splitwm: failed to open the icon-ping connection: {e}");
+            None
+        }
+    });
+    let Some(PingConn { xc, root }) = ping else {
+        return;
+    };
+    let send = || -> R<()> {
+        let ev = ClientMessageEvent::new(32, *root, atom, [0u32; 5]);
+        xc.send_event(false, *root, EventMask::SUBSTRUCTURE_REDIRECT, ev)?;
         xc.flush()?;
         Ok(())
     };
-    if let Err(e) = ping() {
+    if let Err(e) = send() {
         eprintln!("splitwm: failed to ping the WM event loop for an icon fetch: {e}");
     }
 }

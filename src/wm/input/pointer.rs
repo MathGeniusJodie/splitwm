@@ -152,11 +152,14 @@ impl Wm {
             let (mx, my) = (i32::from(e.event_x), i32::from(e.event_y));
             let hit = self.hit_test(mx, my);
             match hit {
-                // Split-control buttons take left and right click (right
-                // picks the opposite split direction); everything else is
-                // left only.
-                Hit::Btn(leaf, kind) => return self.click_split_button(leaf, kind, e.detail == 3),
+                // The split button takes left and right click (right picks
+                // the opposite split direction); Close and Minimize, like
+                // everything else on the underlay, are left only.
+                Hit::Btn(leaf, kind @ BtnKind::Split) => {
+                    return self.click_split_button(leaf, kind, e.detail == 3);
+                }
                 _ if e.detail != 1 => return Ok(()),
+                Hit::Btn(leaf, kind) => return self.click_split_button(leaf, kind, false),
                 // The corner "x" badge on a bottom-bar tile: politely close
                 // that window.
                 Hit::TaskbarClose(win) => return self.close_client(win),
@@ -164,14 +167,12 @@ impl Wm {
                 // it — via `bring_into_layout`, whose `commit_layout` also
                 // scrolls a split that sits outside the viewport back in
                 // (activating a window `place_clients` keeps unmapped would
-                // otherwise focus an unviewable window).
-                Hit::TaskbarTile(win) => {
-                    self.animate = true;
-                    return self.bring_into_layout(win);
-                }
+                // otherwise focus an unviewable window). `animate: true` so
+                // a real layout change transitions.
+                Hit::TaskbarTile(win) => return self.bring_into_layout(win, true),
                 // A quick-launch icon: spawn its command. The new window
                 // lands wherever a normal map lands (the focused split or
-                // the taskbar).
+                // the stash).
                 Hit::QuickLaunch(i) => {
                     if let Some(cmd) = self.quick.get(i).map(|q| q.cmd.clone()) {
                         self.spawn(&cmd);

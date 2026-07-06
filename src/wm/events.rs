@@ -12,6 +12,7 @@ use x11rb::protocol::Event;
 
 use super::input::ActiveDrag;
 use super::types::{clamp_dim, WindowKind, Wm, R};
+use crate::state::Activation;
 use crate::tree::{Rect, Win};
 
 impl Wm {
@@ -98,11 +99,11 @@ impl Wm {
                 // changes the workarea every motion handler computes
                 // against, so it still flushes below.
                 Event::PropertyNotify(_) | Event::Expose(_) | Event::ConfigureRequest(_) => {
-                    contain(self.handle_event(&ev), event_kind(&ev))?;
+                    contain_event(self.handle_event(&ev), &ev)?;
                     continue;
                 }
                 Event::ConfigureNotify(e) if e.window != self.root => {
-                    contain(self.handle_event(&ev), event_kind(&ev))?;
+                    contain_event(self.handle_event(&ev), &ev)?;
                     continue;
                 }
                 _ => {}
@@ -121,7 +122,7 @@ impl Wm {
                     "XinputRawMotion",
                 )?;
             }
-            contain(self.handle_event(&ev), event_kind(&ev))?;
+            contain_event(self.handle_event(&ev), &ev)?;
         }
         for m in pending_motion {
             contain(self.on_motion(&m), "MotionNotify")?;
@@ -300,7 +301,7 @@ impl Wm {
     /// toolkits fight a tiler with a stream of ConfigureRequests, and a
     /// `GetGeometry` round trip per denial stalls the event loop — falling
     /// back to `GetGeometry` only for windows whose geometry we don't track
-    /// (hidden/taskbar'd clients). The window is a root child, so both
+    /// (hidden/stashed clients). The window is a root child, so both
     /// sources are root-relative, as the synthetic event requires.
     fn send_synthetic_configure(&self, win: u32) -> R<()> {
         let (x, y, w, h) = match self.tracked_geometry(win) {
@@ -457,11 +458,24 @@ impl Wm {
     /// if it has one, otherwise into the focused split. The shared policy
     /// behind `_NET_ACTIVE_WINDOW` activation and ICCCM deiconify
     /// MapRequests. It takes focus, so a focused dialog yields the keyboard.
-    pub(crate) fn bring_into_layout(&mut self, win: u32) -> R<()> {
+    /// `animate` requests a transition, but only when rects actually moved
+    /// (a taskbar-tile click skips it for a window already shown and
+    /// focused); it must be set before `commit_layout` runs `arrange`, which
+    /// consumes `self.animate` — setting it after would both miss the
+    /// transition it was meant for and leak into a later, unrelated arrange.
+    pub(crate) fn bring_into_layout(&mut self, win: u32, animate: bool) -> R<()> {
         self.clear_focused_float();
-        if !self.state.activate_client(win) {
-            let leaf = self.state.focused_leaf_valid();
-            self.state.assign_to_leaf(win, leaf);
+        let changed = match self.state.activate_client(win) {
+            Activation::NotFound => {
+                let leaf = self.state.focused_leaf_valid();
+                self.state.assign_to_leaf(win, leaf);
+                true
+            }
+            Activation::Unminimized => true,
+            Activation::Unchanged => false,
+        };
+        if animate {
+            self.animate = changed;
         }
         self.commit_layout()
     }
@@ -470,7 +484,7 @@ impl Wm {
     /// focus it (see `bring_into_layout`); floats just take focus.
     fn on_activate_request(&mut self, win: u32) -> R<()> {
         match self.kind_of(win) {
-            Some(WindowKind::Tiled) => self.bring_into_layout(win),
+            Some(WindowKind::Tiled) => self.bring_into_layout(win, false),
             Some(WindowKind::Float) => {
                 self.focus_float(win)?;
                 self.raise_notifications()
@@ -491,7 +505,7 @@ impl Wm {
             // A map request for a window we manage but have hidden is the
             // ICCCM deiconify request (Iconic -> Normal): bring it into a
             // split rather than blindly mapping it over the layout.
-            Some(WindowKind::Tiled) => self.bring_into_layout(e.window),
+            Some(WindowKind::Tiled) => self.bring_into_layout(e.window, false),
             // The dock re-requesting a map must not fall through to
             // manage(): matches_dock would see this same window already
             // docked, misread it as a second dock, and tile it while
@@ -556,7 +570,7 @@ impl Wm {
             // Unlike `on_unmap`, an unrecognised window still goes through
             // `forget_client`: it's a no-op for a truly unknown window, but
             // catches the one case a `DestroyNotify` can see that `kind_of`
-            // can't — `manage` pinning a window into the split tree/taskbar
+            // can't — `manage` pinning a window into the split tree/stash
             // before failing partway through (before `register_kind` runs).
             // Without this, such a window would be a phantom tile forever.
             Some(WindowKind::Tiled) | None => self.forget_client(win),
@@ -590,31 +604,23 @@ pub(super) fn contain(r: R<()>, what: &str) -> R<()> {
     }
 }
 
-/// The `Event` variant's name, for tagging a `contain`'d error with which
-/// handler actually failed instead of the uninformative literal "event".
-fn event_kind(ev: &Event) -> &'static str {
-    match ev {
-        Event::ButtonPress(_) => "ButtonPress",
-        Event::ButtonRelease(_) => "ButtonRelease",
-        Event::ClientMessage(_) => "ClientMessage",
-        Event::ConfigureNotify(_) => "ConfigureNotify",
-        Event::ConfigureRequest(_) => "ConfigureRequest",
-        Event::DestroyNotify(_) => "DestroyNotify",
-        Event::EnterNotify(_) => "EnterNotify",
-        Event::Error(_) => "Error",
-        Event::Expose(_) => "Expose",
-        Event::KeyPress(_) => "KeyPress",
-        Event::KeyRelease(_) => "KeyRelease",
-        Event::LeaveNotify(_) => "LeaveNotify",
-        Event::MapNotify(_) => "MapNotify",
-        Event::MapRequest(_) => "MapRequest",
-        Event::MappingNotify(_) => "MappingNotify",
-        Event::MotionNotify(_) => "MotionNotify",
-        Event::PropertyNotify(_) => "PropertyNotify",
-        Event::SelectionClear(_) => "SelectionClear",
-        Event::UnmapNotify(_) => "UnmapNotify",
-        Event::XinputHierarchy(_) => "XinputHierarchy",
-        Event::XinputRawMotion(_) => "XinputRawMotion",
-        _ => "event",
+/// Contain a non-fatal error from handling `ev`, tagging it with the
+/// `Event` variant's name. The name is derived from `ev`'s `Debug` output
+/// (x11rb prints every variant as `VariantName(...)`) rather than a
+/// hand-maintained match, so a newly handled variant is tagged correctly
+/// without a matching update here — and since this runs only on the
+/// (rare) error path, the per-event cost of formatting is never paid on
+/// the hot path.
+pub(super) fn contain_event(r: R<()>, ev: &Event) -> R<()> {
+    match r {
+        Err(e) if !e.is_fatal() => {
+            let debug = format!("{ev:?}");
+            let what = debug
+                .find(['(', '{', ' '])
+                .map_or(debug.as_str(), |i| &debug[..i]);
+            eprintln!("splitwm: error handling {what}: {e}");
+            Ok(())
+        }
+        other => other,
     }
 }

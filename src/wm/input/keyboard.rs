@@ -150,10 +150,10 @@ impl Wm {
                 self.state.focus_direction(false);
             }
             Action::NextTab => {
-                self.state.cycle_taskbar(true);
+                self.state.cycle_stash(true);
             }
             Action::PrevTab => {
-                self.state.cycle_taskbar(false);
+                self.state.cycle_stash(false);
             }
             Action::MoveTabNext => {
                 self.animate &= self.state.move_window_to_direction(true).is_some();
@@ -221,29 +221,22 @@ impl Wm {
     }
 
     /// Split the focused leaf in `dir` if it's eligible; otherwise cancel
-    /// the animation queued for the action. Gated the same way as the
-    /// titlebar Split button (which checks `leaf_meta.can_split` and skips
-    /// minimized leaves): splitting a minimized leaf would clone the
-    /// minimized flag into `child_a`, a state the button logic considers
-    /// invalid, and produce split frames already too small for the
-    /// direction, whose windows then overhang and paint over neighbours.
+    /// the animation queued for the action. `can_split_focused` screens out
+    /// frames too small for the direction (whose windows would overhang and
+    /// paint over neighbours); `State::split_focused` itself refuses a
+    /// minimized leaf, so its `false` return also cancels the animation here.
     fn try_split(&mut self, dir: Dir) {
-        if self.can_split_focused(dir) {
-            self.state.split_focused(dir);
-        } else {
+        if !self.can_split_focused(dir) || !self.state.split_focused(dir) {
             self.animate = false;
         }
     }
 
-    /// Whether the focused leaf can be split in `dir` (the same
-    /// `theme::split_fits` threshold the titlebar Split button uses):
-    /// never a minimized leaf, and the frame must fit two children of the
-    /// direction's minimum size plus the gap between them.
+    /// Whether the focused leaf's frame is big enough to split in `dir` (the
+    /// same `theme::split_fits` threshold the titlebar Split button uses).
+    /// The minimized-leaf refusal lives in `State::split_focused` itself, so
+    /// it isn't duplicated here.
     fn can_split_focused(&self, dir: Dir) -> bool {
         let leaf = self.state.focused_leaf_valid();
-        if self.state.tree.leaf(leaf).is_some_and(|l| l.minimized) {
-            return false;
-        }
         // An off-screen leaf (scrolled out of view) has no cached frame
         // rect; its canvas-space geometry has the same size, so size checks
         // work from either. A leaf in neither is unknown — deny, since

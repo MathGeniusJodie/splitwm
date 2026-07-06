@@ -13,6 +13,18 @@ pub enum InsertAt {
     End,
 }
 
+/// Outcome of `activate_client`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Activation {
+    /// `c` isn't tracked in any leaf (sitting in the stash);
+    /// the caller must place it itself.
+    NotFound,
+    /// `c` occupied a minimized leaf that is now shown — rects changed.
+    Unminimized,
+    /// `c` already occupied a shown leaf — nothing a redraw would show moved.
+    Unchanged,
+}
+
 pub struct State {
     pub tree: Tree,
     /// Private so every write outside `#[cfg(test)]` goes through
@@ -43,10 +55,11 @@ pub struct State {
     /// isn't immediately overwritten by it. Private so the only write is
     /// `resize_edge`, whose per-column `min_split_w` clamp keeps it sane.
     canvas_w_extra: i32,
-    /// Windows not currently shown in any split, in the bottom taskbar.
-    /// Private so every insert goes through `push_taskbar`, which owns the
-    /// no-duplicates invariant; read through `taskbar()`.
-    taskbar: Vec<Win>,
+    /// Windows not shown in any split; they appear un-highlighted in the
+    /// bottom taskbar and are what Mod4+[ / Mod4+] cycle through. Private so
+    /// every insert goes through `push_stash`, which owns the
+    /// no-duplicates invariant; read through `stash()`.
+    stash: Vec<Win>,
 }
 
 /// How a collapsing branch hangs in the tree: it is the root, or child
@@ -83,7 +96,7 @@ impl State {
             canvas_w: 0,
             dock_extra: 0,
             canvas_w_extra: 0,
-            taskbar: Vec::new(),
+            stash: Vec::new(),
         }
     }
 
@@ -106,45 +119,45 @@ impl State {
 
     // --- window placement helpers ---
 
-    /// Windows not currently shown in any split, in taskbar (queue) order.
-    pub fn taskbar(&self) -> &[Win] {
-        &self.taskbar
+    /// Windows not currently shown in any split, in stash (queue) order.
+    pub fn stash(&self) -> &[Win] {
+        &self.stash
     }
 
-    /// Drop a client into the bottom taskbar (deduplicated).
-    fn push_taskbar(&mut self, c: Win) {
-        if !self.taskbar.contains(&c) {
-            self.taskbar.push(c);
+    /// Drop a client into the stash (deduplicated).
+    fn push_stash(&mut self, c: Win) {
+        if !self.stash.contains(&c) {
+            self.stash.push(c);
         }
     }
 
-    /// Pull `w` out of the taskbar; whether it was there.
-    fn take_from_taskbar(&mut self, w: Win) -> bool {
-        let len = self.taskbar.len();
-        self.taskbar.retain(|&x| x != w);
-        self.taskbar.len() < len
+    /// Pull `w` out of the stash; whether it was there.
+    fn take_from_stash(&mut self, w: Win) -> bool {
+        let len = self.stash.len();
+        self.stash.retain(|&x| x != w);
+        self.stash.len() < len
     }
 
-    /// Detach `c` from wherever it lives (a split or the taskbar).
+    /// Detach `c` from wherever it lives (a split or the stash).
     fn detach(&mut self, c: Win) {
         if let Some(lid) = self.tree.find_leaf_for_client(c) {
             if let Some(l) = self.tree.leaf_mut(lid) {
                 l.client = None;
             }
         }
-        self.take_from_taskbar(c);
+        self.take_from_stash(c);
     }
 
     /// Place a new client into the focused leaf, bumping any current occupant
-    /// down to the taskbar.
+    /// down to the stash.
     pub fn pin_client(&mut self, c: Win) {
-        if self.tree.find_leaf_for_client(c).is_some() || self.taskbar.contains(&c) {
+        if self.tree.find_leaf_for_client(c).is_some() || self.stash.contains(&c) {
             return;
         }
         self.assign_to_leaf(c, self.focused_leaf_valid());
     }
 
-    /// Put `c` into leaf `dst`, displacing the existing occupant to the taskbar.
+    /// Put `c` into leaf `dst`, displacing the existing occupant to the stash.
     /// `c` is first detached from its previous home. The destination is
     /// un-minimized: showing a window in a leaf means the user wants to see
     /// it, and a minimized leaf's window is never mapped.
@@ -158,7 +171,7 @@ impl State {
         let displaced = self.tree.leaf(dst).and_then(|l| l.client);
         debug_assert_ne!(displaced, Some(c), "detach left {c:#x} in dst");
         if let Some(prev) = displaced {
-            self.push_taskbar(prev);
+            self.push_stash(prev);
         }
         if let Some(l) = self.tree.leaf_mut(dst) {
             l.show(c);
@@ -169,9 +182,9 @@ impl State {
         self.focus_leaf(dst);
     }
 
-    /// Remove a client entirely (window gone): clear it from its split/taskbar.
+    /// Remove a client entirely (window gone): clear it from its split/stash.
     /// If the leaf it occupied remembers a displaced window (`Leaf::prev`)
-    /// that's still in the taskbar, that window is put back into the split —
+    /// that's still in the stash, that window is put back into the split —
     /// closing a focus-stealing popup restores what it displaced.
     pub fn unpin_client(&mut self, c: Win) {
         let lid = self.tree.find_leaf_for_client(c);
@@ -179,7 +192,7 @@ impl State {
         if let Some(lid) = lid {
             let prev = self.tree.leaf(lid).and_then(|l| l.prev);
             if let Some(p) = prev {
-                if self.take_from_taskbar(p) {
+                if self.take_from_stash(p) {
                     if let Some(l) = self.tree.leaf_mut(lid) {
                         l.show(p);
                     }
@@ -202,16 +215,24 @@ impl State {
     /// Focus whatever split currently shows `c`, un-minimizing it —
     /// activation means the user (or a pager) wants the window visible, and
     /// a minimized leaf's window is never mapped, so focusing one without
-    /// restoring it would target an unviewable window.
-    pub fn activate_client(&mut self, c: Win) -> bool {
-        if let Some(lid) = self.tree.find_leaf_for_client(c) {
-            if let Some(l) = self.tree.leaf_mut(lid) {
-                l.minimized = false;
-            }
-            self.focus_leaf(lid);
-            return true;
+    /// restoring it would target an unviewable window. Reports whether that
+    /// changed anything a redraw would show, so callers can skip animating a
+    /// transition that moves no rects (a plain refocus of an already-visible
+    /// window).
+    pub fn activate_client(&mut self, c: Win) -> Activation {
+        let Some(lid) = self.tree.find_leaf_for_client(c) else {
+            return Activation::NotFound;
+        };
+        let was_minimized = self.tree.leaf(lid).is_some_and(|l| l.minimized);
+        if let Some(l) = self.tree.leaf_mut(lid) {
+            l.minimized = false;
         }
-        false
+        self.focus_leaf(lid);
+        if was_minimized {
+            Activation::Unminimized
+        } else {
+            Activation::Unchanged
+        }
     }
 
     /// Currently *shown* client of the focused leaf. A minimized leaf shows
@@ -226,18 +247,18 @@ impl State {
         l.client
     }
 
-    /// Swap the focused split's window with the next/prev taskbar entry,
+    /// Swap the focused split's window with the next/prev stash entry,
     /// cycling which off-screen window is shown.
-    pub fn cycle_taskbar(&mut self, forward: bool) -> Option<Win> {
-        if self.taskbar.is_empty() {
+    pub fn cycle_stash(&mut self, forward: bool) -> Option<Win> {
+        if self.stash.is_empty() {
             return None;
         }
         let lid = self.focused_leaf_valid();
         let displaced = self.tree.leaf(lid).and_then(|l| l.client);
         let next = if forward {
-            self.taskbar.remove(0)
+            self.stash.remove(0)
         } else {
-            self.taskbar.pop()?
+            self.stash.pop()?
         };
         self.assign_to_leaf(next, lid);
         // `assign_to_leaf` pushes the displaced occupant to the *back* —
@@ -247,8 +268,8 @@ impl State {
         // inverse rotations of the same queue.
         if !forward {
             if let Some(d) = displaced {
-                self.take_from_taskbar(d);
-                self.taskbar.insert(0, d);
+                self.take_from_stash(d);
+                self.stash.insert(0, d);
             }
         }
         Some(next)
@@ -281,7 +302,7 @@ impl State {
     }
 
     /// Move the focused window to the adjacent split (displacing its occupant
-    /// to the taskbar). Returns the moved client.
+    /// to the stash). Returns the moved client.
     pub fn move_window_to_direction(&mut self, next: bool) -> Option<Win> {
         let src = self.focused_leaf_valid();
         let dst = self.adjacent_leaf(src, next)?;
@@ -346,14 +367,21 @@ impl State {
     }
 
     /// Split the focused leaf; the existing window stays in `child_a` (now
-    /// focused) and `child_b` starts empty.
-    pub fn split_focused(&mut self, dir: Dir) {
+    /// focused) and `child_b` starts empty. Refused for a minimized leaf: a
+    /// minimized `child_a` cloned from it would be a split state the rest of
+    /// the system (titlebar Split button, keyboard split gate) treats as
+    /// impossible. Returns whether the split happened, so callers that queue
+    /// an animation for the action can cancel it on refusal.
+    pub fn split_focused(&mut self, dir: Dir) -> bool {
         let leaf = self.focused_leaf_valid();
         // `focused_leaf_valid` only hands out live leaves, so this always
         // resolves; a dangling id makes the split a no-op rather than a panic.
         let Some(leaf_data) = self.tree.leaf(leaf).cloned() else {
-            return;
+            return false;
         };
+        if leaf_data.minimized {
+            return false;
+        }
         // child_a keeps the original split's window *and* its accent colour, so
         // colour stays with the content; child_b gets a fresh colour.
         let child_a = self.tree.insert_node(Node::Leaf(leaf_data));
@@ -363,14 +391,15 @@ impl State {
         // `leaf` is now detached from the tree; drop it.
         self.tree.remove_node(leaf);
         self.focus_leaf(child_a);
+        true
     }
 
     /// Relocate `leaf`'s window: into the adjacent sibling's first leaf if it
-    /// is empty, otherwise onto the taskbar. `idx` is `leaf`'s index among
+    /// is empty, otherwise onto the stash. `idx` is `leaf`'s index among
     /// `parent`'s children.
     fn relocate_closed_window(&mut self, parent: NodeId, idx: usize, leaf: NodeId) -> bool {
         // Relocate this leaf's window: into the adjacent sibling's first leaf
-        // if it is empty, otherwise onto the taskbar.
+        // if it is empty, otherwise onto the stash.
         let client = self.tree.leaf(leaf).and_then(|l| l.client);
         let dest_child = {
             let Some(b) = self.tree.branch(parent) else {
@@ -398,7 +427,7 @@ impl State {
                     }
                 }
             } else {
-                self.push_taskbar(c);
+                self.push_stash(c);
             }
         }
         true
@@ -470,7 +499,7 @@ impl State {
     }
 
     /// Close the focused leaf. Its window moves into the adjacent sibling if
-    /// that split is empty, otherwise down to the taskbar.
+    /// that split is empty, otherwise down to the stash.
     pub fn close_focused(&mut self) -> bool {
         let leaf = self.focused_leaf_valid();
         let Some((parent, idx)) = self.tree.find_parent(leaf) else {
@@ -1106,55 +1135,55 @@ mod tests {
         assert_eq!(after[&right_id].w, right_w_before);
     }
 
-    /// Backward taskbar cycling must walk the whole list in reverse, not
-    /// flip-flop between the shown window and the last taskbar entry:
+    /// Backward stash cycling must walk the whole list in reverse, not
+    /// flip-flop between the shown window and the last stash entry:
     /// `assign_to_leaf` pushes the displaced window to the back, which is
     /// exactly where the next backward pop looks, so the displaced window
     /// must be moved to the front.
     #[test]
-    fn cycle_taskbar_prev_visits_every_window() {
+    fn cycle_stash_prev_visits_every_window() {
         let mut s = State::new();
         for w in [10, 1, 2, 3] {
             s.pin_client(w);
         }
-        // Leaf shows 3; taskbar is [10, 1, 2].
+        // Leaf shows 3; stash is [10, 1, 2].
         assert_eq!(s.focused_client(), Some(3));
 
-        let shown: Vec<_> = (0..4).map(|_| s.cycle_taskbar(false).unwrap()).collect();
+        let shown: Vec<_> = (0..4).map(|_| s.cycle_stash(false).unwrap()).collect();
         assert_eq!(shown, vec![2, 1, 10, 3], "prev must rotate, not toggle");
     }
 
     /// One step forward then one step back must restore both the shown
-    /// window and the taskbar order.
+    /// window and the stash order.
     #[test]
-    fn cycle_taskbar_prev_inverts_next() {
+    fn cycle_stash_prev_inverts_next() {
         let mut s = State::new();
         for w in [10, 1, 2, 3] {
             s.pin_client(w);
         }
-        let before = s.taskbar.clone();
-        s.cycle_taskbar(true);
-        s.cycle_taskbar(false);
+        let before = s.stash.clone();
+        s.cycle_stash(true);
+        s.cycle_stash(false);
         assert_eq!(s.focused_client(), Some(3));
-        assert_eq!(s.taskbar, before);
+        assert_eq!(s.stash, before);
     }
 
     /// A popup that displaces the working window and is then destroyed must
-    /// give the split back to the displaced window (pulled from the taskbar).
+    /// give the split back to the displaced window (pulled from the stash).
     #[test]
     fn closing_popup_restores_displaced_window() {
         let mut s = State::new();
         s.pin_client(1); // working window
-        s.pin_client(99); // popup steals the split; 1 -> taskbar
+        s.pin_client(99); // popup steals the split; 1 -> stash
         assert_eq!(s.focused_client(), Some(99));
-        assert!(s.taskbar.contains(&1));
+        assert!(s.stash.contains(&1));
 
         s.unpin_client(99); // popup window destroyed
         assert_eq!(s.focused_client(), Some(1), "displaced window comes back");
-        assert!(!s.taskbar.contains(&1));
+        assert!(!s.stash.contains(&1));
     }
 
-    /// If the displaced window has since left the taskbar (shown elsewhere or
+    /// If the displaced window has since left the stash (shown elsewhere or
     /// itself closed), the split just stays empty — no stale restore.
     #[test]
     fn no_restore_when_displaced_window_is_gone() {
@@ -1164,7 +1193,7 @@ mod tests {
         s.unpin_client(1); // the remembered window itself is destroyed
         s.unpin_client(99);
         assert_eq!(s.focused_client(), None);
-        assert!(s.taskbar.is_empty());
+        assert!(s.stash.is_empty());
     }
 
     /// Restoration is single-shot: after a restore the leaf holds no further
@@ -1174,12 +1203,12 @@ mod tests {
         let mut s = State::new();
         s.pin_client(1);
         s.pin_client(2); // prev = 1
-        s.pin_client(3); // prev = 2, taskbar [1, 2]
+        s.pin_client(3); // prev = 2, stash [1, 2]
         s.unpin_client(3); // restores 2
         assert_eq!(s.focused_client(), Some(2));
-        s.unpin_client(2); // prev was consumed; 1 stays in the taskbar
+        s.unpin_client(2); // prev was consumed; 1 stays in the stash
         assert_eq!(s.focused_client(), None);
-        assert_eq!(s.taskbar, vec![1]);
+        assert_eq!(s.stash, vec![1]);
     }
 
     /// Activating a client whose leaf is minimized must restore the leaf:
@@ -1193,12 +1222,24 @@ mod tests {
         s.split_focused(Dir::H);
         let leaf = s.tree.find_leaf_for_client(1).unwrap();
         s.toggle_minimize(leaf);
-        assert!(s.activate_client(1));
+        assert_eq!(s.activate_client(1), Activation::Unminimized);
         assert!(!s.tree.leaf(leaf).unwrap().minimized);
 
         s.toggle_minimize(leaf);
         s.assign_to_leaf(2, leaf);
         assert!(!s.tree.leaf(leaf).unwrap().minimized);
+    }
+
+    /// `activate_client`'s report distinguishes a real layout change (a
+    /// minimized leaf reappearing) from a no-op refocus of a window that's
+    /// already shown, and from a window not tracked in the tree at all —
+    /// callers use this to skip animating a transition that moves no rects.
+    #[test]
+    fn activation_reports_whether_anything_changed() {
+        let mut s = State::new();
+        s.pin_client(1);
+        assert_eq!(s.activate_client(1), Activation::Unchanged);
+        assert_eq!(s.activate_client(99), Activation::NotFound);
     }
 
     /// Restoring the displaced window into a leaf that was minimized in the
@@ -1209,7 +1250,7 @@ mod tests {
         let mut s = State::new();
         s.pin_client(1);
         s.split_focused(Dir::H);
-        s.pin_client(99); // displaces 1 -> taskbar, prev = 1
+        s.pin_client(99); // displaces 1 -> stash, prev = 1
         let leaf = s.tree.find_leaf_for_client(99).unwrap();
         s.toggle_minimize(leaf);
         s.unpin_client(99); // popup dies while its leaf is minimized
@@ -1221,7 +1262,7 @@ mod tests {
     /// relocates the window into it *and* restores it — the same "a leaf
     /// showing a window is never minimized" invariant as assignment and
     /// activation; the relocated window would otherwise be unmapped and in
-    /// no taskbar, visible nowhere.
+    /// no stash, visible nowhere.
     #[test]
     fn close_into_minimized_sibling_unminimizes() {
         let mut s = State::new();
@@ -1240,14 +1281,14 @@ mod tests {
         let dst = s.tree.find_leaf_for_client(1).unwrap();
         assert!(!s.tree.leaf(dst).unwrap().minimized);
         assert_eq!(s.focused_client(), Some(1));
-        assert!(s.taskbar.is_empty());
+        assert!(s.stash.is_empty());
     }
 
     /// Closing when the adjacent sibling already shows a window pushes the
-    /// closed leaf's window to the taskbar instead of displacing the
+    /// closed leaf's window to the stash instead of displacing the
     /// sibling's occupant.
     #[test]
-    fn close_with_occupied_sibling_pushes_to_taskbar() {
+    fn close_with_occupied_sibling_pushes_to_stash() {
         let mut s = State::new();
         s.pin_client(1);
         s.split_focused(Dir::H);
@@ -1262,7 +1303,7 @@ mod tests {
         s.pin_client(2);
         s.focused_leaf = a;
         assert!(s.close_focused());
-        assert_eq!(s.taskbar, vec![1]);
+        assert_eq!(s.stash, vec![1]);
         assert_eq!(s.focused_client(), Some(2));
     }
 
@@ -1341,6 +1382,26 @@ mod tests {
         assert!(!s.tree.leaf(root).unwrap().minimized);
     }
 
+    /// A minimized leaf must never be split: `child_a` would inherit
+    /// `minimized: true`, a split-then-minimized state the titlebar Split
+    /// button and keyboard split gate both treat as impossible to produce.
+    /// `State::split_focused` is the single place that refuses this, so the
+    /// tree is unchanged and nothing ends up both minimized and freshly split.
+    #[test]
+    fn split_focused_refuses_a_minimized_leaf() {
+        let mut s = State::new();
+        s.split_focused(Dir::H); // two leaves, one non-root and minimizable
+        let leaves = s.tree.collect_leaves();
+        let target = leaves[1];
+        s.toggle_minimize(target);
+        s.focused_leaf = target;
+        let leaf_count_before = s.tree.collect_leaves().len();
+        assert!(!s.split_focused(Dir::V));
+        let leaves_after = s.tree.collect_leaves();
+        assert_eq!(leaves_after.len(), leaf_count_before);
+        assert!(s.tree.leaf(target).unwrap().minimized);
+    }
+
     /// Repeated growing must stop once the neighbour bottoms out at
     /// `MIN_SPLIT_FRAC`, conserving the pair's ratio sum exactly — clamping
     /// both sides independently would let total ratio mass drift upward,
@@ -1404,7 +1465,7 @@ mod tests {
         let mut s = State::new();
         s.pin_client(1);
         s.split_focused(Dir::H); // window 1 stays in the focused child
-        s.pin_client(2); // displaces 1 -> taskbar, prev = 1
+        s.pin_client(2); // displaces 1 -> stash, prev = 1
         assert!(s.close_focused()); // 2 moves into the empty sibling
         assert_eq!(s.focused_client(), Some(2));
         s.unpin_client(2); // popup dies: 1 must come back

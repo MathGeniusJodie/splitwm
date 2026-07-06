@@ -177,13 +177,23 @@ fn wallpaper_cache_path(header: &[u8]) -> Option<std::path::PathBuf> {
                 .filter(|v| !v.is_empty())
                 .map(|home| std::path::PathBuf::from(home).join(".cache"))
         })?;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    header.hash(&mut hasher);
     Some(
         base.join("splitwm")
-            .join(format!("wallpaper-{:016x}", hasher.finish())),
+            .join(format!("wallpaper-{:016x}", fnv1a(header))),
     )
+}
+
+/// FNV-1a over `bytes`. Used instead of `DefaultHasher` because the latter's
+/// output isn't guaranteed stable across Rust releases — the cache filename
+/// only needs to be *a* stable function of the header, not a great one, since
+/// the header itself is re-checked in full on load; a stable hash just keeps
+/// existing cache files from being orphaned by a toolchain upgrade.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+    bytes
+        .iter()
+        .fold(OFFSET, |h, &b| (h ^ u64::from(b)).wrapping_mul(PRIME))
 }
 
 /// Read a cached quantized wallpaper: `header` followed by exactly `dw*dh`
@@ -216,7 +226,50 @@ fn store_cached_wallpaper(
     let mut bytes = Vec::with_capacity(header.len() + indices.len());
     bytes.extend_from_slice(header);
     bytes.extend_from_slice(indices);
-    std::fs::write(cache, bytes)
+    std::fs::write(cache, bytes)?;
+    evict_stale_wallpaper_caches(cache);
+    Ok(())
+}
+
+/// Cap on distinct `wallpaper-*` files kept in the cache directory: enough
+/// for a couple of monitor sizes plus one wallpaper switch, in keeping with
+/// the "bounded in practice, but nothing should grow without a lid" policy
+/// applied to the in-memory caches in `insert_capped` (see `render/mod.rs`).
+/// Each distinct (path, size, palette) header gets its own file and nothing
+/// ever deletes an old one on its own, so without this the directory would
+/// grow by a few megabytes per wallpaper change or resolution switch,
+/// forever.
+const MAX_CACHED_WALLPAPERS: usize = 4;
+
+/// Delete all but the `MAX_CACHED_WALLPAPERS` most-recently-modified
+/// `wallpaper-*` files next to `just_written`, oldest first. Best-effort:
+/// listing or deleting is skipped silently on error, since eviction is
+/// housekeeping and must never turn a successful cache write into a failed
+/// one — a missed eviction just means the directory grows a little more
+/// before the next store retries it.
+fn evict_stale_wallpaper_caches(just_written: &std::path::Path) {
+    let Some(dir) = just_written.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(std::time::SystemTime, std::path::PathBuf)> = entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("wallpaper-"))
+        })
+        .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
+        .collect();
+    if files.len() <= MAX_CACHED_WALLPAPERS {
+        return;
+    }
+    files.sort_by_key(|(mtime, _)| *mtime);
+    for (_, path) in &files[..files.len() - MAX_CACHED_WALLPAPERS] {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// A `dw`x`dh` framebuffer holding `indices` (row-major, `dw*dh` entries).
@@ -269,5 +322,43 @@ mod tests {
         // same wallpaper actually hits its own cache file.
         let a2 = wallpaper_cache_path(b"splitwm-wallpaper-v1\nfoo.png-100x100").unwrap();
         assert_eq!(a, a2);
+    }
+
+    #[test]
+    fn store_evicts_all_but_the_most_recent_n() {
+        let dir =
+            std::env::temp_dir().join(format!("splitwm-wp-evict-test-{}", std::process::id()));
+        // More distinct entries than the cap: each `store_cached_wallpaper`
+        // call should leave only the newest `MAX_CACHED_WALLPAPERS` behind.
+        let n = MAX_CACHED_WALLPAPERS + 3;
+        for i in 0..n {
+            let cache = dir.join(format!("wallpaper-{i:016x}"));
+            let header = format!("splitwm-wallpaper-v1\nentry-{i}").into_bytes();
+            store_cached_wallpaper(&cache, &header, &[0, 1, 2]).unwrap();
+            // Distinct mtimes so "most recent" is unambiguous even on
+            // filesystems with coarse mtime resolution.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let remaining: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_str().unwrap().to_string())
+            .collect();
+        assert_eq!(remaining.len(), MAX_CACHED_WALLPAPERS);
+        for i in (n - MAX_CACHED_WALLPAPERS)..n {
+            assert!(
+                remaining.contains(&format!("wallpaper-{i:016x}")),
+                "expected the most recent entry {i} to survive eviction, got {remaining:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fnv1a_is_deterministic_and_sensitive_to_input() {
+        assert_eq!(fnv1a(b"hello"), fnv1a(b"hello"));
+        assert_ne!(fnv1a(b"hello"), fnv1a(b"hellp"));
     }
 }
