@@ -24,15 +24,26 @@ use crate::state::State;
 use crate::tree::{NodeId, Rect, Tree, Win};
 
 use super::arrange::LayoutAnim;
-use super::dock::DockState;
+use super::dock::{Dock, DockState};
 use super::floats::FloatWin;
-use super::icons::IconResult;
+use super::icons::{IconFreshness, IconResult};
 use super::input::{Cursors, DragState, HScroll, KeyRepeatState};
-use super::notifications::NoteState;
+use super::notifications::{ForeignNote, NoteState};
 use super::present::ShmSeg;
 use super::widgets::{QuickSlot, Widgets};
 
 pub type R<T> = Result<T, WmError>;
+
+/// `Wm::taskbar_compute_parts`'s disjoint-borrow bundle: a `&mut Widgets`
+/// alongside the read-only inputs `widgets::compute_taskbar` needs, named so
+/// the accessor's signature doesn't drown in an inline tuple type.
+pub(crate) type TaskbarParts<'a> = (
+    &'a mut Widgets,
+    &'a Tree,
+    Vec<(Win, &'a Client)>,
+    &'a [QuickSlot],
+    &'a [Win],
+);
 
 /// The `wm` error type, split at construction time into "the X connection
 /// itself is gone" versus everything else. Classifying at the `?` site —
@@ -211,15 +222,9 @@ pub struct Client {
     /// ICCCM focus model, read from `WM_HINTS.input` / `WM_TAKE_FOCUS` in
     /// `WM_PROTOCOLS` at manage time (see `Wm::give_focus`).
     pub focus: FocusModel,
-    /// When `_NET_WM_ICON` was last fetched for this window. A fetch can
-    /// transfer up to 16 MiB and forces a full recomposite, and the property
-    /// is client-controlled: `on_icon_change` rate-limits fetches against
-    /// this (see `ICON_FETCH_COOLDOWN`).
-    pub icon_fetched: std::time::Instant,
-    /// An icon PropertyNotify arrived inside the cooldown window; the fetch
-    /// is deferred to `Wm::flush_stale_icons` so a burst's final icon still
-    /// lands.
-    pub icon_stale: bool,
+    /// `_NET_WM_ICON` fetch cooldown/staleness bookkeeping (see
+    /// `IconFreshness`).
+    pub icon_fresh: IconFreshness,
 }
 
 /// How a window wants keyboard focus delivered (ICCCM 4.1.7): whether
@@ -231,15 +236,11 @@ pub struct FocusModel {
     pub take_focus: bool,
 }
 
-/// Which of the four ways a managed window is handled — the single fact
-/// `Wm::kind_of` answers instead of every event-dispatch site probing
-/// `clients`/`floats`/`dock.docked`/`notes.foreign` in turn (previously
-/// duplicated across `on_map_request`, `on_unmap`, `on_destroy`,
-/// `on_configure_request`, `on_activate_request` and `tracked_geometry`).
-/// Payload stays in each kind's own container; this only says which one, so
-/// a window can't be registered under two kinds at once, and an exhaustive
-/// match over it won't compile once a fifth kind exists until every site is
-/// updated to handle it.
+/// Which of the four ways a managed window is handled — the discriminant
+/// `Wm::kind_of` reads off `ManagedWindow`, for the many event-dispatch sites
+/// that only need to know which kind and not the payload itself. An
+/// exhaustive match over it won't compile once a fifth kind exists until
+/// every site is updated to handle it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum WindowKind {
     Tiled,
@@ -248,25 +249,81 @@ pub enum WindowKind {
     Notification,
 }
 
+/// The payload of a managed window, keyed by its `Win` in `Wm::managed` —
+/// the single store behind every kind. One key holds exactly one variant, so
+/// a window registered under two kinds at once has no representation to
+/// exist in: inserting under a new kind necessarily replaces whatever was
+/// there before. `kind_of` reads `ManagedWindow::kind` off this — the single
+/// fact behind every event-dispatch site that would otherwise need to probe
+/// each kind's own container in turn (`on_map_request`, `on_unmap`,
+/// `on_destroy`, `on_configure_request`, `on_activate_request`,
+/// `tracked_geometry`).
+pub enum ManagedWindow {
+    Tiled(Client),
+    Float(FloatWin),
+    Dock(Dock),
+    Notification(ForeignNote),
+}
+
+impl ManagedWindow {
+    const fn kind(&self) -> WindowKind {
+        match self {
+            Self::Tiled(_) => WindowKind::Tiled,
+            Self::Float(_) => WindowKind::Float,
+            Self::Dock(_) => WindowKind::Dock,
+            Self::Notification(_) => WindowKind::Notification,
+        }
+    }
+
+    /// Extract the payload if this is the `Tiled` variant, handing the whole
+    /// value back unchanged otherwise — the shared shape every per-kind
+    /// `take_managed` extractor uses, so `remove_client` on a window that's
+    /// actually a float can't make it vanish as the wrong thing.
+    fn into_tiled(self) -> Result<Client, Self> {
+        match self {
+            Self::Tiled(c) => Ok(c),
+            other => Err(other),
+        }
+    }
+
+    fn into_float(self) -> Result<FloatWin, Self> {
+        match self {
+            Self::Float(f) => Ok(f),
+            other => Err(other),
+        }
+    }
+
+    fn into_notification(self) -> Result<ForeignNote, Self> {
+        match self {
+            Self::Notification(n) => Ok(n),
+            other => Err(other),
+        }
+    }
+}
+
 pub struct Wm {
     pub conn: RustConnection,
     pub root: Window,
     pub depth: u8,
     pub state: State,
-    /// Tiled clients, keyed by window. Private: see `clients_ref`/
-    /// `client_mut`/`insert_client`/`remove_client`.
-    clients: HashMap<Win, Client>,
-    /// Single source of truth for which container (this one, `floats`,
-    /// `dock.docked`, `notes.foreign`) a managed window belongs to. Private:
-    /// the only way to add or remove an entry is `register_kind`/
-    /// `unregister_kind`, called at the same point the window is inserted
-    /// into or removed from its payload container, so the two can't drift
-    /// apart.
-    window_kind: HashMap<Win, WindowKind>,
-    /// Floating dialogs/transients/fixed-size windows, in mapping order
-    /// (see `FloatWin`). Kept above tiled clients by every arrange. Private:
-    /// see `floats_ref`/`floats_iter_mut`/`add_float`/`remove_float`.
-    floats: Vec<FloatWin>,
+    /// Every managed window's payload, keyed by window (see
+    /// `ManagedWindow`): one key, one kind, so a window can't be registered
+    /// under two kinds at once. Private: see `tiled_iter`/`client_mut`/
+    /// `insert_client`/`remove_client`, `floats_iter`/`float_mut`/
+    /// `add_float`/`remove_float`, `foreign_iter`/`foreign_mut`/
+    /// `add_foreign`/`remove_foreign`, and `dock`/`set_dock`/`clear_dock`.
+    managed: HashMap<Win, ManagedWindow>,
+    /// Mapping order of floats (see `FloatWin`), kept above tiled clients by
+    /// every arrange. Private: maintained only by `add_float`/`remove_float`
+    /// alongside `managed`, and read only through `floats_iter`/`float_mut`,
+    /// which skip/reject any entry no longer present in `managed` rather
+    /// than trusting a stale record.
+    float_order: Vec<Win>,
+    /// Mapping order of foreign notification windows (see `ForeignNote`),
+    /// i.e. pile order (oldest at the bottom). Private: same discipline as
+    /// `float_order`, via `add_foreign`/`remove_foreign`/`foreign_iter`/
+    /// `foreign_mut`.
+    foreign_order: Vec<Win>,
     /// The float that last took focus, if it still has it — keyboard
     /// actions that target "the focused window" (close) act on this before
     /// falling back to the focused split's client. Cleared whenever focus
@@ -300,7 +357,7 @@ pub struct Wm {
     /// mute, held together), each entry independent so one key's release
     /// can't be confused for another's.
     pub layout_key_state: Vec<(u8, KeyRepeatState)>,
-    /// Wall-clock moment `VolumeUp`/`VolumeDown` (index 0/1) last actually
+    /// Wall-clock moment `VolumeDown`/`VolumeUp` (index 0/1) last actually
     /// spawned a command, tracked separately per direction so a tap of one
     /// doesn't throttle an unrelated tap of the other. Unlike
     /// `held_layout_keys`, volume repeats are meant to keep landing while the
@@ -408,9 +465,9 @@ pub struct Wm {
     /// cleared too, so all reads/writes go through `Wm::fullscreen`/
     /// `Wm::set_fullscreen_win`/`Wm::clear_fullscreen`.
     fullscreen: Option<Win>,
-    /// Whether any client has `icon_stale` set, so the per-batch
-    /// `Wm::flush_stale_icons` can skip its clients scan in the (usual)
-    /// steady state where no icon refresh was throttled.
+    /// Whether any client or float's `icon_fresh` is stale, so the
+    /// per-batch `Wm::flush_stale_icons` can skip its clients/floats scan in
+    /// the (usual) steady state where no icon refresh was throttled.
     pub icons_stale: bool,
     /// Results from background theme-icon fetches (see
     /// `Wm::spawn_theme_icon_fetch`), drained by `Wm::on_icon_ping`.
@@ -459,9 +516,9 @@ impl Wm {
             bindings: Vec::new(),
             renderer: init.renderer,
             state: State::new(),
-            clients: HashMap::new(),
-            window_kind: HashMap::new(),
-            floats: Vec::new(),
+            managed: HashMap::new(),
+            float_order: Vec::new(),
+            foreign_order: Vec::new(),
             focused_float: None,
             last_event_time: 0,
             last_event_instant: std::time::Instant::now(),
@@ -476,7 +533,6 @@ impl Wm {
                     .unwrap_or_else(|_| crate::theme::DOCK_TITLE.to_string()),
             },
             notes: NoteState {
-                foreign: Vec::new(),
                 popups: Vec::new(),
                 rx: init.note_rx,
                 dismiss: init.note_dismiss,
@@ -512,12 +568,12 @@ impl Wm {
 
     /// The float holding keyboard focus, if it still exists — self-healing:
     /// a `focused_float` naming a float that's since been removed from
-    /// `floats` is stale bookkeeping, not a live target, so it's cleared
+    /// `managed` is stale bookkeeping, not a live target, so it's cleared
     /// here and treated as `None` rather than trusted by callers.
     pub(crate) fn focused_float(&mut self) -> Option<Win> {
         if self
             .focused_float
-            .is_some_and(|w| !self.floats.iter().any(|f| f.win == w))
+            .is_some_and(|w| !matches!(self.managed.get(&w), Some(ManagedWindow::Float(_))))
         {
             self.focused_float = None;
         }
@@ -543,114 +599,185 @@ impl Wm {
         self.focused_float.take_if(|&mut w| w == win).is_some()
     }
 
-    /// Which kind of managed window `win` is, if any — the single lookup
-    /// behind every event-dispatch cascade that used to test
-    /// `clients`/`floats`/`dock.docked`/`notes.foreign` in sequence.
+    /// Which kind of managed window `win` is, if any.
     pub(crate) fn kind_of(&self, win: Win) -> Option<WindowKind> {
-        self.window_kind.get(&win).copied()
+        self.managed.get(&win).map(ManagedWindow::kind)
     }
 
-    /// Record `win` as `kind`, called at the same point it's inserted into
-    /// that kind's own container. Panics on silently re-registering a window
-    /// under a *different* kind without unregistering it first — two
-    /// containers claiming the same window is exactly the drift this map
-    /// exists to rule out, so this is checked in release builds too rather
-    /// than trusting every call site to pair register/unregister correctly.
-    pub(crate) fn register_kind(&mut self, win: Win, kind: WindowKind) {
-        if let Some(prev) = self.window_kind.insert(win, kind) {
-            assert_eq!(
-                prev, kind,
-                "{win:#x} re-registered as a different WindowKind"
-            );
+    /// Remove `win`'s payload if it holds the variant `extract` expects,
+    /// putting it back unchanged (and returning `None`) if it holds a
+    /// different one — the shared shape behind every per-kind `remove_*`, so
+    /// e.g. `remove_client` on a window that's actually a float can't make
+    /// it vanish as the wrong thing.
+    fn take_managed<T>(
+        &mut self,
+        win: Win,
+        extract: impl FnOnce(ManagedWindow) -> Result<T, ManagedWindow>,
+    ) -> Option<T> {
+        let m = self.managed.remove(&win)?;
+        match extract(m) {
+            Ok(t) => Some(t),
+            Err(m) => {
+                self.managed.insert(win, m);
+                None
+            }
         }
     }
 
-    /// Drop `win`'s kind record, called at the same point it's removed from
-    /// that kind's own container. A no-op if it was never registered.
-    pub(crate) fn unregister_kind(&mut self, win: Win) {
-        self.window_kind.remove(&win);
-    }
-
     /// Disjoint borrows `widgets::compute_taskbar` needs at once: a `&mut
-    /// Widgets` alongside `&self.clients`/`&self.quick`/`&self.bar_order`.
-    /// Direct field projections here (rather than routing the read-only
-    /// fields through their own accessor methods) are what let the borrow
-    /// checker see the mutable `widgets` borrow and the rest as disjoint —
-    /// a method call for each would look like a whole-`self` borrow from
-    /// the caller's side and collide with it.
-    pub(crate) fn taskbar_compute_parts(
-        &mut self,
-    ) -> (
-        &mut Widgets,
-        &Tree,
-        &HashMap<Win, Client>,
-        &[QuickSlot],
-        &[Win],
-    ) {
-        (
-            &mut self.widgets,
-            &self.state.tree,
-            &self.clients,
-            &self.quick,
-            &self.bar_order,
-        )
+    /// Widgets` alongside `&self.quick`/`&self.bar_order` and a snapshot of
+    /// the tiled clients. The snapshot (rather than `&self.managed` itself)
+    /// is what lets the borrow checker see the mutable `widgets` borrow and
+    /// the rest as disjoint — a method call for each would look like a
+    /// whole-`self` borrow from the caller's side and collide with it; the
+    /// small per-arrange `Vec` this allocates is the cost of that (`managed`
+    /// interleaves every kind, so there's no contiguous tiled-only slice to
+    /// borrow directly the way `clients` once was).
+    pub(crate) fn taskbar_compute_parts(&mut self) -> TaskbarParts<'_> {
+        let tiled = self
+            .managed
+            .iter()
+            .filter_map(|(&w, m)| match m {
+                ManagedWindow::Tiled(c) => Some((w, c)),
+                _ => None,
+            })
+            .collect();
+        (&mut self.widgets, &self.state.tree, tiled, &self.quick, &self.bar_order)
     }
 
-    /// Read-only view of every tiled client. `clients` is private so the
-    /// only ways to change its membership are `insert_client`/
-    /// `remove_client` below, which keep `window_kind` paired with it by
-    /// construction instead of by every call site remembering to.
-    pub(crate) fn clients_ref(&self) -> &HashMap<Win, Client> {
-        &self.clients
+    /// Read-only iteration over every tiled client. `managed` is private, so
+    /// the only ways to change a window's membership are `insert_client`/
+    /// `remove_client` (and the analogous per-kind pairs below), which keep
+    /// one map in sync by construction instead of by every call site
+    /// remembering to.
+    pub(crate) fn tiled_iter(&self) -> impl Iterator<Item = (Win, &Client)> + '_ {
+        self.managed.iter().filter_map(|(&w, m)| match m {
+            ManagedWindow::Tiled(c) => Some((w, c)),
+            _ => None,
+        })
     }
 
-    /// Mutable access to an existing client's fields. Doesn't expose the
-    /// map itself, so it can't be used to insert or remove an entry —
+    /// Read-only access to one tiled client, if `win` is one.
+    pub(crate) fn tiled_get(&self, win: Win) -> Option<&Client> {
+        match self.managed.get(&win) {
+            Some(ManagedWindow::Tiled(c)) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to an existing tiled client's fields. Doesn't expose
+    /// the map itself, so it can't be used to insert or remove an entry —
     /// `insert_client`/`remove_client` are still the only way to do that.
     pub(crate) fn client_mut(&mut self, win: Win) -> Option<&mut Client> {
-        self.clients.get_mut(&win)
+        match self.managed.get_mut(&win) {
+            Some(ManagedWindow::Tiled(c)) => Some(c),
+            _ => None,
+        }
     }
 
     /// Register `win` as a tiled client with `client`'s payload.
     pub(crate) fn insert_client(&mut self, win: Win, client: Client) {
-        self.clients.insert(win, client);
-        self.register_kind(win, WindowKind::Tiled);
+        self.managed.insert(win, ManagedWindow::Tiled(client));
     }
 
     /// Unregister `win` as a tiled client, returning its payload if it had
     /// one.
     pub(crate) fn remove_client(&mut self, win: Win) -> Option<Client> {
-        let removed = self.clients.remove(&win);
-        self.unregister_kind(win);
-        removed
+        self.take_managed(win, ManagedWindow::into_tiled)
     }
 
-    /// Read-only view of every float, in mapping order. `floats` is private
-    /// for the same reason `clients` is: `add_float`/`remove_float`/
-    /// `floats_iter_mut` below are the only ways to touch it.
-    pub(crate) fn floats_ref(&self) -> &[FloatWin] {
-        &self.floats
+    /// Read-only iteration over every float, in mapping order.
+    pub(crate) fn floats_iter(&self) -> impl Iterator<Item = &FloatWin> + '_ {
+        self.float_order.iter().filter_map(move |w| match self.managed.get(w) {
+            Some(ManagedWindow::Float(f)) => Some(f),
+            _ => None,
+        })
     }
 
-    /// Mutable iteration over floats' fields in place — can't insert or
-    /// remove an entry through it.
-    pub(crate) fn floats_iter_mut(&mut self) -> std::slice::IterMut<'_, FloatWin> {
-        self.floats.iter_mut()
+    /// Mutable access to one float's fields in place, if `win` is one.
+    /// Doesn't expose the map itself, so it can't be used to insert or
+    /// remove an entry — `add_float`/`remove_float` are still the only way
+    /// to do that.
+    pub(crate) fn float_mut(&mut self, win: Win) -> Option<&mut FloatWin> {
+        match self.managed.get_mut(&win) {
+            Some(ManagedWindow::Float(f)) => Some(f),
+            _ => None,
+        }
     }
 
     /// Register `float.win` as a float with `float`'s payload.
     pub(crate) fn add_float(&mut self, float: FloatWin) {
         let win = float.win;
-        self.floats.push(float);
-        self.register_kind(win, WindowKind::Float);
+        self.float_order.push(win);
+        self.managed.insert(win, ManagedWindow::Float(float));
     }
 
     /// Unregister `win` as a float, returning its payload if it had one.
     pub(crate) fn remove_float(&mut self, win: Win) -> Option<FloatWin> {
-        let idx = self.floats.iter().position(|f| f.win == win)?;
-        let removed = self.floats.remove(idx);
-        self.unregister_kind(win);
+        let removed = self.take_managed(win, ManagedWindow::into_float)?;
+        self.float_order.retain(|&w| w != win);
         Some(removed)
+    }
+
+    /// Read-only iteration over every foreign notification window, in pile
+    /// order (oldest at the bottom).
+    pub(crate) fn foreign_iter(&self) -> impl Iterator<Item = &ForeignNote> + '_ {
+        self.foreign_order.iter().filter_map(move |w| match self.managed.get(w) {
+            Some(ManagedWindow::Notification(n)) => Some(n),
+            _ => None,
+        })
+    }
+
+    /// Mutable access to one foreign notification's fields in place, if
+    /// `win` is one.
+    pub(crate) fn foreign_mut(&mut self, win: Win) -> Option<&mut ForeignNote> {
+        match self.managed.get_mut(&win) {
+            Some(ManagedWindow::Notification(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Register `note.win` as a foreign notification with `note`'s payload.
+    pub(crate) fn add_foreign(&mut self, note: ForeignNote) {
+        let win = note.win;
+        self.foreign_order.push(win);
+        self.managed.insert(win, ManagedWindow::Notification(note));
+    }
+
+    /// Unregister `win` as a foreign notification, returning its payload if
+    /// it had one.
+    pub(crate) fn remove_foreign(&mut self, win: Win) -> Option<ForeignNote> {
+        let removed = self.take_managed(win, ManagedWindow::into_notification)?;
+        self.foreign_order.retain(|&w| w != win);
+        Some(removed)
+    }
+
+    /// The docked window's payload, if one is currently docked — self-healing
+    /// the same way `focused_float`/`fullscreen` are: `dock.docked` naming a
+    /// window no longer present in `managed` as `Dock` would otherwise be
+    /// trusted as live.
+    pub(crate) fn dock(&self) -> Option<Dock> {
+        let win = self.dock.docked?;
+        match self.managed.get(&win) {
+            Some(ManagedWindow::Dock(d)) => Some(*d),
+            _ => None,
+        }
+    }
+
+    /// Pin `win` as the dock with `dock`'s payload.
+    pub(crate) fn set_dock(&mut self, win: Win, dock: Dock) {
+        self.dock.docked = Some(win);
+        self.managed.insert(win, ManagedWindow::Dock(dock));
+    }
+
+    /// Unregister `win` as the dock, clearing `dock.docked` only if it still
+    /// names `win` (a no-op guard, not a self-healing read, since callers
+    /// always pass the window they know is currently docked).
+    pub(crate) fn clear_dock(&mut self, win: Win) {
+        if self.dock.docked == Some(win) {
+            self.dock.docked = None;
+        }
+        self.managed.remove(&win);
     }
 
     /// `win`'s current geometry, or `None` on any request/reply failure —
@@ -779,7 +906,7 @@ pub fn client_rect_in_frame(r: FrameRect, (min_w, min_h): (i32, i32)) -> (i32, i
         r.x + bw,
         r.y + tb,
         (r.w - 2 * bw).max(min_w).max(1),
-        (r.h - tb - bw).max(min_h).max(1),
+        (r.h - tb - crate::theme::BORDER_BOTTOM).max(min_h).max(1),
     )
 }
 

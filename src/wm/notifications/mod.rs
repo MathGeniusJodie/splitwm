@@ -18,15 +18,15 @@ use x11rb::protocol::xproto::{ConfigureWindowAux, ConnectionExt, StackMode};
 use super::types::{Wm, R};
 
 /// Foreign notification windows and our own served-notification popups.
+/// Notification windows (`_NET_WM_WINDOW_TYPE_NOTIFICATION`) themselves live
+/// outside `NoteState`: like the dock window, they live outside `clients`/
+/// the split tree/`bar_order` (no chrome, no taskbar entry, no focus
+/// cycling), and their payload — the size they requested, tracked here
+/// (updated on ConfigureRequest) so restacking the pile doesn't cost a
+/// `GetGeometry` round trip per window — lives in `Wm::managed` as
+/// `ManagedWindow::Notification`, iterated in pile order via
+/// `Wm::foreign_iter`/`Wm::foreign_iter_mut`.
 pub struct NoteState {
-    /// Notification windows (`_NET_WM_WINDOW_TYPE_NOTIFICATION`), in mapping
-    /// order. Like the dock window, they live outside `clients`/the split
-    /// tree/`bar_order`: no chrome, no taskbar entry, no focus cycling.
-    /// They stack above everything at the bottom-right of the screen
-    /// (see `Wm::place_notifications`), at whatever size they requested —
-    /// tracked here (updated on ConfigureRequest) so restacking the pile
-    /// doesn't cost a `GetGeometry` round trip per window.
-    pub foreign: Vec<ForeignNote>,
     /// Speech-bubble popups for notifications *we* serve as the session's
     /// `org.freedesktop.Notifications` daemon (see `crate::notify` and
     /// `Wm::on_note_ping`). Own override-redirect windows, drawn by the
@@ -51,7 +51,7 @@ impl Wm {
     pub(crate) fn place_notifications(&self) -> R<()> {
         let wa = self.wa();
         let bottom = wa.y + wa.h - Self::taskbar_h();
-        self.stack_note_pile(self.notes.foreign.iter().map(|n| (n.win, n.w, n.h)), bottom)?;
+        self.stack_note_pile(self.foreign_iter().map(|n| (n.win, n.w, n.h)), bottom)?;
         self.place_note_popups()
     }
 
@@ -59,7 +59,7 @@ impl Wm {
     /// order — arrange()/focus() raise tiled clients, so notifications must
     /// be re-raised afterwards to stay on top of everything.
     pub(crate) fn raise_notifications(&self) -> R<()> {
-        for n in &self.notes.foreign {
+        for n in self.foreign_iter() {
             self.conn.configure_window(
                 n.win,
                 &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),

@@ -11,7 +11,7 @@ use x11rb::protocol::xproto::{
 };
 
 use super::clients::WmState;
-use super::types::{clamp_dim, WindowKind, Wm, R};
+use super::types::{clamp_dim, Wm, R};
 use crate::tree::Win;
 
 /// The docked-sidebar identity config and the currently docked window.
@@ -20,20 +20,22 @@ pub struct DockState {
     /// revealed by scrolling all the way right (see `DockState::title`),
     /// if one is currently mapped. It lives outside `clients`/the split
     /// tree/`bar_order` entirely: no chrome, no taskbar entry, not part of
-    /// focus cycling, and normal tiled columns never lay out under it.
-    pub docked: Option<Dock>,
+    /// focus cycling, and normal tiled columns never lay out under it. Its
+    /// own payload (the width captured at manage time) lives in `Wm::managed`
+    /// as `ManagedWindow::Dock`, read via `Wm::dock`; this only names which
+    /// window, if any.
+    pub docked: Option<Win>,
     /// Identity that marks the dock window — matched against either half of
     /// its `WM_CLASS` (`SPLITWM_DOCK_TITLE`, default `theme::DOCK_TITLE`);
     /// also the desktop id used to autostart it.
     pub title: String,
 }
 
-/// A docked window and the width captured from its own requested geometry
-/// when it was first managed — the width only exists while something is
-/// docked, so the pair travels as one value.
+/// The width captured from the dock's own requested geometry when it was
+/// first managed — the only fact about it besides which window it is (that
+/// lives in `DockState::docked`, the `Wm::managed` key).
 #[derive(Clone, Copy)]
 pub struct Dock {
-    pub win: Win,
     pub w: i32,
 }
 
@@ -74,11 +76,7 @@ impl Wm {
     /// rest of the session.
     pub(crate) fn manage_dock(&mut self, win: Win) -> R<()> {
         let width = self.geometry(win).map_or(240, |g| i32::from(g.width));
-        self.dock.docked = Some(Dock {
-            win,
-            w: width.max(1),
-        });
-        self.register_kind(win, WindowKind::Dock);
+        self.set_dock(win, Dock { w: width.max(1) });
 
         self.select_and_grab(win, EventMask::STRUCTURE_NOTIFY, true)?;
         // The dock is a mapped managed client too: give it the ICCCM
@@ -88,6 +86,9 @@ impl Wm {
         // arrange() calls place_dock() against the freshly computed canvas,
         // so no separate initial placement is needed here.
         self.arrange()?;
+        // The dock is part of `_NET_CLIENT_LIST` (see `update_client_list`),
+        // so docking must republish it.
+        self.update_client_list()?;
         self.conn.flush()?;
         Ok(())
     }
@@ -101,7 +102,7 @@ impl Wm {
         if self.dock.docked.is_some() {
             return Ok(());
         }
-        let Some(client) = self.clients_ref().get(&win) else {
+        let Some(client) = self.tiled_get(win) else {
             return Ok(());
         };
         // Title changes are frequent (terminals retitle per prompt) and can
@@ -131,7 +132,7 @@ impl Wm {
     /// docked): its width minus the strip already tucked under the canvas
     /// edge. One of `State::update_canvas`'s inputs.
     pub(crate) fn dock_extra(&self) -> i32 {
-        self.dock.docked.map_or(0, |d| d.w - d.overlap())
+        self.dock().map_or(0, |d| d.w - d.overlap())
     }
 
     /// The dock's pinned screen geometry `(x, y, w, h)`: parked at the right
@@ -157,19 +158,21 @@ impl Wm {
     /// The dock went away: drop its record and re-tile now that the scroll
     /// headroom it needed is gone.
     pub(crate) fn forget_dock(&mut self, win: Win) -> R<()> {
-        self.dock.docked = None;
-        self.unregister_kind(win);
+        self.clear_dock(win);
         self.clamp_scroll();
-        self.arrange()
+        self.arrange()?;
+        // Drop it from `_NET_CLIENT_LIST` too, or pagers keep showing a
+        // window that no longer exists.
+        self.update_client_list()
     }
 
     pub(crate) fn place_dock(&self) -> R<()> {
-        let Some(d) = self.dock.docked else {
+        let (Some(win), Some(d)) = (self.dock.docked, self.dock()) else {
             return Ok(());
         };
         let (x, y, w, h) = self.dock_geometry(d);
         self.conn.configure_window(
-            d.win,
+            win,
             &ConfigureWindowAux::new()
                 .x(x)
                 .y(y)
@@ -179,7 +182,7 @@ impl Wm {
                 .sibling(self.underlay)
                 .stack_mode(StackMode::ABOVE),
         )?;
-        self.conn.map_window(d.win)?;
+        self.conn.map_window(win)?;
         Ok(())
     }
 }

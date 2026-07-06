@@ -70,7 +70,7 @@ impl Wm {
         self.arrange()?;
         let f = self.state.focused_client();
         self.focus(f)?;
-        let adopted: Vec<Win> = self.clients_ref().keys().copied().collect();
+        let adopted: Vec<Win> = self.tiled_iter().map(|(w, _)| w).collect();
         for win in adopted {
             self.sync_wm_state(win)?;
         }
@@ -80,7 +80,7 @@ impl Wm {
     /// Record the ICCCM `WM_STATE` matching whether we currently have the
     /// window mapped (Normal) or hidden (Iconic).
     fn sync_wm_state(&self, win: Win) -> R<()> {
-        let mapped = self.clients_ref().get(&win).is_some_and(|c| c.mapped);
+        let mapped = self.tiled_get(win).is_some_and(|c| c.mapped);
         self.set_wm_state(
             win,
             if mapped {
@@ -178,8 +178,7 @@ impl Wm {
                         )
                     }),
                 focus: self.focus_model(win),
-                icon_fetched: std::time::Instant::now(),
-                icon_stale: false,
+                icon_fresh: super::icons::IconFreshness::default(),
             },
         );
         self.refresh_icon_rotations(&class);
@@ -326,16 +325,17 @@ impl Wm {
     /// windows unmapped strands them — the next WM only adopts viewable
     /// windows.
     pub(crate) fn restore_clients(&mut self) -> R<()> {
-        let wins: Vec<Win> = self.clients_ref().keys().copied().collect();
+        let wins: Vec<Win> = self.tiled_iter().map(|(w, _)| w).collect();
         for win in wins {
             self.conn.map_window(win)?;
             self.set_wm_state(win, WmState::Normal)?;
         }
-        if let Some(d) = self.dock.docked {
-            self.conn.map_window(d.win)?;
+        if let Some(win) = self.dock.docked {
+            self.conn.map_window(win)?;
         }
-        for f in self.floats_ref() {
-            self.conn.map_window(f.win)?;
+        let floats: Vec<Win> = self.floats_iter().map(|f| f.win).collect();
+        for win in floats {
+            self.conn.map_window(win)?;
         }
         // A plain flush is not enough right before process exit: the server
         // can notice the connection hang up before draining what we just
@@ -404,7 +404,7 @@ impl Wm {
                 self.repaint_chrome()
             }
             Some(WindowKind::Float) => {
-                let Some(f) = self.floats_iter_mut().find(|f| f.win == win) else {
+                let Some(f) = self.float_mut(win) else {
                     return Ok(());
                 };
                 if f.title == title {
@@ -418,13 +418,80 @@ impl Wm {
         }
     }
 
+    /// A managed window (re)set its `WM_CLASS`, checked after
+    /// `on_dock_identity_change` already had first refusal — a window that
+    /// just got pulled out and re-managed as the dock is no longer a client
+    /// here, so `kind_of` naturally no-ops on it below. Some toolkits (the
+    /// same ones the dock path exists for) set their real class only after
+    /// mapping, which otherwise leaves the taskbar glyph, icon-theme
+    /// fallback, and same-app hue-rotation grouping (`assign_icon_slot`/
+    /// `refresh_icon_rotations`) stuck on whatever `manage`/`manage_float`
+    /// guessed from an empty/placeholder class at map time. No-ops when the
+    /// identity is unchanged — terminals never touch WM_CLASS, but
+    /// PropertyNotify can fire without a real change regardless.
+    pub(crate) fn on_class_change(&mut self, win: Win) -> R<()> {
+        let new_class = self.client_identity(win);
+        match self.kind_of(win) {
+            Some(WindowKind::Tiled) => {
+                let Some(client) = self.client_mut(win) else {
+                    return Ok(());
+                };
+                if client.class == new_class {
+                    return Ok(());
+                }
+                let old_class = std::mem::replace(&mut client.class, new_class.clone());
+                client.label = Self::label_from_class(&new_class);
+                client.icon_rotated = None;
+                let needs_icon = client.icon.is_none();
+                // Cleared before the scan in `assign_icon_slot` runs, so it
+                // doesn't count this client's own about-to-be-replaced slot
+                // as already taken under `new_class` (it now matches
+                // `new_class` but the slot on record still means something
+                // under the old grouping).
+                client.icon_slot = None;
+
+                let slot = self.assign_icon_slot(&new_class);
+                if let Some(client) = self.client_mut(win) {
+                    client.icon_slot = slot;
+                }
+                if needs_icon {
+                    // A real `_NET_WM_ICON` already resolved (`icon: Some`)
+                    // is never refetched here. Only the "nothing resolved
+                    // yet" case retries under the corrected class, in case
+                    // the icon-theme lookup keyed off the old (wrong) name
+                    // failed for it specifically.
+                    let icon = self.resolve_icon(win, &new_class);
+                    if let Some(client) = self.client_mut(win) {
+                        client.icon = icon;
+                    }
+                }
+                self.refresh_icon_rotations(&old_class);
+                self.refresh_icon_rotations(&new_class);
+                self.repaint_chrome()
+            }
+            Some(WindowKind::Float) => {
+                let Some(f) = self.float_mut(win) else {
+                    return Ok(());
+                };
+                let label = Self::label_from_class(&new_class);
+                if f.label == label {
+                    return Ok(());
+                }
+                f.label = label;
+                let frame = f.frame;
+                self.paint_float_frame(frame)
+            }
+            Some(WindowKind::Dock | WindowKind::Notification) | None => Ok(()),
+        }
+    }
+
     /// Refresh `_NET_CLIENT_LIST` on the root: managed tiled windows in
     /// `bar_order` (mapping order) plus the floats and the dock — they're
     /// managed client windows too, and panels/pagers should see them.
     pub(crate) fn update_client_list(&self) -> R<()> {
         let mut list = self.bar_order.clone();
-        list.extend(self.floats_ref().iter().map(|f| f.win));
-        list.extend(self.dock.docked.map(|d| d.win));
+        list.extend(self.floats_iter().map(|f| f.win));
+        list.extend(self.dock.docked);
         self.conn.change_property32(
             PropMode::REPLACE,
             self.root,
@@ -480,7 +547,7 @@ impl Wm {
             self.arrange()?;
             if on {
                 // Hide the chrome frame; the client alone covers the screen.
-                if let Some(f) = self.floats_ref().iter().find(|f| f.win == win) {
+                if let Some(f) = self.floats_iter().find(|f| f.win == win) {
                     self.conn.unmap_window(f.frame)?;
                 }
             }
@@ -492,7 +559,7 @@ impl Wm {
     /// Re-show a float's chrome frame and restore its remembered geometry
     /// after leaving fullscreen. No-op for windows that aren't floats.
     fn restore_float_geometry(&mut self, win: Win) -> R<()> {
-        let Some(f) = self.floats_ref().iter().find(|f| f.win == win) else {
+        let Some(f) = self.floats_iter().find(|f| f.win == win) else {
             return Ok(());
         };
         let (frame, x, y, w, h) = (f.frame, f.x, f.y, f.w, f.h);
@@ -635,7 +702,7 @@ impl Wm {
     }
 
     pub(crate) fn focus(&mut self, win: Option<Win>) -> R<()> {
-        match win.and_then(|w| self.clients_ref().get(&w).map(|c| (w, c.focus))) {
+        match win.and_then(|w| self.tiled_get(w).map(|c| (w, c.focus))) {
             Some((w, model)) => {
                 self.clear_focused_float();
                 self.give_focus(w, model)?;

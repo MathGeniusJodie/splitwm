@@ -3,6 +3,7 @@ mod icon;
 mod launch;
 mod notify;
 mod oklch;
+mod ping;
 mod render;
 mod state;
 mod theme;

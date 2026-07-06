@@ -13,7 +13,7 @@ use x11rb::protocol::xproto::{
 use super::clients::WmState;
 use super::types::{clamp_dim, FrameRect, WindowKind, Wm, R};
 use super::widgets::BtnKind;
-use crate::render::{LeafView, TabInfo};
+use crate::render::{LeafView, TitleInfo};
 use crate::theme;
 use crate::tree::{Dir, NodeId, Rect, Win};
 
@@ -87,7 +87,7 @@ impl Wm {
         // than paying `find_parent`'s full scan per call.
         self.parents = self.state.tree.parent_map();
 
-        // Drag-handle / "+" / tab hit-regions for the current layout.
+        // Drag-handle / "+" / title hit-regions for the current layout.
         self.compute_widgets(wa, &placed);
         self.compute_taskbar(&leaves);
 
@@ -278,7 +278,7 @@ impl Wm {
                     m,
                     t.rect,
                     icon.as_deref(),
-                    self.clients_ref().get(&t.win).map_or('?', |c| c.label),
+                    self.tiled_get(t.win).map_or('?', |c| c.label),
                     t.accent,
                     t.in_split,
                 );
@@ -336,9 +336,9 @@ impl Wm {
 
     fn leaf_view(&self, leaf: NodeId, w: i32, h: i32, buttons: bool) -> LeafView {
         let win = self.state.tree.leaf(leaf).and_then(|l| l.client);
-        let client = win.and_then(|w| self.clients_ref().get(&w));
+        let client = win.and_then(|w| self.tiled_get(w));
         let accent_index = self.leaf_color_index(leaf);
-        let tab = client.map(|c| TabInfo {
+        let titlebar = client.map(|c| TitleInfo {
             label: c.label,
             icon: win.and_then(|w| self.icon_for(w)),
             title: c.title.clone(),
@@ -349,7 +349,7 @@ impl Wm {
             tb_h: theme::tb_h(),
             bw: theme::BORDER_LEFT,
             accent_index,
-            tab,
+            titlebar,
             minimized: self.state.tree.leaf(leaf).is_some_and(|l| l.minimized),
             buttons,
         }
@@ -417,7 +417,7 @@ impl Wm {
                 // WM_NORMAL_HINTS minimum (see `client_rect_in_frame`)
                 // overhangs the frame and paints over the neighbouring
                 // split until the column is widened again.
-                let min_size = self.clients_ref().get(&c).map_or((1, 1), |cl| cl.min_size);
+                let min_size = self.tiled_get(c).map_or((1, 1), |cl| cl.min_size);
                 let (cx, cy, cw, ch) = super::types::client_rect_in_frame(p.target, min_size);
                 self.conn.configure_window(
                     c,
@@ -455,10 +455,9 @@ impl Wm {
             self.note_mapped(fs)?;
         }
         let to_hide: Vec<Win> = self
-            .clients_ref()
-            .iter()
+            .tiled_iter()
             .filter(|(w, cl)| cl.mapped && !visible.contains(w))
-            .map(|(&w, _)| w)
+            .map(|(w, _)| w)
             .collect();
         for w in to_hide {
             // Record the unmap request's sequence number so `on_unmap` can
@@ -530,6 +529,26 @@ impl Wm {
     pub(crate) fn clamp_scroll(&mut self) {
         let wa = self.la();
         self.state.clamp_scroll(wa, self.dock_extra());
+    }
+
+    /// Whether the canvas is gliding toward a new scroll position (see
+    /// `State::step_scroll`) — asked by the event loop to keep it
+    /// non-blocking and frame-paced, exactly like `self.anim`. The two never
+    /// overlap: every path that starts a `LayoutAnim` goes through
+    /// `commit_layout`, which lands the scroll first when a layout animation
+    /// is about to run (see there).
+    pub(crate) fn scroll_animating(&self) -> bool {
+        self.state.scroll_animating()
+    }
+
+    /// Advance the in-flight scroll glide by one frame and re-arrange, so
+    /// leaves entering/leaving the viewport map/unmap mid-glide — a full
+    /// `arrange()` per glide frame is exactly what a scroll burst already
+    /// does today. Called by the event loop once per frame-paced iteration
+    /// while `scroll_animating()` holds.
+    pub(crate) fn step_scroll(&mut self) -> R<()> {
+        self.state.step_scroll();
+        self.arrange()
     }
 
     // --- gap drag handles & "+" insert buttons (composited on the underlay) ---

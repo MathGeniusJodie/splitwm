@@ -59,15 +59,11 @@ impl Wm {
 
     /// Sum of this raw motion event's horizontal-scroll valuator deltas
     /// (in wheel-click fractions), across every device that reported one.
+    /// No debug logging here: this is also called from the event loop's
+    /// per-batch `has_scroll` gate, which just needs the number, not a log
+    /// line — logging happens once, at the actual accumulation site in
+    /// `handle_batch` (see `hscroll_delta_logged`).
     pub(crate) fn hscroll_delta(&self, e: &xinput::RawMotionEvent) -> f64 {
-        if self.debug_scroll {
-            eprintln!(
-                "splitwm: raw motion from sourceid={} mask={:?} known_hscroll_devs={:?}",
-                e.sourceid,
-                e.valuator_mask,
-                self.hscroll.iter().map(|h| h.dev).collect::<Vec<_>>()
-            );
-        }
         self.hscroll
             .iter()
             .filter(|h| h.dev == e.sourceid)
@@ -76,6 +72,21 @@ impl Wm {
                     .map(|v| v / h.incr)
             })
             .sum()
+    }
+
+    /// `hscroll_delta`, plus the `debug_scroll` trace. Used only where the
+    /// delta is actually accumulated (`handle_batch`), so each raw motion
+    /// event is logged exactly once.
+    pub(crate) fn hscroll_delta_logged(&self, e: &xinput::RawMotionEvent) -> f64 {
+        if self.debug_scroll {
+            eprintln!(
+                "splitwm: raw motion from sourceid={} mask={:?} known_hscroll_devs={:?}",
+                e.sourceid,
+                e.valuator_mask,
+                self.hscroll.iter().map(|h| h.dev).collect::<Vec<_>>()
+            );
+        }
+        self.hscroll_delta(e)
     }
 
     /// Apply an accumulated horizontal-scroll delta (wheel-click fractions)
@@ -98,8 +109,11 @@ impl Wm {
         if px == 0 {
             return Ok(());
         }
+        // Land nothing: `scroll_delta` only moves the target, and the main
+        // event loop's `step_scroll` glides `scroll_x` toward it frame by
+        // frame (`Wm::scroll_animating`), so a fast swipe's successive
+        // batches just keep re-aiming a moving target instead of jumping.
         self.state.scroll_delta(wa, px);
-        self.state.land_scroll();
         if self.debug_scroll {
             let t0 = std::time::Instant::now();
             self.arrange()?;

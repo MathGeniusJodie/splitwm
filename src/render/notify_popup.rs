@@ -35,8 +35,10 @@ impl Renderer {
     /// Render one notification as a speech bubble: summary (bold) then body,
     /// wrapped, on the 9-slice-stretched bubble sprite. The framebuffer is
     /// exactly the popup window's size; pixels outside the bubble stay
-    /// `TRANSPARENT` for the caller to shape away.
-    pub fn draw_note(&self, summary: &str, body: &str) -> Framebuffer {
+    /// `TRANSPARENT` for the caller to shape away. Critical notes (never
+    /// auto-expiring, per freedesktop urgency) get a `CRIMSON` summary
+    /// instead of `BLACK` so they read as urgent at a glance.
+    pub fn draw_note(&self, summary: &str, body: &str, is_critical: bool) -> Framebuffer {
         let bubble = crate::assets::bubble();
         let line_h = self.font.as_ref().map_or(14, |f| f.cell_h() + 2);
 
@@ -114,13 +116,14 @@ impl Renderer {
         if let Some(font) = &self.font {
             let mut y = NOTE_PAD_TOP;
             for (line, bold) in &lines {
-                font.draw_text(
-                    &mut fb,
-                    line,
-                    NOTE_PAD_LEFT as isize,
-                    y as isize,
-                    palette_color::BLACK,
-                );
+                // Bold lines are the summary; colour it CRIMSON on critical
+                // notes so they read as urgent at a glance, BLACK otherwise.
+                let color = if *bold && is_critical {
+                    palette_color::CRIMSON
+                } else {
+                    palette_color::BLACK
+                };
+                font.draw_text(&mut fb, line, NOTE_PAD_LEFT as isize, y as isize, color);
                 if *bold {
                     // Faux bold: restrike one pixel right.
                     font.draw_text(
@@ -128,7 +131,7 @@ impl Renderer {
                         line,
                         (NOTE_PAD_LEFT + 1) as isize,
                         y as isize,
-                        palette_color::BLACK,
+                        color,
                     );
                 }
                 y += line_h;

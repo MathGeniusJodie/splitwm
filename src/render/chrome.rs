@@ -13,7 +13,7 @@ use crate::Index;
 
 use super::{accent_swap, Renderer};
 
-pub struct TabInfo {
+pub struct TitleInfo {
     pub label: char,
     /// Icon to draw, already resolved by the caller — the hue-rotated
     /// variant when same-app disambiguation applies (see `Wm::icon_for`).
@@ -30,7 +30,7 @@ pub struct LeafView {
     /// Palette index this split's border and titlebar buttons are swapped to.
     pub accent_index: Index,
     /// The split's single window, if any.
-    pub tab: Option<TabInfo>,
+    pub titlebar: Option<TitleInfo>,
     /// Collapsed to a thin restore strip; renders as `winmin.png` only.
     pub minimized: bool,
     /// Whether split-control buttons are drawn over this titlebar afterward
@@ -323,7 +323,7 @@ impl Renderer {
     }
 
     fn draw_titlebar(&self, fb: &mut Framebuffer, ox: i32, oy: i32, v: &LeafView) {
-        let Some(tab) = &v.tab else {
+        let Some(title) = &v.titlebar else {
             return;
         };
         let isz = theme::BTN_SIZE;
@@ -331,12 +331,12 @@ impl Renderer {
         // so the icon doesn't sit flush against the border art.
         let cx = ox + v.bw + isz / 2 + TITLEBAR_ICON_PAD;
         let cy = oy + v.tb_h / 2;
-        if let Some(img) = &tab.icon {
+        if let Some(img) = &title.icon {
             self.draw_icon(fb, img, cx - isz / 2, cy - isz / 2, isz);
         } else {
-            self.draw_glyph(fb, tab.label, cx, cy, self.fg);
+            self.draw_glyph(fb, title.label, cx, cy, self.fg);
         }
-        self.draw_title(fb, ox, oy, v, tab, cx + isz / 2);
+        self.draw_title(fb, ox, oy, v, title, cx + isz / 2);
     }
 
     /// Draw the window title after the icon/label, clipped so it never runs
@@ -348,10 +348,10 @@ impl Renderer {
         ox: i32,
         oy: i32,
         v: &LeafView,
-        tab: &TabInfo,
+        title: &TitleInfo,
         icon_right: i32,
     ) {
-        if tab.title.is_empty() {
+        if title.title.is_empty() {
             return;
         }
         let Some(font) = &self.font else {
@@ -383,7 +383,7 @@ impl Renderer {
         if y > 0 {
             font.draw_text_clipped(
                 fb,
-                &tab.title,
+                &title.title,
                 text_x as isize,
                 (y - 1) as isize,
                 theme::darker_index(v.accent_index),
@@ -393,7 +393,7 @@ impl Renderer {
         }
         font.draw_text_clipped(
             fb,
-            &tab.title,
+            &title.title,
             text_x as isize,
             y as isize,
             self.fg,

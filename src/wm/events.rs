@@ -18,6 +18,15 @@ use crate::tree::{Rect, Win};
 impl Wm {
     // --- event dispatch ---
 
+    /// Record `t` as the last real server timestamp seen, for ICCCM focus
+    /// handoffs (`Wm::give_focus` wants a real time, not CURRENT_TIME).
+    /// `last_event_instant` records the harvest so `give_focus` can tell
+    /// when even this has gone stale.
+    fn harvest_time(&mut self, t: u32) {
+        self.last_event_time = t;
+        self.last_event_instant = std::time::Instant::now();
+    }
+
     #[allow(clippy::needless_pass_by_value)]
     /// Process a drained batch of events, coalescing consecutive `MotionNotify`
     /// events down to the most recent one. A drag emits motion events far
@@ -50,7 +59,7 @@ impl Wm {
                     continue;
                 }
                 Event::XinputRawMotion(ref e) => {
-                    pending_hscroll += self.hscroll_delta(e);
+                    pending_hscroll += self.hscroll_delta_logged(e);
                     continue;
                 }
                 // Legacy wheel-click compatibility events (buttons 4-7):
@@ -75,6 +84,7 @@ impl Wm {
                 // receive their own copies (these only reach us over the
                 // underlay/root, never from inside a client window).
                 Event::ButtonPress(e) if (4..=7).contains(&e.detail) => {
+                    self.harvest_time(e.time);
                     if self.hscroll.is_empty() {
                         match e.detail {
                             6 => pending_hscroll -= 1.0,
@@ -84,7 +94,10 @@ impl Wm {
                     }
                     continue;
                 }
-                Event::ButtonRelease(e) if (4..=7).contains(&e.detail) => continue,
+                Event::ButtonRelease(e) if (4..=7).contains(&e.detail) => {
+                    self.harvest_time(e.time);
+                    continue;
+                }
                 // High-rate client chatter that neither reads nor mutates
                 // drag/pointer/layout state, handled in place *without*
                 // flushing the coalesced motion. A dock app answers every
@@ -136,12 +149,9 @@ impl Wm {
     fn handle_event(&mut self, ev: &Event) -> R<()> {
         // NOTE: errors from here are contained per-event by `contain` in
         // `handle_batch`; only fatal (connection) errors abort the batch.
-        // Track the last real server timestamp for ICCCM focus handoffs
-        // (`Wm::give_focus` wants a real time, not CURRENT_TIME).
+        // Harvest the last real server timestamp (see `harvest_time`).
         // PropertyNotify counts too: clients update properties while the
-        // user types into them, which no input event of ours would see —
-        // and `last_event_instant` records the harvest so `give_focus` can
-        // tell when even this has gone stale.
+        // user types into them, which no input event of ours would see.
         let time = match ev {
             Event::KeyPress(e) => Some(e.time),
             Event::ButtonPress(e) => Some(e.time),
@@ -151,8 +161,7 @@ impl Wm {
             _ => None,
         };
         if let Some(t) = time {
-            self.last_event_time = t;
-            self.last_event_instant = std::time::Instant::now();
+            self.harvest_time(t);
         }
         match ev {
             Event::MapRequest(e) => self.on_map_request(*e)?,
@@ -176,11 +185,14 @@ impl Wm {
             // by class with a title fallback for classless windows (see
             // `Wm::matches_dock`), and some toolkits set this only after
             // mapping — a late-identified dock would otherwise tile as a
-            // normal window forever.
+            // normal window forever. `on_class_change` runs second and
+            // no-ops on a window `on_dock_identity_change` just turned into
+            // the dock (it's no longer a tiled client or float by then).
             Event::PropertyNotify(e)
                 if e.atom == u32::from(x11rb::protocol::xproto::AtomEnum::WM_CLASS) =>
             {
                 self.on_dock_identity_change(e.window, e.atom)?;
+                self.on_class_change(e.window)?;
             }
             // A managed client (re)set its title: refresh the cached title
             // and, for a still-unidentified dock, retry the classless
@@ -253,7 +265,7 @@ impl Wm {
                     self.raise_fullscreen()?;
                     return self.send_synthetic_configure(e.window);
                 }
-                let Some(f) = self.floats_iter_mut().find(|f| f.win == e.window) else {
+                let Some(f) = self.float_mut(e.window) else {
                     return Ok(());
                 };
                 if u16::from(e.value_mask) & u16::from(ConfigWindow::WIDTH) != 0 {
@@ -283,13 +295,18 @@ impl Wm {
         self.conn.configure_window(e.window, &aux)?;
         // A notification resizing itself keeps its new size, but position
         // stays ours: record the size and re-stack the bottom-right pile.
-        if let Some(n) = self.notes.foreign.iter_mut().find(|n| n.win == e.window) {
+        let is_notification = if let Some(n) = self.foreign_mut(e.window) {
             if u16::from(e.value_mask) & u16::from(ConfigWindow::WIDTH) != 0 {
                 n.w = i32::from(e.width).max(1);
             }
             if u16::from(e.value_mask) & u16::from(ConfigWindow::HEIGHT) != 0 {
                 n.h = i32::from(e.height).max(1);
             }
+            true
+        } else {
+            false
+        };
+        if is_notification {
             self.place_notifications()?;
         }
         Ok(())
@@ -342,7 +359,7 @@ impl Wm {
     fn tracked_geometry(&self, win: Win) -> Option<(i32, i32, i32, i32)> {
         let kind = self.kind_of(win);
         if kind == Some(WindowKind::Dock) {
-            let d = self.dock.docked?;
+            let d = self.dock()?;
             return Some(self.dock_geometry(d));
         }
         // Checked before the float branch below: a fullscreen float must
@@ -358,14 +375,14 @@ impl Wm {
         // the tiled-tree lookup below rather than returning `None` outright
         // if `win` isn't actually in `floats` (a `kind_of`/`floats` desync).
         if kind == Some(WindowKind::Float) {
-            if let Some(f) = self.floats_ref().iter().find(|f| f.win == win) {
+            if let Some(f) = self.floats_iter().find(|f| f.win == win) {
                 return Some((f.x, f.y, f.w.max(1), f.h.max(1)));
             }
         }
         let leaf = self.state.tree.find_leaf_for_client(win)?;
         // A hidden window (minimized, or its split scrolled off-screen) was
         // never configured to its slot; answer from the server instead.
-        let client = self.clients_ref().get(&win);
+        let client = self.tiled_get(win);
         if self.state.tree.leaf(leaf).is_some_and(|l| l.minimized)
             || !client.is_some_and(|c| c.mapped)
         {
@@ -395,7 +412,27 @@ impl Wm {
         self.set_wallpaper();
         self.update_net_workarea()?;
         self.clamp_scroll();
+        self.reclamp_floats()?;
         self.arrange()
+    }
+
+    /// Re-clamp every float against the current workarea so each keeps a
+    /// grabbable strip of its frame on screen (the frame is the only handle
+    /// there is to drag it back with) — a shrinking screen would otherwise
+    /// strand floats parked near the old edges. Reuses `move_float`'s own
+    /// clamp; a float already in range is a no-op. The fullscreen float is
+    /// skipped: its geometry is the workarea itself, reasserted by `arrange`.
+    fn reclamp_floats(&mut self) -> R<()> {
+        let fullscreen = self.fullscreen();
+        let floats: Vec<(Win, i32, i32)> = self
+            .floats_iter()
+            .filter(|f| Some(f.win) != fullscreen)
+            .map(|f| (f.win, f.x, f.y))
+            .collect();
+        for (win, x, y) in floats {
+            self.move_float(win, x, y)?;
+        }
+        Ok(())
     }
 
     /// Keyboard layout or modifier mapping changed at runtime: drop every
@@ -421,8 +458,8 @@ impl Wm {
     }
 
     /// Shared epilogue for every layout-mutating action: keep the focused
-    /// split in view, land the scroll, re-arrange, and focus the focused
-    /// split's client.
+    /// split in view (gliding the scroll there unless a layout animation is
+    /// about to run), re-arrange, and focus the focused split's client.
     pub(crate) fn commit_layout(&mut self) -> R<()> {
         // A layout mutation invalidates any in-progress gap/edge drag: the
         // drag's `parent`/`idx` snapshot may now name a removed node or a
@@ -439,7 +476,18 @@ impl Wm {
         self.clamp_scroll();
         let wa = self.la();
         self.state.ensure_in_view(wa);
-        self.state.land_scroll();
+        // `self.animate` (read here, still un-consumed — `arrange` takes it
+        // right below) tells us whether this call is about to start a
+        // `LayoutAnim`. That animation's placements are computed from
+        // `scroll_x` at arrange time and held fixed for the whole 280ms
+        // transition, so a scroll glide running concurrently would make them
+        // stale every frame; land the scroll first instead. Otherwise — the
+        // flagship case, e.g. focusing an off-viewport split — leave the
+        // target set so the main event loop's `step_scroll` glides the
+        // viewport over.
+        if self.animate {
+            self.state.land_scroll();
+        }
         self.arrange()?;
         // A focused dialog keeps the keyboard across pure layout changes
         // (split/resize/insert): re-assert its focus instead of handing it
@@ -571,7 +619,7 @@ impl Wm {
             // `forget_client`: it's a no-op for a truly unknown window, but
             // catches the one case a `DestroyNotify` can see that `kind_of`
             // can't — `manage` pinning a window into the split tree/stash
-            // before failing partway through (before `register_kind` runs).
+            // before failing partway through (before `insert_client` runs).
             // Without this, such a window would be a phantom tile forever.
             Some(WindowKind::Tiled) | None => self.forget_client(win),
         }
@@ -580,7 +628,7 @@ impl Wm {
     fn on_expose(&mut self, e: ExposeEvent) -> R<()> {
         // The underlay needs no handling here: its composited image is its
         // `background_pixmap`, so the server repaints exposed areas itself.
-        if self.floats_ref().iter().any(|f| f.frame == e.window) {
+        if self.floats_iter().any(|f| f.frame == e.window) {
             self.paint_float_frame(e.window)?;
         } else {
             self.paint_note_win(e.window)?;

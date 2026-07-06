@@ -19,8 +19,7 @@ use dbus::blocking::Connection;
 use dbus::channel::Channel;
 use dbus::message::MessageType;
 use dbus::Message;
-use x11rb::connection::Connection as _;
-use x11rb::protocol::xproto::{ClientMessageEvent, ConnectionExt as _, EventMask};
+use x11rb::protocol::xproto::Atom;
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 
 const BUS_NAME: &str = "org.freedesktop.Notifications";
@@ -72,16 +71,18 @@ pub enum NoteMsg {
     Close(u32),
 }
 
-/// Spawn the daemon thread. Returns the sender the WM uses to report a
-/// popup it closed as `(id, close reason)` — `CloseReason::Dismissed` for a
-/// user click, `CloseReason::Undefined` for a popup-cap eviction — so the
-/// matching `NotificationClosed` signal goes out on the bus with the truth.
-/// Bus errors (no session bus, name already owned) only disable
+/// Spawn the daemon thread. `ping_atom` is `PING_ATOM` as interned on the
+/// WM's own connection (atoms are server-global, so it's equally valid on
+/// `crate::ping`'s shared connection). Returns the sender the WM uses to
+/// report a popup it closed as `(id, close reason)` — `CloseReason::Dismissed`
+/// for a user click, `CloseReason::Undefined` for a popup-cap eviction — so
+/// the matching `NotificationClosed` signal goes out on the bus with the
+/// truth. Bus errors (no session bus, name already owned) only disable
 /// notifications: they log and let the WM run on.
-pub fn spawn(to_wm: Sender<NoteMsg>) -> Sender<(u32, CloseReason)> {
+pub fn spawn(ping_atom: Atom, to_wm: Sender<NoteMsg>) -> Sender<(u32, CloseReason)> {
     let (dismiss_tx, dismiss_rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        if let Err(e) = serve(&to_wm, &dismiss_rx) {
+        if let Err(e) = serve(ping_atom, &to_wm, &dismiss_rx) {
             eprintln!("splitwm: notification daemon stopped: {e}");
         }
     });
@@ -183,28 +184,13 @@ struct Outstanding {
     expiry: Option<Instant>,
 }
 
-fn serve(to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, CloseReason)>) -> R<()> {
-    // Own X connection purely for waking the WM's blocking event loop.
-    // Established before the bus so a bus failure can still be shown to the
-    // user as a popup (below) rather than only a stderr line nobody sees.
-    let (xc, screen) = x11rb::connect(None)?;
-    let root = xc.setup().roots[screen].root;
-    let ping_atom = xc.intern_atom(false, PING_ATOM.as_bytes())?.reply()?.atom;
-    // Best-effort: the ping only wakes the WM's blocking event loop early —
-    // a transient send failure must not kill the daemon thread (the WM still
-    // drains the channel on its next wakeup), so log and continue, matching
-    // `emit_closed`'s policy.
-    let ping = || {
-        let sent = (|| -> R<()> {
-            let ev = ClientMessageEvent::new(32, root, ping_atom, [0u32; 5]);
-            xc.send_event(false, root, EventMask::SUBSTRUCTURE_REDIRECT, ev)?;
-            xc.flush()?;
-            Ok(())
-        })();
-        if let Err(e) = sent {
-            eprintln!("splitwm: failed to ping the WM event loop: {e}");
-        }
-    };
+fn serve(ping_atom: Atom, to_wm: &Sender<NoteMsg>, dismissed: &Receiver<(u32, CloseReason)>) -> R<()> {
+    // `crate::ping::ping` connects lazily on its first call (here, possibly
+    // as early as the `notify_unavailable` below if the bus never comes up)
+    // and is otherwise best-effort: a failed ping only wakes the WM's
+    // blocking event loop late rather than early, so it logs and never kills
+    // this thread, matching `emit_closed`'s policy.
+    let ping = || crate::ping::ping(ping_atom);
 
     let conn = match connect_bus() {
         Ok(c) => c,

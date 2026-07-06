@@ -103,8 +103,8 @@ enum Hit {
     TaskbarTile(Win),
     /// A quick-launch icon in the taskbar (`Wm::quick` index).
     QuickLaunch(usize),
-    /// A leaf's titlebar tab.
-    Tab(NodeId),
+    /// A leaf's titlebar title.
+    Title(NodeId),
     /// A boundary/edge "+" insert button (root-children insert position).
     Plus(InsertAt),
     /// A gap drag handle.
@@ -126,8 +126,11 @@ impl Wm {
         let wa = self.la();
         // Button 1 on a float's frame: focus the float and start moving it.
         if e.detail == 1 {
-            if let Some(f) = self.floats_ref().iter().find(|f| f.frame == e.event) {
-                let (win, fx, fy) = (f.win, f.x, f.y);
+            let hit = self
+                .floats_iter()
+                .find(|f| f.frame == e.event)
+                .map(|f| (f.win, f.x, f.y));
+            if let Some((win, fx, fy)) = hit {
                 self.drags.active = Some(ActiveDrag::Float(FloatDrag {
                     win,
                     dx: i32::from(e.root_x) - fx,
@@ -179,8 +182,8 @@ impl Wm {
                     }
                     return Ok(());
                 }
-                // Click a title (tab) or an empty split's body to focus it.
-                Hit::Tab(leaf) | Hit::LeafBody(leaf) => {
+                // Click a title or an empty split's body to focus it.
+                Hit::Title(leaf) | Hit::LeafBody(leaf) => {
                     self.state.focus_leaf(leaf);
                     self.arrange()?;
                     self.focus(self.state.focused_client())?;
@@ -194,6 +197,11 @@ impl Wm {
                     // A gap next to a minimized leaf can't be dragged (its
                     // pixel size is pinned); ignore the press.
                     if b.resizable {
+                        // Land any in-flight glide first: the drag reads
+                        // `scroll_x` fresh on every motion (see `on_motion`),
+                        // and a scroll still gliding underneath would drift
+                        // the anchor math out from under the pointer.
+                        self.state.land_scroll();
                         self.drags.active = Some(ActiveDrag::Split(SplitDrag {
                             parent: b.parent,
                             idx: b.idx,
@@ -208,6 +216,11 @@ impl Wm {
                 // whichever end of the leftmost/rightmost column isn't being
                 // dragged stays fixed for the whole gesture (see `EdgeDrag`).
                 Hit::Edge(left) => {
+                    // Land any in-flight glide first: `anchor_x` is captured
+                    // against `scroll_x` right now, and a scroll still
+                    // gliding underneath would make the drag's fixed far
+                    // edge drift instead of staying put on screen.
+                    self.state.land_scroll();
                     if let Some((start_x, w)) = self.state.edge_span(wa, left) {
                         let canvas_anchor = if left { start_x + w } else { start_x };
                         let anchor_x = canvas_anchor - self.state.scroll_x();
@@ -366,12 +379,12 @@ impl Wm {
         }
         if let Some(leaf) = self
             .widgets
-            .tab_regions
+            .title_regions
             .iter()
             .find(|(r, _)| rect_contains(*r, mx, my))
             .map(|(_, l)| *l)
         {
-            return Hit::Tab(leaf);
+            return Hit::Title(leaf);
         }
         // "+" buttons sit centred inside their drag handle's (or the edge
         // handle's) larger hit region — check the narrower "+" rects first
@@ -441,7 +454,7 @@ impl Wm {
             Hit::TaskbarClose(_)
             | Hit::TaskbarTile(_)
             | Hit::QuickLaunch(_)
-            | Hit::Tab(_)
+            | Hit::Title(_)
             | Hit::Plus(_) => c.hand,
             Hit::Handle(b) => {
                 // A gap next to a minimized leaf can't be dragged (its size

@@ -367,7 +367,7 @@ pub fn run(replace: bool) -> R<()> {
     // land on the main thread, whose poll they must interrupt.
     install_term_handler();
     let (note_tx, note_rx) = std::sync::mpsc::channel();
-    let note_dismiss = masked(|| crate::notify::spawn(note_tx));
+    let note_dismiss = masked(|| crate::notify::spawn(atoms.splitwm_note, note_tx));
 
     // Background theme-icon fetches (see `Wm::spawn_theme_icon_fetch`) report
     // back over this channel; `icon_tx` is cloned into each fetch thread.
@@ -854,10 +854,10 @@ fn event_loop(wm: &mut Wm) -> R<()> {
         // can render are coalesced (see handle_batch) so renders never pile up.
         // Events drained elsewhere (see `Wm::fresh_timestamp`) were stashed in
         // `pending_events` and are consumed before blocking. While a layout
-        // animation is in flight we never block: the loop runs frame-paced,
-        // handling whatever has arrived between frames.
+        // animation or a scroll glide is in flight we never block: the loop
+        // runs frame-paced, handling whatever has arrived between frames.
         let mut batch = std::mem::take(&mut wm.pending_events);
-        if batch.is_empty() && wm.anim.is_none() {
+        if batch.is_empty() && wm.anim.is_none() && !wm.scroll_animating() {
             match wait_event_deadline(&wm.conn, None)? {
                 Some(ev) => batch.push(ev),
                 // Without a deadline, `None` only means a termination
@@ -946,21 +946,33 @@ fn event_loop(wm: &mut Wm) -> R<()> {
                 wm.anim = None;
                 events::contain(wm.repaint_chrome(), "post-animation-error repaint")?;
             }
-            // Pace only while a next frame is still owed — but wait out the
-            // remainder on the socket, not asleep: input arriving mid-frame
-            // lands in the very next batch (where it can cut the animation)
-            // instead of waiting for the frame timer. Keep draining until the
-            // deadline actually passes: returning on the *first* event let a
-            // stream of non-cutting events (pointer motion reports at up to
-            // ~1 kHz) re-enter the loop immediately and step the animation —
-            // a full-screen recomposite — once per event instead of once per
-            // frame.
-            if wm.anim.is_some() {
-                wm.conn.flush()?;
-                let deadline = frame_start + FRAME;
-                while let Some(ev) = wait_event_deadline(&wm.conn, Some(deadline))? {
-                    wm.pending_events.push(ev);
+        } else if wm.scroll_animating() {
+            // Scroll glides and layout animations never overlap (see
+            // `Wm::scroll_animating`), so this is the `else` of the layout
+            // animation above. Step it once and re-arrange, exactly like a
+            // scroll burst's plain arrange, so leaves entering/leaving the
+            // viewport map/unmap as the glide passes them.
+            if let Err(e) = wm.step_scroll() {
+                if e.is_fatal() {
+                    return Err(e);
                 }
+                eprintln!("splitwm: error stepping scroll glide: {e}");
+                wm.state.land_scroll();
+            }
+        }
+        // Pace only while a next frame is still owed — but wait out the
+        // remainder on the socket, not asleep: input arriving mid-frame lands
+        // in the very next batch (where it can cut the animation) instead of
+        // waiting for the frame timer. Keep draining until the deadline
+        // actually passes: returning on the *first* event let a stream of
+        // non-cutting events (pointer motion reports at up to ~1 kHz) re-enter
+        // the loop immediately and step the animation/glide — a full-screen
+        // recomposite — once per event instead of once per frame.
+        if wm.anim.is_some() || wm.scroll_animating() {
+            wm.conn.flush()?;
+            let deadline = frame_start + FRAME;
+            while let Some(ev) = wait_event_deadline(&wm.conn, Some(deadline))? {
+                wm.pending_events.push(ev);
             }
         }
     }

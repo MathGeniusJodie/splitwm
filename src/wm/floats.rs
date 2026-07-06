@@ -47,15 +47,9 @@ pub struct FloatWin {
     pub label: char,
     /// `_NET_WM_NAME`/`WM_NAME`, kept live by `Wm::on_title_change`.
     pub title: Rc<str>,
-    /// When `_NET_WM_ICON` was last fetched for this float; mirrors
-    /// `Client::icon_fetched` so `Wm::on_icon_change`'s rate limit applies
-    /// here too (`fetch_icon` can move up to 16 MiB of client-controlled
-    /// data per call, and a float is no less able to rewrite its icon in a
-    /// loop than a tiled client is).
-    pub icon_fetched: std::time::Instant,
-    /// An icon PropertyNotify arrived inside the cooldown window; the fetch
-    /// is deferred to `Wm::flush_stale_icons`, same as `Client::icon_stale`.
-    pub icon_stale: bool,
+    /// `_NET_WM_ICON` fetch cooldown/staleness bookkeeping, mirroring
+    /// `Client::icon_fresh` (see `IconFreshness`).
+    pub icon_fresh: super::icons::IconFreshness,
 }
 
 impl Wm {
@@ -99,9 +93,10 @@ impl Wm {
 
     /// Frame insets around a float's client window: the same border art the
     /// splits use — `tb_h` above (the titlebar strip), `BORDER_LEFT` on the
-    /// other three sides, matching `place_clients`'s insets.
-    fn float_insets() -> (i32, i32) {
-        (theme::BORDER_LEFT, theme::tb_h())
+    /// left/right sides, `BORDER_BOTTOM` below, matching `client_rect_in_frame`'s
+    /// insets.
+    fn float_insets() -> (i32, i32, i32) {
+        (theme::BORDER_LEFT, theme::tb_h(), theme::BORDER_BOTTOM)
     }
 
     /// Float `win` (see `FloatWin`): show it at its requested size,
@@ -123,9 +118,9 @@ impl Wm {
         // Keep the frame's outer size within the u16 wire type: an absurd
         // requested size would make the `u16::try_from(..).unwrap_or(1)`
         // below collapse the frame to 1px around a full-size client.
-        let (bw, tb) = Self::float_insets();
+        let (bw, tb, bb) = Self::float_insets();
         w = w.clamp(1, i32::from(u16::MAX) - 2 * bw);
-        h = h.clamp(1, i32::from(u16::MAX) - tb - bw);
+        h = h.clamp(1, i32::from(u16::MAX) - tb - bb);
         // Center over the parent's frame when we know it, else the workarea.
         let around = parent
             .and_then(|p| self.state.tree.find_leaf_for_client(p))
@@ -161,7 +156,7 @@ impl Wm {
             i16::try_from(x - bw).unwrap_or(0),
             i16::try_from(y - tb).unwrap_or(0),
             u16::try_from(w + 2 * bw).unwrap_or(1),
-            u16::try_from(h + tb + bw).unwrap_or(1),
+            u16::try_from(h + tb + bb).unwrap_or(1),
             0,
             WindowClass::INPUT_OUTPUT,
             0, // CopyFromParent
@@ -190,8 +185,7 @@ impl Wm {
             icon,
             label,
             title,
-            icon_fetched: std::time::Instant::now(),
-            icon_stale: false,
+            icon_fresh: super::icons::IconFreshness::default(),
         });
         self.conn.map_window(frame)?;
         self.conn.map_window(win)?;
@@ -222,7 +216,7 @@ impl Wm {
         w: i32,
         h: i32,
     ) -> R<()> {
-        let (bw, tb) = Self::float_insets();
+        let (bw, tb, bb) = Self::float_insets();
         self.conn.configure_window(
             win,
             &ConfigureWindowAux::new()
@@ -238,14 +232,14 @@ impl Wm {
                 .x(x - bw)
                 .y(y - tb)
                 .width(clamp_dim(w + 2 * bw))
-                .height(clamp_dim(h + tb + bw)),
+                .height(clamp_dim(h + tb + bb)),
         )?;
         Ok(())
     }
 
     /// Raise a float as a unit: frame to the top, client just above it.
     pub(crate) fn restack_float(&self, win: Win) -> R<()> {
-        let Some(f) = self.floats_ref().iter().find(|f| f.win == win) else {
+        let Some(f) = self.floats_iter().find(|f| f.win == win) else {
             return Ok(());
         };
         self.conn.configure_window(
@@ -265,18 +259,18 @@ impl Wm {
     /// titlebar icon via `draw_leaf` (control buttons are drawn separately
     /// for splits, so none appear here), shaped to the opaque pixels.
     pub(crate) fn paint_float_frame(&mut self, frame: Win) -> R<()> {
-        let Some(f) = self.floats_ref().iter().find(|f| f.frame == frame) else {
+        let Some(f) = self.floats_iter().find(|f| f.frame == frame) else {
             return Ok(());
         };
-        let (bw, tb) = Self::float_insets();
-        let (fw, fh) = (f.w + 2 * bw, f.h + tb + bw);
+        let (bw, tb, bb) = Self::float_insets();
+        let (fw, fh) = (f.w + 2 * bw, f.h + tb + bb);
         let view = crate::render::LeafView {
             w: fw,
             h: fh,
             tb_h: tb,
             bw,
             accent_index: f.accent,
-            tab: Some(crate::render::TabInfo {
+            titlebar: Some(crate::render::TitleInfo {
                 label: f.label,
                 icon: f.icon.clone(),
                 title: f.title.clone(),
@@ -297,9 +291,9 @@ impl Wm {
     /// Move a float (client + frame) so its client origin lands at (x, y),
     /// keeping at least a grabbable strip on screen.
     pub(crate) fn move_float(&mut self, win: Win, x: i32, y: i32) -> R<()> {
-        let (bw, tb) = Self::float_insets();
+        let (bw, tb, _bb) = Self::float_insets();
         let wa = self.wa();
-        let Some(f) = self.floats_iter_mut().find(|f| f.win == win) else {
+        let Some(f) = self.float_mut(win) else {
             return Ok(());
         };
         // Clamp so the titlebar can't leave the screen (the frame is the
@@ -326,7 +320,7 @@ impl Wm {
 
     /// Give input focus to a float and remember it as the keyboard target.
     pub(crate) fn focus_float(&mut self, win: Win) -> R<()> {
-        let Some(f) = self.floats_ref().iter().find(|f| f.win == win) else {
+        let Some(f) = self.floats_iter().find(|f| f.win == win) else {
             return Ok(());
         };
         self.give_focus(win, f.focus)?;
@@ -364,7 +358,7 @@ impl Wm {
     /// (arrange raises tiled windows; floats must stay above them, below
     /// notifications).
     pub(crate) fn raise_floats(&self) -> R<()> {
-        for f in self.floats_ref() {
+        for f in self.floats_iter() {
             self.restack_float(f.win)?;
         }
         Ok(())

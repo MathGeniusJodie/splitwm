@@ -1,4 +1,4 @@
-//! Widget-region computation (hit-regions, tabs, buttons, taskbar) for the
+//! Widget-region computation (hit-regions, titlebars, buttons, taskbar) for the
 //! underlay. Every function below reads layout/client state and writes into
 //! a `Widgets`; none touch `self.conn` or any other X11 state, so they're
 //! kept as free functions rather than `impl Wm` methods — that keeps them
@@ -15,7 +15,7 @@ use crate::theme;
 use crate::tree::{Boundary, Dir, NodeId, Rect, Tree, Win};
 
 /// Every hit-testable widget rect computed for the current layout: gap drag
-/// handles, "+" insert buttons, tab titles, split-control buttons, taskbar
+/// handles, "+" insert buttons, titlebar titles, split-control buttons, taskbar
 /// tiles, the quick-launch icons, and the canvas-edge resize handles.
 /// Grouped so the whole set is rebuilt (and cleared) as one unit by
 /// `Wm::compute_widgets` — the caches must always describe the same arrange.
@@ -30,7 +30,7 @@ pub struct Widgets {
     /// The pill separating window tiles from the quick-launch icons; only
     /// present when both groups are (an unpaired separator is just clutter).
     pub taskbar_sep: Option<FrameRect>,
-    pub tab_regions: Vec<(FrameRect, NodeId)>,
+    pub title_regions: Vec<(FrameRect, NodeId)>,
     pub taskbar_regions: Vec<TaskTile>,
     pub btn_regions: Vec<(FrameRect, NodeId, BtnKind)>,
     /// Hit-regions for the outer canvas-edge resize handles (see
@@ -46,7 +46,7 @@ impl Widgets {
         self.plus_regions.clear();
         self.quick_regions.clear();
         self.taskbar_sep = None;
-        self.tab_regions.clear();
+        self.title_regions.clear();
         self.btn_regions.clear();
         self.taskbar_regions.clear();
         self.edge_handle_regions.clear();
@@ -66,7 +66,7 @@ pub struct QuickSlot {
     pub show: crate::theme::ShowWhen,
 }
 
-/// The three split-control buttons on the right of every leaf's tab bar
+/// The three split-control buttons on the right of every leaf's titlebar
 /// (count mirrored by `theme::N_SPLIT_BTNS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BtnKind {
@@ -105,7 +105,7 @@ impl Wm {
     pub(crate) fn compute_taskbar(&mut self, leaves: &[NodeId]) {
         let wa = self.wa();
         let (widgets, tree, clients, quick, bar_order) = self.taskbar_compute_parts();
-        compute_taskbar(widgets, tree, clients, quick, bar_order, wa, leaves);
+        compute_taskbar(widgets, tree, &clients, quick, bar_order, wa, leaves);
     }
 }
 
@@ -122,7 +122,7 @@ pub(crate) fn leaf_color_index(tree: &Tree, leaf: NodeId) -> crate::Index {
 fn compute_taskbar(
     widgets: &mut Widgets,
     tree: &Tree,
-    clients: &HashMap<Win, Client>,
+    clients: &[(Win, &Client)],
     quick: &[QuickSlot],
     bar_order: &[Win],
     wa: Rect,
@@ -141,8 +141,8 @@ fn compute_taskbar(
     // matches it.
     let running = |class: &str| {
         clients
-            .values()
-            .any(|c| c.class.eq_ignore_ascii_case(class))
+            .iter()
+            .any(|(_, c)| c.class.eq_ignore_ascii_case(class))
     };
     let visible: Vec<usize> = (0..quick.len())
         .filter(|&i| match quick[i].show {
@@ -230,7 +230,6 @@ fn compute_taskbar(
         Some(t) => t + gap + sep_w + gap,
         None => left,
     };
-    widgets.quick_regions.clear();
     for i in visible {
         widgets.quick_regions.push((
             FrameRect {
@@ -246,7 +245,7 @@ fn compute_taskbar(
     widgets.taskbar_regions = tiles;
 }
 
-/// Per-leaf titlebar hit-rects, trailing "+" new-tab buttons, and split-control buttons.
+/// Per-leaf titlebar hit-rects and split-control buttons.
 fn compute_leaf_widgets(widgets: &mut Widgets, tree: &Tree, placed: &[Placement]) {
     let tb_h = theme::tb_h();
     let bw = theme::BORDER_LEFT;
@@ -255,7 +254,7 @@ fn compute_leaf_widgets(widgets: &mut Widgets, tree: &Tree, placed: &[Placement]
         let has_client = leaf.is_some_and(|l| l.client.is_some());
         let minimized = leaf.is_some_and(|l| l.minimized);
         if has_client && !minimized {
-            widgets.tab_regions.push((
+            widgets.title_regions.push((
                 FrameRect {
                     x: p.target.x + bw,
                     y: p.target.y,
@@ -471,8 +470,7 @@ mod tests {
                 input: true,
                 take_focus: false,
             },
-            icon_fetched: std::time::Instant::now(),
-            icon_stale: false,
+            icon_fresh: super::super::icons::IconFreshness::default(),
         }
     }
 
@@ -519,7 +517,7 @@ mod tests {
     #[test]
     fn taskbar_stride_never_overlaps_within_available_width() {
         let tree = crate::tree::Tree::new();
-        let clients: HashMap<Win, Client> = HashMap::new();
+        let clients: Vec<(Win, &Client)> = Vec::new();
         // A pathological number of windows: the stride must compress
         // (clamped at a floor of 10px) rather than run tiles off-screen or
         // silently drop any of them.
@@ -543,8 +541,8 @@ mod tests {
     #[test]
     fn quick_launch_hidden_when_its_class_is_running() {
         let tree = crate::tree::Tree::new();
-        let mut clients = HashMap::new();
-        clients.insert(1 as Win, test_client("Firefox"));
+        let firefox = test_client("Firefox");
+        let clients: Vec<(Win, &Client)> = vec![(1 as Win, &firefox)];
         let quick = [QuickSlot {
             cmd: "firefox".into(),
             icon: None,
@@ -562,7 +560,7 @@ mod tests {
     #[test]
     fn quick_launch_shown_when_its_class_is_not_running() {
         let tree = crate::tree::Tree::new();
-        let clients: HashMap<Win, Client> = HashMap::new();
+        let clients: Vec<(Win, &Client)> = Vec::new();
         let quick = [QuickSlot {
             cmd: "firefox".into(),
             icon: None,

@@ -80,10 +80,10 @@ impl Wm {
             action,
             Action::FocusNext
                 | Action::FocusPrev
-                | Action::NextTab
-                | Action::PrevTab
-                | Action::MoveTabNext
-                | Action::MoveTabPrev
+                | Action::StashNext
+                | Action::StashPrev
+                | Action::MoveWindowNext
+                | Action::MoveWindowPrev
         ) {
             self.clear_focused_float();
         }
@@ -95,8 +95,8 @@ impl Wm {
                 | Action::Close
                 | Action::Grow
                 | Action::Shrink
-                | Action::MoveTabNext
-                | Action::MoveTabPrev
+                | Action::MoveWindowNext
+                | Action::MoveWindowPrev
         );
         // On split the existing content moves to a fresh leaf id; carry its
         // current frame rect over so it slides from its old spot, not a sliver.
@@ -149,16 +149,16 @@ impl Wm {
             Action::FocusPrev => {
                 self.state.focus_direction(false);
             }
-            Action::NextTab => {
+            Action::StashNext => {
                 self.state.cycle_stash(true);
             }
-            Action::PrevTab => {
+            Action::StashPrev => {
                 self.state.cycle_stash(false);
             }
-            Action::MoveTabNext => {
+            Action::MoveWindowNext => {
                 self.animate &= self.state.move_window_to_direction(true).is_some();
             }
-            Action::MoveTabPrev => {
+            Action::MoveWindowPrev => {
                 self.animate &= self.state.move_window_to_direction(false).is_some();
             }
             Action::Grow => self.animate &= self.state.resize_focused(theme::RESIZE_STEP),
@@ -287,13 +287,14 @@ impl Wm {
                 };
                 self.state.focus_leaf(leaf);
                 let pre = self.prev_frame_rect.get(&leaf).copied();
-                self.state.split_focused(dir);
+                self.animate = self.state.split_focused(dir);
                 // Carry the pre-split frame so content slides from its old spot.
-                if let Some(rect) = pre {
-                    self.prev_frame_rect
-                        .insert(self.state.focused_leaf_valid(), rect);
+                if self.animate {
+                    if let Some(rect) = pre {
+                        self.prev_frame_rect
+                            .insert(self.state.focused_leaf_valid(), rect);
+                    }
                 }
-                self.animate = true;
             }
             BtnKind::Close => {
                 if meta.parent_dir.is_none() {

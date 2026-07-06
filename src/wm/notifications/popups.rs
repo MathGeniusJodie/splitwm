@@ -71,7 +71,9 @@ impl Wm {
     /// Show a note, reusing its popup when the id already exists (a sender
     /// updating via `replaces_id`).
     fn show_note(&mut self, note: Note) -> R<()> {
-        let fb = self.renderer.draw_note(&note.summary, &note.body);
+        let fb = self
+            .renderer
+            .draw_note(&note.summary, &note.body, note.urgency >= 2);
         let (w, h) = (fb.width as i32, fb.height as i32);
         let win = match self.notes.popups.iter_mut().find(|p| p.note.id == note.id) {
             Some(p) => {
@@ -134,7 +136,9 @@ impl Wm {
         let Some(p) = self.notes.popups.iter().find(|p| p.win == win) else {
             return Ok(());
         };
-        let fb = self.renderer.draw_note(&p.note.summary, &p.note.body);
+        let fb = self
+            .renderer
+            .draw_note(&p.note.summary, &p.note.body, p.note.urgency >= 2);
         self.blit_fb(win, &fb)
     }
 
@@ -209,7 +213,7 @@ impl Wm {
     pub(crate) fn place_note_popups(&self) -> R<()> {
         let wa = self.wa();
         let gap = theme::GAP;
-        let foreign_h: i32 = self.notes.foreign.iter().map(|n| gap + n.h).sum();
+        let foreign_h: i32 = self.foreign_iter().map(|n| gap + n.h).sum();
         let bottom = wa.y + wa.h - Self::taskbar_h() - foreign_h;
         self.stack_note_pile(self.notes.popups.iter().map(|p| (p.win, p.w, p.h)), bottom)?;
         Ok(())

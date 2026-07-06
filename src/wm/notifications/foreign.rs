@@ -7,7 +7,7 @@ use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{ConnectionExt, EventMask};
 
 use super::super::clients::WmState;
-use super::super::types::{WindowKind, Wm, R};
+use super::super::types::{Wm, R};
 use crate::tree::Win;
 
 /// A foreign notification window (`_NET_WM_WINDOW_TYPE_NOTIFICATION`) and
@@ -33,14 +33,13 @@ impl Wm {
     /// stack upward above older ones.
     pub(crate) fn manage_notification(&mut self, win: Win) -> R<()> {
         self.select_and_grab(win, EventMask::STRUCTURE_NOTIFY, false)?;
-        if !self.notes.foreign.iter().any(|n| n.win == win) {
+        if self.foreign_iter().all(|n| n.win != win) {
             // One geometry query at manage time; size updates thereafter
             // come from the window's own ConfigureRequests.
             let (w, h) = self
                 .geometry(win)
                 .map_or((1, 1), |g| (i32::from(g.width), i32::from(g.height)));
-            self.notes.foreign.push(ForeignNote { win, w, h });
-            self.register_kind(win, WindowKind::Notification);
+            self.add_foreign(ForeignNote { win, w, h });
         }
         self.place_notifications()?;
         self.conn.map_window(win)?;
@@ -53,8 +52,7 @@ impl Wm {
 
     /// Stop tracking a closed notification and re-stack the survivors.
     pub(crate) fn forget_notification(&mut self, win: Win) -> R<()> {
-        self.notes.foreign.retain(|n| n.win != win);
-        self.unregister_kind(win);
+        self.remove_foreign(win);
         self.place_notifications()?;
         Ok(())
     }

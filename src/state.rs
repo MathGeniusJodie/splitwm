@@ -1,4 +1,4 @@
-//! Layout state plus every mutation of the split tree / tab stacks and the
+//! Layout state plus every mutation of the split tree / stash and the
 //! scroll bookkeeping — there is exactly one layout (no workspaces/tags).
 
 use crate::theme;
@@ -34,9 +34,12 @@ pub struct State {
     /// focus is never handed out. Tests assign the field directly to set up
     /// states.
     focused_leaf: NodeId,
-    /// Current and target scroll offsets. Private so every mutation goes
-    /// through the clamping/landing methods below — `update_canvas`
-    /// re-clamps both whenever the scroll range changes.
+    /// Current and target scroll offsets — `scroll_x` glides toward
+    /// `scroll_target` one frame at a time via `step_scroll`, driven by the
+    /// main event loop while they differ (`scroll_animating`). Private so
+    /// every mutation goes through the clamping/landing/stepping methods
+    /// below — `update_canvas` re-clamps both whenever the scroll range
+    /// changes.
     scroll_x: i32,
     scroll_target: i32,
     /// Canvas width, derived by `update_canvas` (0 until the first call;
@@ -642,9 +645,44 @@ impl State {
         self.scroll_x
     }
 
-    /// Land the scroll: snap the current offset to the target.
+    /// Land the scroll: snap the current offset to the target. Used where a
+    /// glide would be wrong — landing before an edge/split drag arms (so its
+    /// anchor math stays exact) and landing before a layout animation starts
+    /// (whose placements are computed from `scroll_x` at arrange time, so a
+    /// concurrently-gliding scroll would make them stale each frame).
     pub fn land_scroll(&mut self) {
         self.scroll_x = self.scroll_target;
+    }
+
+    /// Per-frame fraction of the remaining distance closed by `step_scroll`,
+    /// tuned for the event loop's 16ms frame cadence: snappy enough to keep
+    /// pace with a trackpad swipe's moving target, while still reading as a
+    /// glide alongside the 280ms layout animation (`Wm::ANIM_DURATION`).
+    const SCROLL_GLIDE_K: f64 = 0.25;
+    /// Below this remaining distance, `step_scroll` snaps rather than
+    /// asymptotically approaching forever.
+    const SCROLL_SNAP_PX: i32 = 1;
+
+    /// Advance the scroll glide by one frame toward `scroll_target`: an
+    /// exponential approach that snaps once within `SCROLL_SNAP_PX`. A
+    /// target that moves mid-glide (fresh scroll input) is simply re-aimed —
+    /// there's no fixed-duration tween to restart. Returns whether the glide
+    /// is still in flight, so callers know whether to keep stepping.
+    pub fn step_scroll(&mut self) -> bool {
+        let delta = self.scroll_target - self.scroll_x;
+        if delta.abs() <= Self::SCROLL_SNAP_PX {
+            self.scroll_x = self.scroll_target;
+        } else {
+            self.scroll_x += (f64::from(delta) * Self::SCROLL_GLIDE_K).round() as i32;
+        }
+        self.scroll_animating()
+    }
+
+    /// Whether `scroll_x` has not yet caught up to `scroll_target` — the
+    /// event loop keeps stepping frames (and stays non-blocking) while this
+    /// holds, exactly like it does for `Wm::anim`.
+    pub fn scroll_animating(&self) -> bool {
+        self.scroll_x != self.scroll_target
     }
 
     /// Shift both offsets by `delta` without clamping — used by the
@@ -1622,5 +1660,96 @@ mod tests {
 
         s.clamp_scroll(WA, 0);
         assert_eq!(s.scroll_x(), s.max_scroll(WA));
+    }
+
+    /// Repeated stepping must monotonically close the distance to the
+    /// target and report `true` (still animating) until it arrives.
+    #[test]
+    fn step_scroll_approaches_target() {
+        let mut s = State::new();
+        s.split_focused(Dir::H);
+        s.split_focused(Dir::H);
+        s.split_focused(Dir::H);
+        s.update_canvas(WA, 0);
+        let max = s.max_scroll(WA);
+        assert!(max > 0, "canvas should out-span the viewport");
+        s.scroll_to(WA, max);
+        assert!(s.scroll_animating());
+
+        let mut prev = s.scroll_x();
+        let mut still_going = true;
+        for _ in 0..1000 {
+            still_going = s.step_scroll();
+            let cur = s.scroll_x();
+            assert!(cur >= prev, "scroll must move monotonically toward target");
+            prev = cur;
+            if !still_going {
+                break;
+            }
+        }
+        assert!(!still_going, "glide must terminate");
+        assert_eq!(s.scroll_x(), max);
+        assert!(!s.scroll_animating());
+    }
+
+    /// A target within `SCROLL_SNAP_PX` of the current offset lands in a
+    /// single step rather than crawling the last pixel forever.
+    #[test]
+    fn step_scroll_snaps_within_threshold() {
+        let mut s = State::new();
+        s.split_focused(Dir::H);
+        s.split_focused(Dir::H);
+        s.split_focused(Dir::H);
+        s.update_canvas(WA, 0);
+        let max = s.max_scroll(WA);
+        assert!(max >= 1, "need scroll room for this test");
+        s.scroll_to(WA, max - 1);
+        s.land_scroll();
+        s.scroll_to(WA, max);
+        assert!(s.scroll_animating(), "not yet landed on the target");
+        let still_animating = s.step_scroll();
+        assert_eq!(s.scroll_x(), max, "1px remainder must snap in one step");
+        assert!(!still_animating);
+    }
+
+    /// Retargeting mid-glide (fresh scroll input) must re-aim smoothly
+    /// rather than restart or overshoot toward the abandoned target.
+    #[test]
+    fn step_scroll_moving_target_reaims() {
+        let mut s = State::new();
+        for _ in 0..4 {
+            s.split_focused(Dir::H);
+        }
+        s.update_canvas(WA, 0);
+        let max = s.max_scroll(WA);
+        assert!(max >= 40, "need scroll room for this test");
+        s.scroll_to(WA, max);
+        for _ in 0..3 {
+            s.step_scroll();
+        }
+        assert!(s.scroll_animating(), "should still be gliding");
+        // New input re-aims at a nearer target before the old one lands.
+        s.scroll_to(WA, 0);
+        assert_eq!(s.scroll_target, 0);
+        let before = s.scroll_x();
+        assert!(before > 0, "glide should have made progress toward max");
+        while s.step_scroll() {}
+        assert_eq!(s.scroll_x(), 0);
+    }
+
+    /// Edge-drag scroll compensation (`shift_scroll`) stays an exact,
+    /// instant shift of both offsets together — it must never leave a drag
+    /// gliding underneath the pointer, so it's unaffected by the glide
+    /// machinery entirely.
+    #[test]
+    fn shift_scroll_stays_exact_not_a_glide() {
+        let mut s = State::new();
+        // Fresh state: both offsets start at 0.
+        assert!(!s.scroll_animating());
+        s.shift_scroll(-30);
+        // Both offsets move together by exactly `delta`; no glide opens up.
+        assert_eq!(s.scroll_x(), -30);
+        assert_eq!(s.scroll_target, -30);
+        assert!(!s.scroll_animating());
     }
 }

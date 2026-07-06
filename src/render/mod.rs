@@ -1,4 +1,4 @@
-//! Software rendering of leaf decorations (tab bar, focus border, content
+//! Software rendering of leaf decorations (titlebar, focus border, content
 //! background) as an indexed-colour `pixel_graphics::Framebuffer`, presented
 //! once per frame into a BGRX byte buffer ready for X `PutImage` on a
 //! depth-24 `TrueColor` visual. Each concern owns its own module: wallpaper
@@ -26,7 +26,7 @@ mod taskbar;
 mod wallpaper;
 
 pub use buttons::BtnIcon;
-pub use chrome::{LeafView, TabInfo};
+pub use chrome::{LeafView, TitleInfo};
 pub use taskbar::{draw_close_badge, draw_plus, draw_taskbar_sep};
 
 use std::cell::RefCell;

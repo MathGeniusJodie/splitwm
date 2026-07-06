@@ -4,9 +4,7 @@
 
 use std::rc::Rc;
 
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::{Atom, AtomEnum, ClientMessageEvent, ConnectionExt, EventMask};
-use x11rb::rust_connection::RustConnection;
+use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
 
 use super::types::{WindowKind, Wm, R};
 use crate::icon::{self, Icon};
@@ -17,6 +15,61 @@ use crate::tree::Win;
 /// `Wm::on_icon_change`). Long enough to blunt a rewrite loop, short
 /// enough that a real icon change still lands promptly.
 const ICON_FETCH_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Per-window `_NET_WM_ICON` fetch cooldown/staleness bookkeeping, shared by
+/// `Client` and `FloatWin` (a float is no less able to rewrite its icon in a
+/// loop than a tiled client is). `fetched` moves up to 16 MiB of
+/// client-controlled property data and ends in a full recomposite each time,
+/// so `Wm::on_icon_change` rate-limits against it via `throttled`; a notify
+/// that lands inside the cooldown is remembered via `stale` and re-fetched by
+/// `Wm::flush_stale_icons` once the cooldown passes, so a burst's final icon
+/// is never lost.
+pub struct IconFreshness {
+    fetched: std::time::Instant,
+    stale: bool,
+}
+
+impl Default for IconFreshness {
+    /// Fresh bookkeeping for a window just managed: no cooldown in effect,
+    /// nothing stale.
+    fn default() -> Self {
+        Self {
+            fetched: std::time::Instant::now(),
+            stale: false,
+        }
+    }
+}
+
+impl IconFreshness {
+    /// Whether an icon refresh requested `now` falls inside the cooldown
+    /// since the last fetch. When it does, marks the refresh stale (for
+    /// `due`/`flush_stale_icons` to pick up later) instead of performing it.
+    /// When it doesn't, stamps `now` as the new fetch time and clears any
+    /// prior staleness, on the assumption the caller will fetch immediately.
+    pub fn throttled(&mut self, now: std::time::Instant) -> bool {
+        if now.duration_since(self.fetched) < ICON_FETCH_COOLDOWN {
+            self.stale = true;
+            true
+        } else {
+            self.fetched = now;
+            self.stale = false;
+            false
+        }
+    }
+
+    /// Whether a previously throttled refresh is ready to retry at `now`.
+    pub fn due(&self, now: std::time::Instant) -> bool {
+        self.stale && now.duration_since(self.fetched) >= ICON_FETCH_COOLDOWN
+    }
+
+    /// Whether a refresh is deferred, regardless of whether its cooldown has
+    /// elapsed yet — used to keep `Wm::icons_stale` set for an entry that's
+    /// stale but still inside the cooldown, so a later batch still retries
+    /// it once `due` turns true.
+    pub fn is_stale(&self) -> bool {
+        self.stale
+    }
+}
 
 /// Result of a background theme-icon fetch (see
 /// `Wm::spawn_theme_icon_fetch`), tagged with the window it was resolved
@@ -71,7 +124,7 @@ impl Wm {
     /// First hue-rotation slot (see `theme::icon_hue_rotation`) not already
     /// held by another open window of `class`, so windows of one app stay
     /// distinguishable while a free slot remains. Freeing is implicit: once
-    /// a window is unmanaged it drops out of `self.clients`, so its slot no
+    /// a window is unmanaged it drops out of `managed`, so its slot no
     /// longer counts as used.
     // Only `theme::ICON_HUE_STEPS` distinct hues exist for disambiguating
     // same-class windows; once that many are already in use, this silently
@@ -79,8 +132,8 @@ impl Wm {
     // or reusing a hue, so windows past the step count share an icon look.
     pub(crate) fn assign_icon_slot(&self, class: &str) -> Option<usize> {
         let used: std::collections::HashSet<usize> = self
-            .clients_ref()
-            .values()
+            .tiled_iter()
+            .map(|(_, c)| c)
             .filter(|c| c.class.as_ref() == class)
             .filter_map(|c| c.icon_slot)
             .collect();
@@ -93,16 +146,15 @@ impl Wm {
     /// are kept (the slot is persistent for the window's lifetime).
     pub(crate) fn refresh_icon_rotations(&mut self, class: &Rc<str>) {
         let wins: Vec<Win> = self
-            .clients_ref()
-            .iter()
+            .tiled_iter()
             .filter(|(_, c)| c.class == *class)
-            .map(|(&w, _)| w)
+            .map(|(w, _)| w)
             .collect();
         if wins.len() < 2 {
             return;
         }
         for win in wins {
-            let (slot, icon) = match self.clients_ref().get(&win) {
+            let (slot, icon) = match self.tiled_get(win) {
                 Some(c) if c.icon_rotated.is_none() => (c.icon_slot, c.icon.clone()),
                 _ => continue,
             };
@@ -127,10 +179,10 @@ impl Wm {
     /// while another window of the same app class is open (same-app
     /// disambiguation), the plain icon otherwise.
     pub(crate) fn icon_for(&self, win: Win) -> Option<Rc<Icon>> {
-        let client = self.clients_ref().get(&win)?;
+        let client = self.tiled_get(win)?;
         let siblings = self
-            .clients_ref()
-            .values()
+            .tiled_iter()
+            .map(|(_, c)| c)
             .filter(|c| c.class == client.class)
             .count();
         if siblings >= 2 {
@@ -142,7 +194,7 @@ impl Wm {
     }
 
     /// Read `_NET_WM_ICON` and pick the icon whose size is closest to (but
-    /// preferably >=) the tab height. The property is a list of
+    /// preferably >=) the titlebar height. The property is a list of
     /// `width, height, w*h ARGB pixels` blocks packed as 32-bit CARDINALs.
     pub(crate) fn fetch_icon(&self, win: Win) -> Option<Rc<Icon>> {
         // Capped read, not u32::MAX: the property is client-controlled, and
@@ -210,7 +262,7 @@ impl Wm {
             // A send failure just means the WM is shutting down (the
             // receiver dropped with it); nothing to report.
             let _ = tx.send(IconResult { win, icon });
-            ping_icon_thread(atom);
+            crate::ping::ping(atom);
         });
     }
 
@@ -218,8 +270,8 @@ impl Wm {
     /// that set the property only after mapping (Electron, notably) would
     /// otherwise keep whatever `manage`/`manage_float` resolved at map time.
     /// Dispatches on `kind_of` since tiled clients and floats keep their
-    /// rate-limit bookkeeping (`icon_fetched`/`icon_stale`) and repaint
-    /// (`repaint_chrome` vs. `paint_float_frame`) in different places.
+    /// `icon_fresh` bookkeeping and repaint (`repaint_chrome` vs.
+    /// `paint_float_frame`) in different places.
     pub(crate) fn on_icon_change(&mut self, win: Win) -> R<()> {
         match self.kind_of(win) {
             Some(WindowKind::Tiled) => self.on_icon_change_tiled(win),
@@ -233,19 +285,10 @@ impl Wm {
         let Some(client) = self.client_mut(win) else {
             return Ok(());
         };
-        // Rate-limit: the fetch below moves up to 16 MiB of client-
-        // controlled property data and ends in a full recomposite, so a
-        // client rewriting its icon in a loop must not be able to run it
-        // per notify. A throttled notify is remembered as stale and
-        // re-fetched by `flush_stale_icons` once the cooldown passes, so a
-        // burst's final icon is never lost.
-        if now.duration_since(client.icon_fetched) < ICON_FETCH_COOLDOWN {
-            client.icon_stale = true;
+        if client.icon_fresh.throttled(now) {
             self.icons_stale = true;
             return Ok(());
         }
-        client.icon_fetched = now;
-        client.icon_stale = false;
         let class = client.class.clone();
         let Some(icon) = self.fetch_icon(win) else {
             return Ok(());
@@ -259,25 +302,22 @@ impl Wm {
         self.repaint_chrome()
     }
 
-    /// Float counterpart of `on_icon_change_tiled`: same cooldown/stale
-    /// mechanics on `FloatWin`'s own fields, but repaints just this float's
+    /// Float counterpart of `on_icon_change_tiled`: same `IconFreshness`
+    /// mechanics on `FloatWin`'s own field, but repaints just this float's
     /// chrome frame instead of the shared tiled composite.
     fn on_icon_change_float(&mut self, win: Win) -> R<()> {
         let now = std::time::Instant::now();
-        let Some(float) = self.floats_iter_mut().find(|f| f.win == win) else {
+        let Some(float) = self.float_mut(win) else {
             return Ok(());
         };
-        if now.duration_since(float.icon_fetched) < ICON_FETCH_COOLDOWN {
-            float.icon_stale = true;
+        if float.icon_fresh.throttled(now) {
             self.icons_stale = true;
             return Ok(());
         }
-        float.icon_fetched = now;
-        float.icon_stale = false;
         let Some(icon) = self.fetch_icon(win) else {
             return Ok(());
         };
-        let Some(float) = self.floats_iter_mut().find(|f| f.win == win) else {
+        let Some(float) = self.float_mut(win) else {
             return Ok(());
         };
         float.icon = Some(icon);
@@ -297,22 +337,20 @@ impl Wm {
         }
         let now = std::time::Instant::now();
         let due: Vec<Win> = self
-            .clients_ref()
-            .iter()
-            .filter(|(_, c)| {
-                c.icon_stale && now.duration_since(c.icon_fetched) >= ICON_FETCH_COOLDOWN
-            })
-            .map(|(&w, _)| w)
-            .chain(self.floats_ref().iter().filter_map(|f| {
-                (f.icon_stale && now.duration_since(f.icon_fetched) >= ICON_FETCH_COOLDOWN)
-                    .then_some(f.win)
-            }))
+            .tiled_iter()
+            .filter(|(_, c)| c.icon_fresh.due(now))
+            .map(|(w, _)| w)
+            .chain(
+                self.floats_iter()
+                    .filter(|f| f.icon_fresh.due(now))
+                    .map(|f| f.win),
+            )
             .collect();
         for win in due {
             self.on_icon_change(win)?;
         }
-        self.icons_stale = self.clients_ref().values().any(|c| c.icon_stale)
-            || self.floats_ref().iter().any(|f| f.icon_stale);
+        self.icons_stale = self.tiled_iter().any(|(_, c)| c.icon_fresh.is_stale())
+            || self.floats_iter().any(|f| f.icon_fresh.is_stale());
         Ok(())
     }
 
@@ -349,7 +387,7 @@ impl Wm {
                     }
                 }
                 Some(WindowKind::Float) => {
-                    let Some(float) = self.floats_iter_mut().find(|f| f.win == win) else {
+                    let Some(float) = self.float_mut(win) else {
                         continue;
                     };
                     if float.icon.is_none() {
@@ -367,63 +405,6 @@ impl Wm {
             self.repaint_chrome()?;
         }
         Ok(())
-    }
-}
-
-/// The connection a background theme-icon fetch thread pings the WM's event
-/// loop over, plus the root window `send_event` targets it at.
-struct PingConn {
-    xc: RustConnection,
-    root: u32,
-}
-
-/// Shared across every `spawn_theme_icon_fetch` thread for the lifetime of
-/// the process. `RustConnection` is `Send + Sync` (its I/O is internally
-/// synchronized), so unlike `self.conn` — the WM's own connection, not safe
-/// to touch off the main thread — this one is fine to share. `None` means an
-/// earlier connect attempt failed; that's cached rather than retried, since a
-/// missing ping only delays a result already sitting in the mpsc channel
-/// until the WM's next natural wakeup, never loses it, so paying a fresh
-/// connect-and-auth handshake per fetch for no better outcome isn't worth it.
-static PING: std::sync::OnceLock<Option<PingConn>> = std::sync::OnceLock::new();
-
-/// Wake the WM's blocking event loop from a background theme-icon fetch
-/// thread (`Wm::spawn_theme_icon_fetch`), by sending a `SPLITWM_ICON`
-/// ClientMessage to root — same mechanism `notify.rs`'s daemon thread uses
-/// to wake the WM after a `NoteMsg`. Reuses one lazily-connected `PING`
-/// connection across every fetch thread rather than paying a fresh
-/// connect/auth handshake per ping. Best-effort: a failed ping (whether the
-/// initial connect or this send) only delays the result being applied until
-/// the WM's next natural wakeup, never loses it (the result itself already
-/// sat down in the mpsc channel before this runs); a `send_event` failure on
-/// an already-live connection is logged and otherwise ignored rather than
-/// tearing down and reconnecting, since the WM will pick the result up on
-/// its own soon enough anyway. Takes the already-interned `atom` (atoms are
-/// server-global, so the caller's value is valid on this shared connection
-/// too) rather than paying an extra round trip to re-intern it here on every
-/// fetch.
-fn ping_icon_thread(atom: Atom) {
-    let ping = PING.get_or_init(|| match x11rb::connect(None) {
-        Ok((xc, screen)) => {
-            let root = xc.setup().roots[screen].root;
-            Some(PingConn { xc, root })
-        }
-        Err(e) => {
-            eprintln!("splitwm: failed to open the icon-ping connection: {e}");
-            None
-        }
-    });
-    let Some(PingConn { xc, root }) = ping else {
-        return;
-    };
-    let send = || -> R<()> {
-        let ev = ClientMessageEvent::new(32, *root, atom, [0u32; 5]);
-        xc.send_event(false, *root, EventMask::SUBSTRUCTURE_REDIRECT, ev)?;
-        xc.flush()?;
-        Ok(())
-    };
-    if let Err(e) = send() {
-        eprintln!("splitwm: failed to ping the WM event loop for an icon fetch: {e}");
     }
 }
 
