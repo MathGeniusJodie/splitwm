@@ -142,5 +142,9 @@ Mapping notes vs X11:
   alacritty/test clients, drive bindings by injecting via the compositor's
   own debug channel or wtype through a virtual-keyboard protocol (TBD),
   screenshot via wlr-screencopy into /tmp/splitshots.
+- Real VT (tty backend): `./vttest.sh` from a VT login builds with the
+  `tty` feature, scrubs leaked `DISPLAY` vars, and takes the seat;
+  `./vttest.sh kill` from X ends it by recorded pid (never pkill — the
+  live session's WM shares the binary name).
 - X11 test scripts (test.sh/itest.sh/drive.sh) stay in-tree as the spec
   for their replacements until the harness lands, then get deleted.
