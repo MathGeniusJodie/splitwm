@@ -1,28 +1,40 @@
 [package]
 name = "splitwm"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
-x11rb = { version = "0.13", features = ["xinput", "render", "shape", "shm", "xkb"] }
-# memfd_create/ftruncate/mmap for the MIT-SHM frame buffer shared with the X
-# server (the fd itself is passed over the wire via ShmAttachFd).
-libc = "0.2"
-# Session-bus server for org.freedesktop.Notifications (the WM doubles as the
-# notification daemon); binds the system libdbus, driven from its own thread.
-dbus = "0.9"
-# Chrome art is baked by build.rs; user wallpapers and theme icons are
-# decoded at runtime via pixel_graphics::magick_decode_rgba, which shells
-# out to ImageMagick (also handling non-PNG sources — JPEG wallpapers, SVG
-# icons — directly, with no separate conversion step needed).
+# Wayland compositor framework: display/protocol machinery, GLES renderer,
+# winit backend for nested development runs, XWayland integration. The TTY
+# session backend lives behind the `tty` feature below because its libseat
+# link-time dependency isn't installed everywhere this builds.
+smithay = { version = "0.7", default-features = false, features = [
+    "backend_winit",
+    "backend_egl",
+    "renderer_gl",
+    "desktop",
+    "wayland_frontend",
+    "xwayland",
+] }
+# Chrome art is baked by build.rs; wallpapers and theme icons are decoded at
+# runtime via pixel_graphics::magick_decode_rgba (ImageMagick shell-out).
 pixel-graphics = { path = "../pixel-graphics" }
 pixel-fonts = { path = "../pixel-fonts" }
-# Freedesktop icon-theme lookup and .desktop parsing (taskbar icons, dock
-# autostart) — spec-following code not worth maintaining by hand.
-freedesktop-icons = { version = "0.4.0", default-features = false }
-freedesktop-desktop-entry = { version = "0.8.1", default-features = false }
-# Generated X11 keysym constants for theme::BINDINGS.
-xkeysym = "0.2.1"
+# Smithay logs through tracing; RUST_LOG-style filtering for debugging.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Real-session backend (DRM/GBM scanout, libinput, libseat session). Off by
+# default: linking needs the libseat system library (Arch package `seatd`).
+tty = [
+    "smithay/backend_udev",
+    "smithay/backend_drm",
+    "smithay/backend_gbm",
+    "smithay/backend_libinput",
+    "smithay/backend_session_libseat",
+    "smithay/renderer_multi",
+]
 
 [build-dependencies]
 pixel-graphics = { path = "../pixel-graphics" }
