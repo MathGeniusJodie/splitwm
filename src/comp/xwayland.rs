@@ -111,6 +111,22 @@ impl XWaylandShellHandler for Comp {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
         &mut self.xwayland_shell_state
     }
+
+    /// The wl_surface for an X11 window arrives only with a later commit,
+    /// usually after the map. An override-redirect window that mapped
+    /// surfaceless gets its promised keyboard focus here (rofi's X-side
+    /// keyboard grab is dead until XWayland holds our focus).
+    fn surface_associated(&mut self, _xwm: XwmId, wl_surface: WlSurface, window: X11Surface) {
+        if self
+            .or_windows
+            .iter()
+            .any(|s| s.window_id() == window.window_id())
+        {
+            let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
+            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+            keyboard.set_focus(self, Some(wl_surface), serial);
+        }
+    }
 }
 delegate_xwayland_shell!(Comp);
 

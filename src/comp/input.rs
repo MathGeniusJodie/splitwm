@@ -60,13 +60,12 @@ impl Comp {
                                     // The VT syms only exist on the
                                     // ctrl+alt-modified level; bindings
                                     // keep matching level-0 syms + mods.
-                                    let intercepted =
-                                        vt_switch_target(handle.modified_sym().raw())
-                                            .map(Intercepted::SwitchVt)
-                                            .or_else(|| {
-                                                crate::comp::actions::binding_action(mods, sym)
-                                                    .map(Intercepted::Action)
-                                            });
+                                    let intercepted = vt_switch_target(handle.modified_sym().raw())
+                                        .map(Intercepted::SwitchVt)
+                                        .or_else(|| {
+                                            crate::comp::actions::binding_action(mods, sym)
+                                                .map(Intercepted::Action)
+                                        });
                                     let Some(intercepted) = intercepted else {
                                         return FilterResult::Forward;
                                     };
@@ -153,9 +152,13 @@ impl Comp {
                         self.chrome_press = true;
                         consumed = true;
                     } else {
-                        let clicked = self
-                            .surface_under(pos)
-                            .and_then(|(s, _)| self.managed.win_for_surface(&s));
+                        let under = self.surface_under(pos);
+                        // A surface that maps to no managed window is an
+                        // override-redirect X11 window (rofi): the click
+                        // must forward to it, not hit-test the chrome
+                        // underneath.
+                        let over_unmanaged = under.is_some();
+                        let clicked = under.and_then(|(s, _)| self.managed.win_for_surface(&s));
                         match clicked {
                             Some(win) if event.button_code() == BTN_LEFT => {
                                 match self.managed.kind_of(win) {
@@ -175,8 +178,11 @@ impl Comp {
                             }
                             Some(_) => {}
                             // Chrome click: hit-test dispatch (buttons, tiles,
-                            // handles, "+", titles, float frames...).
-                            None if matches!(event.button_code(), BTN_LEFT | BTN_RIGHT) => {
+                            // handles, "+", titles, float frames...). Only
+                            // where no surface is under the pointer at all.
+                            None if !over_unmanaged
+                                && matches!(event.button_code(), BTN_LEFT | BTN_RIGHT) =>
+                            {
                                 if self.on_chrome_button(pos, event.button_code() == BTN_RIGHT) {
                                     self.chrome_press = true;
                                     consumed = true;

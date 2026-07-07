@@ -30,6 +30,9 @@ this port must reproduce unless a deviation is listed below.
   icon-theme lookup keyed on app_id → XWayland `_NET_WM_ICON`.
   Hue-rotation disambiguation unchanged.
 - **Notifications on zbus** driven by calloop (no libdbus, no thread).
+- **Natural scrolling forced on** for the tty seat's libinput devices
+  (Jodie, 2026-07-07) — master inherited the X server's scroll config,
+  which this replaces; nested sessions still inherit the host's.
 - **Volume keys are single-shot per press** (deviation: X11 auto-repeat
   used to make holding the key keep adjusting; no compositor-side repeat
   timer).
@@ -86,18 +89,22 @@ this port must reproduce unless a deviation is listed below.
       for hardware-plane offload. Verified: builds/tests both feature
       sets, nested winit regression drive (tiling+split+chrome intact),
       and a real-VT session (Jodie, 2026-07-07): seat/input/scanout,
-      tiling, chrome, VT switching all work. Two findings fixed after:
+      tiling, chrome, VT switching all work. Findings fixed after:
       debug builds unusably slow at native resolution (vttest.sh now
       builds release into `target/vttest/`, never touching the live
-      session's `target/release` binary), and a wayland-capable rofi
+      session's `target/release` binary); a wayland-capable rofi
       picking its layer-shell backend (LAUNCHER_CMD scrubs
       WAYLAND_DISPLAY so rofi stays on XWayland per the v1 decision);
-      both await her re-test. Gaps: named cursor shapes
+      o-r keyboard focus granted at map time, before XWayland
+      associates the wl_surface, so rofi typed into nothing (now
+      granted in surface_associated); clicks on o-r surfaces falling
+      through to the chrome hit-test. Rofi input+centering re-verified
+      nested; VT re-test pending. Gaps: named cursor shapes
       beyond the arrow (hover feedback still absent, see M5); output
       name fixed at startup even if the connector swaps; mode changes on
-      an unchanged connector ignored; libinput devices run defaults (no
-      tap-to-click config); multi-GPU and multi-output out of scope
-      (master had one X screen).
+      an unchanged connector ignored; libinput devices run defaults
+      except natural scrolling (no tap-to-click config); multi-GPU and
+      multi-output out of scope (master had one X screen).
 - [ ] **Harness** (grows from M1): headless socket tests, screenshot drive
 
 ## Architecture (new src/)

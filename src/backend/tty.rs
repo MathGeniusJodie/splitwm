@@ -252,9 +252,20 @@ pub fn run() {
 
     let handle = event_loop.handle();
     handle
-        .insert_source(LibinputInputBackend::new(libinput), |event, (), comp| {
-            comp.process_input_event(event);
-        })
+        .insert_source(
+            LibinputInputBackend::new(libinput),
+            |mut event, (), comp| {
+                // Devices run libinput defaults except scroll direction:
+                // natural scrolling to match Jodie's X session (the X server
+                // owned that knob on master).
+                if let smithay::backend::input::InputEvent::DeviceAdded { device } = &mut event {
+                    if device.config_scroll_has_natural_scroll() {
+                        let _ = device.config_scroll_set_natural_scroll_enabled(true);
+                    }
+                }
+                comp.process_input_event(event);
+            },
+        )
         .expect("insert libinput source");
 
     // VT switches: libseat pauses the session (devices revoked) and later
