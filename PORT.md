@@ -46,8 +46,11 @@ this port must reproduce unless a deviation is listed below.
 - [x] **M1** protocol core: compositor/xdg-shell/shm/dmabuf/seat/output/
       data-device; alacritty runs with keyboard focus
 - [x] **M2** pure core ported with tests: theme, tree, layout state, oklch
-- [ ] **M3** chrome rendering: pixel-graphics → GLES textures (borders,
-      titlebars, buttons, taskbar, wallpaper); reused buffers
+- [~] **M3** chrome rendering: DONE — underlay pipeline (render/* ported
+      verbatim, MemoryRenderBuffer element behind clients, dirty-gated),
+      leaf frames/titlebars/focus outline verified. REMAINING: taskbar
+      strip+tiles composited, wallpaper wired to SPLITWM_WALLPAPER,
+      titlebar buttons (needs M5 btn_regions), notify_popup (M8).
 - [~] **M4** tiling behavior: keyboard tiling core DONE (splits ↔ windows,
       manage/displace, stash cycle, focus, resize, spawn, xdg-decoration
       SSD); taskbar visuals + titlebar buttons land with M3/M5
