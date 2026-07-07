@@ -9,6 +9,7 @@ pub mod actions;
 pub mod chrome;
 pub mod handlers;
 pub mod input;
+pub mod pointer;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -74,6 +75,19 @@ pub struct Comp {
     pub parents: std::collections::HashMap<crate::tree::NodeId, (crate::tree::NodeId, usize)>,
     /// `SPLITWM_WALLPAPER`, kept so an output resize can rescale it.
     pub wallpaper_path: Option<String>,
+
+    // Pointer interaction state (see comp::pointer).
+    pub drag: Option<pointer::ActiveDrag>,
+    /// Sub-pixel scroll remainder carried between axis events.
+    pub hscroll_frac: f64,
+    /// Set by an action that wants its layout change animated; consumed by
+    /// the next `arrange`.
+    pub animate: bool,
+    /// In-flight layout transition (chrome-only interpolation).
+    pub anim: Option<chrome::LayoutAnim>,
+    /// Every leaf's frame rect from the last arrange, on-screen or not —
+    /// animation start rects and the empty-leaf-body hit region.
+    pub prev_frame_rect: std::collections::HashMap<crate::tree::NodeId, crate::widgets::FrameRect>,
 
     // Wayland plumbing.
     pub dh: DisplayHandle,
@@ -174,7 +188,12 @@ impl Comp {
             size: backend.window_size(),
             refresh: 60_000,
         };
-        output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
+        output.change_current_state(
+            Some(mode),
+            Some(Transform::Flipped180),
+            None,
+            Some((0, 0).into()),
+        );
         output.set_preferred(mode);
         let damage_tracker = OutputDamageTracker::from_output(&output);
 
@@ -214,12 +233,21 @@ impl Comp {
                 .map(|q| crate::widgets::QuickSlot {
                     cmd: std::env::var(q.env).unwrap_or_else(|_| q.default.to_string()),
                     icon: None,
-                    label: q.label.chars().next().map_or('?', |c| c.to_ascii_uppercase()),
+                    label: q
+                        .label
+                        .chars()
+                        .next()
+                        .map_or('?', |c| c.to_ascii_uppercase()),
                     show: q.show,
                 })
                 .collect(),
             parents: std::collections::HashMap::new(),
             wallpaper_path,
+            drag: None,
+            hscroll_frac: 0.0,
+            animate: false,
+            anim: None,
+            prev_frame_rect: std::collections::HashMap::new(),
             dh,
             handle,
             signal: event_loop.get_signal(),
@@ -268,7 +296,10 @@ impl Comp {
                     // SAFETY: the display is never dropped or replaced while
                     // this source lives; calloop owns it for the loop's life.
                     unsafe {
-                        display.get_mut().dispatch_clients(comp).expect("dispatch clients");
+                        display
+                            .get_mut()
+                            .dispatch_clients(comp)
+                            .expect("dispatch clients");
                     }
                     Ok(PostAction::Continue)
                 },
@@ -287,11 +318,16 @@ impl Comp {
         smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         Point<f64, Logical>,
     )> {
-        self.space.element_under(pos).and_then(|(window, location)| {
-            window
-                .surface_under(pos - location.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
-                .map(|(s, p)| (s, (p.to_f64() + location.to_f64())))
-        })
+        self.space
+            .element_under(pos)
+            .and_then(|(window, location)| {
+                window
+                    .surface_under(
+                        pos - location.to_f64(),
+                        smithay::desktop::WindowSurfaceType::ALL,
+                    )
+                    .map(|(s, p)| (s, (p.to_f64() + location.to_f64())))
+            })
     }
 
     /// The split-layout area: the output minus the bottom taskbar strip
@@ -326,8 +362,14 @@ impl Comp {
 
         // Every on-screen leaf gets a placement (chrome draws empty and
         // minimized frames too); only occupied, unminimized ones map a
-        // window.
+        // window. frame_rects keeps every leaf's rect, on-screen or not,
+        // so a leaf scrolled out of view keeps a sane animation start /
+        // hit rect when it returns.
         self.placed.clear();
+        let mut frame_rects: std::collections::HashMap<
+            crate::tree::NodeId,
+            crate::widgets::FrameRect,
+        > = std::collections::HashMap::new();
         let mut shown: Vec<crate::tree::Win> = Vec::new();
         for leaf in self.state.tree.collect_leaves() {
             let Some(geo) = geos.get(&leaf).copied() else {
@@ -339,6 +381,7 @@ impl Comp {
                 w: geo.w.max(1),
                 h: geo.h.max(1),
             };
+            frame_rects.insert(leaf, frame);
             if frame.x + frame.w <= wa.x || frame.x >= wa.x + wa.w {
                 continue;
             }
@@ -408,7 +451,37 @@ impl Comp {
             &leaves,
         );
 
-        self.chrome_dirty = true;
+        // Layout-changing actions animate: capture start rects and let the
+        // redraw tick interpolate the chrome. Client windows are already
+        // configured at their final rects above, so focus delivered right
+        // after this arrange targets a mapped window; only the composited
+        // chrome slides. A non-animated arrange cancels any transition in
+        // flight (it describes a newer layout).
+        if std::mem::take(&mut self.animate) {
+            let placed_from = self
+                .placed
+                .iter()
+                .map(|p| {
+                    let from = self.prev_frame_rect.get(&p.leaf).copied().unwrap_or(
+                        crate::widgets::FrameRect {
+                            x: p.target.x,
+                            y: p.target.y,
+                            w: 1,
+                            h: p.target.h,
+                        },
+                    );
+                    (from, *p)
+                })
+                .collect();
+            self.anim = Some(chrome::LayoutAnim {
+                start: std::time::Instant::now(),
+                placed: placed_from,
+            });
+        } else {
+            self.anim = None;
+            self.chrome_dirty = true;
+        }
+        self.prev_frame_rect = frame_rects;
         self.refocus();
     }
 
@@ -437,7 +510,8 @@ impl Comp {
             size,
             refresh: 60_000,
         };
-        self.output.change_current_state(Some(mode), None, None, None);
+        self.output
+            .change_current_state(Some(mode), None, None, None);
         self.output.set_preferred(mode);
         if let Some(path) = self.wallpaper_path.clone() {
             self.chrome.set_wallpaper(&path, size.w, size.h);
@@ -446,7 +520,15 @@ impl Comp {
 
     /// Composite one frame and pace clients' frame callbacks.
     pub fn redraw(&mut self) {
-        if self.chrome_dirty {
+        // Scroll glide: step toward the target and re-place windows.
+        if self.state.scroll_animating() {
+            self.state.step_scroll();
+            self.arrange();
+        }
+        if self.anim.is_some() {
+            self.step_animation();
+            self.chrome_dirty = false;
+        } else if self.chrome_dirty {
             self.compose_chrome();
             self.chrome_dirty = false;
         }

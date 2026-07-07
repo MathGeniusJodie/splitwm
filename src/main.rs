@@ -21,11 +21,11 @@ mod render;
 mod shell;
 #[allow(dead_code)]
 mod state;
-mod widgets;
 #[allow(dead_code)]
 mod theme;
 #[allow(dead_code)]
 mod tree;
+mod widgets;
 
 /// A `pixel-graphics` palette index, threaded through as the accent-colour
 /// representation for splits so border rendering can palette-swap them.

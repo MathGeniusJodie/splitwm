@@ -8,8 +8,8 @@
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
-use crate::tree::{Rect, Win};
 use crate::theme;
+use crate::tree::{Rect, Win};
 
 #[derive(Default)]
 pub struct Managed {

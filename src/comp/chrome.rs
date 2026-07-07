@@ -8,20 +8,20 @@
 //! via take_screen_base/retire_frame, and the memory buffer is rewritten
 //! only when the chrome is actually dirty.
 
-use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::element::memory::{
-    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
-};
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::desktop::space::SpaceRenderElements;
-use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::render_elements;
-use smithay::utils::{Buffer as BufferCoords, Rectangle, Transform};
 use super::Comp;
 use crate::render::{BtnIcon, LeafView, TitleInfo};
 use crate::theme;
 use crate::tree::Dir;
 use crate::widgets::{leaf_meta, BtnKind, Placement};
+use smithay::backend::allocator::Fourcc;
+use smithay::backend::renderer::element::memory::{
+    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
+};
+use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::desktop::space::SpaceRenderElements;
+use smithay::render_elements;
+use smithay::utils::{Buffer as BufferCoords, Rectangle, Transform};
 
 render_elements! {
     /// Everything one output frame is made of, front-to-back: client
@@ -31,10 +31,82 @@ render_elements! {
     Chrome=MemoryRenderBufferRenderElement<GlesRenderer>,
 }
 
+/// ease-out-back: slight overshoot past the target, then settle.
+fn ease_out_back(t: f32) -> f32 {
+    let c = 1.1_f32;
+    let t = t - 1.0;
+    let inner = (c + 1.0).mul_add(t, c);
+    (t * t).mul_add(inner, 1.0)
+}
+
+fn lerp_rect(
+    a: crate::widgets::FrameRect,
+    b: crate::widgets::FrameRect,
+    p: f32,
+) -> crate::widgets::FrameRect {
+    let l = |s: i32, e: i32| s + ((e - s) as f32 * p) as i32;
+    crate::widgets::FrameRect {
+        x: l(a.x, b.x),
+        y: l(a.y, b.y),
+        w: l(a.w, b.w).max(1),
+        h: l(a.h, b.h).max(1),
+    }
+}
+
+/// How long a layout transition takes, wall-clock.
+const ANIM_DURATION: std::time::Duration = std::time::Duration::from_millis(280);
+
+/// An in-flight layout animation, stepped by the redraw tick (~60 Hz).
+/// Client windows are already at their final rects (placed by the arrange
+/// that started this); only the composited chrome interpolates.
+pub struct LayoutAnim {
+    pub start: std::time::Instant,
+    /// Each animated leaf's start rect paired with its target placement.
+    pub placed: Vec<(crate::widgets::FrameRect, Placement)>,
+}
+
 impl Comp {
     /// Redraw the underlay for the current placements. Runs only when
     /// something chrome-visible changed (`chrome_dirty`), not per frame.
     pub fn compose_chrome(&mut self) {
+        let placed = self.placed.clone();
+        self.compose_frame(&placed, true);
+    }
+
+    /// Advance the in-flight layout animation by wall-clock time (called
+    /// once per redraw tick). The final frame recomposes with widgets,
+    /// matching what a non-animated arrange would have left.
+    pub fn step_animation(&mut self) {
+        let Some(anim) = &self.anim else {
+            return;
+        };
+        let t = (anim.start.elapsed().as_secs_f32() / ANIM_DURATION.as_secs_f32()).min(1.0);
+        if t >= 1.0 {
+            self.finish_animation();
+            return;
+        }
+        let e = ease_out_back(t);
+        let interp: Vec<Placement> = anim
+            .placed
+            .iter()
+            .map(|&(from, p)| Placement {
+                target: lerp_rect(from, p.target, e),
+                ..p
+            })
+            .collect();
+        self.compose_frame(&interp, false);
+    }
+
+    /// Snap an in-flight animation to its end state (chrome with widgets).
+    pub fn finish_animation(&mut self) {
+        if self.anim.take().is_some() {
+            self.compose_chrome();
+        }
+    }
+
+    /// Composite the wallpaper, every placed leaf's chrome, the taskbar,
+    /// and (unless mid-animation) the widgets, into the chrome buffer.
+    fn compose_frame(&mut self, placed: &[Placement], widgets: bool) {
         let size = self
             .output
             .current_mode()
@@ -43,72 +115,69 @@ impl Comp {
         let (w, h) = (size.w.max(1), size.h.max(1));
 
         let mut fb = self.chrome.take_screen_base(w as u32, h as u32);
-        for p in &self.placed {
+        for p in placed {
             let view = self.leaf_view(p);
             self.chrome
                 .draw_leaf(&mut fb, p.target.x, p.target.y, &view);
             if p.focused {
-                self.chrome.draw_focus_outline(
+                self.chrome
+                    .draw_focus_outline(&mut fb, p.target.x, p.target.y, p.target.w, p.target.h);
+            }
+        }
+
+        if widgets {
+            // "+" insert buttons in the gaps and at the canvas edges.
+            for (r, _) in &self.widgets.plus_regions {
+                crate::render::draw_plus(&mut fb, r.x + r.w / 2, r.y + r.h / 2, r.w);
+            }
+
+            // Split-control buttons over each titlebar. A minimized leaf's
+            // region is the whole frame (a single restore button); draw_leaf's
+            // winmin art already shows it, so no glyph is drawn on top.
+            for (r, leaf, kind) in &self.widgets.btn_regions {
+                let Some(p) = placed.iter().find(|p| p.leaf == *leaf) else {
+                    continue;
+                };
+                let meta = leaf_meta(
+                    &self.state.tree,
+                    self.parents.get(leaf).copied(),
+                    *leaf,
+                    p.target,
+                );
+                if meta.minimized {
+                    continue;
+                }
+                let (icon, disabled) = match kind {
+                    // A V-branch parent means this leaf collapses to a row
+                    // (short/wide) when minimized, so its button previews that
+                    // with the horizontal glyph.
+                    BtnKind::Minimize => (
+                        if meta.parent_dir == Some(Dir::V) {
+                            BtnIcon::MinimizeH
+                        } else {
+                            BtnIcon::Minimize
+                        },
+                        meta.parent_dir.is_none(),
+                    ),
+                    BtnKind::Split => (
+                        if meta.wider {
+                            BtnIcon::VSplit
+                        } else {
+                            BtnIcon::HSplit
+                        },
+                        !meta.can_split,
+                    ),
+                    BtnKind::Close => (BtnIcon::Close, meta.parent_dir.is_none()),
+                };
+                self.chrome.draw_button(
                     &mut fb,
-                    p.target.x,
-                    p.target.y,
-                    p.target.w,
-                    p.target.h,
+                    r.x + r.w / 2,
+                    r.y + r.h / 2,
+                    icon,
+                    disabled,
+                    crate::widgets::leaf_color_index(&self.state.tree, *leaf),
                 );
             }
-        }
-
-        // "+" insert buttons in the gaps and at the canvas edges.
-        for (r, _) in &self.widgets.plus_regions {
-            crate::render::draw_plus(&mut fb, r.x + r.w / 2, r.y + r.h / 2, r.w);
-        }
-
-        // Split-control buttons over each titlebar. A minimized leaf's
-        // region is the whole frame (a single restore button); draw_leaf's
-        // winmin art already shows it, so no glyph is drawn on top.
-        for (r, leaf, kind) in &self.widgets.btn_regions {
-            let Some(p) = self.placed.iter().find(|p| p.leaf == *leaf) else {
-                continue;
-            };
-            let meta = leaf_meta(
-                &self.state.tree,
-                self.parents.get(leaf).copied(),
-                *leaf,
-                p.target,
-            );
-            if meta.minimized {
-                continue;
-            }
-            let (icon, disabled) = match kind {
-                // A V-branch parent means this leaf collapses to a row
-                // (short/wide) when minimized, so its button previews that
-                // with the horizontal glyph.
-                BtnKind::Minimize => (
-                    if meta.parent_dir == Some(Dir::V) {
-                        BtnIcon::MinimizeH
-                    } else {
-                        BtnIcon::Minimize
-                    },
-                    meta.parent_dir.is_none(),
-                ),
-                BtnKind::Split => (
-                    if meta.wider {
-                        BtnIcon::VSplit
-                    } else {
-                        BtnIcon::HSplit
-                    },
-                    !meta.can_split,
-                ),
-                BtnKind::Close => (BtnIcon::Close, meta.parent_dir.is_none()),
-            };
-            self.chrome.draw_button(
-                &mut fb,
-                r.x + r.w / 2,
-                r.y + r.h / 2,
-                icon,
-                disabled,
-                crate::widgets::leaf_color_index(&self.state.tree, *leaf),
-            );
         }
 
         // Bottom bar: one tile per managed window; split-visible windows
@@ -116,12 +185,9 @@ impl Comp {
         // close badge. Icons arrive in M8; the class-initial glyph stands
         // in meanwhile.
         for t in &self.widgets.taskbar_regions {
-            let label = self
-                .managed
-                .get(t.win)
-                .map_or('?', |w| {
-                    crate::widgets::label_from_class(&crate::shell::toplevel_app_id(w))
-                });
+            let label = self.managed.get(t.win).map_or('?', |w| {
+                crate::widgets::label_from_class(&crate::shell::toplevel_app_id(w))
+            });
             self.chrome
                 .draw_taskbar_item(&mut fb, t.rect, None, label, t.accent, t.in_split);
             crate::render::draw_close_badge(&mut fb, t.close.x, t.close.y, t.close.w);

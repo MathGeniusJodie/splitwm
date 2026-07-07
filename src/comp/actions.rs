@@ -140,7 +140,7 @@ impl Comp {
 
     /// Fire-and-forget spawn through the shell, like master's fallback
     /// path. The systemd-run transient-scope launcher ports in M8.
-    fn spawn(&self, cmd: &str) {
+    pub fn spawn(&self, cmd: &str) {
         if let Err(err) = std::process::Command::new("/bin/sh")
             .arg("-c")
             .arg(cmd)

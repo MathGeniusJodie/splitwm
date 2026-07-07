@@ -137,7 +137,12 @@ impl XdgShellHandler for Comp {
         }
     }
 
-    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
         surface.with_pending_state(|state| {
             state.geometry = positioner.get_geometry();
             state.positioner = positioner;
@@ -197,7 +202,12 @@ impl DmabufHandler for Comp {
         &mut self.dmabuf_state
     }
 
-    fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: smithay::backend::allocator::dmabuf::Dmabuf, notifier: ImportNotifier) {
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: smithay::backend::allocator::dmabuf::Dmabuf,
+        notifier: ImportNotifier,
+    ) {
         if self.backend.renderer().import_dmabuf(&dmabuf, None).is_ok() {
             let _ = notifier.successful::<Comp>();
         } else {

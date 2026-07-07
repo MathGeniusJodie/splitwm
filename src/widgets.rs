@@ -188,11 +188,7 @@ pub fn compute_taskbar(
     // Which quick-launch entries are visible right now: each entry's
     // `ShowWhen` rule is keyed on whether a managed window's class
     // matches it.
-    let running = |class: &str| {
-        clients
-            .iter()
-            .any(|(_, c)| c.eq_ignore_ascii_case(class))
-    };
+    let running = |class: &str| clients.iter().any(|(_, c)| c.eq_ignore_ascii_case(class));
     let visible: Vec<usize> = (0..quick.len())
         .filter(|&i| match quick[i].show {
             theme::ShowWhen::Always => true,

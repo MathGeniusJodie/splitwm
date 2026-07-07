@@ -38,8 +38,7 @@ impl Comp {
                             let raw = code.raw();
                             match key_state {
                                 KeyState::Pressed => {
-                                    let sym =
-                                        handle.raw_syms().first().map_or(0, |s| s.raw());
+                                    let sym = handle.raw_syms().first().map_or(0, |s| s.raw());
                                     let Some(action) =
                                         crate::comp::actions::binding_action(mods, sym)
                                     else {
@@ -77,7 +76,14 @@ impl Comp {
                     .expect("output is mapped");
                 let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
                 let serial = SERIAL_COUNTER.next_serial();
-                let under = self.surface_under(pos);
+                // An active gap/edge drag consumes motion: the pointer
+                // still moves (for the drag math) but no client gets
+                // enter/motion until the button releases.
+                let under = if self.on_drag_motion(pos) {
+                    None
+                } else {
+                    self.surface_under(pos)
+                };
                 let pointer = self.seat.get_pointer().expect("seat has a pointer");
                 pointer.motion(
                     self,
@@ -91,25 +97,36 @@ impl Comp {
                 pointer.frame(self);
             }
             InputEvent::PointerButton { event } => {
+                const BTN_LEFT: u32 = 0x110;
+                const BTN_RIGHT: u32 = 0x111;
                 let pointer = self.seat.get_pointer().expect("seat has a pointer");
-                let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
                 let serial = SERIAL_COUNTER.next_serial();
+                let pos = pointer.current_location();
 
-                if event.state() == ButtonState::Pressed && !pointer.is_grabbed() {
-                    // Click-to-focus: clicking a window focuses its leaf in
-                    // the layout, which in turn drives keyboard focus.
+                if event.state() == ButtonState::Released {
+                    self.end_drag();
+                } else if !pointer.is_grabbed() {
                     let clicked = self
                         .space
-                        .element_under(pointer.current_location())
+                        .element_under(pos)
                         .map(|(w, _)| w.clone())
                         .and_then(|w| self.managed.win_for_window(&w));
-                    if let Some(win) = clicked {
-                        if let Some(leaf) = self.state.tree.find_leaf_for_client(win) {
-                            self.state.focus_leaf(leaf);
+                    match clicked {
+                        // Click-to-focus on a client window (button 1),
+                        // through the layout like master's activate_client.
+                        Some(win) => {
+                            if event.button_code() == BTN_LEFT {
+                                self.state.activate_client(win);
+                                self.arrange();
+                            }
                         }
+                        // Chrome click: hit-test dispatch (buttons, tiles,
+                        // handles, "+", titles...).
+                        None if matches!(event.button_code(), BTN_LEFT | BTN_RIGHT) => {
+                            self.on_chrome_button(pos, event.button_code() == BTN_RIGHT);
+                        }
+                        None => {}
                     }
-                    let _ = keyboard;
-                    self.refocus();
                 }
 
                 pointer.button(
@@ -124,30 +141,57 @@ impl Comp {
                 pointer.frame(self);
             }
             InputEvent::PointerAxis { event } => {
+                let pointer = self.seat.get_pointer().expect("seat has a pointer");
                 let horizontal = event.amount(Axis::Horizontal).unwrap_or_else(|| {
                     event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0
                 });
                 let vertical = event.amount(Axis::Vertical).unwrap_or_else(|| {
                     event.amount_v120(Axis::Vertical).unwrap_or(0.0) * 15.0 / 120.0
                 });
+
+                // Horizontal swipes pan the canvas (always over chrome,
+                // Mod4-gated over a client); a panned swipe is consumed,
+                // never also delivered to the client underneath.
+                let over_client = self
+                    .space
+                    .element_under(pointer.current_location())
+                    .is_some();
+                let mut panned = false;
+                if horizontal != 0.0 && self.hscroll_allowed(over_client) {
+                    // Wheel-click units: discrete steps when the device
+                    // reports them, else continuous units at libinput's
+                    // ~15/click scale.
+                    let clicks = event
+                        .amount_v120(Axis::Horizontal)
+                        .map_or(horizontal / 15.0, |v| v / 120.0);
+                    self.apply_hscroll(clicks);
+                    panned = true;
+                }
+
                 let mut frame = AxisFrame::new(event.time_msec()).source(event.source());
-                if horizontal != 0.0 {
+                let mut any = false;
+                if horizontal != 0.0 && !panned {
                     frame = frame.value(Axis::Horizontal, horizontal);
+                    any = true;
                 }
                 if vertical != 0.0 {
                     frame = frame.value(Axis::Vertical, vertical);
+                    any = true;
                 }
                 if event.source() == AxisSource::Finger {
                     if event.amount(Axis::Horizontal) == Some(0.0) {
                         frame = frame.stop(Axis::Horizontal);
+                        any = true;
                     }
                     if event.amount(Axis::Vertical) == Some(0.0) {
                         frame = frame.stop(Axis::Vertical);
+                        any = true;
                     }
                 }
-                let pointer = self.seat.get_pointer().expect("seat has a pointer");
-                pointer.axis(self, frame);
-                pointer.frame(self);
+                if any {
+                    pointer.axis(self, frame);
+                    pointer.frame(self);
+                }
             }
             _ => {}
         }
