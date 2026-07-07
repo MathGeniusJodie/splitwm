@@ -21,6 +21,7 @@ mod render;
 mod shell;
 #[allow(dead_code)]
 mod state;
+mod widgets;
 #[allow(dead_code)]
 mod theme;
 #[allow(dead_code)]

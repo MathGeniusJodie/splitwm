@@ -59,6 +59,34 @@ impl Managed {
     }
 }
 
+/// The xdg toplevel's current title, or empty when unset.
+pub fn toplevel_title(window: &Window) -> std::rc::Rc<str> {
+    read_toplevel_data(window, |d| d.title.clone()).into()
+}
+
+/// The xdg toplevel's app_id — the Wayland analogue of `WM_CLASS`,
+/// grouping windows of one app for labels/icons/quick-launch rules.
+pub fn toplevel_app_id(window: &Window) -> String {
+    read_toplevel_data(window, |d| d.app_id.clone())
+}
+
+fn read_toplevel_data(
+    window: &Window,
+    f: impl Fn(&smithay::wayland::shell::xdg::XdgToplevelSurfaceRoleAttributes) -> Option<String>,
+) -> String {
+    window
+        .toplevel()
+        .and_then(|t| {
+            smithay::wayland::compositor::with_states(t.wl_surface(), |states| {
+                states
+                    .data_map
+                    .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                    .and_then(|d| d.lock().ok().and_then(|d| f(&d)))
+            })
+        })
+        .unwrap_or_default()
+}
+
 /// Client-area rect inside a leaf's chrome frame: below the titlebar,
 /// inside the side/bottom borders. `min` lets a client's size floor
 /// overhang the frame rather than be clipped (matching master).

@@ -62,7 +62,18 @@ pub struct Comp {
     pub chrome_size: (i32, i32),
     pub chrome_dirty: bool,
     /// On-screen leaves as of the last arrange (chrome + hit regions).
-    pub placed: Vec<chrome::Placement>,
+    pub placed: Vec<crate::widgets::Placement>,
+    /// Every hit-testable widget rect for the current layout, rebuilt as
+    /// one unit each arrange.
+    pub widgets: crate::widgets::Widgets,
+    /// Taskbar quick-launch entries, resolved once at startup (icons and
+    /// .desktop resolution arrive with M8).
+    pub quick: Vec<crate::widgets::QuickSlot>,
+    /// Parent lookup for every node, rebuilt from one arena walk per
+    /// arrange, so per-event consumers skip `Tree::find_parent`'s scan.
+    pub parents: std::collections::HashMap<crate::tree::NodeId, (crate::tree::NodeId, usize)>,
+    /// `SPLITWM_WALLPAPER`, kept so an output resize can rescale it.
+    pub wallpaper_path: Option<String>,
 
     // Wayland plumbing.
     pub dh: DisplayHandle,
@@ -172,12 +183,21 @@ impl Comp {
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
 
+        let mut chrome = crate::render::Renderer::new();
+        let wallpaper_path = std::env::var("SPLITWM_WALLPAPER").ok();
+        if let Some(path) = &wallpaper_path {
+            let size = backend.window_size();
+            if !chrome.set_wallpaper(path, size.w, size.h) {
+                tracing::warn!("could not load wallpaper {path}");
+            }
+        }
+
         Comp {
             backend,
             output,
             damage_tracker,
             clear,
-            chrome: crate::render::Renderer::new(),
+            chrome,
             chrome_buf: smithay::backend::renderer::element::memory::MemoryRenderBuffer::new(
                 smithay::backend::allocator::Fourcc::Argb8888,
                 (1, 1),
@@ -188,6 +208,18 @@ impl Comp {
             chrome_size: (0, 0),
             chrome_dirty: true,
             placed: Vec::new(),
+            widgets: crate::widgets::Widgets::default(),
+            quick: crate::theme::QUICK
+                .iter()
+                .map(|q| crate::widgets::QuickSlot {
+                    cmd: std::env::var(q.env).unwrap_or_else(|_| q.default.to_string()),
+                    icon: None,
+                    label: q.label.chars().next().map_or('?', |c| c.to_ascii_uppercase()),
+                    show: q.show,
+                })
+                .collect(),
+            parents: std::collections::HashMap::new(),
+            wallpaper_path,
             dh,
             handle,
             signal: event_loop.get_signal(),
@@ -313,10 +345,10 @@ impl Comp {
             let leaf_data = self.state.tree.leaf(leaf);
             let minimized = leaf_data.is_some_and(|l| l.minimized);
             let client = leaf_data.and_then(|l| l.client);
-            self.placed.push(chrome::Placement {
+            self.placed.push(crate::widgets::Placement {
                 leaf,
-                frame,
-                client,
+                target: frame,
+                active_client: client,
                 focused: focused == leaf,
             });
             let Some(c) = client else {
@@ -336,8 +368,6 @@ impl Comp {
             self.space.map_element(window, (cx, cy), false);
             shown.push(c);
         }
-        self.chrome_dirty = true;
-
         let to_hide: Vec<Window> = self
             .managed
             .iter()
@@ -348,6 +378,37 @@ impl Comp {
             self.space.unmap_elem(window);
         }
 
+        // Hit regions and taskbar tiles for this layout, as one unit.
+        self.parents = self.state.tree.parent_map();
+        self.widgets.clear();
+        crate::widgets::compute_leaf_widgets(&mut self.widgets, &self.state.tree, &self.placed);
+        crate::widgets::compute_boundary_widgets(&mut self.widgets, &self.state, wa);
+        let full = crate::tree::Rect {
+            x: 0,
+            y: 0,
+            w: wa.w,
+            h: wa.h + crate::theme::TASKBAR_H,
+        };
+        let app_ids: Vec<(crate::tree::Win, String)> = self
+            .managed
+            .iter()
+            .map(|(w, window)| (w, crate::shell::toplevel_app_id(window)))
+            .collect();
+        let classes: Vec<(crate::tree::Win, &str)> =
+            app_ids.iter().map(|(w, s)| (*w, s.as_str())).collect();
+        let bar_order: Vec<crate::tree::Win> = self.managed.iter().map(|(w, _)| w).collect();
+        let leaves = self.state.tree.collect_leaves();
+        crate::widgets::compute_taskbar(
+            &mut self.widgets,
+            &self.state.tree,
+            &classes,
+            &self.quick,
+            &bar_order,
+            full,
+            &leaves,
+        );
+
+        self.chrome_dirty = true;
         self.refocus();
     }
 
@@ -378,6 +439,9 @@ impl Comp {
         };
         self.output.change_current_state(Some(mode), None, None, None);
         self.output.set_preferred(mode);
+        if let Some(path) = self.wallpaper_path.clone() {
+            self.chrome.set_wallpaper(&path, size.w, size.h);
+        }
     }
 
     /// Composite one frame and pace clients' frame callbacks.

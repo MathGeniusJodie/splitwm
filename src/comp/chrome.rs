@@ -17,13 +17,11 @@ use smithay::desktop::space::SpaceRenderElements;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::render_elements;
 use smithay::utils::{Buffer as BufferCoords, Rectangle, Transform};
-use smithay::wayland::compositor::with_states;
-use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
-
 use super::Comp;
-use crate::render::{LeafView, TitleInfo};
+use crate::render::{BtnIcon, LeafView, TitleInfo};
 use crate::theme;
-use crate::tree::{NodeId, Rect, Win};
+use crate::tree::Dir;
+use crate::widgets::{leaf_meta, BtnKind, Placement};
 
 render_elements! {
     /// Everything one output frame is made of, front-to-back: client
@@ -31,17 +29,6 @@ render_elements! {
     pub OutputElement<=GlesRenderer>;
     Window=SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
     Chrome=MemoryRenderBufferRenderElement<GlesRenderer>,
-}
-
-/// One on-screen leaf's placement, captured by `arrange` for the chrome
-/// composer and (from M5) the pointer's hit regions. Present for every
-/// visible leaf — empty and minimized ones still draw chrome.
-pub struct Placement {
-    pub leaf: NodeId,
-    /// Screen-space frame rect (scroll already applied).
-    pub frame: Rect,
-    pub client: Option<Win>,
-    pub focused: bool,
 }
 
 impl Comp {
@@ -58,11 +45,102 @@ impl Comp {
         let mut fb = self.chrome.take_screen_base(w as u32, h as u32);
         for p in &self.placed {
             let view = self.leaf_view(p);
-            self.chrome.draw_leaf(&mut fb, p.frame.x, p.frame.y, &view);
+            self.chrome
+                .draw_leaf(&mut fb, p.target.x, p.target.y, &view);
             if p.focused {
-                self.chrome
-                    .draw_focus_outline(&mut fb, p.frame.x, p.frame.y, p.frame.w, p.frame.h);
+                self.chrome.draw_focus_outline(
+                    &mut fb,
+                    p.target.x,
+                    p.target.y,
+                    p.target.w,
+                    p.target.h,
+                );
             }
+        }
+
+        // "+" insert buttons in the gaps and at the canvas edges.
+        for (r, _) in &self.widgets.plus_regions {
+            crate::render::draw_plus(&mut fb, r.x + r.w / 2, r.y + r.h / 2, r.w);
+        }
+
+        // Split-control buttons over each titlebar. A minimized leaf's
+        // region is the whole frame (a single restore button); draw_leaf's
+        // winmin art already shows it, so no glyph is drawn on top.
+        for (r, leaf, kind) in &self.widgets.btn_regions {
+            let Some(p) = self.placed.iter().find(|p| p.leaf == *leaf) else {
+                continue;
+            };
+            let meta = leaf_meta(
+                &self.state.tree,
+                self.parents.get(leaf).copied(),
+                *leaf,
+                p.target,
+            );
+            if meta.minimized {
+                continue;
+            }
+            let (icon, disabled) = match kind {
+                // A V-branch parent means this leaf collapses to a row
+                // (short/wide) when minimized, so its button previews that
+                // with the horizontal glyph.
+                BtnKind::Minimize => (
+                    if meta.parent_dir == Some(Dir::V) {
+                        BtnIcon::MinimizeH
+                    } else {
+                        BtnIcon::Minimize
+                    },
+                    meta.parent_dir.is_none(),
+                ),
+                BtnKind::Split => (
+                    if meta.wider {
+                        BtnIcon::VSplit
+                    } else {
+                        BtnIcon::HSplit
+                    },
+                    !meta.can_split,
+                ),
+                BtnKind::Close => (BtnIcon::Close, meta.parent_dir.is_none()),
+            };
+            self.chrome.draw_button(
+                &mut fb,
+                r.x + r.w / 2,
+                r.y + r.h / 2,
+                icon,
+                disabled,
+                crate::widgets::leaf_color_index(&self.state.tree, *leaf),
+            );
+        }
+
+        // Bottom bar: one tile per managed window; split-visible windows
+        // get an accent highlight box, and every tile carries a corner
+        // close badge. Icons arrive in M8; the class-initial glyph stands
+        // in meanwhile.
+        for t in &self.widgets.taskbar_regions {
+            let label = self
+                .managed
+                .get(t.win)
+                .map_or('?', |w| {
+                    crate::widgets::label_from_class(&crate::shell::toplevel_app_id(w))
+                });
+            self.chrome
+                .draw_taskbar_item(&mut fb, t.rect, None, label, t.accent, t.in_split);
+            crate::render::draw_close_badge(&mut fb, t.close.x, t.close.y, t.close.w);
+        }
+        if let Some(sep) = self.widgets.taskbar_sep {
+            crate::render::draw_taskbar_sep(&mut fb, sep);
+        }
+        for &(r, i) in &self.widgets.quick_regions {
+            let Some(q) = self.quick.get(i) else {
+                continue;
+            };
+            self.chrome.draw_taskbar_item(
+                &mut fb,
+                r,
+                q.icon.as_deref(),
+                q.label,
+                theme::palette_color::CREAM,
+                false,
+            );
         }
 
         if self.chrome_size != (w, h) {
@@ -85,39 +163,23 @@ impl Comp {
     /// What a leaf's chrome shows: accent, title, minimized state. Icons
     /// arrive in M8 (`TitleInfo.icon` stays `None` until then).
     fn leaf_view(&self, p: &Placement) -> LeafView {
-        let titlebar = p.client.and_then(|c| self.managed.get(c)).map(|window| {
-            let title: std::rc::Rc<str> = window
-                .toplevel()
-                .map(|t| {
-                    with_states(t.wl_surface(), |states| {
-                        states
-                            .data_map
-                            .get::<XdgToplevelSurfaceData>()
-                            .and_then(|d| d.lock().ok().and_then(|d| d.title.clone()))
-                            .unwrap_or_default()
-                    })
-                })
-                .unwrap_or_default()
-                .into();
-            TitleInfo {
-                label: title.chars().next().map_or('?', |c| c.to_ascii_uppercase()),
+        let titlebar = p
+            .active_client
+            .and_then(|c| self.managed.get(c))
+            .map(|window| TitleInfo {
+                label: crate::widgets::label_from_class(&crate::shell::toplevel_app_id(window)),
                 icon: None,
-                title,
-            }
-        });
+                title: crate::shell::toplevel_title(window),
+            });
         LeafView {
-            w: p.frame.w,
-            h: p.frame.h,
+            w: p.target.w,
+            h: p.target.h,
             tb_h: theme::tb_h(),
             bw: theme::BORDER_LEFT,
-            accent_index: self
-                .state
-                .tree
-                .leaf(p.leaf)
-                .map_or(theme::FALLBACK_ACCENT_INDEX, |l| l.color),
+            accent_index: crate::widgets::leaf_color_index(&self.state.tree, p.leaf),
             titlebar,
             minimized: self.state.tree.leaf(p.leaf).is_some_and(|l| l.minimized),
-            buttons: false,
+            buttons: true,
         }
     }
 }
