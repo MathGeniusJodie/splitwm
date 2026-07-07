@@ -71,8 +71,8 @@ fn layer_elements(
 /// One frame's render elements, front-to-back: Overlay layer surfaces
 /// topmost, override-redirect X11 windows (rofi, menus), notification
 /// bubbles, the Top layer, floats with their frame chrome, the
-/// tiled/fullscreen Space, the dock, the Bottom/Background layers, the
-/// chrome underlay behind everything.
+/// tiled/fullscreen Space, the dock, the Bottom layer, the chrome
+/// underlay, the Background layer behind everything.
 pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<OutputElement> {
     use smithay::backend::renderer::element::AsRenderElements as _;
     use smithay::utils::{Logical, Point};
@@ -158,6 +158,13 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
             (Point::<i32, Logical>::from((rect.x, rect.y)) - window.geometry().loc).to_physical(1);
         elements.extend(window.render_elements::<OutputElement>(renderer, loc, 1.0.into(), 1.0));
     }
+    // Bottom layer surfaces (cozyui's native sidebar) sit above the
+    // chrome underlay: the wallpaper is baked into that opaque buffer, so
+    // "above the wallpaper, below the windows" can only mean above the
+    // whole underlay. A zone-respecting panel overlaps no leaf frame —
+    // the exclusive zone already shrank the layout — only the taskbar
+    // rows in its column, exactly like the dock.
+    layer_elements(renderer, &layer_map, Layer::Bottom, &mut elements);
     match MemoryRenderBufferRenderElement::from_buffer(
         renderer,
         (0.0, 0.0),
@@ -170,11 +177,10 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
         Ok(el) => elements.push(OutputElement::Chrome(el)),
         Err(err) => tracing::error!("chrome element: {err}"),
     }
-    // The chrome underlay is splitwm's own background/bottom content
-    // (wallpaper, leaf frames, taskbar) in one opaque buffer; foreign
-    // Bottom/Background layer surfaces stack behind it, where the opaque
-    // underlay occludes them.
-    layer_elements(renderer, &layer_map, Layer::Bottom, &mut elements);
+    // The chrome underlay's wallpaper is this session's background layer;
+    // a foreign Background surface (a wallpaper client) stacks behind the
+    // opaque underlay, occluded, rather than being allowed to cover the
+    // leaf frames and taskbar drawn into the same buffer.
     layer_elements(renderer, &layer_map, Layer::Background, &mut elements);
     elements
 }

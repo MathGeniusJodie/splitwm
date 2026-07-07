@@ -429,11 +429,12 @@ impl Comp {
     )> {
         // Stacking order: Overlay layer surfaces topmost, then
         // override-redirect X11 windows, the Top layer, floats (top of
-        // stack first), the tiled/fullscreen Space, the dock at the
-        // bottom. Bottom/Background layer surfaces get no pointer input:
-        // they render behind the opaque chrome underlay (see
-        // chrome::output_elements), and what can't be seen must not
-        // swallow clicks meant for the chrome.
+        // stack first), the tiled/fullscreen Space, the dock, the Bottom
+        // layer at the bottom — the same front-to-back order
+        // chrome::output_elements renders. Background surfaces get no
+        // pointer input: they render behind the opaque chrome underlay,
+        // and what can't be seen must not swallow clicks meant for the
+        // chrome.
         use smithay::wayland::shell::wlr_layer::Layer;
         if let Some(hit) = self.layer_surface_under(&[Layer::Overlay], pos) {
             return Some(hit);
@@ -470,12 +471,17 @@ impl Comp {
         {
             return Some(hit);
         }
-        let (_, window, d) = self.managed.dock()?;
-        let rect = self.dock_geometry(d);
-        let loc = Point::<i32, Logical>::from((rect.x, rect.y)) - window.geometry().loc;
-        window
-            .surface_under(pos - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
-            .map(|(s, p)| (s, p.to_f64() + loc.to_f64()))
+        if let Some((_, window, d)) = self.managed.dock() {
+            let rect = self.dock_geometry(d);
+            let loc = Point::<i32, Logical>::from((rect.x, rect.y)) - window.geometry().loc;
+            if let Some(hit) = window
+                .surface_under(pos - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
+                .map(|(s, p)| (s, p.to_f64() + loc.to_f64()))
+            {
+                return Some(hit);
+            }
+        }
+        self.layer_surface_under(&[Layer::Bottom], pos)
     }
 
     /// Current output size in pixels. The backend configures a mode before

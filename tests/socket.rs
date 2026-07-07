@@ -588,6 +588,96 @@ fn layer_shell_zone_and_keyboard() {
 }
 
 #[test]
+fn bottom_layer_panel_visible_and_clickable() {
+    // The cozyui contract: a Bottom-layer panel anchored to the right
+    // edge with an exclusive zone shrinks the tiling area, composites
+    // above the opaque chrome underlay (wallpaper included), and takes
+    // the keyboard on click (OnDemand interactivity).
+    const PANEL_W: i32 = 300;
+    const OUTPUT_H: i32 = 800;
+    let mut s = Session::boot();
+    let a = s.open_window();
+    s.wait_until("window tiled", |app| {
+        app.wins[a].activated && app.wins[a].size.0 > 0
+    });
+    s.wait_until("keyboard on the window", |app| app.focus_is(a));
+    let full = s.app.wins[a].size;
+
+    let layer_shell: zwlr_layer_shell_v1::ZwlrLayerShellV1 = s
+        .globals
+        .bind(&s.qh, 1..=4, ())
+        .expect("bind zwlr_layer_shell_v1");
+    let surface = s.compositor.create_surface(&s.qh, ());
+    let layer = layer_shell.get_layer_surface(
+        &surface,
+        None,
+        zwlr_layer_shell_v1::Layer::Bottom,
+        "splitwm-test-sidebar".into(),
+        &s.qh,
+        (),
+    );
+    layer.set_size(PANEL_W as u32, 0);
+    layer.set_anchor(
+        zwlr_layer_surface_v1::Anchor::Top
+            | zwlr_layer_surface_v1::Anchor::Bottom
+            | zwlr_layer_surface_v1::Anchor::Right,
+    );
+    layer.set_exclusive_zone(PANEL_W);
+    layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand);
+    surface.commit();
+    s.wait_until("layer surface configured", |app| app.layer_configures > 0);
+
+    // A solid red full-strip buffer, so the screenshot can prove the
+    // panel's pixels — not the wallpaper — fill the reserved strip.
+    let shm: wl_shm::WlShm = s.globals.bind(&s.qh, 1..=1, ()).expect("bind wl_shm");
+    let file = tempfile::tempfile().expect("shm backing file");
+    let len = PANEL_W * OUTPUT_H * 4;
+    // Argb8888 little-endian: B, G, R, A.
+    let red: Vec<u8> = [0u8, 0, 255, 255].repeat((PANEL_W * OUTPUT_H) as usize);
+    (&file).write_all(&red).expect("fill shm with red");
+    let pool = shm.create_pool(file.as_fd(), len, &s.qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        PANEL_W,
+        OUTPUT_H,
+        PANEL_W * 4,
+        wl_shm::Format::Argb8888,
+        &s.qh,
+        (),
+    );
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+    s.wait_until("window shrinks by the exclusive zone", |app| {
+        app.wins[a].size.0 > 0 && app.wins[a].size.0 <= full.0 - PANEL_W + 50
+    });
+
+    // Sample mid-strip. `.rgba` makes `shot` write raw R,G,B,A rows, so
+    // the assertion reads bytes instead of parsing encoder output.
+    let (px, py) = (OUTPUT_W - PANEL_W / 2, OUTPUT_H / 2);
+    let path = std::env::temp_dir().join(format!("splitwm-test-bottom-{}.rgba", std::process::id()));
+    let path = path.to_str().expect("utf-8 temp path").to_string();
+    s.wm.cmd(&format!("shot {path}"));
+    let frame = std::fs::read(&path).expect("read screenshot");
+    std::fs::remove_file(&path).ok();
+    let at = ((py * OUTPUT_W + px) * 4) as usize;
+    assert_eq!(
+        &frame[at..at + 4],
+        &[255, 0, 0, 255],
+        "the panel strip should show the panel's pixels at ({px}, {py})"
+    );
+
+    // OnDemand keyboard: a click inside the strip hands the panel the
+    // keyboard; a click back on the tiled client reclaims it.
+    let layer_id = surface.id();
+    s.wm.cmd(&format!("click {px} {py}"));
+    s.wait_until("click hands the panel the keyboard", |app| {
+        app.focused.as_ref() == Some(&layer_id)
+    });
+    s.wm.cmd("click 40 40");
+    s.wait_until("keyboard returns to the tiled window", |app| app.focus_is(a));
+}
+
+#[test]
 fn sigterm_ends_the_session() {
     // No quit binding, faithful to master: SIGTERM is the only way out.
     let mut s = Session::boot();
