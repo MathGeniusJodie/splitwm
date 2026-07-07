@@ -190,8 +190,15 @@ impl Comp {
             let label = self.managed.get(t.win).map_or('?', |w| {
                 crate::widgets::label_from_class(&crate::shell::toplevel_app_id(w))
             });
-            self.chrome
-                .draw_taskbar_item(&mut fb, t.rect, None, label, t.accent, t.in_split);
+            let icon = self.icon_for(t.win);
+            self.chrome.draw_taskbar_item(
+                &mut fb,
+                t.rect,
+                icon.as_deref(),
+                label,
+                t.accent,
+                t.in_split,
+            );
             crate::render::draw_close_badge(&mut fb, t.close.x, t.close.y, t.close.w);
         }
         if let Some(sep) = self.widgets.taskbar_sep {
@@ -233,10 +240,10 @@ impl Comp {
     fn leaf_view(&self, p: &Placement) -> LeafView {
         let titlebar = p
             .active_client
-            .and_then(|c| self.managed.get(c))
-            .map(|window| TitleInfo {
+            .and_then(|c| self.managed.get(c).map(|w| (c, w)))
+            .map(|(c, window)| TitleInfo {
                 label: crate::widgets::label_from_class(&crate::shell::toplevel_app_id(window)),
-                icon: None,
+                icon: self.icon_for(c),
                 title: crate::shell::toplevel_title(window),
             });
         LeafView {

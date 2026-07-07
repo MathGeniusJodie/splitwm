@@ -25,7 +25,13 @@ impl Comp {
             self.manage_float(window);
         } else {
             let surface = window.toplevel().map(|t| t.wl_surface().clone());
+            let class = crate::shell::toplevel_app_id(&window);
             let win = self.managed.insert(window, Kind::Tiled);
+            let slot = self.assign_icon_slot(&class);
+            if let Some(entry) = self.managed.entry_mut(win) {
+                entry.icon_slot = slot;
+            }
+            self.spawn_icon_fetch(win, class);
             self.state.pin_client(win);
             if let Some(surface) = surface {
                 if let Some(idx) = self.pending_fullscreen.iter().position(|s| *s == surface) {
@@ -140,8 +146,10 @@ impl Comp {
             ),
             frame_dirty: true,
         };
+        let class = crate::shell::toplevel_app_id(&window);
         let win = self.managed.insert(window, Kind::Float(data));
         self.float_stack.insert(0, win);
+        self.spawn_icon_fetch(win, class);
         self.focus_float(win);
     }
 
@@ -256,6 +264,7 @@ impl Comp {
         };
         let title = crate::shell::toplevel_title(window);
         let label = label_from_class(&crate::shell::toplevel_app_id(window));
+        let icon = self.managed.entry(win).and_then(|m| m.icon.clone());
         let rect = f.frame_rect();
         let accent = f.accent;
         let view = LeafView {
@@ -264,11 +273,7 @@ impl Comp {
             tb_h: theme::tb_h(),
             bw: theme::BORDER_LEFT,
             accent_index: accent,
-            titlebar: Some(TitleInfo {
-                label,
-                icon: None,
-                title,
-            }),
+            titlebar: Some(TitleInfo { label, icon, title }),
             minimized: false,
             buttons: false,
         };

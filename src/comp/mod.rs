@@ -8,6 +8,7 @@
 pub mod actions;
 pub mod chrome;
 pub mod handlers;
+pub mod icons;
 pub mod input;
 pub mod manage;
 pub mod pointer;
@@ -136,6 +137,10 @@ pub struct Comp {
     /// press.
     pub held_bound_keys: Vec<u32>,
 
+    /// Off-thread icon fetches report back over this channel (see
+    /// `comp::icons`).
+    pub icon_tx: calloop::channel::Sender<icons::IconResult>,
+
     // XWayland: the WM connection (once Ready) and unmanaged
     // override-redirect windows (rofi, menus), topmost last.
     pub xwm: Option<smithay::xwayland::X11Wm>,
@@ -234,6 +239,16 @@ impl Comp {
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
 
+        // Off-thread icon fetches land back on the loop over this channel.
+        let (icon_tx, icon_rx) = calloop::channel::channel();
+        handle
+            .insert_source(icon_rx, |event, (), comp: &mut Comp| {
+                if let calloop::channel::Event::Msg(result) = event {
+                    comp.on_icon_result(result);
+                }
+            })
+            .expect("insert icon channel source");
+
         let mut chrome = crate::render::Renderer::new();
         let wallpaper_path = std::env::var("SPLITWM_WALLPAPER").ok();
         if let Some(path) = &wallpaper_path {
@@ -242,6 +257,24 @@ impl Comp {
                 tracing::warn!("could not load wallpaper {path}");
             }
         }
+
+        // Quick-launch entries with their theme icons, resolved once at
+        // startup (a handful of ImageMagick decodes, before the loop).
+        let quick: Vec<crate::widgets::QuickSlot> = crate::launch::quick_launches()
+            .into_iter()
+            .map(|q| crate::widgets::QuickSlot {
+                icon: crate::launch::find_icon_file(q.icon)
+                    .and_then(|p| crate::icon::load_image(&p))
+                    .map(|i| std::rc::Rc::new(crate::icon::quantize(chrome.palette(), &i))),
+                cmd: q.cmd,
+                label: q
+                    .label
+                    .chars()
+                    .next()
+                    .map_or('?', |c| c.to_ascii_uppercase()),
+                show: q.show,
+            })
+            .collect();
 
         Comp {
             backend,
@@ -260,19 +293,7 @@ impl Comp {
             chrome_dirty: true,
             placed: Vec::new(),
             widgets: crate::widgets::Widgets::default(),
-            quick: crate::theme::QUICK
-                .iter()
-                .map(|q| crate::widgets::QuickSlot {
-                    cmd: std::env::var(q.env).unwrap_or_else(|_| q.default.to_string()),
-                    icon: None,
-                    label: q
-                        .label
-                        .chars()
-                        .next()
-                        .map_or('?', |c| c.to_ascii_uppercase()),
-                    show: q.show,
-                })
-                .collect(),
+            quick,
             parents: std::collections::HashMap::new(),
             wallpaper_path,
             drag: None,
@@ -297,6 +318,7 @@ impl Comp {
             fullscreen: None,
             pending_fullscreen: Vec::new(),
             held_bound_keys: Vec::new(),
+            icon_tx,
             xwm: None,
             or_windows: Vec::new(),
             xwayland_shell_state,

@@ -14,6 +14,7 @@ mod comp;
 // chrome renderer and pointer interactions up to it.
 #[allow(dead_code)]
 mod icon;
+mod launch;
 #[allow(dead_code)]
 mod oklch;
 #[allow(dead_code)]
@@ -90,6 +91,10 @@ fn main() {
     // X11 clients (rofi, legacy apps) arrive via XWayland; DISPLAY is set
     // once the server reports Ready.
     comp.start_xwayland();
+
+    // Warm the deadline-bounded systemd-run probe at startup so the first
+    // launch never pays for it inside the event loop.
+    launch::have_systemd_run();
 
     // Children spawned by the compositor (terminal, launcher, quick-launch)
     // inherit the session; nested test runs read it from stdout.

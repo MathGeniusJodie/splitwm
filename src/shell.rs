@@ -84,6 +84,12 @@ pub struct ManagedWindow {
     pub win: Win,
     pub window: Window,
     pub kind: Kind,
+    /// Palette-quantized app icon, resolved off-thread after manage (see
+    /// `comp::icons`); `icon_rotated` is the pre-rendered hue variant for
+    /// same-app disambiguation, `icon_slot` the persistent hue slot.
+    pub icon: Option<std::rc::Rc<crate::icon::Icon>>,
+    pub icon_rotated: Option<std::rc::Rc<crate::icon::Icon>>,
+    pub icon_slot: Option<usize>,
 }
 
 #[derive(Default)]
@@ -103,6 +109,9 @@ impl Managed {
             win: self.next,
             window,
             kind,
+            icon: None,
+            icon_rotated: None,
+            icon_slot: None,
         });
         self.next
     }
