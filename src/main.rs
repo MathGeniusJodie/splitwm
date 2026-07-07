@@ -33,11 +33,15 @@ fn main() {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    // Inside a session (Wayland or X11) run nested; on a bare VT own the
-    // seat. Same heuristic X11 tools use for "am I on a display".
+    // The harness runs offscreen regardless of any host display; otherwise,
+    // inside a session (Wayland or X11) run nested, and on a bare VT own
+    // the seat. Same heuristic X11 tools use for "am I on a display".
     let nested =
         std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some();
-    if nested {
+    if std::env::var_os("SPLITWM_HEADLESS").is_some_and(|v| v != "0") {
+        tracing::info!("SPLITWM_HEADLESS: compositing offscreen for the harness");
+        backend::headless::run();
+    } else if nested {
         tracing::info!("display detected: running nested on the winit backend");
         backend::winit::run();
     } else {

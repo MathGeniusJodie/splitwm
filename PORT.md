@@ -43,6 +43,13 @@ this port must reproduce unless a deviation is listed below.
 - Key repeats: chords the compositor intercepts swallow their repeats and
   release; volume single-shot covers the only hold-relevant case.
 
+## Later (post-v1)
+
+- Wire up **layer-shell** (wlr-layer-shell): would let rofi and friends run
+  as native Wayland surfaces instead of the XWayland override-redirect
+  pin, and opens the door to panels/OSDs. Revisit the LAUNCHER_CMD
+  WAYLAND_DISPLAY scrub when it lands.
+
 ## Milestones
 
 - [x] **M0** scaffold: winit window, GLES clear, calloop loop, clean exit
@@ -53,11 +60,12 @@ this port must reproduce unless a deviation is listed below.
 - [x] **M4** tiling behavior incl. taskbar + xdg-decoration ServerSide
 - [x] **M5** pointer: chrome clicks (buttons/tiles/badges/quick/"+"),
       gap+edge drags, canvas panning w/ Mod4 gate + glide, ease-out-back
-      animations. Not yet visually verified (thin wrappers over unit-
-      tested state fns; harness will cover): scroll glide end-to-end,
-      taskbar-tile activation of a *stashed* window, edge drags, hover
-      cursor shapes (still unimplemented after M9: the tty backend
-      renders a cursor, but shape switching over chrome is absent).
+      animations. Scroll glide is drive-verified end-to-end; stash
+      restore is socket-tested via the keyboard cycle. Still unverified
+      (needs pointer injection, see Harness gaps): taskbar-tile *clicks*
+      on a stashed window, edge drags, hover cursor shapes (still
+      unimplemented after M9: the tty backend renders a cursor, but
+      shape switching over chrome is absent).
 - [x] **M6** floats, fullscreen, dock (DOCK_TITLE/DOCK_OVERLAP);
       verified: zenity float + frame drag, cozyui dock layering,
       startup-fullscreen. Note: clicking the dock hands it the keyboard
@@ -105,20 +113,35 @@ this port must reproduce unless a deviation is listed below.
       an unchanged connector ignored; libinput devices run defaults
       except natural scrolling (no tap-to-click config); multi-GPU and
       multi-output out of scope (master had one X screen).
-- [ ] **Harness** (grows from M1): headless socket tests, screenshot drive
+- [x] **Harness**: headless socket tests + screenshot drive. A headless
+      backend (offscreen GLES on surfaceless EGL, fixed 1280x800, no
+      feature gate, `SPLITWM_HEADLESS=1`) and a stdin **debug channel**
+      (`SPLITWM_DEBUG_CHANNEL=1`; `key`/`spawn`/`scroll`/`shot`, acked on
+      stdout) carry both: `tests/socket.rs` boots the real binary and
+      asserts manage/displacement/golden-ratio splits/taskbar cycle/polite
+      close/focus order/SIGTERM as a real Wayland client over the socket;
+      `drive.sh` (reborn, invisible — no Xephyr) walks the old X11 drive
+      sequence and screenshots 12 steps into /tmp/splitshots. Verified:
+      both feature sets green, drive shots eyeballed (content-sampled
+      accent, icon hue rotation, canvas pan). Gaps: no pointer injection
+      (chrome clicks/drags/hover ride manual nested runs), no XWayland
+      client in the socket tests, output size fixed.
 
 ## Architecture (new src/)
 
 ```
-main.rs        logging, backend selection (nested → winit, bare VT → tty)
-backend/       Backend enum + winit and tty (feature-gated) sessions;
-               Comp reaches presentation only through the enum
+main.rs        logging, backend selection (nested → winit, bare VT → tty,
+               SPLITWM_HEADLESS → headless)
+backend/       Backend enum + winit, tty (feature-gated), and headless
+               (offscreen, for the harness) sessions; Comp reaches
+               presentation only through the enum
 assets.rs      baked chrome art (unchanged from master; build.rs unchanged)
 theme.rs       palette/metrics/bindings/QUICK (keysyms via xkbcommon)
 oklch.rs       icon hue rotation (ported verbatim + tests)
 tree.rs        pure split-tree math (ported verbatim + tests)
 layout.rs      master's state.rs: per-tag layout + taskbar mutations
-comp/          compositor State, calloop wiring, delegate handlers, focus
+comp/          compositor State, calloop wiring, delegate handlers, focus,
+               the harness's stdin debug channel
 shell/         window abstraction (Wayland | X11), xdg handlers, floats,
                fullscreen, dock
 input/         keybinding dispatch, pointer drags/hit regions, scroll
@@ -147,17 +170,30 @@ Mapping notes vs X11:
 ## Testing
 
 - Unit: ported tree/layout/theme/oklch tests + new ones per module.
-- Integration (itest.sh analog): compositor on a headless/winit backend
-  with a private `WAYLAND_DISPLAY`; test clients via smithay-client-toolkit
-  assert configure sizes, states, focus order, close semantics over the
-  real socket. Rust `#[test]`s, no display needed for the headless set.
-- Visual (drive.sh analog): nested winit run inside the X session, spawn
-  alacritty/test clients, drive bindings by injecting via the compositor's
-  own debug channel or wtype through a virtual-keyboard protocol (TBD),
-  screenshot via wlr-screencopy into /tmp/splitshots.
+- Integration (`tests/socket.rs`, the itest.sh analog): `cargo test`
+  boots the real binary on the headless backend (cargo builds the bin for
+  integration tests; `CARGO_BIN_EXE_splitwm` points at it) and connects
+  as a plain wayland-client — raw protocol rather than the planned
+  smithay-client-toolkit; fewer moving parts and the same crate family.
+  Asserts configure sizes, activated state, keyboard focus order,
+  displacement, split shares, taskbar cycle, polite close, and SIGTERM
+  shutdown, all client-observably over the real socket. Nothing appears
+  on the host desktop.
+- Visual (`drive.sh`): the same headless run driven from bash over the
+  debug channel — spawns alacritty, walks the old X11 drive's
+  split/tab/focus/grow/scroll/close sequence, screenshots each step into
+  /tmp/splitshots (framebuffer readback, ImageMagick encode). Runs under
+  `dbus-run-session` so the notification daemon owns its bus name
+  instead of squatting a refusal bubble in every shot.
+- Debug channel protocol (stdin, `SPLITWM_DEBUG_CHANNEL=1`, any
+  backend): `key <chord>` resolves through the same `binding_action`
+  table as the keyboard; `spawn <cmd>`; `scroll <clicks>`; `shot <path>`
+  (headless only). Every command acks on stdout — drivers synchronize on
+  acks, not sleeps.
 - Real VT (tty backend): `./vttest.sh` from a VT login builds with the
   `tty` feature, scrubs leaked `DISPLAY` vars, and takes the seat;
   `./vttest.sh kill` from X ends it by recorded pid (never pkill — the
   live session's WM shares the binary name).
-- X11 test scripts (test.sh/itest.sh/drive.sh) stay in-tree as the spec
-  for their replacements until the harness lands, then get deleted.
+- The X11 scripts are gone from this branch (master keeps them as the
+  X11 spec): itest.sh → tests/socket.rs, drive.sh → rewritten headless,
+  test.sh → obsolete (a nested run is just `cargo run` in a session).

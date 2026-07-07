@@ -128,7 +128,7 @@ impl Tty {
 fn tty(comp: &mut Comp) -> &mut Tty {
     match &mut comp.backend {
         crate::backend::Backend::Tty(t) => t,
-        crate::backend::Backend::Winit(_) => unreachable!("tty event on the winit backend"),
+        _ => unreachable!("tty event on a non-tty backend"),
     }
 }
 

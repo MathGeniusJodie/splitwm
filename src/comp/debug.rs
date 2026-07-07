@@ -1,0 +1,111 @@
+//! The harness's debug channel: a line protocol on stdin, opt-in via
+//! `SPLITWM_DEBUG_CHANNEL=1`, driving the compositor the way the keyboard
+//! would. Every command is acked on stdout (`ok …` / `err …`) so a driver
+//! can synchronize on completion; `shot` acks only once the image is on
+//! disk (see `backend::headless`).
+//!
+//! Commands:
+//! - `key <chord>` — dispatch a `theme::BINDINGS` chord, e.g.
+//!   `key super+shift+c`. The chord is resolved through the same
+//!   `binding_action` table the keyboard dispatcher uses; only bound
+//!   chords exist here (there is nothing to forward a plain key *to*).
+//! - `spawn <cmd>` — launch a client the way quick-launch would, for
+//!   drives that need something other than `$TERMINAL`.
+//! - `scroll <clicks>` — pan the canvas by wheel clicks (the Mod4+wheel
+//!   path), positive scrolls right.
+//! - `shot <path>` — write the next composited frame to `path`
+//!   (headless backend only).
+
+use std::io::Read as _;
+
+use smithay::input::keyboard::{xkb, ModifiersState};
+use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
+
+use super::Comp;
+
+pub fn insert_channel(handle: &LoopHandle<'static, Comp>) {
+    let mut pending: Vec<u8> = Vec::new();
+    handle
+        .insert_source(
+            Generic::new(std::io::stdin(), Interest::READ, Mode::Level),
+            move |_, stdin, comp| {
+                // Level-triggered readiness: at least one byte is readable,
+                // so a single read never blocks the loop.
+                let mut chunk = [0u8; 4096];
+                // SAFETY: stdin is neither dropped nor replaced here.
+                let n = match unsafe { stdin.get_mut() }.read(&mut chunk) {
+                    Ok(n) => n,
+                    Err(err) => {
+                        tracing::warn!("debug channel read: {err}");
+                        return Ok(PostAction::Remove);
+                    }
+                };
+                if n == 0 {
+                    // Driver hung up; the channel is done for this session.
+                    return Ok(PostAction::Remove);
+                }
+                pending.extend_from_slice(&chunk[..n]);
+                while let Some(eol) = pending.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = pending.drain(..=eol).collect();
+                    command(comp, String::from_utf8_lossy(&line).trim());
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .expect("insert debug channel source");
+}
+
+fn command(comp: &mut Comp, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    match line.split_once(' ') {
+        Some(("key", chord)) => match chord_action(chord) {
+            Some(action) => {
+                comp.do_action(action);
+                println!("ok key {chord}");
+            }
+            None => println!("err key {chord}: no such binding"),
+        },
+        Some(("spawn", cmd)) => {
+            crate::launch::spawn(cmd);
+            println!("ok spawn {cmd}");
+        }
+        Some(("scroll", clicks)) => match clicks.parse::<f64>() {
+            Ok(clicks) => {
+                comp.apply_hscroll(clicks);
+                println!("ok scroll {clicks}");
+            }
+            Err(err) => println!("err scroll {clicks}: {err}"),
+        },
+        Some(("shot", path)) => {
+            // The ack for the success path comes from the headless render,
+            // after the file is written.
+            if !comp.backend.request_shot(path) {
+                println!("err shot {path}: this backend cannot read frames back");
+            }
+        }
+        _ => println!("err {line}: unknown command"),
+    }
+}
+
+/// Resolve `super+shift+c`-style chords against `theme::BINDINGS`, through
+/// the same lookup the keyboard dispatcher uses. Key names are xkb keysym
+/// names (`v`, `bracketright`, `XF86AudioRaiseVolume`), case-insensitive.
+fn chord_action(chord: &str) -> Option<crate::theme::Action> {
+    let parts: Vec<&str> = chord.split('+').collect();
+    let (key, mod_names) = parts.split_last()?;
+    let mut mods = ModifiersState::default();
+    for name in mod_names {
+        match name.to_ascii_lowercase().as_str() {
+            "super" | "mod4" | "logo" => mods.logo = true,
+            "shift" => mods.shift = true,
+            "alt" | "mod1" => mods.alt = true,
+            "ctrl" | "control" => mods.ctrl = true,
+            _ => return None,
+        }
+    }
+    let sym = xkb::keysym_from_name(key, xkb::KEYSYM_CASE_INSENSITIVE);
+    super::actions::binding_action(&mods, sym.raw())
+}

@@ -52,6 +52,13 @@ tty = [
     "smithay/backend_session_libseat",
 ]
 
+[dev-dependencies]
+# The socket tests (tests/socket.rs) boot the real binary headless and
+# drive it as ordinary Wayland clients over its own socket.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
+tempfile = "3"
+
 [build-dependencies]
 pixel-graphics = { path = "../pixel-graphics" }
 

@@ -7,6 +7,7 @@
 
 pub mod actions;
 pub mod chrome;
+pub mod debug;
 pub mod handlers;
 pub mod icons;
 pub mod input;
@@ -740,6 +741,7 @@ impl Comp {
                     }
                 }
             }
+            crate::backend::Backend::Headless(h) => h.render(&scene, self.clear),
             #[cfg(feature = "tty")]
             crate::backend::Backend::Tty(t) => {
                 t.render(&scene, pointer_loc, &self.cursor_status, self.clear);

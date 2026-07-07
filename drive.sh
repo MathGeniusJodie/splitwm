@@ -1,103 +1,113 @@
 #!/bin/bash
-# Full self-contained Xephyr test drive. Runs everything in one process group
-# so the nested X session lives for the duration of this script.
+# Self-contained visual test drive on the headless backend: boots the
+# compositor offscreen (nothing pops up on the host desktop), drives it
+# over the debug channel, and screenshots each step into /tmp/splitshots.
+# Requires: alacritty, ImageMagick. The channel acks every command on
+# stdout, so each step is synchronized, not timed.
 set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 SHOTS=/tmp/splitshots
+LOG=/tmp/drive-splitwm.log
+FIFO=$(mktemp -u /tmp/drive-splitwm.XXXXXX.fifo)
 mkdir -p "$SHOTS"; rm -f "$SHOTS"/*.png
-export DISPLAY_HOST="${DISPLAY:-:0}"
+mkfifo "$FIFO"
 
-# Initialised before the trap: under `set -u` an early exit would otherwise
-# expand unset variables inside cleanup.
 WM_PID=""
-XEPHYR_PID=""
 FAILED=0
 cleanup() {
-    [ -n "$WM_PID" ] && kill "$WM_PID" 2>/dev/null
-    [ -n "$XEPHYR_PID" ] && kill "$XEPHYR_PID" 2>/dev/null
+    if [ -n "$WM_PID" ]; then
+        # $WM_PID may be the dbus-run-session wrapper: end its children
+        # (splitwm, dbus-daemon) too — parent-scoped, never by name.
+        pkill -TERM -P "$WM_PID" 2>/dev/null
+        kill "$WM_PID" 2>/dev/null
+    fi
+    rm -f "$FIFO"
 }
 trap cleanup EXIT
-
-# Overridable so a server already on :1 (someone's live session) can't get
-# hijacked: default to a display an interactive session won't be using.
-DPY=":${SPLITWM_DRIVE_DPY:-9}"
 
 # cargo test/check don't produce the binary this script runs; build it here
 # so the drive never exercises a stale target/debug/splitwm.
 cargo build --manifest-path "$DIR/Cargo.toml" 2>/tmp/drive-build.log || { cat /tmp/drive-build.log; exit 1; }
 
-DISPLAY="$DISPLAY_HOST" Xephyr "$DPY" -ac -screen 1280x800 >/tmp/drive-xephyr.log 2>&1 &
-XEPHYR_PID=$!
-for i in $(seq 1 40); do
-    kill -0 "$XEPHYR_PID" 2>/dev/null || { echo "Xephyr DOWN"; cat /tmp/drive-xephyr.log; exit 1; }
-    DISPLAY="$DPY" xdotool getdisplaygeometry >/dev/null 2>&1 && break
-    sleep 0.25
-done
-DISPLAY="$DPY" xdotool getdisplaygeometry >/dev/null 2>&1 || { echo "Xephyr DOWN"; cat /tmp/drive-xephyr.log; exit 1; }
-echo "Xephyr up"
-
-DISPLAY="$DPY" TERMINAL=xterm SPLITWM_WALLPAPER=/tmp/wall.png "$DIR/target/debug/splitwm" >/tmp/drive-splitwm.log 2>&1 &
+# A private session bus lets the compositor's notification daemon own
+# org.freedesktop.Notifications instead of losing it to the live session's
+# (whose refusal bubble would squat in every screenshot).
+BUS=""
+command -v dbus-run-session >/dev/null && BUS="dbus-run-session --"
+SPLITWM_HEADLESS=1 SPLITWM_DEBUG_CHANNEL=1 TERMINAL=alacritty \
+    SPLITWM_WALLPAPER="${SPLITWM_WALLPAPER:-/tmp/wall.png}" \
+    $BUS "$DIR/target/debug/splitwm" <"$FIFO" >"$LOG" 2>&1 &
 WM_PID=$!
-sleep 0.7
-kill -0 $WM_PID 2>/dev/null || { echo "WM DOWN"; cat /tmp/drive-splitwm.log; exit 1; }
-echo "WM up"
+exec 3>"$FIFO" # hold the channel's write end open for the whole drive
 
-shot() { DISPLAY="$DPY" import -window root "$SHOTS/$1.png" 2>/dev/null && echo "shot $1" || { echo "shot $1 FAILED"; FAILED=1; }; }
-key() { DISPLAY="$DPY" xdotool key --clearmodifiers "$1"; sleep 0.4; }
-term() { DISPLAY="$DPY" xterm -e "sleep 3000" & sleep 1.2; }
+# wait_line <pattern>: wait for a line in the log (an ack, or startup).
+wait_line() {
+    for _ in $(seq 1 100); do
+        grep -qF "$1" "$LOG" && return 0
+        kill -0 "$WM_PID" 2>/dev/null || { echo "WM DIED waiting for: $1"; tail -20 "$LOG"; exit 1; }
+        sleep 0.1
+    done
+    echo "TIMEOUT waiting for: $1"; FAILED=1; return 1
+}
+
+wait_line "WAYLAND_DISPLAY=" || exit 1
+echo "WM up ($(grep -m1 WAYLAND_DISPLAY= "$LOG"))"
+
+key() { echo "key $1" >&3; wait_line "ok key $1"; sleep 0.4; }
+shot() { echo "shot $SHOTS/$1.png" >&3; wait_line "ok shot $SHOTS/$1.png" && echo "shot $1"; }
+term() { key super+Return; sleep 1.2; }
 # A solid-colour terminal so window-content sampling has something to read.
-cterm() { DISPLAY="$DPY" xterm -bg "$1" -e "sleep 3000" & sleep 1.2; }
+cterm() { echo "spawn alacritty -o colors.primary.background='\"$1\"'" >&3; wait_line "ok spawn"; sleep 1.2; }
 
 # 1: two terminals stacked as tabs in one split
 term; term
 shot 01_two_tabs
 
 # 2: split horizontally (Mod4+v) -> new empty split to the right
-key "super+v"
+key super+v
 shot 02_split_h
 # put a coloured terminal in the new split -> content-sampled accent
-cterm "DarkGreen"
-sleep 0.6
+cterm "#006400"
 shot 03_term_in_split2
 
 # 3: split vertically (Mod4+h)
-key "super+h"
+key super+h
 term
 shot 04_split_v
 
 # 4: focus prev / next
-key "super+Left"
+key super+Left
 shot 05_focus_left
-key "super+Right"
+key super+Right
 shot 06_focus_right
 
 # 5: cycle tabs in first split
-key "super+Left"
-key "super+bracketright"
+key super+Left
+key super+bracketright
 shot 07_next_tab
 
 # 6: grow / shrink
-key "super+l"
-key "super+l"
+key super+l
+key super+l
 shot 08_grow
-key "super+shift+l"
+key super+shift+l
 shot 09_shrink
 
 # 7: scroll the canvas (many splits)
-key "super+v"; term
-key "super+v"; term
-key "super+v"; term
+key super+v; term
+key super+v; term
+key super+v; term
 shot 10_many_splits
-DISPLAY="$DPY" xdotool keydown super; DISPLAY="$DPY" xdotool click 4; DISPLAY="$DPY" xdotool click 4; DISPLAY="$DPY" xdotool keyup super
-sleep 0.4
+echo "scroll 2" >&3; wait_line "ok scroll 2"
+sleep 0.6 # let the glide settle
 shot 11_scrolled
 
 # 8: close a split (Mod4+q)
-key "super+q"
+key super+q
 shot 12_closed
 
 echo "=== splitwm.log tail ==="
-tail -5 /tmp/drive-splitwm.log
+tail -5 "$LOG"
 if [ "$FAILED" -eq 0 ]; then
     echo "DONE"
 else
