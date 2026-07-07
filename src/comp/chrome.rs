@@ -19,17 +19,15 @@ use smithay::backend::renderer::element::memory::{
 };
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::desktop::space::SpaceRenderElements;
 use smithay::render_elements;
 use smithay::utils::{Buffer as BufferCoords, Rectangle, Transform};
 
 render_elements! {
-    /// Everything one output frame is made of, front-to-back: floats (and
-    /// the dock, rendered with the same variant) with their frame chrome,
-    /// tiled client surfaces, the chrome underlay at the back.
+    /// Everything one output frame is made of: client surfaces of every
+    /// kind (tiled, floats, dock, layer, o-r) and the software-drawn
+    /// chrome buffers (underlay, float frames, notes, cursor).
     pub OutputElement<=GlesRenderer>;
     Float=WaylandSurfaceRenderElement<GlesRenderer>,
-    Window=SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
     Chrome=MemoryRenderBufferRenderElement<GlesRenderer>,
 }
 
@@ -48,15 +46,41 @@ pub struct Scene<'a> {
     pub chrome_buf: &'a MemoryRenderBuffer,
 }
 
-/// One frame's render elements, front-to-back: override-redirect X11
-/// windows (rofi, menus) topmost, notification bubbles, floats with their
-/// frame chrome, the tiled/fullscreen Space, the dock, the chrome underlay
-/// behind everything.
+/// Append render elements for every layer surface on `layer`, topmost
+/// first (matching `elements`' front-to-back order).
+fn layer_elements(
+    renderer: &mut GlesRenderer,
+    map: &smithay::desktop::LayerMap,
+    layer: smithay::wayland::shell::wlr_layer::Layer,
+    elements: &mut Vec<OutputElement>,
+) {
+    use smithay::backend::renderer::element::AsRenderElements as _;
+    for l in map.layers_on(layer).rev() {
+        let Some(geo) = map.layer_geometry(l) else {
+            continue;
+        };
+        elements.extend(l.render_elements::<OutputElement>(
+            renderer,
+            geo.loc.to_physical(1),
+            1.0.into(),
+            1.0,
+        ));
+    }
+}
+
+/// One frame's render elements, front-to-back: Overlay layer surfaces
+/// topmost, override-redirect X11 windows (rofi, menus), notification
+/// bubbles, the Top layer, floats with their frame chrome, the
+/// tiled/fullscreen Space, the dock, the Bottom/Background layers, the
+/// chrome underlay behind everything.
 pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<OutputElement> {
     use smithay::backend::renderer::element::AsRenderElements as _;
     use smithay::utils::{Logical, Point};
+    use smithay::wayland::shell::wlr_layer::Layer;
 
+    let layer_map = smithay::desktop::layer_map_for_output(scene.output);
     let mut elements: Vec<OutputElement> = Vec::new();
+    layer_elements(renderer, &layer_map, Layer::Overlay, &mut elements);
     for or in scene.or_windows.iter().rev() {
         let Some(surface) = or.surface.wl_surface() else {
             continue;
@@ -94,6 +118,7 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
             Err(err) => tracing::error!("note element: {err}"),
         }
     }
+    layer_elements(renderer, &layer_map, Layer::Top, &mut elements);
     for &fw in scene.float_stack {
         let Some((window, f)) = scene.managed.float(fw) else {
             continue;
@@ -114,14 +139,19 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
             Err(err) => tracing::error!("float frame element: {err}"),
         }
     }
-    match smithay::desktop::space::space_render_elements::<_, smithay::desktop::Window, _>(
-        renderer,
-        [scene.space],
-        scene.output,
-        1.0,
-    ) {
-        Ok(els) => elements.extend(els.into_iter().map(OutputElement::Window)),
-        Err(err) => tracing::error!("space elements: {err:?}"),
+    // The Space's windows in stacking order, via the region renderer —
+    // NOT space_render_elements, which draws every layer surface itself
+    // (in an order that buries Overlay under floats and puts Background
+    // over the chrome underlay) and locks the LayerMap this function
+    // already holds.
+    if let Some(geo) = scene.space.output_geometry(scene.output) {
+        elements.extend(
+            scene
+                .space
+                .render_elements_for_region(renderer, &geo, 1.0, 1.0)
+                .into_iter()
+                .map(OutputElement::Float),
+        );
     }
     if let Some((window, rect)) = scene.dock_place {
         let loc =
@@ -140,6 +170,12 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
         Ok(el) => elements.push(OutputElement::Chrome(el)),
         Err(err) => tracing::error!("chrome element: {err}"),
     }
+    // The chrome underlay is splitwm's own background/bottom content
+    // (wallpaper, leaf frames, taskbar) in one opaque buffer; foreign
+    // Bottom/Background layer surfaces stack behind it, where the opaque
+    // underlay occludes them.
+    layer_elements(renderer, &layer_map, Layer::Bottom, &mut elements);
+    layer_elements(renderer, &layer_map, Layer::Background, &mut elements);
     elements
 }
 

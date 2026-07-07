@@ -1,23 +1,63 @@
 //! Nested development backend: the compositor lives inside a winit window
 //! on the host desktop. The host session provides the clock (a 60 Hz timer
-//! stands in for vblank) and draws the hardware cursor.
+//! stands in for vblank) and draws the hardware cursor: named shapes map
+//! onto the host cursor (approximate glyphs, zero latency); only a
+//! client-committed cursor surface is composited into the frame instead.
 
 use std::time::Duration;
 
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{self, WinitEvent, WinitGraphicsBackend};
+use smithay::input::pointer::{CursorIcon, CursorImageStatus};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::Transform;
+use smithay::utils::{IsAlive as _, Transform};
 
 use crate::comp::Comp;
+
+/// What the host window's cursor was last set to, so redraw only issues
+/// winit cursor calls on change.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostCursor {
+    Icon(CursorIcon),
+    Hidden,
+}
 
 pub struct Winit {
     pub backend: WinitGraphicsBackend<GlesRenderer>,
     pub damage_tracker: OutputDamageTracker,
+    host_cursor: Option<HostCursor>,
+}
+
+impl Winit {
+    /// Reflect the seat's cursor on the host window. Returns `true` when
+    /// the frame must composite the cursor itself (a client-committed
+    /// cursor surface, which has no host analog).
+    pub fn apply_cursor(&mut self, status: &CursorImageStatus) -> bool {
+        let (host, composite) = match status {
+            CursorImageStatus::Surface(s) if s.alive() => (HostCursor::Hidden, true),
+            CursorImageStatus::Surface(_) => (HostCursor::Icon(CursorIcon::Default), false),
+            CursorImageStatus::Named(icon) => (HostCursor::Icon(*icon), false),
+            CursorImageStatus::Hidden => (HostCursor::Hidden, false),
+        };
+        if self.host_cursor != Some(host) {
+            let window = self.backend.window();
+            match host {
+                HostCursor::Icon(icon) => {
+                    // smithay and winit share the cursor-icon crate, so the
+                    // seat's CursorIcon is winit's own.
+                    window.set_cursor(smithay::reexports::winit::window::Cursor::Icon(icon));
+                    window.set_cursor_visible(true);
+                }
+                HostCursor::Hidden => window.set_cursor_visible(false),
+            }
+            self.host_cursor = Some(host);
+        }
+        composite
+    }
 }
 
 pub fn run() {
@@ -55,6 +95,7 @@ pub fn run() {
         super::Backend::Winit(Winit {
             backend,
             damage_tracker,
+            host_cursor: None,
         }),
     );
 

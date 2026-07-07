@@ -37,15 +37,14 @@ zbus = "5"
 # Smithay logs through tracing; RUST_LOG-style filtering for debugging.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# xcursor-theme parsing for the tty backend's composited cursor (no host
-# session draws one on DRM).
-xcursor = { version = "0.3", optional = true }
+# xcursor-theme parsing for the composited cursor's named shapes beyond the
+# hand-drawn sprites (shapes clients request via cursor-shape-v1).
+xcursor = "0.3"
 
 [features]
 # Real-session backend (DRM/GBM scanout, libinput, libseat session). Off by
 # default: linking needs the libseat system library (Arch package `seatd`).
 tty = [
-    "dep:xcursor",
     "smithay/backend_udev",
     "smithay/backend_gbm",
     "smithay/backend_libinput",
@@ -57,6 +56,8 @@ tty = [
 # drive it as ordinary Wayland clients over its own socket.
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client"] }
+# wlr-layer-shell client bindings for the layer-shell socket tests.
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 tempfile = "3"
 
 [build-dependencies]

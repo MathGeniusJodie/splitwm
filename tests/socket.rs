@@ -18,6 +18,7 @@ use wayland_client::protocol::{
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle, WEnum};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 /// The headless backend's fixed output, and the taskbar strip under the
 /// layout area — a generous bound; the exact chrome insets stay the
@@ -100,6 +101,22 @@ impl Wm {
     fn key(&mut self, chord: &str) {
         self.cmd(&format!("key {chord}"));
     }
+
+    /// Send a query command and return its ack payload (the text after
+    /// `ok <line> `).
+    fn query(&mut self, line: &str) -> String {
+        writeln!(self.stdin, "{line}").expect("write debug channel");
+        loop {
+            let mut ack = String::new();
+            let n = self.stdout.read_line(&mut ack).expect("read ack");
+            assert!(n > 0, "compositor exited awaiting ack for: {line}");
+            let ack = ack.trim();
+            if let Some(rest) = ack.strip_prefix(&format!("ok {line} ")) {
+                return rest.to_string();
+            }
+            assert!(!ack.starts_with("err "), "query failed: {ack}");
+        }
+    }
 }
 
 impl Drop for Wm {
@@ -129,6 +146,8 @@ struct App {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     /// The wl_surface holding keyboard focus, by protocol id.
     focused: Option<wayland_client::backend::ObjectId>,
+    /// zwlr_layer_surface configures seen (each acked on arrival).
+    layer_configures: u32,
 }
 
 impl App {
@@ -246,6 +265,23 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for App {
     }
 }
 
+impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for App {
+    fn event(
+        app: &mut App,
+        layer: &zwlr_layer_surface_v1::ZwlrLayerSurfaceV1,
+        event: zwlr_layer_surface_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        if let zwlr_layer_surface_v1::Event::Configure { serial, .. } = event {
+            layer.ack_configure(serial);
+            app.layer_configures += 1;
+        }
+    }
+}
+
+wayland_client::delegate_noop!(App: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 wayland_client::delegate_noop!(App: ignore wl_compositor::WlCompositor);
 wayland_client::delegate_noop!(App: ignore wl_surface::WlSurface);
 wayland_client::delegate_noop!(App: ignore wl_shm::WlShm);
@@ -258,6 +294,7 @@ struct Session {
     queue: EventQueue<App>,
     qh: QueueHandle<App>,
     app: App,
+    globals: wayland_client::globals::GlobalList,
     compositor: wl_compositor::WlCompositor,
     wm_base: xdg_wm_base::XdgWmBase,
     pool: wl_shm_pool::WlShmPool,
@@ -300,6 +337,7 @@ impl Session {
             queue,
             qh,
             app: App::default(),
+            globals,
             compositor,
             wm_base,
             pool,
@@ -438,10 +476,10 @@ fn override_redirect_keyboard_focus() {
     let a = s.open_window();
     s.wait_until("client holds the keyboard", |app| app.focus_is(a));
 
-    // Launched like LAUNCHER_CMD (WAYLAND_DISPLAY scrubbed, so rofi runs
-    // under XWayland), but with a private pidfile: rofi's default is one
-    // global instance per user, and the test must neither block nor be
-    // blocked by a launcher on the live session.
+    // WAYLAND_DISPLAY is scrubbed to pin rofi onto XWayland — the o-r
+    // path under test (the launcher itself runs native layer-shell now).
+    // The private pidfile keeps this instance from blocking, or being
+    // blocked by, a launcher on the live session.
     s.wm.await_xwayland();
     s.wm.cmd(&format!(
         "spawn env -u WAYLAND_DISPLAY rofi -show drun -pid /tmp/splitwm-test-rofi-{}.pid",
@@ -464,6 +502,89 @@ fn override_redirect_keyboard_focus() {
     s.wait_until("click on rofi returns it the keyboard", |app| {
         app.focused.is_none()
     });
+}
+
+#[test]
+fn chrome_hover_cursor_shapes() {
+    // Hover feedback over the chrome, observed through the debug
+    // channel's `cursor` query: the arrow where nothing is clickable, the
+    // resize arrow over the canvas-edge drag handle.
+    let mut s = Session::boot();
+    let a = s.open_window();
+    s.wait_until("window mapped", |app| app.wins[a].activated);
+
+    // The top-left corner sits above the edge-handle strip (which starts
+    // a gap down) and outside every leaf frame: nothing to hit.
+    s.wm.cmd("motion 5 5");
+    assert_eq!(s.wm.query("cursor"), "default");
+
+    // The left canvas-edge drag handle spans the outer margin strip
+    // (x within the gap, y past the first gap) — a horizontal resize.
+    s.wm.cmd("motion 10 300");
+    assert_eq!(s.wm.query("cursor"), "ew-resize");
+}
+
+#[test]
+fn layer_shell_zone_and_keyboard() {
+    // wlr-layer-shell: an Overlay surface with an exclusive zone shrinks
+    // the tiling area, and exclusive keyboard interactivity holds the
+    // keyboard while mapped (the native-rofi contract). Destroying it
+    // restores both.
+    let mut s = Session::boot();
+    let a = s.open_window();
+    s.wait_until("window tiled", |app| {
+        app.wins[a].activated && app.wins[a].size.0 > 0
+    });
+    s.wait_until("keyboard on the window", |app| app.focus_is(a));
+    let full = s.app.wins[a].size;
+
+    let layer_shell: zwlr_layer_shell_v1::ZwlrLayerShellV1 = s
+        .globals
+        .bind(&s.qh, 1..=4, ())
+        .expect("bind zwlr_layer_shell_v1");
+    let surface = s.compositor.create_surface(&s.qh, ());
+    let layer = layer_shell.get_layer_surface(
+        &surface,
+        None,
+        zwlr_layer_shell_v1::Layer::Overlay,
+        "splitwm-test-panel".into(),
+        &s.qh,
+        (),
+    );
+    layer.set_size(300, 0);
+    layer.set_anchor(
+        zwlr_layer_surface_v1::Anchor::Left
+            | zwlr_layer_surface_v1::Anchor::Top
+            | zwlr_layer_surface_v1::Anchor::Bottom,
+    );
+    layer.set_exclusive_zone(300);
+    layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::Exclusive);
+    // Pre-buffer commit: the compositor answers with a configure.
+    surface.commit();
+    s.wait_until("layer surface configured", |app| app.layer_configures > 0);
+
+    // Mapping it takes the exclusive zone out of the tiling area and the
+    // keyboard away from the window.
+    let buffer = s
+        .pool
+        .create_buffer(0, BUF, BUF, BUF * 4, wl_shm::Format::Argb8888, &s.qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+    s.wait_until("window shrinks by the exclusive zone", |app| {
+        app.wins[a].size.0 > 0 && app.wins[a].size.0 <= full.0 - 250
+    });
+    let layer_id = surface.id();
+    s.wait_until("keyboard moves to the layer surface", |app| {
+        app.focused.as_ref() == Some(&layer_id)
+    });
+
+    // Teardown: zone and keyboard return to the layout.
+    layer.destroy();
+    surface.destroy();
+    s.wait_until("window regains the full slot", |app| {
+        app.wins[a].size == full
+    });
+    s.wait_until("keyboard returns to the window", |app| app.focus_is(a));
 }
 
 #[test]

@@ -29,8 +29,8 @@ use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_to
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use smithay::{
-    delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_output, delegate_seat,
-    delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
+    delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
 use super::{ClientState, Comp};
@@ -102,6 +102,7 @@ impl CompositorHandler for Comp {
             }
         }
 
+        self.layer_commit(surface);
         self.popups.commit(surface);
     }
 }
@@ -313,12 +314,18 @@ impl SeatHandler for Comp {
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        // Tracked for the tty backend, which composites the cursor itself;
-        // nested sessions show the host's cursor and never read this.
+        // Set by clients (a committed cursor surface or a cursor-shape-v1
+        // request) and by the chrome's hover feedback; consumed at redraw
+        // by whichever backend presents the cursor.
         self.cursor_status = image;
     }
 }
 delegate_seat!(Comp);
+
+// cursor-shape-v1 serves tablet tools too; splitwm has no tablet support,
+// so the trait's default no-op image callback is the whole implementation.
+impl smithay::wayland::tablet_manager::TabletSeatHandler for Comp {}
+delegate_cursor_shape!(Comp);
 
 impl SelectionHandler for Comp {
     type SelectionUserData = ();

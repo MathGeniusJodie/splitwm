@@ -8,7 +8,7 @@
 //! first connected connector, replaced (never extended) when connectors
 //! come and go. Unlike the nested backend there is no host to draw a
 //! cursor, so the frame composites one: the focused client's committed
-//! cursor surface, else the xcursor theme's arrow.
+//! cursor surface, else the named shape's image (see `comp::cursor`).
 
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::Fourcc;
@@ -18,16 +18,12 @@ use smithay::backend::drm::output::{DrmOutput, DrmOutputManager, DrmOutputRender
 use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode};
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
-use smithay::backend::renderer::element::memory::{
-    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
-};
-use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::Color32F;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session as _};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
-use smithay::input::pointer::{CursorImageStatus, CursorImageSurfaceData};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
@@ -35,9 +31,10 @@ use smithay::reexports::drm::control::{connector, crtc, Device as _, ModeTypeFla
 use smithay::reexports::input::Libinput;
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::{DeviceFd, IsAlive as _, Logical, Point, Transform};
+use smithay::utils::{DeviceFd, Logical, Point, Transform};
 
 use crate::comp::chrome::{self, OutputElement};
+use crate::comp::cursor::{cursor_elements, CursorCache};
 use crate::comp::Comp;
 
 type Allocator = GbmAllocator<DrmDeviceFd>;
@@ -74,9 +71,6 @@ pub struct Tty {
     queued: bool,
     /// The session lost the devices (VT switched away).
     paused: bool,
-    /// Theme arrow for when no client cursor surface applies: the buffer
-    /// and its hotspot.
-    cursor: Option<(MemoryRenderBuffer, Point<i32, Logical>)>,
 }
 
 impl Tty {
@@ -94,6 +88,7 @@ impl Tty {
         scene: &chrome::Scene<'_>,
         pointer_loc: Point<f64, Logical>,
         cursor_status: &CursorImageStatus,
+        cursors: &mut CursorCache,
         clear: Color32F,
     ) {
         if self.paused || self.queued {
@@ -102,12 +97,7 @@ impl Tty {
         let Some(out) = self.scanout.as_mut() else {
             return;
         };
-        let mut elements = cursor_elements(
-            &mut self.renderer,
-            pointer_loc,
-            cursor_status,
-            self.cursor.as_ref(),
-        );
+        let mut elements = cursor_elements(&mut self.renderer, pointer_loc, cursor_status, cursors);
         elements.extend(chrome::output_elements(&mut self.renderer, scene));
         match out.render_frame(&mut self.renderer, &elements, clear, FrameFlags::DEFAULT) {
             Ok(res) => {
@@ -244,7 +234,6 @@ pub fn run() {
             scanout: None,
             queued: false,
             paused: false,
-            cursor: load_cursor(),
         }),
     );
     // Bring up scanout on the connector found above.
@@ -445,85 +434,3 @@ fn reconnect(comp: &mut Comp) {
     comp.redraw();
 }
 
-/// The composited cursor: the client's committed cursor surface when one
-/// applies, else the xcursor theme arrow. Cursor-kind elements let the
-/// DRM compositor place them on the hardware cursor plane.
-fn cursor_elements(
-    renderer: &mut GlesRenderer,
-    loc: Point<f64, Logical>,
-    status: &CursorImageStatus,
-    fallback: Option<&(MemoryRenderBuffer, Point<i32, Logical>)>,
-) -> Vec<OutputElement> {
-    match status {
-        CursorImageStatus::Hidden => Vec::new(),
-        CursorImageStatus::Surface(surface) if surface.alive() => {
-            let hotspot = smithay::wayland::compositor::with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<CursorImageSurfaceData>()
-                    .map_or_else(Point::default, |data| data.lock().unwrap().hotspot)
-            });
-            smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
-                renderer,
-                surface,
-                (loc.to_i32_round() - hotspot).to_physical(1),
-                1.0,
-                1.0,
-                Kind::Cursor,
-            )
-            .into_iter()
-            .map(OutputElement::Float)
-            .collect()
-        }
-        // A named shape (or a dead cursor surface): the theme arrow. Shape
-        // lookup beyond the arrow is still an open gap (master showed
-        // hand/resize cursors over chrome).
-        _ => {
-            let Some((buf, hotspot)) = fallback else {
-                return Vec::new();
-            };
-            match MemoryRenderBufferRenderElement::from_buffer(
-                renderer,
-                (loc.x - f64::from(hotspot.x), loc.y - f64::from(hotspot.y)),
-                buf,
-                None,
-                None,
-                None,
-                Kind::Cursor,
-            ) {
-                Ok(el) => vec![OutputElement::Chrome(el)],
-                Err(err) => {
-                    tracing::error!("cursor element: {err}");
-                    Vec::new()
-                }
-            }
-        }
-    }
-}
-
-/// Load the arrow from the xcursor theme (`XCURSOR_THEME`/`XCURSOR_SIZE`,
-/// defaults matching every other Wayland compositor). `None` means no
-/// theme is installed; the session runs cursorless like a bare console.
-fn load_cursor() -> Option<(MemoryRenderBuffer, Point<i32, Logical>)> {
-    let size: i32 = std::env::var("XCURSOR_SIZE")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(24);
-    let theme = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into());
-    let theme = xcursor::CursorTheme::load(&theme);
-    let path = theme.load_icon("left_ptr")?;
-    let data = std::fs::read(path).ok()?;
-    let images = xcursor::parser::parse_xcursor(&data)?;
-    let img = images
-        .into_iter()
-        .min_by_key(|i| (i.size as i32 - size).abs())?;
-    let buffer = MemoryRenderBuffer::from_slice(
-        &img.pixels_rgba,
-        Fourcc::Abgr8888,
-        (img.width as i32, img.height as i32),
-        1,
-        Transform::Normal,
-        None,
-    );
-    Some((buffer, (img.xhot as i32, img.yhot as i32).into()))
-}

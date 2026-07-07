@@ -253,7 +253,10 @@ impl Comp {
                     // Click on an o-r window: re-grant it the keyboard
                     // before forwarding the button — its X-side grab only
                     // works while XWayland holds our focus, and a click
-                    // elsewhere may have moved the focus off it.
+                    // elsewhere may have moved the focus off it. A layer
+                    // surface that accepts keyboard focus (OnDemand
+                    // panels; an Exclusive one already holds it) gets the
+                    // keyboard by click too, like the dock.
                     None => {
                         if let Some(s) = under.as_ref().filter(|s| {
                             self.or_windows
@@ -263,6 +266,15 @@ impl Comp {
                             let keyboard =
                                 self.seat.get_keyboard().expect("seat has a keyboard");
                             keyboard.set_focus(self, Some(s.clone()), serial);
+                        } else if let Some(s) = under.as_ref() {
+                            let focusable = smithay::desktop::layer_map_for_output(&self.output)
+                                .layer_for_surface(s, smithay::desktop::WindowSurfaceType::ALL)
+                                .is_some_and(|l| l.can_receive_keyboard_focus());
+                            if focusable {
+                                let keyboard =
+                                    self.seat.get_keyboard().expect("seat has a keyboard");
+                                keyboard.set_focus(self, Some(s.clone()), serial);
+                            }
                         }
                     }
                 }
@@ -296,10 +308,24 @@ impl Comp {
         } else {
             self.surface_under(pos)
         };
-        // Off every surface, the cursor is the compositor's again: drop
-        // whatever shape the last client committed.
+        // Off every surface, the cursor is the compositor's: hover
+        // feedback over the chrome (master's hover_cursor), and during a
+        // drag the gesture's own shape wherever the pointer strays.
         if under.is_none() {
-            self.cursor_status = smithay::input::pointer::CursorImageStatus::default_named();
+            use smithay::input::pointer::CursorIcon;
+            let icon = match self.drag {
+                Some(crate::comp::pointer::ActiveDrag::Split(d)) => {
+                    if d.vertical {
+                        CursorIcon::NsResize
+                    } else {
+                        CursorIcon::EwResize
+                    }
+                }
+                Some(crate::comp::pointer::ActiveDrag::Edge(_)) => CursorIcon::EwResize,
+                Some(crate::comp::pointer::ActiveDrag::Float(_)) => CursorIcon::Pointer,
+                None => self.hover_cursor(pos),
+            };
+            self.cursor_status = smithay::input::pointer::CursorImageStatus::Named(icon);
         }
         let pointer = self.seat.get_pointer().expect("seat has a pointer");
         pointer.motion(

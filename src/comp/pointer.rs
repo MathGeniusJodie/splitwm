@@ -4,6 +4,7 @@
 //! floats join in M6. Unlike X11, the surface under the pointer and the
 //! modifier state are already ours — no server round-trips, no caching.
 
+use smithay::input::pointer::CursorIcon;
 use smithay::utils::{Logical, Point};
 
 use super::Comp;
@@ -223,8 +224,9 @@ impl Comp {
     }
 
     /// Priority-ordered hit-test of everything clickable on the chrome,
-    /// mirroring master so click dispatch and (future) cursor feedback
-    /// stay in lockstep.
+    /// shared by `on_chrome_button` (dispatch) and `hover_cursor`
+    /// (feedback) — a single ordering both consume, so click handling and
+    /// hover feedback can never drift apart (master's invariant).
     fn hit_test(&self, mx: i32, my: i32) -> Hit {
         if let Some((leaf, kind)) = self
             .widgets
@@ -314,6 +316,63 @@ impl Comp {
             return Hit::LeafBody(leaf);
         }
         Hit::Miss
+    }
+
+    /// Pick the pointer shape for a hover position on the chrome,
+    /// mirroring master's `hover_cursor`: resize arrows over gap/edge drag
+    /// handles, the hand over clickable things, the "disabled" shape over
+    /// a disabled titlebar button, the arrow otherwise. Consumes the same
+    /// `hit_test` ordering as `on_chrome_button`, so the advertised cursor
+    /// always matches the click.
+    pub fn hover_cursor(&self, pos: Point<f64, Logical>) -> CursorIcon {
+        let (mx, my) = (pos.x as i32, pos.y as i32);
+        // Float frames take the press outright (see on_chrome_button) and
+        // advertise the hand, like master's frame windows did.
+        if self.float_frame_at(pos).is_some() {
+            return CursorIcon::Pointer;
+        }
+        match self.hit_test(mx, my) {
+            Hit::Btn(leaf, kind) => {
+                // Mirror compose_frame's enabled/disabled choice for the
+                // button art (a minimized leaf's whole-frame region is
+                // always a live restore button).
+                if let Some(&frame) = self.prev_frame_rect.get(&leaf) {
+                    let meta = leaf_meta(
+                        &self.state.tree,
+                        self.parents.get(&leaf).copied(),
+                        leaf,
+                        frame,
+                    );
+                    let disabled = !meta.minimized
+                        && match kind {
+                            BtnKind::Close | BtnKind::Minimize => meta.parent_dir.is_none(),
+                            BtnKind::Split => !meta.can_split,
+                        };
+                    if disabled {
+                        return CursorIcon::NotAllowed;
+                    }
+                }
+                CursorIcon::Pointer
+            }
+            Hit::TaskbarClose(_)
+            | Hit::TaskbarTile(_)
+            | Hit::QuickLaunch(_)
+            | Hit::Title(_)
+            | Hit::Plus(_) => CursorIcon::Pointer,
+            Hit::Handle(b) => {
+                // A gap next to a minimized leaf can't be dragged; don't
+                // advertise a resize that won't happen.
+                if !b.resizable {
+                    CursorIcon::Default
+                } else if b.dir == Dir::V {
+                    CursorIcon::NsResize
+                } else {
+                    CursorIcon::EwResize
+                }
+            }
+            Hit::Edge(_) => CursorIcon::EwResize,
+            Hit::LeafBody(_) | Hit::Miss => CursorIcon::Default,
+        }
     }
 
     /// Act on a split-control button click. `secondary` is a right-click,

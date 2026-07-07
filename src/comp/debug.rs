@@ -19,6 +19,8 @@
 //!   path), positive scrolls right.
 //! - `shot <path>` — write the next composited frame to `path`
 //!   (headless backend only).
+//! - `cursor` — report what the pointer shows right now: `hidden`, a
+//!   client `surface`, or a named shape (`default`, `ew-resize`, …).
 
 use std::io::Read as _;
 
@@ -109,6 +111,15 @@ fn command(comp: &mut Comp, line: &str) {
             if !comp.backend.request_shot(path) {
                 println!("err shot {path}: this backend cannot read frames back");
             }
+        }
+        None if line == "cursor" => {
+            use smithay::input::pointer::CursorImageStatus;
+            let name = match &comp.cursor_status {
+                CursorImageStatus::Hidden => "hidden",
+                CursorImageStatus::Surface(_) => "surface",
+                CursorImageStatus::Named(icon) => icon.name(),
+            };
+            println!("ok cursor {name}");
         }
         _ => println!("err {line}: unknown command"),
     }

@@ -1,6 +1,7 @@
-# splitwm (Rust)
+# splitwm (Wayland)
 
-A from-scratch X11 window manager in Rust, a standalone port of
+A from-scratch Wayland compositor in Rust ([smithay](https://smithay.github.io/)),
+the Wayland port of splitwm — itself a standalone port of
 [MathGeniusJodie/awesome](https://github.com/MathGeniusJodie/awesome)'s
 **splitwm** layout (originally Lua on AwesomeWM) — a
 terminal-multiplexer-style tiling layout where:
@@ -13,58 +14,81 @@ terminal-multiplexer-style tiling layout where:
   wider than the screen (trackpad two-finger swipe, or Mod4+swipe over a
   window).
 - All chrome — bitmap window borders, titlebars, buttons, drag handles,
-  taskbar — is **palette-swapped pixel art** (the na16 palette), composited
-  in software onto a single full-screen underlay window below every client.
+  taskbar, even the pointer — is **palette-swapped pixel art** (the na16
+  palette), rasterised in software and composited under/around the client
+  surfaces.
+
+The X11 implementation lives on `master` and remains the behavioral spec:
+this compositor reproduces it unless a deviation is listed below.
 
 ## Stack
 
-- **[x11rb](https://crates.io/crates/x11rb)** — pure-Rust X11/XCB binding
-  (`xinput` feature for smooth trackpad scrolling).
-- **pixel-graphics** (vendored) — palette-indexed software rasteriser,
-  sprite drawing, and the palette-swap machinery behind the per-split
-  accent colours; the underlay is composited into its framebuffers and
-  blitted via `PutImage`.
-- **pixel-fonts** (vendored) — baked bitmap pixel font for labels (text
-  degrades to nothing if the font atlas can't be loaded).
-- pixel-graphics PNG decoding — user wallpapers (non-PNG formats are
-  converted via ImageMagick's `magick`/`convert` when installed).
-- **dbus** — the WM doubles as the session's
-  `org.freedesktop.Notifications` daemon on its own thread.
+- **smithay 0.7** — compositor framework: protocol machinery, GLES
+  renderer, XWayland. Three backends: **winit** (nested development runs
+  inside an existing session), **tty** (real seat via
+  DRM/GBM/libinput/libseat, behind the `tty` cargo feature — linking needs
+  the system `libseat`), and **headless** (offscreen, for the test
+  harness, `SPLITWM_HEADLESS=1`).
+- **pixel-graphics / pixel-fonts** (vendored) — palette-indexed software
+  rasteriser and bitmap font behind all chrome; frames are drawn into CPU
+  buffers and uploaded as textures. Wallpapers and theme icons decode via
+  ImageMagick shell-out.
+- **zbus** — the compositor doubles as the session's
+  `org.freedesktop.Notifications` daemon, bridged to calloop (no thread
+  per notification, no libdbus).
+- **xkbcommon** (via smithay) + **xkeysym** — keyboard handling; xkb
+  config comes from the environment (`XKB_DEFAULT_LAYOUT` …).
+- **freedesktop-icons / freedesktop-desktop-entry** — taskbar icon lookup
+  and `.desktop` resolution.
+- **xcursor** — theme lookup for named cursor shapes beyond the
+  hand-drawn sprites.
+
+## Protocols
+
+wl_compositor, xdg-shell, wl_shm, linux-dmabuf (v4 feedback with a render
+node), wl_seat, wl_output/xdg-output, wl_data_device, xdg-decoration
+(ServerSide forced on every toplevel; clients that ignore it keep their
+CSD), **wlr-layer-shell**, **cursor-shape-v1**, and full **XWayland** —
+X11 and Wayland windows share one window abstraction and lifecycle.
 
 ## Architecture
 
-| file | role |
+| path | role |
 |------|------|
-| `src/theme.rs`      | palette indices, colours, layout metrics |
-| `src/tree.rs`       | pure split-tree math + geometry |
-| `src/state.rs`      | per-tag layout state + all tree/taskbar mutations |
-| `src/render.rs`     | software rendering: 9-slice borders, buttons, icons |
-| `src/oklch.rs`      | OKLCH hue rotation for same-app icon disambiguation |
-| `src/launch.rs`     | quick-launch + `.desktop` command/icon resolution |
-| `src/wm/mod.rs`     | become WM, EWMH announcement, event loop |
-| `src/wm/events.rs`  | event dispatch: keys, buttons, drags, scroll coalescing |
-| `src/wm/clients.rs` | client lifecycle, icons, focus, WM_DELETE/WM_STATE |
-| `src/wm/arrange.rs` | layout → placements, underlay compositing, animation |
-| `src/wm/widgets.rs` | hit-region computation (handles, "+", tabs, taskbar) |
+| `src/main.rs`    | logging, backend selection (nested → winit, bare VT → tty, `SPLITWM_HEADLESS` → headless) |
+| `src/backend/`   | backend enum + winit/tty/headless sessions; `Comp` reaches presentation only through the enum |
+| `src/theme.rs`   | palette/metrics/bindings/quick-launch table |
+| `src/tree.rs`    | pure split-tree math (ported verbatim from master + tests) |
+| `src/state.rs`   | per-tag layout state + all tree/taskbar mutations |
+| `src/render/`    | software chrome rendering: wallpaper, 9-slice borders, buttons, icons, taskbar |
+| `src/widgets.rs` | hit-region computation (handles, "+", titles, taskbar) |
+| `src/oklch.rs`   | OKLCH hue rotation for same-app icon disambiguation |
+| `src/comp/`      | compositor state, calloop wiring, delegate handlers, input, pointer/cursor, layer-shell, XWayland, debug channel |
+| `src/shell.rs`   | window abstraction (Wayland \| X11), floats, fullscreen, dock |
+| `src/notify.rs`  | zbus notification daemon (popups render as chrome) |
+| `src/launch.rs`  | spawn via systemd-run scope with a bounded probe |
 
-There is **no reparenting**: clients stay children of the root, positioned
-below their split's titlebar, and all decoration is drawn on the underlay.
-Windows hidden from the layout are unmapped (with ICCCM `WM_STATE` kept in
-sync, and self-inflicted unmaps distinguished from client withdrawal); on
-quit or WM handover everything is remapped so nothing is stranded.
+Mapping notes vs the X11 spec:
 
-ICCCM/EWMH surface: `WM_S<n>` manager selection (`--replace` supported both
-ways), `WM_STATE`, `WM_DELETE_WINDOW` for polite closing,
-`_NET_SUPPORTING_WM_CHECK`, `_NET_CLIENT_LIST`, `_NET_ACTIVE_WINDOW`,
-`_NET_WM_ICON`. Single monitor, single tag; RandR screen resizes and
-keyboard-mapping changes are handled.
+- No underlay window and no unmap/remap dance: the compositor composites
+  chrome directly and simply doesn't draw taskbar'd windows. `WM_STATE` /
+  restore-on-exit machinery has no analog.
+- "Politely close then kill" → `xdg_toplevel.close()`; the kill fallback
+  exists only for XWayland clients (`WM_DELETE_WINDOW`, as on master).
+- Canvas scroll offsets are render-time offsets, not window moves.
+- Redraws are vblank-driven (DRM) or 60 Hz timer-paced (winit/headless);
+  animations key off `Instant` as before.
+- The pointer is composited from master's hand-drawn cursor sprites
+  (arrow, hand, disabled, text); other shapes clients request via
+  cursor-shape-v1 resolve through the xcursor theme. Nested (winit)
+  sessions map named shapes onto the host's hardware cursor instead.
 
 ## Keybindings (Mod4 = Super)
 
 | key | action |
 |-----|--------|
-| `Mod4+Return`        | open terminal (`$TERMINAL`, default `xterm`) |
-| `Mod4+Space`         | app launcher (`rofi -show drun`) |
+| `Mod4+Return`        | open terminal (`$TERMINAL`, default `alacritty`) |
+| `Mod4+Space`         | app launcher (`rofi -show combi`, native layer-shell) |
 | `Mod4+v`             | split into columns |
 | `Mod4+h`             | split into rows |
 | `Mod4+q`             | close current split (window goes to sibling/taskbar) |
@@ -74,7 +98,9 @@ keyboard-mapping changes are handled.
 | `Mod4+Shift+]` / `[` | move window to next / previous split |
 | `Mod4+l` / `=`       | grow split |
 | `Mod4+Shift+l` / `Mod4+-` | shrink split |
-| `Mod4+Shift+c`       | close focused window (`WM_DELETE_WINDOW`, falls back to kill) |
+| `Mod4+Shift+c`       | close focused window politely |
+| `XF86Audio{Raise,Lower}Volume` / `Mute` | volume via `wpctl` (single-shot per press) |
+| `Ctrl+Alt+F1..F12`   | VT switch (tty backend; the X server's job on master) |
 | trackpad h-swipe     | scroll the canvas (over gaps; hold Mod4 over a window) |
 | drag a gap handle    | resize the two adjacent columns |
 | drag a canvas edge   | resize the outer column into its margin |
@@ -84,51 +110,88 @@ keyboard-mapping changes are handled.
 | taskbar quick-launch icons | spawn that app (right of the pill separator) |
 | titlebar buttons     | minimize / split (right-click: other direction) / close split |
 
-There is no quit binding: splitwm ends its session by being replaced
-(another WM's `--replace`) or via `SIGTERM`/`SIGINT` — remapping all hidden
-windows on the way out either way.
+There is no quit binding, faithful to master: `SIGTERM` (from another VT
+or a remote shell) is the only way out, on every backend.
 
 ## Environment
 
 - `SPLITWM_WALLPAPER=/path/to/image` — scaled wallpaper behind the gaps
-  (PNG natively; other formats need ImageMagick installed).
-- `SPLITWM_DOCK_TITLE` — override the `WM_NAME` matched to dock a window
-  off-screen past the canvas's right end, revealed by scrolling all the way
-  right (default in `theme::DOCK_TITLE`).
-- `SPLITWM_DEBUG_SCROLL=1` — log scroll-device discovery and batch timings.
-- Taskbar quick-launch commands are configured per entry in `theme::QUICK`
-  (each with its own env-var override); see that table for the current set.
+  (any format ImageMagick can decode).
+- `SPLITWM_DOCK_TITLE` — override the app_id/title matched to dock a
+  window off-screen past the canvas's right end (default in
+  `theme::DOCK_TITLE`).
+- `SPLITWM_DEBUG_SCROLL=1` — log scroll batching.
+- `SPLITWM_HEADLESS=1` — offscreen backend for the harness;
+  `SPLITWM_DEBUG_CHANNEL=1` — line protocol on stdin driving keys,
+  pointer, spawns, screenshots, and cursor queries (see `comp/debug.rs`).
+- `XCURSOR_THEME` / `XCURSOR_SIZE` — theme for named cursor shapes the
+  sprites don't cover.
+- Taskbar quick-launch commands are configured per entry in
+  `theme::QUICK` (each with its own env-var override).
 
 ## Build & test
 
 ```sh
-cargo build --release
-cargo test          # layout-state unit tests
+cargo build --release                 # nested/headless backends
+cargo build --release --features tty  # + the real-seat DRM backend
 
-# Asserting ICCCM/EWMH integration test in a nested X server (Xephyr):
-# WM_STATE transitions, _NET_CLIENT_LIST, focus, withdrawal, restore-on-exit.
-# Exits nonzero on any failed assertion.
-./itest.sh
+cargo test          # unit tests + tests/socket.rs: boots the real binary
+                    # headless and asserts manage/displacement/splits/
+                    # focus/layer-shell/cursor/close/SIGTERM as a real
+                    # Wayland client over the socket. Nothing appears on
+                    # the host desktop.
 
-# Launch in a nested X server (Xephyr) and drive an automated UI test that
-# splits, tabs, scrolls, resizes and closes, dropping screenshots in
-# /tmp/splitshots:
+# Headless screenshot drive: walks the split/tab/focus/grow/scroll/close
+# sequence over the debug channel, dropping screenshots in /tmp/splitshots:
 ./drive.sh
 
-# Or just open a Xephyr and run it interactively:
-Xephyr :1 -ac -screen 1280x800 &
-DISPLAY=:1 ./target/release/splitwm
+# Nested interactive run inside an existing Wayland/X session:
+cargo run
+
+# Real VT session (build with the tty feature, from a VT login):
+./vttest.sh          # takes the seat; ./vttest.sh kill ends it by pid
 ```
 
-## Status
+## Deviations from master (approved)
 
-Implemented: n-ary tree splits with flattening, scrollable canvas with
-edge/gap resize and column insertion, bottom taskbar with cycle/close,
-per-split persistent accent colours (palette-swapped bitmap chrome), app
-icons from `_NET_WM_ICON` quantized to the chrome palette (hue-rotated per
-window when one app has several), taskbar quick-launch icons, docked
-sidebar, layout animations (ease-out-back, ~60 fps paced), smooth trackpad
-canvas panning, `--replace` in both directions.
+- Default terminal **alacritty** (was xterm); `$TERMINAL` still wins.
+- The launcher runs as a **native layer-shell surface** (a
+  wayland-capable rofi picks its wayland backend; an X11-only rofi still
+  works through XWayland as an override-redirect float).
+- **Icons**: freedesktop icon-theme lookup keyed on app_id/class only —
+  smithay 0.7 exposes neither xdg-toplevel-icon nor `_NET_WM_ICON`.
+  Hue-rotation disambiguation unchanged.
+- **Volume keys are single-shot per press** (X11 auto-repeat used to make
+  holding the key keep adjusting; there is no compositor-side repeat
+  timer).
+- **Natural scrolling forced on** for the tty seat's libinput devices
+  (master inherited the X server's scroll config); nested sessions
+  inherit the host's.
+- Clicking the dock hands it the keyboard via the same override slot as
+  floats, kept until the next deliberate focus move — arrange runs
+  oftener than on X11, where dock focus survived until any WM focus
+  action.
+- Layer-shell specifics: **Bottom/Background** surfaces render behind the
+  compositor's own opaque chrome underlay (wallpaper/frames/taskbar are
+  one buffer), so they're occluded and get no pointer input; the taskbar
+  strip is not exclusive-zone-aware, so a bottom-anchored exclusive panel
+  overlaps it; OnDemand keyboard interactivity is click-to-focus and
+  yields on the next layout focus move.
+
+## Known gaps
+
+- No `XKillClient` fallback for unresponsive X11 clients (close is
+  polite-only on both backends).
+- Notifications: a daemon replacing us mid-run isn't detected until
+  restart (`NameLost` unwatched); `CloseNotification`'s signal emits on
+  the 250 ms popup tick instead of immediately.
+- TTY backend: output name fixed at startup even if the connector swaps;
+  mode changes on an unchanged connector are ignored; libinput devices
+  run defaults except natural scrolling (no tap-to-click config);
+  single GPU, single output by design (master had one X screen).
+- Harness: pointer injection stops at motion + left click (drags and
+  hover feel still ride manual nested runs); headless output size fixed
+  at 1280x800.
 
 Intentionally not implemented: multi-monitor, multiple tags, a status
 bar/clock, and the Lua original's slanted tab bars, per-leaf tab stacks,

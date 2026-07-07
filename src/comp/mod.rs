@@ -7,10 +7,12 @@
 
 pub mod actions;
 pub mod chrome;
+pub mod cursor;
 pub mod debug;
 pub mod handlers;
 pub mod icons;
 pub mod input;
+pub mod layers;
 pub mod manage;
 pub mod notifications;
 pub mod pointer;
@@ -32,9 +34,11 @@ use smithay::reexports::wayland_server::backend::{ClientData, ClientId, Disconne
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
@@ -58,9 +62,14 @@ pub struct Comp {
     /// Gap background (na16 gunmetal), resolved once from the baked palette.
     pub clear: Color32F,
     /// What the seat's pointer wants shown: a client-committed cursor
-    /// surface, a named shape, or hidden. Only the tty backend renders it;
-    /// nested sessions ride the host's hardware cursor.
+    /// surface, a named shape (from chrome hover feedback or a client's
+    /// cursor-shape-v1 request), or hidden. The tty backend composites it;
+    /// nested sessions map named shapes onto the host's hardware cursor
+    /// and composite only cursor surfaces.
     pub cursor_status: CursorImageStatus,
+    /// Lazily-uploaded named cursor images: master's hand-drawn sprites
+    /// plus xcursor-theme lookups (see `comp::cursor`).
+    pub cursors: cursor::CursorCache,
 
     // Software-rendered chrome (the ported pixel-art renderer) and its
     // GPU-side buffer.
@@ -157,6 +166,11 @@ pub struct Comp {
     pub x11_query: Option<smithay::reexports::x11rb::rust_connection::RustConnection>,
     pub xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
 
+    // Layer-shell surfaces live in the output's LayerMap (smithay); this
+    // caches the map's non-exclusive zone so `layout_area` — called from
+    // every input path — never takes the map's mutex.
+    pub layer_zone: Rectangle<i32, Logical>,
+
     // Protocol globals.
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -170,6 +184,11 @@ pub struct Comp {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Comp>,
     pub data_device_state: DataDeviceState,
+    pub layer_shell_state: WlrLayerShellState,
+    /// Never read, but dropping it would unpublish the cursor-shape-v1
+    /// global (how clients name pointer shapes for us to draw).
+    #[allow(dead_code)]
+    pub cursor_shape_state: CursorShapeManagerState,
     pub dmabuf_state: DmabufState,
     /// Never read, but it identifies the live dmabuf global for teardown.
     #[allow(dead_code)]
@@ -206,6 +225,8 @@ impl Comp {
             smithay::wayland::xwayland_shell::XWaylandShellState::new::<Comp>(&dh);
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Comp>(&dh);
+        let layer_shell_state = WlrLayerShellState::new::<Comp>(&dh);
+        let cursor_shape_state = CursorShapeManagerState::new::<Comp>(&dh);
 
         let mut seat: Seat<Comp> = seat_state.new_wl_seat(&dh, "seat-0");
         // xkb defaults come from the environment (XKB_DEFAULT_LAYOUT etc.),
@@ -286,11 +307,20 @@ impl Comp {
             })
             .collect();
 
+        let layer_zone = Rectangle::from_size(
+            output
+                .current_mode()
+                .expect("output has a mode")
+                .size
+                .to_logical(1),
+        );
+
         Comp {
             backend,
             output,
             clear,
             cursor_status: CursorImageStatus::default_named(),
+            cursors: cursor::CursorCache::new(),
             chrome,
             chrome_buf: smithay::backend::renderer::element::memory::MemoryRenderBuffer::new(
                 smithay::backend::allocator::Fourcc::Argb8888,
@@ -335,6 +365,7 @@ impl Comp {
             or_windows: Vec::new(),
             x11_query: None,
             xwayland_shell_state,
+            layer_zone,
             compositor_state,
             xdg_shell_state,
             xdg_decoration_state,
@@ -342,6 +373,8 @@ impl Comp {
             output_manager_state,
             seat_state,
             data_device_state,
+            layer_shell_state,
+            cursor_shape_state,
             dmabuf_state,
             dmabuf_global,
         }
@@ -394,10 +427,21 @@ impl Comp {
         smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         Point<f64, Logical>,
     )> {
-        // Stacking order: override-redirect X11 windows topmost, then
-        // floats (top of stack first), the tiled/fullscreen Space, the
-        // dock at the bottom.
+        // Stacking order: Overlay layer surfaces topmost, then
+        // override-redirect X11 windows, the Top layer, floats (top of
+        // stack first), the tiled/fullscreen Space, the dock at the
+        // bottom. Bottom/Background layer surfaces get no pointer input:
+        // they render behind the opaque chrome underlay (see
+        // chrome::output_elements), and what can't be seen must not
+        // swallow clicks meant for the chrome.
+        use smithay::wayland::shell::wlr_layer::Layer;
+        if let Some(hit) = self.layer_surface_under(&[Layer::Overlay], pos) {
+            return Some(hit);
+        }
         if let Some(hit) = xwayland::or_surface_under(&self.or_windows, pos) {
+            return Some(hit);
+        }
+        if let Some(hit) = self.layer_surface_under(&[Layer::Top], pos) {
             return Some(hit);
         }
         for &fw in &self.float_stack {
@@ -442,15 +486,18 @@ impl Comp {
     }
 
     /// The split-layout area: the output minus the bottom taskbar strip
-    /// (master's `la()`). Scale is 1 — this compositor lives in the same
+    /// (master's `la()`), further shrunk by layer-shell exclusive zones
+    /// (panels, OSDs). Scale is 1 — this compositor lives in the same
     /// pixel world as its chrome art.
     pub fn layout_area(&self) -> crate::tree::Rect {
         let size = self.output_size();
+        let z = self.layer_zone;
+        let bottom = (z.loc.y + z.size.h).min(size.h - crate::theme::TASKBAR_H);
         crate::tree::Rect {
-            x: 0,
-            y: 0,
-            w: size.w,
-            h: (size.h - crate::theme::TASKBAR_H).max(1),
+            x: z.loc.x,
+            y: z.loc.y,
+            w: z.size.w.max(1),
+            h: (bottom - z.loc.y).max(1),
         }
     }
 
@@ -566,11 +613,14 @@ impl Comp {
         self.widgets.clear();
         crate::widgets::compute_leaf_widgets(&mut self.widgets, &self.state.tree, &self.placed);
         crate::widgets::compute_boundary_widgets(&mut self.widgets, &self.state, wa);
+        // The taskbar strip spans the full output, not the (possibly
+        // zone-shrunk) layout area.
+        let size = self.output_size();
         let full = crate::tree::Rect {
             x: 0,
             y: 0,
-            w: wa.w,
-            h: wa.h + crate::theme::TASKBAR_H,
+            w: size.w,
+            h: size.h,
         };
         let app_ids: Vec<(crate::tree::Win, String)> = self
             .managed
@@ -646,8 +696,12 @@ impl Comp {
                 toplevel.send_pending_configure();
             }
         }
-        let target = focused.and_then(|c| self.managed.get(c)).and_then(|w| {
-            smithay::wayland::seat::WaylandFocus::wl_surface(w).map(|s| s.into_owned())
+        // An exclusive-keyboard layer surface (rofi) outranks every window
+        // while mapped.
+        let target = self.exclusive_layer_surface().or_else(|| {
+            focused.and_then(|c| self.managed.get(c)).and_then(|w| {
+                smithay::wayland::seat::WaylandFocus::wl_surface(w).map(|s| s.into_owned())
+            })
         });
         let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
@@ -661,6 +715,8 @@ impl Comp {
         self.output
             .change_current_state(Some(mode), None, None, None);
         self.output.set_preferred(mode);
+        // Layer surfaces re-anchor to the new size; the zone follows.
+        self.sync_layer_zone();
         if let Some(path) = self.wallpaper_path.clone() {
             self.chrome.set_wallpaper(&path, mode.size.w, mode.size.h);
         }
@@ -700,8 +756,8 @@ impl Comp {
             .map(|(_, window, d)| (window.clone(), self.dock_geometry(d)));
         let note_rects = self.note_rects();
 
-        // The seat pointer's spot, for the composited cursor on tty (a
-        // nested session rides the host's hardware cursor instead).
+        // The seat pointer's spot, for wherever the cursor is composited
+        // (tty always; winit for client cursor surfaces).
         let pointer_loc = self
             .seat
             .get_pointer()
@@ -723,6 +779,10 @@ impl Comp {
         };
         match &mut self.backend {
             crate::backend::Backend::Winit(w) => {
+                // Named shapes ride the host's hardware cursor (zero
+                // latency); a client-committed cursor surface has no host
+                // analog, so it composites like on tty.
+                let composite_cursor = w.apply_cursor(&self.cursor_status);
                 let size = w.backend.window_size();
                 let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
                 let rendered = {
@@ -733,7 +793,17 @@ impl Comp {
                     else {
                         return;
                     };
-                    let elements = chrome::output_elements(renderer, &scene);
+                    let mut elements = if composite_cursor {
+                        cursor::cursor_elements(
+                            renderer,
+                            pointer_loc,
+                            &self.cursor_status,
+                            &mut self.cursors,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+                    elements.extend(chrome::output_elements(renderer, &scene));
                     w.damage_tracker
                         .render_output(renderer, &mut fb, 0, &elements, self.clear)
                         .inspect_err(|err| tracing::error!("render: {err:?}"))
@@ -748,11 +818,15 @@ impl Comp {
             crate::backend::Backend::Headless(h) => h.render(&scene, self.clear),
             #[cfg(feature = "tty")]
             crate::backend::Backend::Tty(t) => {
-                t.render(&scene, pointer_loc, &self.cursor_status, self.clear);
+                t.render(
+                    &scene,
+                    pointer_loc,
+                    &self.cursor_status,
+                    &mut self.cursors,
+                    self.clear,
+                );
             }
         }
-        #[cfg(not(feature = "tty"))]
-        let _ = pointer_loc;
 
         // Frame callbacks let clients produce their next buffer; throttle to
         // once per redraw cycle. Every managed kind gets one (floats and
@@ -774,6 +848,11 @@ impl Comp {
                     |_, _| Some(output.clone()),
                 );
             }
+        }
+        for layer in smithay::desktop::layer_map_for_output(&output).layers() {
+            layer.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
+                Some(output.clone())
+            });
         }
     }
 }
