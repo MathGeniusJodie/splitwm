@@ -57,12 +57,16 @@ impl Comp {
                             match key_state {
                                 KeyState::Pressed => {
                                     let sym = handle.raw_syms().first().map_or(0, |s| s.raw());
-                                    let intercepted = vt_switch_target(sym)
-                                        .map(Intercepted::SwitchVt)
-                                        .or_else(|| {
-                                            crate::comp::actions::binding_action(mods, sym)
-                                                .map(Intercepted::Action)
-                                        });
+                                    // The VT syms only exist on the
+                                    // ctrl+alt-modified level; bindings
+                                    // keep matching level-0 syms + mods.
+                                    let intercepted =
+                                        vt_switch_target(handle.modified_sym().raw())
+                                            .map(Intercepted::SwitchVt)
+                                            .or_else(|| {
+                                                crate::comp::actions::binding_action(mods, sym)
+                                                    .map(Intercepted::Action)
+                                            });
                                     let Some(intercepted) = intercepted else {
                                         return FilterResult::Forward;
                                     };

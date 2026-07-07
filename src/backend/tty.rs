@@ -282,6 +282,11 @@ pub fn run() {
                         out.reset_buffers();
                     }
                 }
+                // Releases of chord keys held across the switch (the VT
+                // chord itself, at minimum) were lost with the devices;
+                // without this the next press of the same key would be
+                // swallowed as a "repeat" of a chord still thought held.
+                comp.held_bound_keys.clear();
                 comp.chrome_dirty = true;
                 comp.redraw();
             }
