@@ -46,16 +46,14 @@ this port must reproduce unless a deviation is listed below.
 - [x] **M1** protocol core: compositor/xdg-shell/shm/dmabuf/seat/output/
       data-device; alacritty runs with keyboard focus
 - [x] **M2** pure core ported with tests: theme, tree, layout state, oklch
-- [~] **M3** chrome rendering: DONE — underlay pipeline (render/* ported
-      verbatim, MemoryRenderBuffer element behind clients, dirty-gated),
-      leaf frames/titlebars/focus outline verified. REMAINING: taskbar
-      strip+tiles composited, wallpaper wired to SPLITWM_WALLPAPER,
-      titlebar buttons (needs M5 btn_regions), notify_popup (M8).
-- [~] **M4** tiling behavior: keyboard tiling core DONE (splits ↔ windows,
-      manage/displace, stash cycle, focus, resize, spawn, xdg-decoration
-      SSD); taskbar visuals + titlebar buttons land with M3/M5
-- [ ] **M5** pointer: handle/edge drags, '+' insertion, canvas scroll +
-      glide, Mod4+swipe over windows, ease-out-back animations
+- [x] **M3** chrome rendering (notify_popup bubble drawing waits on M8)
+- [x] **M4** tiling behavior incl. taskbar + xdg-decoration ServerSide
+- [x] **M5** pointer: chrome clicks (buttons/tiles/badges/quick/"+"),
+      gap+edge drags, canvas panning w/ Mod4 gate + glide, ease-out-back
+      animations. Not yet visually verified (thin wrappers over unit-
+      tested state fns; harness will cover): scroll glide end-to-end,
+      taskbar-tile activation of a *stashed* window, edge drags, hover
+      cursor shapes (unimplemented — no cursor rendering until M9).
 - [ ] **M6** floats, fullscreen, dock (DOCK_TITLE/DOCK_OVERLAP)
 - [ ] **M7** XWayland: full X11 lifecycle, rofi works
 - [ ] **M8** notifications (zbus), quick-launch, .desktop/icon lookup,
