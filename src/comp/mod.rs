@@ -11,6 +11,7 @@ pub mod handlers;
 pub mod icons;
 pub mod input;
 pub mod manage;
+pub mod notifications;
 pub mod pointer;
 pub mod xwayland;
 
@@ -141,6 +142,11 @@ pub struct Comp {
     /// `comp::icons`).
     pub icon_tx: calloop::channel::Sender<icons::IconResult>,
 
+    // Served-notification popups and the dismissal path back to the
+    // daemon thread (which emits NotificationClosed on the bus).
+    pub note_popups: Vec<notifications::NotePopup>,
+    pub note_dismiss_tx: std::sync::mpsc::Sender<(u32, crate::notify::CloseReason)>,
+
     // XWayland: the WM connection (once Ready) and unmanaged
     // override-redirect windows (rofi, menus), topmost last.
     pub xwm: Option<smithay::xwayland::X11Wm>,
@@ -249,6 +255,17 @@ impl Comp {
             })
             .expect("insert icon channel source");
 
+        // The notification daemon feeds Show/Close over its own channel.
+        let (note_tx, note_rx) = calloop::channel::channel();
+        handle
+            .insert_source(note_rx, |event, (), comp: &mut Comp| {
+                if let calloop::channel::Event::Msg(msg) = event {
+                    comp.on_note_msg(msg);
+                }
+            })
+            .expect("insert notification channel source");
+        let note_dismiss_tx = crate::notify::spawn(note_tx);
+
         let mut chrome = crate::render::Renderer::new();
         let wallpaper_path = std::env::var("SPLITWM_WALLPAPER").ok();
         if let Some(path) = &wallpaper_path {
@@ -319,6 +336,8 @@ impl Comp {
             pending_fullscreen: Vec::new(),
             held_bound_keys: Vec::new(),
             icon_tx,
+            note_popups: Vec::new(),
+            note_dismiss_tx,
             xwm: None,
             or_windows: Vec::new(),
             xwayland_shell_state,
@@ -680,11 +699,13 @@ impl Comp {
         for win in dirty_frames {
             self.paint_float_frame(win);
         }
-        // Dock element inputs, resolved before the renderer borrow below.
+        // Dock/note element inputs, resolved before the renderer borrow
+        // below (both need &self, which the bound renderer excludes).
         let dock_place = self
             .managed
             .dock()
             .map(|(_, window, d)| (window.clone(), self.dock_geometry(d)));
+        let note_rects = self.note_rects();
 
         let size = self.backend.window_size();
         let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
@@ -719,6 +740,25 @@ impl Comp {
                     .into_iter()
                     .map(chrome::OutputElement::Float),
                 );
+            }
+            // Notification bubbles above floats (master raised them so a
+            // focused dialog never buries an incoming note).
+            for (id, rect) in note_rects {
+                let Some(p) = self.note_popups.iter().find(|p| p.id == id) else {
+                    continue;
+                };
+                match smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    (f64::from(rect.x), f64::from(rect.y)),
+                    &p.buf,
+                    None,
+                    None,
+                    None,
+                    smithay::backend::renderer::element::Kind::Unspecified,
+                ) {
+                    Ok(el) => elements.push(chrome::OutputElement::Chrome(el)),
+                    Err(err) => tracing::error!("note element: {err}"),
+                }
             }
             for &fw in &self.float_stack {
                 let Some((window, f)) = self.managed.float(fw) else {

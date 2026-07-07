@@ -21,8 +21,7 @@
 mod buttons;
 mod chrome;
 mod icon_cache;
-// notify_popup rejoins when the notification daemon ports (M8): it draws
-// crate::notify::Note bubbles, which don't exist yet.
+mod notify_popup;
 mod taskbar;
 mod wallpaper;
 

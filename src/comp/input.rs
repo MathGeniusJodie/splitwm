@@ -110,9 +110,16 @@ impl Comp {
                     // client that never saw the press.
                     consumed = std::mem::take(&mut self.chrome_press);
                 } else if !pointer.is_grabbed() {
+                    // Any click on a notification bubble dismisses it,
+                    // before everything else (they render topmost).
+                    if self.dismiss_note_at(pos) {
+                        self.chrome_press = true;
+                        consumed = true;
+                    } else
                     // Float chrome frames overlap client surfaces beneath
                     // them; they win the press outright.
-                    if event.button_code() == BTN_LEFT && self.float_frame_at(pos).is_some() {
+                    if event.button_code() == BTN_LEFT && self.float_frame_at(pos).is_some()
+                    {
                         self.on_chrome_button(pos, false);
                         self.chrome_press = true;
                         consumed = true;

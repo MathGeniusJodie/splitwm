@@ -15,6 +15,7 @@ mod comp;
 #[allow(dead_code)]
 mod icon;
 mod launch;
+mod notify;
 #[allow(dead_code)]
 mod oklch;
 #[allow(dead_code)]
