@@ -760,6 +760,7 @@ impl Comp {
             .managed
             .dock()
             .map(|(_, window, d)| (window.clone(), self.dock_geometry(d)));
+        let layer_dock = self.layer_dock_place();
         let note_rects = self.note_rects();
 
         // The seat pointer's spot, for wherever the cursor is composited
@@ -781,6 +782,7 @@ impl Comp {
             space: &self.space,
             output: &self.output,
             dock_place: &dock_place,
+            layer_dock: &layer_dock,
             chrome_buf: &self.chrome_buf,
         };
         match &mut self.backend {

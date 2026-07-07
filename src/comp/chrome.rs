@@ -43,25 +43,41 @@ pub struct Scene<'a> {
     pub space: &'a smithay::desktop::Space<smithay::desktop::Window>,
     pub output: &'a smithay::output::Output,
     pub dock_place: &'a Option<(smithay::desktop::Window, crate::tree::Rect)>,
+    /// The dock layer surface's scrolled position (`Comp::layer_dock_place`);
+    /// it renders there instead of where the `LayerMap` pinned it.
+    pub layer_dock: &'a Option<(
+        smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        smithay::utils::Point<i32, smithay::utils::Logical>,
+    )>,
     pub chrome_buf: &'a MemoryRenderBuffer,
 }
 
 /// Append render elements for every layer surface on `layer`, topmost
-/// first (matching `elements`' front-to-back order).
+/// first (matching `elements`' front-to-back order). A surface matching
+/// `override_loc` renders at that position instead of its map geometry
+/// (the dock panel riding the canvas scroll).
 fn layer_elements(
     renderer: &mut GlesRenderer,
     map: &smithay::desktop::LayerMap,
     layer: smithay::wayland::shell::wlr_layer::Layer,
+    override_loc: &Option<(
+        smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+        smithay::utils::Point<i32, smithay::utils::Logical>,
+    )>,
     elements: &mut Vec<OutputElement>,
 ) {
     use smithay::backend::renderer::element::AsRenderElements as _;
     for l in map.layers_on(layer).rev() {
-        let Some(geo) = map.layer_geometry(l) else {
-            continue;
+        let loc = match override_loc {
+            Some((s, p)) if s == l.wl_surface() => *p,
+            _ => match map.layer_geometry(l) {
+                Some(geo) => geo.loc,
+                None => continue,
+            },
         };
         elements.extend(l.render_elements::<OutputElement>(
             renderer,
-            geo.loc.to_physical(1),
+            loc.to_physical(1),
             1.0.into(),
             1.0,
         ));
@@ -80,7 +96,7 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
 
     let layer_map = smithay::desktop::layer_map_for_output(scene.output);
     let mut elements: Vec<OutputElement> = Vec::new();
-    layer_elements(renderer, &layer_map, Layer::Overlay, &mut elements);
+    layer_elements(renderer, &layer_map, Layer::Overlay, &None, &mut elements);
     for or in scene.or_windows.iter().rev() {
         let Some(surface) = or.surface.wl_surface() else {
             continue;
@@ -118,7 +134,7 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
             Err(err) => tracing::error!("note element: {err}"),
         }
     }
-    layer_elements(renderer, &layer_map, Layer::Top, &mut elements);
+    layer_elements(renderer, &layer_map, Layer::Top, &None, &mut elements);
     for &fw in scene.float_stack {
         let Some((window, f)) = scene.managed.float(fw) else {
             continue;
@@ -161,10 +177,16 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
     // Bottom layer surfaces (cozyui's native sidebar) sit above the
     // chrome underlay: the wallpaper is baked into that opaque buffer, so
     // "above the wallpaper, below the windows" can only mean above the
-    // whole underlay. A zone-respecting panel overlaps no leaf frame —
-    // the exclusive zone already shrank the layout — only the taskbar
-    // rows in its column, exactly like the dock.
-    layer_elements(renderer, &layer_map, Layer::Bottom, &mut elements);
+    // whole underlay. The dock panel among them rides the canvas scroll
+    // (`layer_dock`), parked past its right end like the XWayland dock,
+    // so columns scrolled over it cover it and scrolling right reveals it.
+    layer_elements(
+        renderer,
+        &layer_map,
+        Layer::Bottom,
+        scene.layer_dock,
+        &mut elements,
+    );
     match MemoryRenderBufferRenderElement::from_buffer(
         renderer,
         (0.0, 0.0),
@@ -181,7 +203,7 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
     // a foreign Background surface (a wallpaper client) stacks behind the
     // opaque underlay, occluded, rather than being allowed to cover the
     // leaf frames and taskbar drawn into the same buffer.
-    layer_elements(renderer, &layer_map, Layer::Background, &mut elements);
+    layer_elements(renderer, &layer_map, Layer::Background, &None, &mut elements);
     elements
 }
 

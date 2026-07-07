@@ -637,6 +637,11 @@ impl State {
         self.scroll_x = self.scroll_x.clamp(0, max_scroll);
     }
 
+    /// The dock scroll room last supplied to `update_canvas`.
+    pub fn dock_extra(&self) -> i32 {
+        self.dock_extra
+    }
+
     // --- scroll ---
 
     pub fn scroll_x(&self) -> i32 {

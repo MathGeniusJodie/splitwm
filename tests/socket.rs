@@ -388,6 +388,25 @@ impl Session {
         self.app.wins[win].surface.commit();
         win
     }
+
+    /// Screenshot the output and sample one pixel as R,G,B,A (`shot`
+    /// writes raw rows for a `.rgba` path and acks after the file is
+    /// complete).
+    fn pixel(&mut self, x: i32, y: i32) -> [u8; 4] {
+        // Tests share the process and run concurrently: the path must be
+        // unique per session, not just per process.
+        let path = std::env::temp_dir().join(format!(
+            "splitwm-test-px-{}-{}.rgba",
+            std::process::id(),
+            self.wm.child.id()
+        ));
+        let path = path.to_str().expect("utf-8 temp path").to_string();
+        self.wm.cmd(&format!("shot {path}"));
+        let frame = std::fs::read(&path).expect("read screenshot");
+        std::fs::remove_file(&path).ok();
+        let at = ((y * OUTPUT_W + x) * 4) as usize;
+        frame[at..at + 4].try_into().expect("pixel in bounds")
+    }
 }
 
 #[test]
@@ -651,18 +670,11 @@ fn bottom_layer_panel_visible_and_clickable() {
         app.wins[a].size.0 > 0 && app.wins[a].size.0 <= full.0 - PANEL_W + 50
     });
 
-    // Sample mid-strip. `.rgba` makes `shot` write raw R,G,B,A rows, so
-    // the assertion reads bytes instead of parsing encoder output.
+    // Sample mid-strip: the panel's pixels, not the wallpaper, fill it.
     let (px, py) = (OUTPUT_W - PANEL_W / 2, OUTPUT_H / 2);
-    let path = std::env::temp_dir().join(format!("splitwm-test-bottom-{}.rgba", std::process::id()));
-    let path = path.to_str().expect("utf-8 temp path").to_string();
-    s.wm.cmd(&format!("shot {path}"));
-    let frame = std::fs::read(&path).expect("read screenshot");
-    std::fs::remove_file(&path).ok();
-    let at = ((py * OUTPUT_W + px) * 4) as usize;
     assert_eq!(
-        &frame[at..at + 4],
-        &[255, 0, 0, 255],
+        s.pixel(px, py),
+        [255, 0, 0, 255],
         "the panel strip should show the panel's pixels at ({px}, {py})"
     );
 
@@ -675,6 +687,124 @@ fn bottom_layer_panel_visible_and_clickable() {
     });
     s.wm.cmd("click 40 40");
     s.wait_until("keyboard returns to the tiled window", |app| app.focus_is(a));
+}
+
+#[test]
+fn dock_layer_panel_rides_the_canvas_scroll() {
+    // The dock-named Bottom panel (cozyui's native sidebar) gets the
+    // XWayland dock's scroll semantics instead of a static pin: the tiled
+    // layout keeps the full width (the exclusive zone becomes scroll room
+    // past the canvas end), only the overlap strip past the zone shows at
+    // scroll 0, scrolling right reveals the rest, clicks land at the
+    // scrolled position, and scrolling back tucks it away again.
+    const PANEL_W: i32 = 300;
+    // The revealable share; the remaining 100 px stay tucked under the
+    // canvas edge even when scrolled fully right.
+    const ZONE: i32 = 200;
+    const OUTPUT_H: i32 = 800;
+    const RED: [u8; 4] = [255, 0, 0, 255];
+    // Inside the parked overlap strip (right edge, scroll 0)…
+    const PARKED_X: i32 = OUTPUT_W - 50;
+    // …and inside the zone that only a full right-scroll reveals.
+    const REVEALED_X: i32 = OUTPUT_W - ZONE - 30;
+    const SAMPLE_Y: i32 = OUTPUT_H / 2;
+
+    fn wait_pixel(s: &mut Session, what: &str, x: i32, y: i32, want_red: bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            // Flush the client too: a just-queued commit only reaches the
+            // compositor on a roundtrip.
+            s.queue.roundtrip(&mut s.app).expect("roundtrip");
+            if (s.pixel(x, y) == RED) == want_red {
+                return;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for: {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    let mut s = Session::boot();
+    let a = s.open_window();
+    s.wait_until("window tiled", |app| {
+        app.wins[a].activated && app.wins[a].size.0 > 0
+    });
+    let full = s.app.wins[a].size;
+
+    let layer_shell: zwlr_layer_shell_v1::ZwlrLayerShellV1 = s
+        .globals
+        .bind(&s.qh, 1..=4, ())
+        .expect("bind zwlr_layer_shell_v1");
+    let surface = s.compositor.create_surface(&s.qh, ());
+    let layer = layer_shell.get_layer_surface(
+        &surface,
+        None,
+        zwlr_layer_shell_v1::Layer::Bottom,
+        // The dock identity: this namespace is what opts the panel in.
+        "cozyui".into(),
+        &s.qh,
+        (),
+    );
+    layer.set_size(PANEL_W as u32, 0);
+    layer.set_anchor(
+        zwlr_layer_surface_v1::Anchor::Top
+            | zwlr_layer_surface_v1::Anchor::Bottom
+            | zwlr_layer_surface_v1::Anchor::Right,
+    );
+    layer.set_exclusive_zone(ZONE);
+    layer.set_keyboard_interactivity(zwlr_layer_surface_v1::KeyboardInteractivity::OnDemand);
+    surface.commit();
+    s.wait_until("layer surface configured", |app| app.layer_configures > 0);
+
+    // A solid red full-strip buffer, so screenshots track where the panel
+    // actually composites.
+    let shm: wl_shm::WlShm = s.globals.bind(&s.qh, 1..=1, ()).expect("bind wl_shm");
+    let file = tempfile::tempfile().expect("shm backing file");
+    let len = PANEL_W * OUTPUT_H * 4;
+    // Argb8888 little-endian: B, G, R, A.
+    let red: Vec<u8> = [0u8, 0, 255, 255].repeat((PANEL_W * OUTPUT_H) as usize);
+    (&file).write_all(&red).expect("fill shm with red");
+    let pool = shm.create_pool(file.as_fd(), len, &s.qh, ());
+    let buffer = pool.create_buffer(
+        0,
+        PANEL_W,
+        OUTPUT_H,
+        PANEL_W * 4,
+        wl_shm::Format::Argb8888,
+        &s.qh,
+        (),
+    );
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+
+    // Parked at scroll 0: the overlap strip pokes in at the right edge,
+    // the zone's share stays past it, offscreen.
+    wait_pixel(&mut s, "overlap strip parked at the right edge", PARKED_X, SAMPLE_Y, true);
+    assert_ne!(
+        s.pixel(REVEALED_X, SAMPLE_Y),
+        RED,
+        "the zone's share should still be past the canvas end at scroll 0"
+    );
+
+    // Scrolling right (clamped to the dock's scroll room) glides the
+    // panel into view.
+    s.wm.cmd("scroll 50");
+    wait_pixel(&mut s, "right scroll reveals the panel", REVEALED_X, SAMPLE_Y, true);
+
+    // Input follows the scrolled position: OnDemand click-to-focus works
+    // where the panel now shows.
+    let layer_id = surface.id();
+    s.wm.cmd(&format!("click {REVEALED_X} {SAMPLE_Y}"));
+    s.wait_until("click at the scrolled position hands the panel the keyboard", |app| {
+        app.focused.as_ref() == Some(&layer_id)
+    });
+
+    // Scrolling back tucks it away again, and the layout never gave up
+    // any width for it: the zone was scroll room, not a strut.
+    s.wm.cmd("scroll -50");
+    wait_pixel(&mut s, "left scroll tucks the panel away", REVEALED_X, SAMPLE_Y, false);
+    s.wait_until("tiled window kept the full slot throughout", |app| {
+        app.wins[a].size == full
+    });
 }
 
 #[test]
@@ -697,3 +827,4 @@ fn sigterm_ends_the_session() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
+

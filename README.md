@@ -171,12 +171,19 @@ cargo run
   floats, kept until the next deliberate focus move — arrange runs
   oftener than on X11, where dock focus survived until any WM focus
   action.
-- Layer-shell specifics: **Bottom/Background** surfaces render behind the
+- Layer-shell specifics: **Background** surfaces render behind the
   compositor's own opaque chrome underlay (wallpaper/frames/taskbar are
-  one buffer), so they're occluded and get no pointer input; the taskbar
+  one buffer), so they're occluded and get no pointer input; **Bottom**
+  surfaces render just above the underlay and take clicks; the taskbar
   strip is not exclusive-zone-aware, so a bottom-anchored exclusive panel
   overlaps it; OnDemand keyboard interactivity is click-to-focus and
   yields on the next layout focus move.
+- The dock panel's native layer surface (Bottom, namespace = dock
+  identity, anchored full-height right) rides the scrolling canvas like
+  the XWayland dock: its exclusive zone becomes scroll room past the
+  canvas end instead of statically shrinking the layout, and its
+  position shifts with the scroll, so scrolling left tucks it offscreen
+  and scrolling fully right reveals all but its declared overlap strip.
 
 ## Known gaps
 

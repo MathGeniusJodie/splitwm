@@ -49,8 +49,7 @@ impl Comp {
     /// client-controlled free text, and matching it for classed windows
     /// would let any browser tab titled "cozyui" get yanked out of tiling.
     pub fn matches_dock(&self, window: &Window) -> bool {
-        let identity =
-            std::env::var("SPLITWM_DOCK_TITLE").unwrap_or_else(|_| theme::DOCK_TITLE.to_string());
+        let identity = theme::dock_identity();
         let app_id = crate::shell::toplevel_app_id(window);
         if !app_id.is_empty() {
             return app_id.eq_ignore_ascii_case(&identity);
@@ -166,9 +165,14 @@ impl Comp {
 
     /// The extra scroll room the docked sidebar needs (zero when nothing
     /// is docked): its width minus the strip already tucked under the
-    /// canvas edge.
+    /// canvas edge. The dock is either a managed window (XWayland cozyui)
+    /// or a native layer surface (see `layer_dock_extra`), whichever is
+    /// present.
     pub fn dock_extra(&self) -> i32 {
-        self.managed.dock().map_or(0, |(_, _, d)| d.w - d.overlap())
+        if let Some((_, _, d)) = self.managed.dock() {
+            return d.w - d.overlap();
+        }
+        self.layer_dock_extra()
     }
 
     /// The dock's pinned screen geometry: parked at the right end of the

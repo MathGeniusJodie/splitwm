@@ -168,6 +168,13 @@ pub const TASKBAR_CLOSE: i32 = 17;
 /// Overridable at runtime with the `SPLITWM_DOCK_TITLE` environment variable.
 pub const DOCK_TITLE: &str = "cozyui";
 
+/// The dock identity in effect this run: `SPLITWM_DOCK_TITLE` when set,
+/// else [`DOCK_TITLE`]. Matched (case-insensitively) against a toplevel's
+/// app_id/title and a layer surface's namespace to recognize the dock.
+pub fn dock_identity() -> String {
+    std::env::var("SPLITWM_DOCK_TITLE").unwrap_or_else(|_| DOCK_TITLE.to_string())
+}
+
 /// How far the docked sidebar is tucked under the right end of the split
 /// canvas, in px: `Wm::place_dock` shifts the dock left by this much from
 /// the canvas edge, and the canvas (stacked above it) overlaps it by the
