@@ -65,11 +65,7 @@ impl Comp {
     /// Screen rects of the popups, stacked bottom-right above the taskbar,
     /// oldest nearest the corner, growing upward.
     pub fn note_rects(&self) -> Vec<(u32, FrameRect)> {
-        let size = self
-            .output
-            .current_mode()
-            .map(|m| m.size)
-            .unwrap_or_else(|| self.backend.window_size());
+        let size = self.output_size();
         let gap = theme::GAP;
         let mut bottom = size.h - theme::TASKBAR_H;
         let mut rects = Vec::with_capacity(self.note_popups.len());

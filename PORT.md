@@ -53,7 +53,8 @@ this port must reproduce unless a deviation is listed below.
       animations. Not yet visually verified (thin wrappers over unit-
       tested state fns; harness will cover): scroll glide end-to-end,
       taskbar-tile activation of a *stashed* window, edge drags, hover
-      cursor shapes (unimplemented — no cursor rendering until M9).
+      cursor shapes (still unimplemented after M9: the tty backend
+      renders a cursor, but shape switching over chrome is absent).
 - [x] **M6** floats, fullscreen, dock (DOCK_TITLE/DOCK_OVERLAP);
       verified: zenity float + frame drag, cozyui dock layering,
       startup-fullscreen. Note: clicking the dock hands it the keyboard
@@ -75,13 +76,30 @@ this port must reproduce unless a deviation is listed below.
       N/A on Wayland. xdg-toplevel-icon protocol not in smithay 0.7 —
       icons come from theme lookup by app_id/class only (X11
       _NET_WM_ICON also unexposed by smithay's X11Surface).
-- [ ] **M9** TTY backend: udev/DRM/GBM/libinput/libseat, output resize
+- [x] **M9** TTY backend: udev/DRM/GBM/libinput/libseat behind the `tty`
+      feature (now links; seatd installed). Single GPU, single output:
+      the first connected connector at its preferred mode, vblank-paced
+      via DrmOutputManager, connector hotplug replaces the output (mode
+      republish + full relayout). VT switching (Ctrl+Alt+Fn) handled by
+      the compositor — the X server's job on master. Composited cursor:
+      client cursor surfaces, else the xcursor-theme arrow, Kind::Cursor
+      for hardware-plane offload. Verified: builds/tests both feature
+      sets, nested winit regression drive (tiling+split+chrome intact).
+      **Not yet run on a real VT** — can't take the seat from inside the
+      live session; needs Jodie on a spare VT. Gaps: named cursor shapes
+      beyond the arrow (hover feedback still absent, see M5); output
+      name fixed at startup even if the connector swaps; mode changes on
+      an unchanged connector ignored; libinput devices run defaults (no
+      tap-to-click config); multi-GPU and multi-output out of scope
+      (master had one X screen).
 - [ ] **Harness** (grows from M1): headless socket tests, screenshot drive
 
 ## Architecture (new src/)
 
 ```
-main.rs        CLI, logging, backend selection (winit now, tty later)
+main.rs        logging, backend selection (nested → winit, bare VT → tty)
+backend/       Backend enum + winit and tty (feature-gated) sessions;
+               Comp reaches presentation only through the enum
 assets.rs      baked chrome art (unchanged from master; build.rs unchanged)
 theme.rs       palette/metrics/bindings/QUICK (keysyms via xkbcommon)
 oklch.rs       icon hue rotation (ported verbatim + tests)
@@ -109,8 +127,9 @@ Mapping notes vs X11:
 ## Environment
 
 - Present: wayland 1.25, libinput 1.31, xkbcommon 1.13, EGL, GBM, udev,
-  libdisplay-info, pixman, alacritty, rofi.
-- Missing (Jodie to install): `xorg-xwayland` (M7), `seatd` (M9/`tty`).
+  libdisplay-info, pixman, alacritty, rofi, xorg-xwayland, seatd 0.9.
+- `tty` stays an opt-in cargo feature even with seatd installed; folding
+  it into the default build is Jodie's call.
 
 ## Testing
 

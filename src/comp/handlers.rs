@@ -312,7 +312,11 @@ impl SeatHandler for Comp {
     }
 
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: CursorImageStatus) {}
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        // Tracked for the tty backend, which composites the cursor itself;
+        // nested sessions show the host's cursor and never read this.
+        self.cursor_status = image;
+    }
 }
 delegate_seat!(Comp);
 

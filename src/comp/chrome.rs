@@ -33,6 +33,116 @@ render_elements! {
     Chrome=MemoryRenderBufferRenderElement<GlesRenderer>,
 }
 
+/// Borrows of everything `output_elements` composites, so `redraw` can
+/// hand the scene to a backend while that backend is itself mutably
+/// borrowed out of `Comp`.
+pub struct Scene<'a> {
+    pub or_windows: &'a [smithay::xwayland::X11Surface],
+    pub note_popups: &'a [super::notifications::NotePopup],
+    pub note_rects: &'a [(u32, crate::widgets::FrameRect)],
+    pub float_stack: &'a [crate::tree::Win],
+    pub managed: &'a crate::shell::Managed,
+    pub space: &'a smithay::desktop::Space<smithay::desktop::Window>,
+    pub output: &'a smithay::output::Output,
+    pub dock_place: &'a Option<(smithay::desktop::Window, crate::tree::Rect)>,
+    pub chrome_buf: &'a MemoryRenderBuffer,
+}
+
+/// One frame's render elements, front-to-back: override-redirect X11
+/// windows (rofi, menus) topmost, notification bubbles, floats with their
+/// frame chrome, the tiled/fullscreen Space, the dock, the chrome underlay
+/// behind everything.
+pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<OutputElement> {
+    use smithay::backend::renderer::element::AsRenderElements as _;
+    use smithay::utils::{Logical, Point};
+
+    let mut elements: Vec<OutputElement> = Vec::new();
+    for or in scene.or_windows.iter().rev() {
+        let Some(surface) = or.wl_surface() else {
+            continue;
+        };
+        let loc = or.geometry().loc.to_physical(1);
+        elements.extend(
+            smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
+                renderer,
+                &surface,
+                loc,
+                1.0,
+                1.0,
+                smithay::backend::renderer::element::Kind::Unspecified,
+            )
+            .into_iter()
+            .map(OutputElement::Float),
+        );
+    }
+    // Notification bubbles above floats (master raised them so a focused
+    // dialog never buries an incoming note).
+    for (id, rect) in scene.note_rects {
+        let Some(p) = scene.note_popups.iter().find(|p| p.id == *id) else {
+            continue;
+        };
+        match MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            (f64::from(rect.x), f64::from(rect.y)),
+            &p.buf,
+            None,
+            None,
+            None,
+            smithay::backend::renderer::element::Kind::Unspecified,
+        ) {
+            Ok(el) => elements.push(OutputElement::Chrome(el)),
+            Err(err) => tracing::error!("note element: {err}"),
+        }
+    }
+    for &fw in scene.float_stack {
+        let Some((window, f)) = scene.managed.float(fw) else {
+            continue;
+        };
+        let loc = (Point::<i32, Logical>::from((f.x, f.y)) - window.geometry().loc).to_physical(1);
+        elements.extend(window.render_elements::<OutputElement>(renderer, loc, 1.0.into(), 1.0));
+        let rect = f.frame_rect();
+        match MemoryRenderBufferRenderElement::from_buffer(
+            renderer,
+            (f64::from(rect.x), f64::from(rect.y)),
+            &f.frame_buf,
+            None,
+            None,
+            None,
+            smithay::backend::renderer::element::Kind::Unspecified,
+        ) {
+            Ok(el) => elements.push(OutputElement::Chrome(el)),
+            Err(err) => tracing::error!("float frame element: {err}"),
+        }
+    }
+    match smithay::desktop::space::space_render_elements::<_, smithay::desktop::Window, _>(
+        renderer,
+        [scene.space],
+        scene.output,
+        1.0,
+    ) {
+        Ok(els) => elements.extend(els.into_iter().map(OutputElement::Window)),
+        Err(err) => tracing::error!("space elements: {err:?}"),
+    }
+    if let Some((window, rect)) = scene.dock_place {
+        let loc =
+            (Point::<i32, Logical>::from((rect.x, rect.y)) - window.geometry().loc).to_physical(1);
+        elements.extend(window.render_elements::<OutputElement>(renderer, loc, 1.0.into(), 1.0));
+    }
+    match MemoryRenderBufferRenderElement::from_buffer(
+        renderer,
+        (0.0, 0.0),
+        scene.chrome_buf,
+        None,
+        None,
+        None,
+        smithay::backend::renderer::element::Kind::Unspecified,
+    ) {
+        Ok(el) => elements.push(OutputElement::Chrome(el)),
+        Err(err) => tracing::error!("chrome element: {err}"),
+    }
+    elements
+}
+
 /// ease-out-back: slight overshoot past the target, then settle.
 fn ease_out_back(t: f32) -> f32 {
     let c = 1.1_f32;
@@ -109,11 +219,7 @@ impl Comp {
     /// Composite the wallpaper, every placed leaf's chrome, the taskbar,
     /// and (unless mid-animation) the widgets, into the chrome buffer.
     fn compose_frame(&mut self, placed: &[Placement], widgets: bool) {
-        let size = self
-            .output
-            .current_mode()
-            .map(|m| m.size)
-            .unwrap_or_else(|| self.backend.window_size());
+        let size = self.output_size();
         let (w, h) = (size.w.max(1), size.h.max(1));
 
         let mut fb = self.chrome.take_screen_base(w as u32, h as u32);

@@ -37,17 +37,19 @@ zbus = "5"
 # Smithay logs through tracing; RUST_LOG-style filtering for debugging.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# xcursor-theme parsing for the tty backend's composited cursor (no host
+# session draws one on DRM).
+xcursor = { version = "0.3", optional = true }
 
 [features]
 # Real-session backend (DRM/GBM scanout, libinput, libseat session). Off by
 # default: linking needs the libseat system library (Arch package `seatd`).
 tty = [
+    "dep:xcursor",
     "smithay/backend_udev",
-    "smithay/backend_drm",
     "smithay/backend_gbm",
     "smithay/backend_libinput",
     "smithay/backend_session_libseat",
-    "smithay/renderer_multi",
 ]
 
 [build-dependencies]

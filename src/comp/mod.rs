@@ -19,14 +19,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use smithay::backend::egl::EGLDevice;
-use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::element::AsRenderElements as _;
-use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{Color32F, ImportDma as _};
-use smithay::backend::winit::WinitGraphicsBackend;
 use smithay::desktop::{PopupManager, Space, Window};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatState};
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::output::{Mode, Output};
 use smithay::reexports::calloop;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopHandle, LoopSignal, PostAction};
@@ -54,12 +51,15 @@ impl ClientData for ClientState {
 }
 
 pub struct Comp {
-    // Presentation.
-    pub backend: WinitGraphicsBackend<GlesRenderer>,
+    // Presentation (winit window or DRM output; see crate::backend).
+    pub backend: crate::backend::Backend,
     pub output: Output,
-    pub damage_tracker: OutputDamageTracker,
     /// Gap background (na16 gunmetal), resolved once from the baked palette.
     pub clear: Color32F,
+    /// What the seat's pointer wants shown: a client-committed cursor
+    /// surface, a named shape, or hidden. Only the tty backend renders it;
+    /// nested sessions ride the host's hardware cursor.
+    pub cursor_status: CursorImageStatus,
 
     // Software-rendered chrome (the ported pixel-art renderer) and its
     // GPU-side buffer.
@@ -173,14 +173,25 @@ pub struct Comp {
 }
 
 impl Comp {
+    /// `output` arrives configured by the backend (mode, transform,
+    /// global): everything after this reads sizes from the output alone,
+    /// never from the backend.
     pub fn new(
         event_loop: &mut EventLoop<'static, Comp>,
         display: Display<Comp>,
-        mut backend: WinitGraphicsBackend<GlesRenderer>,
-        clear: Color32F,
+        output: Output,
+        mut backend: crate::backend::Backend,
     ) -> Comp {
         let dh = display.handle();
         let handle = event_loop.handle();
+
+        let g = crate::assets::palette().color(crate::theme::palette_color::GUNMETAL);
+        let clear = Color32F::new(
+            f32::from(g.r) / 255.0,
+            f32::from(g.g) / 255.0,
+            f32::from(g.b) / 255.0,
+            1.0,
+        );
 
         let compositor_state = CompositorState::new::<Comp>(&dh);
         let xdg_shell_state = XdgShellState::new::<Comp>(&dh);
@@ -203,10 +214,11 @@ impl Comp {
         // buffers: with a render node, v4 with default feedback; without
         // one (software GL in CI), a plain v3 global.
         let mut dmabuf_state = DmabufState::new();
-        let render_node = EGLDevice::device_for_display(backend.renderer().egl_context().display())
+        let renderer = backend.renderer();
+        let render_node = EGLDevice::device_for_display(renderer.egl_context().display())
             .ok()
             .and_then(|device| device.try_get_render_node().ok().flatten());
-        let formats = backend.renderer().dmabuf_formats();
+        let formats = renderer.dmabuf_formats();
         let dmabuf_global = match render_node {
             Some(node) => {
                 let feedback = DmabufFeedbackBuilder::new(node.dev_id(), formats)
@@ -216,29 +228,6 @@ impl Comp {
             }
             None => dmabuf_state.create_global::<Comp>(&dh, formats),
         };
-
-        let output = Output::new(
-            "winit".to_string(),
-            PhysicalProperties {
-                size: (0, 0).into(),
-                subpixel: Subpixel::Unknown,
-                make: "splitwm".into(),
-                model: "winit".into(),
-            },
-        );
-        let _global = output.create_global::<Comp>(&dh);
-        let mode = Mode {
-            size: backend.window_size(),
-            refresh: 60_000,
-        };
-        output.change_current_state(
-            Some(mode),
-            Some(Transform::Flipped180),
-            None,
-            Some((0, 0).into()),
-        );
-        output.set_preferred(mode);
-        let damage_tracker = OutputDamageTracker::from_output(&output);
 
         let mut space = Space::default();
         space.map_output(&output, (0, 0));
@@ -269,7 +258,7 @@ impl Comp {
         let mut chrome = crate::render::Renderer::new();
         let wallpaper_path = std::env::var("SPLITWM_WALLPAPER").ok();
         if let Some(path) = &wallpaper_path {
-            let size = backend.window_size();
+            let size = output.current_mode().expect("output has a mode").size;
             if !chrome.set_wallpaper(path, size.w, size.h) {
                 tracing::warn!("could not load wallpaper {path}");
             }
@@ -296,8 +285,8 @@ impl Comp {
         Comp {
             backend,
             output,
-            damage_tracker,
             clear,
+            cursor_status: CursorImageStatus::default_named(),
             chrome,
             chrome_buf: smithay::backend::renderer::element::memory::MemoryRenderBuffer::new(
                 smithay::backend::allocator::Fourcc::Argb8888,
@@ -440,15 +429,18 @@ impl Comp {
             .map(|(s, p)| (s, p.to_f64() + loc.to_f64()))
     }
 
+    /// Current output size in pixels. The backend configures a mode before
+    /// `Comp` exists and keeps it current on every resize, so a modeless
+    /// output is a backend bug.
+    pub fn output_size(&self) -> Size<i32, Physical> {
+        self.output.current_mode().expect("output has a mode").size
+    }
+
     /// The split-layout area: the output minus the bottom taskbar strip
     /// (master's `la()`). Scale is 1 — this compositor lives in the same
     /// pixel world as its chrome art.
     pub fn layout_area(&self) -> crate::tree::Rect {
-        let size = self
-            .output
-            .current_mode()
-            .map(|m| m.size)
-            .unwrap_or_else(|| self.backend.window_size());
+        let size = self.output_size();
         crate::tree::Rect {
             x: 0,
             y: 0,
@@ -534,11 +526,7 @@ impl Comp {
         // client, regardless of where (or whether) its split is on screen.
         if let Some(fs) = self.fullscreen {
             if let Some(window) = self.managed.get(fs).cloned() {
-                let size = self
-                    .output
-                    .current_mode()
-                    .map(|m| m.size)
-                    .unwrap_or_else(|| self.backend.window_size());
+                let size = self.output_size();
                 if let Some(toplevel) = window.toplevel() {
                     toplevel.with_pending_state(|s| s.size = Some((size.w, size.h).into()));
                     toplevel.send_pending_configure();
@@ -661,18 +649,18 @@ impl Comp {
         keyboard.set_focus(self, target, serial);
     }
 
-    /// The output was resized (nested window resize stands in for RandR).
-    pub fn resize_output(&mut self, size: Size<i32, Physical>) {
-        let mode = Mode {
-            size,
-            refresh: 60_000,
-        };
+    /// The output changed mode (nested window resize, or a tty connector
+    /// swap standing in for RandR): republish, rescale the wallpaper, and
+    /// relayout everything into the new area.
+    pub fn resize_output(&mut self, mode: Mode) {
         self.output
             .change_current_state(Some(mode), None, None, None);
         self.output.set_preferred(mode);
         if let Some(path) = self.wallpaper_path.clone() {
-            self.chrome.set_wallpaper(&path, size.w, size.h);
+            self.chrome.set_wallpaper(&path, mode.size.w, mode.size.h);
         }
+        self.arrange();
+        self.chrome_dirty = true;
     }
 
     /// Composite one frame and pace clients' frame callbacks.
@@ -707,126 +695,58 @@ impl Comp {
             .map(|(_, window, d)| (window.clone(), self.dock_geometry(d)));
         let note_rects = self.note_rects();
 
-        let size = self.backend.window_size();
-        let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
-        let rendered = {
-            let Ok((renderer, mut fb)) = self
-                .backend
-                .bind()
-                .inspect_err(|err| tracing::error!("bind: {err}"))
-            else {
-                return;
-            };
-            // Front-to-back: floats (top of stack first) with their frame
-            // chrome, tiled clients, the dock, the chrome underlay behind
-            // everything.
-            let mut elements: Vec<chrome::OutputElement> = Vec::new();
-            // Override-redirect X11 windows (rofi, menus) above everything,
-            // last-mapped topmost.
-            for or in self.or_windows.iter().rev() {
-                let Some(surface) = or.wl_surface() else {
-                    continue;
-                };
-                let loc = or.geometry().loc.to_physical(1);
-                elements.extend(
-                    smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
-                        renderer,
-                        &surface,
-                        loc,
-                        1.0,
-                        1.0,
-                        smithay::backend::renderer::element::Kind::Unspecified,
-                    )
-                    .into_iter()
-                    .map(chrome::OutputElement::Float),
-                );
-            }
-            // Notification bubbles above floats (master raised them so a
-            // focused dialog never buries an incoming note).
-            for (id, rect) in note_rects {
-                let Some(p) = self.note_popups.iter().find(|p| p.id == id) else {
-                    continue;
-                };
-                match smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement::from_buffer(
-                    renderer,
-                    (f64::from(rect.x), f64::from(rect.y)),
-                    &p.buf,
-                    None,
-                    None,
-                    None,
-                    smithay::backend::renderer::element::Kind::Unspecified,
-                ) {
-                    Ok(el) => elements.push(chrome::OutputElement::Chrome(el)),
-                    Err(err) => tracing::error!("note element: {err}"),
-                }
-            }
-            for &fw in &self.float_stack {
-                let Some((window, f)) = self.managed.float(fw) else {
-                    continue;
-                };
-                let loc = (Point::<i32, Logical>::from((f.x, f.y)) - window.geometry().loc)
-                    .to_physical(1);
-                elements.extend(window.render_elements::<chrome::OutputElement>(
-                    renderer,
-                    loc,
-                    1.0.into(),
-                    1.0,
-                ));
-                let rect = f.frame_rect();
-                match smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement::from_buffer(
-                    renderer,
-                    (f64::from(rect.x), f64::from(rect.y)),
-                    &f.frame_buf,
-                    None,
-                    None,
-                    None,
-                    smithay::backend::renderer::element::Kind::Unspecified,
-                ) {
-                    Ok(el) => elements.push(chrome::OutputElement::Chrome(el)),
-                    Err(err) => tracing::error!("float frame element: {err}"),
-                }
-            }
-            match smithay::desktop::space::space_render_elements::<_, Window, _>(
-                renderer,
-                [&self.space],
-                &self.output,
-                1.0,
-            ) {
-                Ok(els) => elements.extend(els.into_iter().map(chrome::OutputElement::Window)),
-                Err(err) => tracing::error!("space elements: {err:?}"),
-            }
-            if let Some((window, rect)) = &dock_place {
-                let loc = (Point::<i32, Logical>::from((rect.x, rect.y)) - window.geometry().loc)
-                    .to_physical(1);
-                elements.extend(window.render_elements::<chrome::OutputElement>(
-                    renderer,
-                    loc,
-                    1.0.into(),
-                    1.0,
-                ));
-            }
-            match smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement::from_buffer(
-                renderer,
-                (0.0, 0.0),
-                &self.chrome_buf,
-                None,
-                None,
-                None,
-                smithay::backend::renderer::element::Kind::Unspecified,
-            ) {
-                Ok(el) => elements.push(chrome::OutputElement::Chrome(el)),
-                Err(err) => tracing::error!("chrome element: {err}"),
-            }
-            self.damage_tracker
-                .render_output(renderer, &mut fb, 0, &elements, self.clear)
-                .inspect_err(|err| tracing::error!("render: {err:?}"))
-                .is_ok()
+        // The seat pointer's spot, for the composited cursor on tty (a
+        // nested session rides the host's hardware cursor instead).
+        let pointer_loc = self
+            .seat
+            .get_pointer()
+            .expect("seat has a pointer")
+            .current_location();
+
+        // Scene borrows and the backend borrow are disjoint `Comp` fields,
+        // so the backend can consume the scene while borrowed mutably.
+        let scene = chrome::Scene {
+            or_windows: &self.or_windows,
+            note_popups: &self.note_popups,
+            note_rects: &note_rects,
+            float_stack: &self.float_stack,
+            managed: &self.managed,
+            space: &self.space,
+            output: &self.output,
+            dock_place: &dock_place,
+            chrome_buf: &self.chrome_buf,
         };
-        if rendered {
-            if let Err(err) = self.backend.submit(Some(&[full])) {
-                tracing::error!("submit: {err}");
+        match &mut self.backend {
+            crate::backend::Backend::Winit(w) => {
+                let size = w.backend.window_size();
+                let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
+                let rendered = {
+                    let Ok((renderer, mut fb)) = w
+                        .backend
+                        .bind()
+                        .inspect_err(|err| tracing::error!("bind: {err}"))
+                    else {
+                        return;
+                    };
+                    let elements = chrome::output_elements(renderer, &scene);
+                    w.damage_tracker
+                        .render_output(renderer, &mut fb, 0, &elements, self.clear)
+                        .inspect_err(|err| tracing::error!("render: {err:?}"))
+                        .is_ok()
+                };
+                if rendered {
+                    if let Err(err) = w.backend.submit(Some(&[full])) {
+                        tracing::error!("submit: {err}");
+                    }
+                }
+            }
+            #[cfg(feature = "tty")]
+            crate::backend::Backend::Tty(t) => {
+                t.render(&scene, pointer_loc, &self.cursor_status, self.clear);
             }
         }
+        #[cfg(not(feature = "tty"))]
+        let _ = pointer_loc;
 
         // Frame callbacks let clients produce their next buffer; throttle to
         // once per redraw cycle. Every managed kind gets one (floats and

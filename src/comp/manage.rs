@@ -177,11 +177,7 @@ impl Comp {
     /// taskbar strip in its column).
     pub fn dock_geometry(&self, d: DockData) -> crate::tree::Rect {
         let wa = self.layout_area();
-        let size = self
-            .output
-            .current_mode()
-            .map(|m| m.size)
-            .unwrap_or_else(|| self.backend.window_size());
+        let size = self.output_size();
         let canvas_w = self.state.canvas_w(wa);
         crate::tree::Rect {
             x: wa.x + canvas_w - d.overlap() - self.state.scroll_x(),

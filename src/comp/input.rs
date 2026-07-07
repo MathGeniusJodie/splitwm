@@ -5,12 +5,30 @@
 use smithay::backend::input::{
     AbsolutePositionEvent as _, Axis, AxisSource, ButtonState, Event as _, InputBackend,
     InputEvent, KeyState, KeyboardKeyEvent as _, PointerAxisEvent as _, PointerButtonEvent as _,
+    PointerMotionEvent as _,
 };
 use smithay::input::keyboard::FilterResult;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
-use smithay::utils::SERIAL_COUNTER;
+use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 
 use super::Comp;
+
+/// What an intercepted key press asks of the compositor: a WM action from
+/// `theme::BINDINGS`, or a VT switch (session-level, tty backend only —
+/// the X server owned these chords on master).
+enum Intercepted {
+    Action(crate::theme::Action),
+    SwitchVt(i32),
+}
+
+/// Ctrl+Alt+Fn arrives from xkb as one dedicated keysym per VT.
+fn vt_switch_target(sym: u32) -> Option<i32> {
+    const FIRST: u32 = crate::theme::ks::XF86_Switch_VT_1;
+    const LAST: u32 = crate::theme::ks::XF86_Switch_VT_12;
+    (FIRST..=LAST)
+        .contains(&sym)
+        .then(|| (sym - FIRST + 1) as i32)
+}
 
 impl Comp {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
@@ -28,7 +46,7 @@ impl Comp {
                 // release are swallowed too, so clients never see half a
                 // press.
                 let action = keyboard
-                    .input::<Option<crate::theme::Action>, _>(
+                    .input::<Option<Intercepted>, _>(
                         self,
                         code,
                         key_state,
@@ -39,9 +57,13 @@ impl Comp {
                             match key_state {
                                 KeyState::Pressed => {
                                     let sym = handle.raw_syms().first().map_or(0, |s| s.raw());
-                                    let Some(action) =
-                                        crate::comp::actions::binding_action(mods, sym)
-                                    else {
+                                    let intercepted = vt_switch_target(sym)
+                                        .map(Intercepted::SwitchVt)
+                                        .or_else(|| {
+                                            crate::comp::actions::binding_action(mods, sym)
+                                                .map(Intercepted::Action)
+                                        });
+                                    let Some(intercepted) = intercepted else {
                                         return FilterResult::Forward;
                                     };
                                     if comp.held_bound_keys.contains(&raw) {
@@ -49,7 +71,7 @@ impl Comp {
                                         return FilterResult::Intercept(None);
                                     }
                                     comp.held_bound_keys.push(raw);
-                                    FilterResult::Intercept(Some(action))
+                                    FilterResult::Intercept(Some(intercepted))
                                 }
                                 KeyState::Released => {
                                     if let Some(idx) =
@@ -65,8 +87,10 @@ impl Comp {
                         },
                     )
                     .flatten();
-                if let Some(action) = action {
-                    self.do_action(action);
+                match action {
+                    Some(Intercepted::Action(action)) => self.do_action(action),
+                    Some(Intercepted::SwitchVt(vt)) => self.backend.change_vt(vt),
+                    None => {}
                 }
             }
             InputEvent::PointerMotionAbsolute { event } => {
@@ -75,26 +99,27 @@ impl Comp {
                     .output_geometry(&self.output)
                     .expect("output is mapped");
                 let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
-                let serial = SERIAL_COUNTER.next_serial();
-                // An active gap/edge drag consumes motion: the pointer
-                // still moves (for the drag math) but no client gets
-                // enter/motion until the button releases.
-                let under = if self.on_drag_motion(pos) {
-                    None
-                } else {
-                    self.surface_under(pos)
-                };
+                self.pointer_moved(pos, event.time_msec());
+            }
+            // Relative motion (libinput mice/touchpads on the tty backend;
+            // winit only ever reports absolute). The compositor owns the
+            // cursor position: integrate and clamp to the output.
+            InputEvent::PointerMotion { event } => {
+                let output_geo = self
+                    .space
+                    .output_geometry(&self.output)
+                    .expect("output is mapped");
                 let pointer = self.seat.get_pointer().expect("seat has a pointer");
-                pointer.motion(
-                    self,
-                    under,
-                    &MotionEvent {
-                        location: pos,
-                        serial,
-                        time: event.time_msec(),
-                    },
+                let mut pos = pointer.current_location() + event.delta();
+                pos.x = pos.x.clamp(
+                    f64::from(output_geo.loc.x),
+                    f64::from(output_geo.loc.x + output_geo.size.w) - 1.0,
                 );
-                pointer.frame(self);
+                pos.y = pos.y.clamp(
+                    f64::from(output_geo.loc.y),
+                    f64::from(output_geo.loc.y + output_geo.size.h) - 1.0,
+                );
+                self.pointer_moved(pos, event.time_msec());
             }
             InputEvent::PointerButton { event } => {
                 const BTN_LEFT: u32 = 0x110;
@@ -226,5 +251,35 @@ impl Comp {
             }
             _ => {}
         }
+    }
+
+    /// Deliver a pointer position to the seat, shared by the absolute
+    /// (winit) and relative (libinput) motion paths.
+    fn pointer_moved(&mut self, pos: Point<f64, Logical>, time_msec: u32) {
+        let serial = SERIAL_COUNTER.next_serial();
+        // An active gap/edge drag consumes motion: the pointer still moves
+        // (for the drag math) but no client gets enter/motion until the
+        // button releases.
+        let under = if self.on_drag_motion(pos) {
+            None
+        } else {
+            self.surface_under(pos)
+        };
+        // Off every surface, the cursor is the compositor's again: drop
+        // whatever shape the last client committed.
+        if under.is_none() {
+            self.cursor_status = smithay::input::pointer::CursorImageStatus::default_named();
+        }
+        let pointer = self.seat.get_pointer().expect("seat has a pointer");
+        pointer.motion(
+            self,
+            under,
+            &MotionEvent {
+                location: pos,
+                serial,
+                time: time_msec,
+            },
+        );
+        pointer.frame(self);
     }
 }
