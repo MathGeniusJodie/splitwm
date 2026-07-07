@@ -314,8 +314,11 @@ pub const MOD1: u16 = 0x08; // Alt
 pub const SHIFT: u16 = 0x01;
 
 /// Command `Action::SpawnLauncher` spawns: rofi in combi mode (drun + run +
-/// window).
-pub const LAUNCHER_CMD: &str = "rofi -show combi";
+/// window). WAYLAND_DISPLAY is scrubbed so a wayland-capable rofi doesn't
+/// pick its wayland backend (which needs layer-shell, out of scope in v1)
+/// and instead runs under XWayland as the override-redirect float the
+/// launcher design counts on.
+pub const LAUNCHER_CMD: &str = "env -u WAYLAND_DISPLAY rofi -show combi";
 /// Command `Action::VolumeUp` spawns to raise the default sink's volume.
 pub const VOLUME_UP_CMD: &str = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+";
 /// Command `Action::VolumeDown` spawns to lower the default sink's volume.

@@ -84,9 +84,15 @@ this port must reproduce unless a deviation is listed below.
       the compositor — the X server's job on master. Composited cursor:
       client cursor surfaces, else the xcursor-theme arrow, Kind::Cursor
       for hardware-plane offload. Verified: builds/tests both feature
-      sets, nested winit regression drive (tiling+split+chrome intact).
-      **Not yet run on a real VT** — can't take the seat from inside the
-      live session; needs Jodie on a spare VT. Gaps: named cursor shapes
+      sets, nested winit regression drive (tiling+split+chrome intact),
+      and a real-VT session (Jodie, 2026-07-07): seat/input/scanout,
+      tiling, chrome, VT switching all work. Two findings fixed after:
+      debug builds unusably slow at native resolution (vttest.sh now
+      builds release into `target/vttest/`, never touching the live
+      session's `target/release` binary), and a wayland-capable rofi
+      picking its layer-shell backend (LAUNCHER_CMD scrubs
+      WAYLAND_DISPLAY so rofi stays on XWayland per the v1 decision);
+      both await her re-test. Gaps: named cursor shapes
       beyond the arrow (hover feedback still absent, see M5); output
       name fixed at startup even if the connector swaps; mode changes on
       an unchanged connector ignored; libinput devices run defaults (no

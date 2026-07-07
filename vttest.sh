@@ -8,7 +8,10 @@ set -u
 DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG=/tmp/splitwm-tty.log
 PIDFILE=/tmp/splitwm-tty.pid
-BIN="$DIR/target/debug/splitwm"
+# Release build (debug is unusably slow at native resolution), in its own
+# target dir: `target/release/splitwm` is the live X session's WM and must
+# never be overwritten from this branch.
+BIN="$DIR/target/vttest/release/splitwm"
 
 # The recorded pid, but only while it is really our test binary — a
 # stale pidfile must never aim `kill` at a recycled pid.
@@ -17,7 +20,7 @@ test_pid() {
     local pid
     pid=$(cat "$PIDFILE")
     [ -n "$pid" ] || return 1
-    grep -qa "target/debug/splitwm" "/proc/$pid/cmdline" 2>/dev/null || return 1
+    grep -qa "target/vttest/release/splitwm" "/proc/$pid/cmdline" 2>/dev/null || return 1
     echo "$pid"
 }
 
@@ -56,8 +59,9 @@ if pid=$(test_pid); then
     exit 1
 fi
 
-echo "building (cargo build --features tty)..."
-cargo build --features tty --manifest-path "$DIR/Cargo.toml" 2>/tmp/vttest-build.log ||
+echo "building (release, own target dir; first time takes a few minutes)..."
+cargo build --release --features tty --target-dir "$DIR/target/vttest" \
+    --manifest-path "$DIR/Cargo.toml" 2>/tmp/vttest-build.log ||
     { cat /tmp/vttest-build.log; exit 1; }
 
 THIS_VT="$(tty | grep -o '[0-9]*$')"
