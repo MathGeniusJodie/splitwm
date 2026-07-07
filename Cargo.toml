@@ -23,6 +23,9 @@ smithay = { version = "0.7", default-features = false, features = [
 # runtime via pixel_graphics::magick_decode_rgba (ImageMagick shell-out).
 pixel-graphics = { path = "../pixel-graphics" }
 pixel-fonts = { path = "../pixel-fonts" }
+# Keysym constants for theme::BINDINGS. X11 keysym values are xkb keysym
+# values, so this pure-constants crate serves the Wayland keyboard unchanged.
+xkeysym = "0.2.1"
 # Smithay logs through tracing; RUST_LOG-style filtering for debugging.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -9,6 +9,20 @@
 #[allow(dead_code)]
 mod assets;
 mod comp;
+// The ported layout core is consumed from M3/M4 on; the allows come off as
+// the render and shell layers wire it up.
+#[allow(dead_code)]
+mod oklch;
+#[allow(dead_code)]
+mod state;
+#[allow(dead_code)]
+mod theme;
+#[allow(dead_code)]
+mod tree;
+
+/// A `pixel-graphics` palette index, threaded through as the accent-colour
+/// representation for splits so border rendering can palette-swap them.
+pub type Index = pixel_graphics::Index;
 
 use std::time::Duration;
 
