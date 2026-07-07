@@ -107,11 +107,7 @@ impl Comp {
             }
             _ if secondary => {}
             Hit::Btn(leaf, kind) => self.click_split_button(leaf, kind, false),
-            Hit::TaskbarClose(win) => {
-                if let Some(t) = self.managed.get(win).and_then(|w| w.toplevel()) {
-                    t.send_close();
-                }
-            }
+            Hit::TaskbarClose(win) => self.close_client(win),
             Hit::TaskbarTile(win) => self.bring_into_layout(win, true),
             Hit::QuickLaunch(i) => {
                 if let Some(cmd) = self.quick.get(i).map(|q| q.cmd.clone()) {

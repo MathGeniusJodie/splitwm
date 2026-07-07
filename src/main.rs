@@ -87,6 +87,10 @@ fn main() {
         })
         .expect("insert redraw timer");
 
+    // X11 clients (rofi, legacy apps) arrive via XWayland; DISPLAY is set
+    // once the server reports Ready.
+    comp.start_xwayland();
+
     // Children spawned by the compositor (terminal, launcher, quick-launch)
     // inherit the session; nested test runs read it from stdout.
     std::env::set_var("WAYLAND_DISPLAY", &comp.socket_name);

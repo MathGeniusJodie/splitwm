@@ -41,9 +41,14 @@ impl CompositorHandler for Comp {
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
+        // The XWayland client is inserted by smithay's spawn with its own
+        // data type; every client we insert ourselves carries ClientState.
+        if let Some(data) = client.get_data::<smithay::xwayland::XWaylandClientData>() {
+            return &data.compositor_state;
+        }
         &client
             .get_data::<ClientState>()
-            .expect("every client carries ClientState")
+            .expect("every client carries ClientState or XWaylandClientData")
             .compositor_state
     }
 

@@ -11,6 +11,7 @@ pub mod handlers;
 pub mod input;
 pub mod manage;
 pub mod pointer;
+pub mod xwayland;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -135,6 +136,12 @@ pub struct Comp {
     /// press.
     pub held_bound_keys: Vec<u32>,
 
+    // XWayland: the WM connection (once Ready) and unmanaged
+    // override-redirect windows (rofi, menus), topmost last.
+    pub xwm: Option<smithay::xwayland::X11Wm>,
+    pub or_windows: Vec<smithay::xwayland::X11Surface>,
+    pub xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
+
     // Protocol globals.
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
@@ -169,6 +176,8 @@ impl Comp {
         let xdg_decoration_state = XdgDecorationState::new::<Comp>(&dh);
         let shm_state = ShmState::new::<Comp>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Comp>(&dh);
+        let xwayland_shell_state =
+            smithay::wayland::xwayland_shell::XWaylandShellState::new::<Comp>(&dh);
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Comp>(&dh);
 
@@ -288,6 +297,9 @@ impl Comp {
             fullscreen: None,
             pending_fullscreen: Vec::new(),
             held_bound_keys: Vec::new(),
+            xwm: None,
+            or_windows: Vec::new(),
+            xwayland_shell_state,
             compositor_state,
             xdg_shell_state,
             xdg_decoration_state,
@@ -347,8 +359,12 @@ impl Comp {
         smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         Point<f64, Logical>,
     )> {
-        // Stacking order: floats (top of stack first), then the tiled/
-        // fullscreen Space, then the dock at the bottom.
+        // Stacking order: override-redirect X11 windows topmost, then
+        // floats (top of stack first), the tiled/fullscreen Space, the
+        // dock at the bottom.
+        if let Some(hit) = xwayland::or_surface_under(&self.or_windows, pos) {
+            return Some(hit);
+        }
         for &fw in &self.float_stack {
             let Some((window, f)) = self.managed.float(fw) else {
                 continue;
@@ -462,6 +478,12 @@ impl Comp {
             if let Some(toplevel) = window.toplevel() {
                 toplevel.with_pending_state(|s| s.size = Some((cw, ch).into()));
                 toplevel.send_pending_configure();
+            } else if let Some(x11) = window.x11_surface() {
+                let _ = x11.configure(Rectangle::<i32, Logical>::new(
+                    (cx, cy).into(),
+                    (cw, ch).into(),
+                ));
+                let _ = x11.set_mapped(true);
             }
             self.space.map_element(window, (cx, cy), false);
             shown.push(c);
@@ -479,6 +501,12 @@ impl Comp {
                 if let Some(toplevel) = window.toplevel() {
                     toplevel.with_pending_state(|s| s.size = Some((size.w, size.h).into()));
                     toplevel.send_pending_configure();
+                } else if let Some(x11) = window.x11_surface() {
+                    let _ = x11.configure(Rectangle::<i32, Logical>::new(
+                        (0, 0).into(),
+                        (size.w, size.h).into(),
+                    ));
+                    let _ = x11.set_mapped(true);
                 }
                 self.space.map_element(window, (0, 0), true);
                 shown.push(fs);
@@ -492,6 +520,11 @@ impl Comp {
             .collect();
         for window in &to_hide {
             self.space.unmap_elem(window);
+            // A stashed X11 window is really unmapped (its WM_STATE
+            // bookkeeping lives inside smithay).
+            if let Some(x11) = window.x11_surface() {
+                let _ = x11.set_mapped(false);
+            }
         }
 
         // Hit regions and taskbar tiles for this layout, as one unit.
@@ -579,9 +612,9 @@ impl Comp {
                 toplevel.send_pending_configure();
             }
         }
-        let target = focused
-            .and_then(|c| self.managed.get(c))
-            .and_then(|w| w.toplevel().map(|t| t.wl_surface().clone()));
+        let target = focused.and_then(|c| self.managed.get(c)).and_then(|w| {
+            smithay::wayland::seat::WaylandFocus::wl_surface(w).map(|s| s.into_owned())
+        });
         let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
         keyboard.set_focus(self, target, serial);
@@ -645,6 +678,26 @@ impl Comp {
             // chrome, tiled clients, the dock, the chrome underlay behind
             // everything.
             let mut elements: Vec<chrome::OutputElement> = Vec::new();
+            // Override-redirect X11 windows (rofi, menus) above everything,
+            // last-mapped topmost.
+            for or in self.or_windows.iter().rev() {
+                let Some(surface) = or.wl_surface() else {
+                    continue;
+                };
+                let loc = or.geometry().loc.to_physical(1);
+                elements.extend(
+                    smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
+                        renderer,
+                        &surface,
+                        loc,
+                        1.0,
+                        1.0,
+                        smithay::backend::renderer::element::Kind::Unspecified,
+                    )
+                    .into_iter()
+                    .map(chrome::OutputElement::Float),
+                );
+            }
             for &fw in &self.float_stack {
                 let Some((window, f)) = self.managed.float(fw) else {
                     continue;
@@ -722,6 +775,17 @@ impl Comp {
             window.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
                 Some(output.clone())
             });
+        }
+        for or in &self.or_windows {
+            if let Some(surface) = or.wl_surface() {
+                smithay::desktop::utils::send_frames_surface_tree(
+                    &surface,
+                    &output,
+                    elapsed,
+                    Some(Duration::ZERO),
+                    |_, _| Some(output.clone()),
+                );
+            }
         }
     }
 }

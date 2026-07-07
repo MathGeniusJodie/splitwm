@@ -131,9 +131,7 @@ impl Comp {
         let Some(win) = self.focused_float().or_else(|| self.state.focused_client()) else {
             return;
         };
-        if let Some(toplevel) = self.managed.get(win).and_then(|w| w.toplevel()) {
-            toplevel.send_close();
-        }
+        self.close_client(win);
     }
 
     /// Keep the focused leaf visible: master glides there (M5); for now the

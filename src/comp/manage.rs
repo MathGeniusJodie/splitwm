@@ -16,14 +16,12 @@ use crate::tree::Win;
 use crate::widgets::label_from_class;
 
 impl Comp {
-    /// First commit with a buffer: decide what this window is and manage
-    /// it accordingly.
+    /// First commit with a buffer (Wayland) or map request (X11): decide
+    /// what this window is and manage it accordingly.
     pub fn classify_and_manage(&mut self, window: Window) {
         if self.matches_dock(&window) && self.managed.dock().is_none() {
             self.manage_dock(window);
-        } else if crate::shell::toplevel_parent(&window).is_some()
-            || crate::shell::toplevel_fixed_size(&window)
-        {
+        } else if self.wants_float(&window) {
             self.manage_float(window);
         } else {
             let surface = window.toplevel().map(|t| t.wl_surface().clone());
@@ -54,6 +52,50 @@ impl Comp {
         crate::shell::toplevel_title(window).as_ref() == identity
     }
 
+    /// Whether `window` should float instead of tiling: a transient (xdg
+    /// parent / `WM_TRANSIENT_FOR`), a declared X11 dialog, or a
+    /// fixed-size window (min == max — it can't be resized, so stretching
+    /// it into a split only produces gravel).
+    fn wants_float(&self, window: &Window) -> bool {
+        if self.parent_win_of(window).is_some() {
+            return true;
+        }
+        if let Some(x11) = window.x11_surface() {
+            if x11.is_transient_for().is_some()
+                || x11.window_type() == Some(smithay::xwayland::xwm::WmWindowType::Dialog)
+            {
+                return true;
+            }
+            return x11.size_hints().is_some_and(|h| {
+                matches!((h.min_size, h.max_size),
+                    (Some((minw, minh)), Some((maxw, maxh)))
+                        if minw == maxw && minh == maxh && minw > 0 && minh > 0)
+            });
+        }
+        crate::shell::toplevel_fixed_size(window)
+    }
+
+    /// The managed `Win` this window declares as its parent, either
+    /// backend.
+    fn parent_win_of(&self, window: &Window) -> Option<Win> {
+        if let Some(surface) = crate::shell::toplevel_parent(window) {
+            return self.managed.win_for_surface(&surface);
+        }
+        let parent_id = window.x11_surface()?.is_transient_for()?;
+        self.managed.entries_windows().find_map(|(w, wd)| {
+            wd.x11_surface()
+                .is_some_and(|s| s.window_id() == parent_id)
+                .then_some(w)
+        })
+    }
+
+    /// Politely close a managed window, whichever backend it speaks.
+    pub fn close_client(&self, win: Win) {
+        if let Some(window) = self.managed.get(win) {
+            crate::shell::close_window(window);
+        }
+    }
+
     /// Float `window`: show it at its requested size, centered over its
     /// parent's split frame when that parent is a tiled client currently
     /// on screen, otherwise centered in the workarea. Its chrome frame
@@ -61,8 +103,7 @@ impl Comp {
     /// it; dragging the frame moves the pair. It takes focus immediately
     /// (a dialog exists to be answered).
     pub fn manage_float(&mut self, window: Window) {
-        let parent =
-            crate::shell::toplevel_parent(&window).and_then(|s| self.managed.win_for_surface(&s));
+        let parent = self.parent_win_of(&window);
         let size = window.geometry().size;
         let (w, h) = (size.w.max(1), size.h.max(1));
 

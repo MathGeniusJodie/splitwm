@@ -147,14 +147,24 @@ impl Managed {
         })
     }
 
-    /// The `Win` whose window's root surface is `surface`, any kind.
+    /// The `Win` whose window's root surface is `surface`, any kind and
+    /// either backend (X11 surfaces resolve via their associated wl
+    /// surface).
     pub fn win_for_surface(&self, surface: &WlSurface) -> Option<Win> {
+        use smithay::desktop::WindowSurface;
+        use smithay::wayland::seat::WaylandFocus as _;
+        let _ = WindowSurface::Wayland; // backend-agnostic via WaylandFocus
         self.entries.iter().find_map(|m| {
             m.window
-                .toplevel()
-                .is_some_and(|t| t.wl_surface() == surface)
+                .wl_surface()
+                .is_some_and(|s| *s == *surface)
                 .then_some(m.win)
         })
+    }
+
+    /// Every managed entry as `(Win, &Window)`, any kind.
+    pub fn entries_windows(&self) -> impl Iterator<Item = (Win, &Window)> {
+        self.entries.iter().map(|m| (m.win, &m.window))
     }
 
     pub fn win_for_window(&self, window: &Window) -> Option<Win> {
@@ -189,15 +199,33 @@ impl Managed {
     }
 }
 
-/// The xdg toplevel's current title, or empty when unset.
+/// The window's current title (xdg toplevel title / X11 `_NET_WM_NAME`),
+/// or empty when unset.
 pub fn toplevel_title(window: &Window) -> std::rc::Rc<str> {
+    if let Some(x11) = window.x11_surface() {
+        return x11.title().into();
+    }
     read_toplevel_data(window, |d| d.title.clone()).into()
 }
 
-/// The xdg toplevel's app_id — the Wayland analogue of `WM_CLASS`,
+/// The window's class identity (xdg app_id / X11 `WM_CLASS` class half),
 /// grouping windows of one app for labels/icons/quick-launch rules.
 pub fn toplevel_app_id(window: &Window) -> String {
+    if let Some(x11) = window.x11_surface() {
+        return x11.class();
+    }
     read_toplevel_data(window, |d| d.app_id.clone())
+}
+
+/// Politely ask a window to close, whichever backend it speaks.
+pub fn close_window(window: &Window) {
+    if let Some(toplevel) = window.toplevel() {
+        toplevel.send_close();
+    } else if let Some(x11) = window.x11_surface() {
+        if let Err(err) = x11.close() {
+            tracing::warn!("x11 close: {err}");
+        }
+    }
 }
 
 /// The xdg toplevel's parent surface (`xdg_toplevel.set_parent`), the
