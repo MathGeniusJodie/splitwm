@@ -54,8 +54,17 @@ this port must reproduce unless a deviation is listed below.
       tested state fns; harness will cover): scroll glide end-to-end,
       taskbar-tile activation of a *stashed* window, edge drags, hover
       cursor shapes (unimplemented — no cursor rendering until M9).
-- [ ] **M6** floats, fullscreen, dock (DOCK_TITLE/DOCK_OVERLAP)
-- [ ] **M7** XWayland: full X11 lifecycle, rofi works
+- [x] **M6** floats, fullscreen, dock (DOCK_TITLE/DOCK_OVERLAP);
+      verified: zenity float + frame drag, cozyui dock layering,
+      startup-fullscreen. Note: clicking the dock hands it the keyboard
+      via the same override slot as floats (kept until the next
+      deliberate focus move — arrange runs oftener than on X11, where
+      dock focus survived until any WM focus action).
+- [x] **M7** XWayland: X11 clients share the classify/tile/float/dock
+      path; o-r windows (rofi) topmost + keyboard while mapped; tiled
+      X11 ConfigureRequests denied by re-assert. Verified: xterm tiles,
+      rofi drun overlays. No XKillClient fallback yet for unresponsive
+      X11 clients (close is polite-only both backends).
 - [ ] **M8** notifications (zbus), quick-launch, .desktop/icon lookup,
       icon hue rotation
 - [ ] **M9** TTY backend: udev/DRM/GBM/libinput/libseat, output resize
