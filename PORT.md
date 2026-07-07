@@ -65,8 +65,16 @@ this port must reproduce unless a deviation is listed below.
       X11 ConfigureRequests denied by re-assert. Verified: xterm tiles,
       rofi drun overlays. No XKillClient fallback yet for unresponsive
       X11 clients (close is polite-only both backends).
-- [ ] **M8** notifications (zbus), quick-launch, .desktop/icon lookup,
-      icon hue rotation
+- [x] **M8** notifications (zbus), quick-launch, .desktop/icon lookup,
+      icon hue rotation. Verified: theme icons + green hue-rotated
+      same-app icon, notify-send bubbles w/ urgency styling + corner
+      transparency, GetServerInformation. Gaps vs master: NameLost
+      mid-run not watched (a replacing daemon isn't detected until
+      restart); CloseNotification's signal emits on the 250ms tick
+      instead of immediately; foreign-daemon X11 notification windows
+      N/A on Wayland. xdg-toplevel-icon protocol not in smithay 0.7 —
+      icons come from theme lookup by app_id/class only (X11
+      _NET_WM_ICON also unexposed by smithay's X11Surface).
 - [ ] **M9** TTY backend: udev/DRM/GBM/libinput/libseat, output resize
 - [ ] **Harness** (grows from M1): headless socket tests, screenshot drive
 
