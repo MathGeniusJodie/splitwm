@@ -4,7 +4,7 @@
 
 use smithay::backend::input::{
     AbsolutePositionEvent as _, Axis, AxisSource, ButtonState, Event as _, InputBackend,
-    InputEvent, KeyboardKeyEvent as _, PointerAxisEvent as _, PointerButtonEvent as _,
+    InputEvent, KeyState, KeyboardKeyEvent as _, PointerAxisEvent as _, PointerButtonEvent as _,
 };
 use smithay::input::keyboard::FilterResult;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
@@ -18,15 +18,57 @@ impl Comp {
             InputEvent::Keyboard { event } => {
                 let serial = SERIAL_COUNTER.next_serial();
                 let time = event.time_msec();
+                let key_state = event.state();
+                let code = event.key_code();
                 let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
-                keyboard.input::<(), _>(
-                    self,
-                    event.key_code(),
-                    event.state(),
-                    serial,
-                    time,
-                    |_, _, _| FilterResult::Forward,
-                );
+                // Bindings are matched on the level-0 keysym plus an exact
+                // modifier mask, before the client sees anything. A chord we
+                // intercept owns the whole key cycle: its auto-repeats (a
+                // nested winit session repeats; libinput doesn't) and its
+                // release are swallowed too, so clients never see half a
+                // press.
+                let action = keyboard
+                    .input::<Option<crate::theme::Action>, _>(
+                        self,
+                        code,
+                        key_state,
+                        serial,
+                        time,
+                        |comp, mods, handle| {
+                            let raw = code.raw();
+                            match key_state {
+                                KeyState::Pressed => {
+                                    let sym =
+                                        handle.raw_syms().first().map_or(0, |s| s.raw());
+                                    let Some(action) =
+                                        crate::comp::actions::binding_action(mods, sym)
+                                    else {
+                                        return FilterResult::Forward;
+                                    };
+                                    if comp.held_bound_keys.contains(&raw) {
+                                        // Auto-repeat of a held chord.
+                                        return FilterResult::Intercept(None);
+                                    }
+                                    comp.held_bound_keys.push(raw);
+                                    FilterResult::Intercept(Some(action))
+                                }
+                                KeyState::Released => {
+                                    if let Some(idx) =
+                                        comp.held_bound_keys.iter().position(|&k| k == raw)
+                                    {
+                                        comp.held_bound_keys.swap_remove(idx);
+                                        FilterResult::Intercept(None)
+                                    } else {
+                                        FilterResult::Forward
+                                    }
+                                }
+                            }
+                        },
+                    )
+                    .flatten();
+                if let Some(action) = action {
+                    self.do_action(action);
+                }
             }
             InputEvent::PointerMotionAbsolute { event } => {
                 let output_geo = self
@@ -54,20 +96,20 @@ impl Comp {
                 let serial = SERIAL_COUNTER.next_serial();
 
                 if event.state() == ButtonState::Pressed && !pointer.is_grabbed() {
-                    // Click-to-focus, raising like the X11 version's
-                    // click-anywhere focus model.
-                    let under = self
+                    // Click-to-focus: clicking a window focuses its leaf in
+                    // the layout, which in turn drives keyboard focus.
+                    let clicked = self
                         .space
                         .element_under(pointer.current_location())
-                        .map(|(w, _)| w.clone());
-                    if let Some(window) = &under {
-                        self.space.raise_element(window, true);
+                        .map(|(w, _)| w.clone())
+                        .and_then(|w| self.managed.win_for_window(&w));
+                    if let Some(win) = clicked {
+                        if let Some(leaf) = self.state.tree.find_leaf_for_client(win) {
+                            self.state.focus_leaf(leaf);
+                        }
                     }
-                    keyboard.set_focus(
-                        self,
-                        under.and_then(|w| w.toplevel().map(|t| t.wl_surface().clone())),
-                        serial,
-                    );
+                    let _ = keyboard;
+                    self.refocus();
                 }
 
                 pointer.button(

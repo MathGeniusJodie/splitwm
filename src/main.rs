@@ -9,10 +9,12 @@
 #[allow(dead_code)]
 mod assets;
 mod comp;
-// The ported layout core is consumed from M3/M4 on; the allows come off as
-// the render and shell layers wire it up.
+// oklch is consumed by the icon pipeline in M8; the remaining allows cover
+// the layout core's scroll/boundary/taskbar surface until M3/M5 wire the
+// chrome renderer and pointer interactions up to it.
 #[allow(dead_code)]
 mod oklch;
+mod shell;
 #[allow(dead_code)]
 mod state;
 #[allow(dead_code)]

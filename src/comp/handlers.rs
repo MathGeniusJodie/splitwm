@@ -25,9 +25,11 @@ use smithay::wayland::shell::xdg::{
     XdgToplevelSurfaceData,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_output, delegate_seat,
-    delegate_shm, delegate_xdg_shell,
+    delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
 use super::{ClientState, Comp};
@@ -109,43 +111,24 @@ impl XdgShellHandler for Comp {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        // M1: every toplevel fills the output; the split tree takes over
-        // placement in M4.
-        let size = self.output.current_mode().map(|m| m.size);
-        surface.with_pending_state(|state| {
-            state.size = size.map(|s| (s.w, s.h).into());
-        });
+        // Manage: the new window takes the focused split; whatever occupied
+        // it is displaced to the stash (master's pin_client semantics).
         let window = Window::new_wayland_window(surface);
-        self.space.map_element(window.clone(), (0, 0), true);
-
-        let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
-        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-        keyboard.set_focus(
-            self,
-            window.toplevel().map(|t| t.wl_surface().clone()),
-            serial,
-        );
+        let win = self.managed.insert(window);
+        self.state.pin_client(win);
+        self.arrange();
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        let window = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().is_some_and(|t| *t == surface))
-            .cloned();
-        if let Some(window) = window {
+        let Some(win) = self.managed.win_for_surface(surface.wl_surface()) else {
+            return;
+        };
+        if let Some(window) = self.managed.remove(win) {
             self.space.unmap_elem(&window);
         }
-        // Hand focus to the topmost remaining window, matching the X11
-        // behavior of never leaving focus on a dead client.
-        let next = self
-            .space
-            .elements()
-            .next_back()
-            .and_then(|w| w.toplevel().map(|t| t.wl_surface().clone()));
-        let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
-        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-        keyboard.set_focus(self, next, serial);
+        self.state.unpin_client(win);
+        // arrange refocuses, so focus never rests on a dead client.
+        self.arrange();
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
@@ -168,6 +151,35 @@ impl XdgShellHandler for Comp {
     }
 }
 delegate_xdg_shell!(Comp);
+
+/// All decoration is compositor chrome: every toplevel is told to draw
+/// nothing of its own, whatever it asks for.
+impl XdgDecorationHandler for Comp {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _requested: DecorationMode) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        if toplevel.is_initial_configure_sent() {
+            toplevel.send_pending_configure();
+        }
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        if toplevel.is_initial_configure_sent() {
+            toplevel.send_pending_configure();
+        }
+    }
+}
+delegate_xdg_decoration!(Comp);
 
 impl BufferHandler for Comp {
     fn buffer_destroyed(&mut self, _buffer: &WlBuffer) {}

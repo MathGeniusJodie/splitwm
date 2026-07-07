@@ -5,6 +5,7 @@
 //! full-output into a `Space`, and input is forwarded to whatever holds
 //! focus. The split-tree layout replaces the naive Space placement in M4.
 
+pub mod actions;
 pub mod handlers;
 pub mod input;
 
@@ -30,6 +31,7 @@ use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
@@ -66,9 +68,23 @@ pub struct Comp {
     pub seat: Seat<Comp>,
     pub start: std::time::Instant,
 
+    // The layout core (pure, ported from master) and the Win <-> Window
+    // bridge it drives.
+    pub state: crate::state::State,
+    pub managed: crate::shell::Managed,
+    /// Keycodes whose press we intercepted for a binding: their repeats are
+    /// swallowed (a nested winit session auto-repeats; libinput doesn't)
+    /// and their release must not leak to the client that never saw the
+    /// press.
+    pub held_bound_keys: Vec<u32>,
+
     // Protocol globals.
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
+    /// Never read, but dropping it would unpublish the xdg-decoration
+    /// global (all chrome is ours; clients are told not to decorate).
+    #[allow(dead_code)]
+    pub xdg_decoration_state: XdgDecorationState,
     pub shm_state: ShmState,
     /// Never read, but dropping it would unpublish the xdg-output global.
     #[allow(dead_code)]
@@ -93,6 +109,7 @@ impl Comp {
 
         let compositor_state = CompositorState::new::<Comp>(&dh);
         let xdg_shell_state = XdgShellState::new::<Comp>(&dh);
+        let xdg_decoration_state = XdgDecorationState::new::<Comp>(&dh);
         let shm_state = ShmState::new::<Comp>(&dh, vec![]);
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Comp>(&dh);
         let mut seat_state = SeatState::new();
@@ -159,8 +176,12 @@ impl Comp {
             popups: PopupManager::default(),
             seat,
             start: std::time::Instant::now(),
+            state: crate::state::State::new(),
+            managed: crate::shell::Managed::default(),
+            held_bound_keys: Vec::new(),
             compositor_state,
             xdg_shell_state,
+            xdg_decoration_state,
             shm_state,
             output_manager_state,
             seat_state,
@@ -219,6 +240,99 @@ impl Comp {
                 .surface_under(pos - location.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
                 .map(|(s, p)| (s, (p.to_f64() + location.to_f64())))
         })
+    }
+
+    /// The split-layout area: the output minus the bottom taskbar strip
+    /// (master's `la()`). Scale is 1 — this compositor lives in the same
+    /// pixel world as its chrome art.
+    pub fn layout_area(&self) -> crate::tree::Rect {
+        let size = self
+            .output
+            .current_mode()
+            .map(|m| m.size)
+            .unwrap_or_else(|| self.backend.window_size());
+        crate::tree::Rect {
+            x: 0,
+            y: 0,
+            w: size.w,
+            h: (size.h - crate::theme::TASKBAR_H).max(1),
+        }
+    }
+
+    /// Re-place every window from the layout state: configure sizes, map
+    /// what a shown leaf displays, unmap the stash / minimized / scrolled-
+    /// out-of-view, then re-derive keyboard focus. The equivalent of
+    /// master's `arrange` minus chrome and animation (M3/M5).
+    pub fn arrange(&mut self) {
+        let wa = self.layout_area();
+        // Canvas width / dock scroll room are State's own invariants; the
+        // dock contributes from M6.
+        self.state.update_canvas(wa, 0);
+        let geos = self.state.compute(wa);
+        let scroll_x = self.state.scroll_x();
+
+        let mut shown: Vec<crate::tree::Win> = Vec::new();
+        for leaf in self.state.tree.collect_leaves() {
+            let Some(geo) = geos.get(&leaf).copied() else {
+                continue;
+            };
+            let frame = crate::tree::Rect {
+                x: geo.x - scroll_x,
+                y: geo.y,
+                w: geo.w.max(1),
+                h: geo.h.max(1),
+            };
+            let leaf_data = self.state.tree.leaf(leaf);
+            let minimized = leaf_data.is_some_and(|l| l.minimized);
+            let Some(c) = leaf_data.and_then(|l| l.client) else {
+                continue;
+            };
+            let off_screen = frame.x + frame.w <= wa.x || frame.x >= wa.x + wa.w;
+            if minimized || off_screen {
+                continue;
+            }
+            let Some(window) = self.managed.get(c).cloned() else {
+                continue;
+            };
+            let (cx, cy, cw, ch) = crate::shell::client_rect_in_frame(frame, (1, 1));
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|s| s.size = Some((cw, ch).into()));
+                toplevel.send_pending_configure();
+            }
+            self.space.map_element(window, (cx, cy), false);
+            shown.push(c);
+        }
+
+        let to_hide: Vec<Window> = self
+            .managed
+            .iter()
+            .filter(|(w, _)| !shown.contains(w))
+            .map(|(_, window)| window.clone())
+            .collect();
+        for window in &to_hide {
+            self.space.unmap_elem(window);
+        }
+
+        self.refocus();
+    }
+
+    /// Point keyboard focus (and xdg activated state) at the layout's
+    /// focused client, or nothing when the focused leaf is empty.
+    pub fn refocus(&mut self) {
+        let focused = self.state.focused_client();
+        for (win, window) in self.managed.iter() {
+            if window.set_activated(focused == Some(win)) {
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.send_pending_configure();
+                }
+            }
+        }
+        let target = focused
+            .and_then(|c| self.managed.get(c))
+            .and_then(|w| w.toplevel().map(|t| t.wl_surface().clone()));
+        let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
+        let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+        keyboard.set_focus(self, target, serial);
     }
 
     /// The output was resized (nested window resize stands in for RandR).
