@@ -1,14 +1,18 @@
-//! Software rendering of leaf decorations (titlebar, focus border, content
-//! background) as an indexed-colour `pixel_graphics::Framebuffer`, presented
-//! once per frame into a BGRX byte buffer ready for X `PutImage` on a
-//! depth-24 `TrueColor` visual. Each concern owns its own module: wallpaper
-//! loading/caching in `wallpaper`, a leaf's border/titlebar chrome in
-//! `chrome`, its split-control buttons in `buttons`, icon blitting/caching
-//! (shared by the titlebar and the taskbar) in `icon_cache`, the taskbar's
-//! own tiles/badges/insert-button in `taskbar`, and served-notification
-//! speech bubbles in `notify_popup`. The `Renderer` struct itself and the
-//! handful of drawing primitives genuinely shared across all of the above
-//! live here.
+//! Software rendering of the chrome pieces (wallpaper, leaf decorations,
+//! taskbar, insert buttons) as indexed-colour `pixel_graphics::Framebuffer`s.
+//! The index bytes upload straight to the GPU as `R8` textures and the
+//! palette lookup happens in a fragment shader (`comp::indexed`); this module
+//! only draws the indices. Each piece is drawn into its own small buffer at
+//! its own origin (leaf frames at (0,0) into a leaf-sized buffer, the taskbar
+//! into a strip-sized buffer, each "+" into a square) — see `comp::chrome`,
+//! which owns the per-piece texture caches and composites them by position.
+//! Each concern owns its own module: wallpaper loading/caching in
+//! `wallpaper`, a leaf's border/titlebar chrome in `chrome`, its
+//! split-control buttons in `buttons`, icon blitting/caching (shared by the
+//! titlebar and the taskbar) in `icon_cache`, the taskbar's own
+//! tiles/badges/insert-button in `taskbar`, and served-notification speech
+//! bubbles in `notify_popup`. The `Renderer` struct itself and the handful
+//! of drawing primitives genuinely shared across all of the above live here.
 
 #![allow(
     clippy::cast_possible_truncation,
@@ -34,7 +38,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 use pixel_fonts::{BitmapFont, FUSION_PIXEL_12_SPEC};
-use pixel_graphics::{Framebuffer, Paint as PgPaint, PaletteIndex, PresentLut, Swap};
+use pixel_graphics::{Framebuffer, Paint as PgPaint, PaletteIndex, Swap};
 
 use crate::oklch::OklabPalette;
 use crate::theme::{self, palette_color};
@@ -52,18 +56,12 @@ pub struct Renderer {
     /// The na16 palette all art/indices resolve through, paired with its
     /// precomputed `OKLab` coordinates for perceptual nearest-colour snapping.
     palette: OklabPalette,
-    /// Index -> BGRX output table used by `present`.
-    lut: Box<PresentLut>,
     /// Palette index used for foreground text/glyph strokes.
     fg: Index,
     /// Screen-sized scaled wallpaper (quantized to the palette), tagged
-    /// with the (path, w, h) it was loaded for; frame backgrounds copy it
-    /// each frame.
+    /// with the (path, w, h) it was loaded for; `wallpaper_base` copies it
+    /// into the full-output wallpaper piece on load/resize.
     wallpaper: Option<Wallpaper>,
-    /// The full-screen compositing framebuffer, recycled between frames via
-    /// `take_screen_base`/`retire_frame`: allocating ~8 MB per composited
-    /// frame (60/s during animations) would be pure churn.
-    frame: Option<Framebuffer>,
     /// Bitmap window border; palette-swapped to each leaf's accent at draw
     /// time via `accent_swap`.
     border: NineSlice,
@@ -142,14 +140,11 @@ impl Renderer {
                 None
             }
         };
-        let lut = palette.inner().present_lut();
         let fg = palette.inner().closest_to_white_index();
         Self {
             font,
-            lut,
             fg,
             wallpaper: None,
-            frame: None,
             border: NineSlice {
                 sprite: crate::assets::winborder(),
                 l: theme::BORDER_LEFT,
@@ -187,71 +182,36 @@ impl Renderer {
         }
     }
 
-    /// Present an indexed framebuffer as X11 BGRX bytes into a slice of exactly
-    /// `w * h * BYTES_PER_PIXEL` bytes — e.g. the MIT-SHM mapping, so the
-    /// full-screen frame is written once, directly where the server reads it.
-    pub fn present_into_slice(&self, fb: &Framebuffer, out: &mut [u8]) {
-        // Fail loudly at the boundary rather than handing a short slice to
-        // present_into — `out` is typically the MIT-SHM mapping, and a
-        // framebuffer/segment resize race must not become a deep panic (or
-        // worse) inside pixel-graphics.
-        assert_eq!(
-            out.len(),
-            fb.width * fb.height * Framebuffer::BYTES_PER_PIXEL
-        );
-        fb.present_into(out, &self.lut);
-    }
-
-    /// A screen-sized framebuffer initialised with the wallpaper (or the
-    /// solid background colour). All leaf chrome is composited onto this.
-    /// Recycles the previous frame's buffer (hand it back via
-    /// `retire_frame`) so per-frame compositing allocates nothing.
-    pub fn take_screen_base(&mut self, w: u32, h: u32) -> Framebuffer {
+    /// The full-output wallpaper piece: a `w`x`h` framebuffer holding the
+    /// scaled wallpaper (or the solid background colour where the image
+    /// doesn't reach), fully opaque. Rebuilt only on load / resize, so a
+    /// fresh allocation is fine here.
+    pub fn wallpaper_base(&self, w: u32, h: u32) -> Framebuffer {
         let (w, h) = (w.max(1) as usize, h.max(1) as usize);
-        let mut fb = match self.frame.take() {
-            Some(f) if f.width == w && f.height == h => f,
-            _ => Framebuffer::new(w, h, palette_color::BLACK),
-        };
-        // A same-size wallpaper repaints every pixel on its own; only clear
-        // first when it can't (absent, or mid-resize before its rescale).
-        let covered = self
-            .wallpaper
-            .as_ref()
-            .is_some_and(|wp| wp.fb.width >= w && wp.fb.height >= h);
-        if !covered {
-            fb.fill_rect_paint(
-                0,
-                0,
-                w,
-                h,
-                PgPaint::Solid(PaletteIndex::new(palette_color::BLACK)),
-            );
-        }
+        let mut fb = Framebuffer::new(w, h, palette_color::BLACK);
         if let Some(wp) = &self.wallpaper {
-            // `copy_from`, not `blit_from`: the quantized wallpaper only
-            // ever holds real palette indices (never `TRANSPARENT`), and
-            // this is a full-screen blit on every composited frame —
-            // `blit_from`'s per-pixel transparency test would be ~8M
-            // pointless branches per 4K frame.
+            // `copy_from`, not `blit_from`: the quantized wallpaper only ever
+            // holds real palette indices (never `TRANSPARENT`), so no
+            // per-pixel transparency test is needed; the black initialiser
+            // backs any margin an undersized image leaves.
             fb.copy_from(&wp.fb, 0, 0);
         }
         fb
     }
 
-    /// Return the compositing framebuffer for reuse by the next
-    /// `take_screen_base`.
-    pub fn retire_frame(&mut self, fb: Framebuffer) {
-        self.frame = Some(fb);
-    }
-
-    /// 2px focus outline traced just inside the focused split's frame rect,
-    /// in the palette's closest-to-white colour.
-    pub fn draw_focus_outline(&self, fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32) {
-        const T: i32 = 2;
-        fill(fb, x, y, w, T, self.fg);
-        fill(fb, x, y + h - T, w, T, self.fg);
-        fill(fb, x, y + T, T, h - 2 * T, self.fg);
-        fill(fb, x + w - T, y + T, T, h - 2 * T, self.fg);
+    /// The focus outline's colour: the palette's closest-to-white entry as
+    /// premultiplied `[r, g, b, a]` (opaque, so the channels pass through).
+    /// The 2px outline draws as its own GPU solid element stacked over the
+    /// underlay, not painted into it, so a focus change moves the outline
+    /// without recompositing the chrome.
+    pub fn focus_color(&self) -> [f32; 4] {
+        let c = self.palette.inner().color(self.fg);
+        [
+            f32::from(c.r) / 255.0,
+            f32::from(c.g) / 255.0,
+            f32::from(c.b) / 255.0,
+            1.0,
+        ]
     }
 
     /// Draw a single character centred at (cx, cy) in palette colour `color`.

@@ -6,7 +6,6 @@
 //! always resolves while the window is managed, and tiled insertion order
 //! is the taskbar order (matching master's `managed` store).
 
-use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
@@ -31,10 +30,11 @@ pub struct FloatData {
     /// Accent palette index for the chrome — the transient parent's split
     /// colour when it has one, so the dialog visibly belongs to it.
     pub accent: crate::Index,
-    /// The frame chrome, rendered as its own element just below the client
-    /// surface; repainted only when its content (size/title/accent)
-    /// changes — a drag just moves the element.
-    pub frame_buf: MemoryRenderBuffer,
+    /// The frame chrome's indexed GPU texture, rendered as its own element
+    /// just below the client surface; re-uploaded only when its content
+    /// (size/title/accent) changes — a drag just moves the element. `None`
+    /// until the first paint, which happens before the float is first shown.
+    pub frame_tex: Option<crate::comp::indexed::IndexedTexture>,
     pub frame_dirty: bool,
 }
 

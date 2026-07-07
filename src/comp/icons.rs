@@ -74,8 +74,10 @@ impl Comp {
             kind_tiled = matches!(entry.kind, Kind::Tiled);
         }
         if kind_tiled {
+            // The new icon changes the leaf's and taskbar tile's content
+            // fingerprints, so the next redraw's `update_chrome_pieces`
+            // re-renders just those pieces.
             self.refresh_icon_rotations(&class);
-            self.chrome_dirty = true;
         } else if let Some((_, f)) = self.managed.float_mut(r.win) {
             f.frame_dirty = true;
         }

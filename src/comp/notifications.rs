@@ -3,10 +3,9 @@
 //! daemon then emits `NotificationClosed(id, 2)`); Show/Close arrive from
 //! the daemon over a calloop channel.
 
-use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
-use smithay::utils::{Logical, Point, Transform};
+use smithay::utils::{Logical, Point};
 
+use super::indexed::IndexedTexture;
 use super::Comp;
 use crate::notify::{CloseReason, NoteMsg};
 use crate::theme;
@@ -14,7 +13,10 @@ use crate::widgets::FrameRect;
 
 pub struct NotePopup {
     pub id: u32,
-    pub buf: MemoryRenderBuffer,
+    /// The bubble's indexed GPU texture. Its rounded corners are
+    /// `TRANSPARENT`-indexed, which the palette shader draws as fully
+    /// transparent (the X11 version SHAPE'd the window instead).
+    pub tex: IndexedTexture,
     pub w: i32,
     pub h: i32,
 }
@@ -27,27 +29,14 @@ impl Comp {
                     .chrome
                     .draw_note(&note.summary, &note.body, note.urgency >= 2);
                 let (w, h) = (fb.width as i32, fb.height as i32);
-                let buf =
-                    MemoryRenderBuffer::new(Fourcc::Argb8888, (w, h), 1, Transform::Normal, None);
-                {
-                    // The bubble's rounded corners are TRANSPARENT-indexed;
-                    // present them as alpha 0 (the X11 version SHAPE'd the
-                    // window instead) so clients show through.
-                    let mut lut = self.chrome.palette().inner().present_lut();
-                    lut[usize::from(pixel_graphics::TRANSPARENT)] = [0, 0, 0, 0];
-                    let full: smithay::utils::Rectangle<i32, smithay::utils::Buffer> =
-                        smithay::utils::Rectangle::from_size((w, h).into());
-                    let mut b = buf.clone();
-                    b.render()
-                        .draw(|out| {
-                            fb.present_into(out, &lut);
-                            Ok::<_, std::convert::Infallible>(vec![full])
-                        })
-                        .expect("present note bubble");
-                }
+                // The bubble has TRANSPARENT-indexed corners, so it is not
+                // opaque.
+                let mut tex = None;
+                self.indexed
+                    .upload(self.backend.renderer(), &mut tex, &fb, false);
                 let popup = NotePopup {
                     id: note.id,
-                    buf,
+                    tex: tex.expect("note bubble uploaded"),
                     w,
                     h,
                 };

@@ -325,7 +325,7 @@ impl Comp {
                 Some(crate::comp::pointer::ActiveDrag::Float(_)) => CursorIcon::Pointer,
                 None => self.hover_cursor(pos),
             };
-            self.cursor_status = smithay::input::pointer::CursorImageStatus::Named(icon);
+            self.cursor_status = Some(icon);
         }
         let pointer = self.seat.get_pointer().expect("seat has a pointer");
         pointer.motion(

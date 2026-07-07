@@ -1,39 +1,75 @@
-//! Compositing the software-rendered chrome under the client windows.
+//! The ex-underlay, split into independently-textured pieces so scrolling
+//! and layout animation stay pure GPU element placement.
 //!
-//! The ported `render::Renderer` draws wallpaper + leaf frames into one
-//! palette-indexed full-output `Framebuffer` (the X11 version's underlay);
-//! here it is presented into a `MemoryRenderBuffer` (smithay owns the
-//! texture upload and damage) and rendered as the bottom element of every
-//! frame. Nothing allocates per frame: the indexed framebuffer recycles
-//! via take_screen_base/retire_frame, and the memory buffer is rewritten
-//! only when the chrome is actually dirty.
+//! The chrome that renders behind the client windows — the wallpaper, every
+//! placed leaf's frame, the "+" insert buttons and the bottom taskbar — is
+//! not one full-output framebuffer but a set of separately-cached pieces,
+//! each an 8bpp palette-indexed `pixel_graphics::Framebuffer` uploaded as an
+//! `R8` GPU texture the palette shader resolves (see `super::indexed`):
+//!
+//! * **wallpaper** — one full-output opaque texture, rebuilt only when the
+//!   output size changes (a resize rescales the image too);
+//! * **leaf chrome** — one leaf-sized texture per placed leaf (border,
+//!   titlebar text/icon, the baked split-control buttons, or the minimized
+//!   restore strip), rebuilt only when that leaf's content fingerprint
+//!   (`LeafKey`) changes; its corners are transparent, so it is not opaque;
+//! * **plus buttons** — one texture per distinct "+" size, shared across
+//!   every gap/edge insert region;
+//! * **taskbar** — one strip-sized texture over the bottom bar (tiles,
+//!   close badges, separator, quick-launch), rebuilt only when its
+//!   fingerprint (`TaskbarKey`) changes; transparent between tiles so the
+//!   wallpaper shows through.
+//!
+//! Each frame `redraw` builds render elements from the cached textures and
+//! positions them: a scroll only moves the elements, never touching a
+//! texture. A content change re-renders and re-uploads just its own piece.
+//! Layout animation interpolates each leaf's full rect (position and size,
+//! ease-out-back), and an animating leaf re-renders at its interpolated size
+//! each tick — so borders stay a constant thickness and titlebars stay crisp
+//! as the frame scales, which GPU texture scaling could not do; only the
+//! leaves actually resizing pay, idle leaves and steady-state frames stay
+//! cached. The focus outline (four GPU solid strips, above the leaf group)
+//! rides the focused leaf's interpolated rect.
+//!
+//! Stacking within the ex-underlay's slot, front-to-back: the focus outline,
+//! the taskbar (in front of the leaf frames, as the old single buffer drew
+//! it last), the plus buttons, the leaf frames (which never overlap, so
+//! their order is free), then the opaque wallpaper at the back.
 
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use super::indexed::{IndexedElement, IndexedProgram, IndexedTexture};
 use super::Comp;
-use crate::render::{BtnIcon, LeafView, TitleInfo};
+use crate::icon::Icon;
+use crate::render::{BtnIcon, LeafView, Renderer, TitleInfo};
 use crate::theme;
-use crate::tree::Dir;
-use crate::widgets::{leaf_meta, BtnKind, Placement};
-use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::element::memory::{
-    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
-};
+use crate::tree::{Dir, NodeId};
+use crate::widgets::{leaf_meta, BtnKind, FrameRect, Placement};
+use crate::Index;
+use pixel_graphics::Framebuffer;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::render_elements;
-use smithay::utils::{Buffer as BufferCoords, Rectangle, Transform};
+use smithay::utils::{Logical, Point};
 
 render_elements! {
     /// Everything one output frame is made of: client surfaces of every
-    /// kind (tiled, floats, dock, layer, o-r) and the software-drawn
-    /// chrome buffers (underlay, float frames, notes, cursor).
+    /// kind (tiled, floats, dock, layer, o-r), the software-drawn chrome
+    /// pieces (wallpaper, leaf frames, plus buttons, taskbar, float frames,
+    /// notes, cursor) that the palette shader resolves straight from their
+    /// indexed GPU textures, and the focused split's 2px focus outline as
+    /// GPU solid strips.
     pub OutputElement<=GlesRenderer>;
     Float=WaylandSurfaceRenderElement<GlesRenderer>,
-    Chrome=MemoryRenderBufferRenderElement<GlesRenderer>,
+    Chrome=IndexedElement,
+    Solid=smithay::backend::renderer::element::solid::SolidColorRenderElement,
 }
 
-/// Borrows of everything `output_elements` composites, so `redraw` can
-/// hand the scene to a backend while that backend is itself mutably
-/// borrowed out of `Comp`.
+/// Borrows of everything `output_elements` composites, so `redraw` can hand
+/// the scene to a backend while that backend is itself mutably borrowed out
+/// of `Comp`.
 pub struct Scene<'a> {
     pub or_windows: &'a [crate::comp::xwayland::OrWindow],
     pub note_popups: &'a [super::notifications::NotePopup],
@@ -49,7 +85,23 @@ pub struct Scene<'a> {
         smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         smithay::utils::Point<i32, smithay::utils::Logical>,
     )>,
-    pub chrome_buf: &'a MemoryRenderBuffer,
+    pub indexed: &'a IndexedProgram,
+    /// The full-output opaque wallpaper texture (bottom of the ex-underlay
+    /// group). `None` only before the first `update_chrome_pieces`, which
+    /// every redraw runs before building the scene.
+    pub wallpaper: Option<&'a IndexedTexture>,
+    /// Each placed leaf's frame texture with the origin it draws at this
+    /// frame (interpolated mid-animation, settled otherwise).
+    pub leaf_chrome: &'a [(Point<i32, Logical>, &'a IndexedTexture)],
+    /// The "+" insert-button textures with the gap/edge origins they draw
+    /// at; empty while a layout animation runs.
+    pub plus: &'a [(Point<i32, Logical>, &'a IndexedTexture)],
+    /// The taskbar strip texture and its top-left origin.
+    pub taskbar: Option<(Point<i32, Logical>, &'a IndexedTexture)>,
+    /// The focused split's 2px outline as four solid strips (empty when no
+    /// leaf holds focus), stacked just over the leaf group so a focus change
+    /// moves them without re-uploading any texture.
+    pub focus_outline: &'a [smithay::backend::renderer::element::solid::SolidColorRenderElement],
 }
 
 /// Append render elements for every layer surface on `layer`, topmost
@@ -84,11 +136,22 @@ fn layer_elements(
     }
 }
 
+/// A chrome element drawing `tex` at `loc` (output-relative, scale 1).
+fn chrome_at(
+    indexed: &IndexedProgram,
+    tex: &IndexedTexture,
+    loc: Point<i32, Logical>,
+) -> OutputElement {
+    OutputElement::Chrome(indexed.element(tex, loc.to_physical(1), Kind::Unspecified))
+}
+
 /// One frame's render elements, front-to-back: Overlay layer surfaces
 /// topmost, override-redirect X11 windows (rofi, menus), notification
 /// bubbles, the Top layer, floats with their frame chrome, the
-/// tiled/fullscreen Space, the dock, the Bottom layer, the chrome
-/// underlay, the Background layer behind everything.
+/// tiled/fullscreen Space, the dock, the Bottom layer, then the ex-underlay
+/// group — the focus outline, the taskbar, the plus buttons, the leaf
+/// frames, and the opaque wallpaper — and the Background layer behind
+/// everything.
 pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<OutputElement> {
     use smithay::backend::renderer::element::AsRenderElements as _;
     use smithay::utils::{Logical, Point};
@@ -121,18 +184,11 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
         let Some(p) = scene.note_popups.iter().find(|p| p.id == *id) else {
             continue;
         };
-        match MemoryRenderBufferRenderElement::from_buffer(
-            renderer,
-            (f64::from(rect.x), f64::from(rect.y)),
-            &p.buf,
-            None,
-            None,
-            None,
-            smithay::backend::renderer::element::Kind::Unspecified,
-        ) {
-            Ok(el) => elements.push(OutputElement::Chrome(el)),
-            Err(err) => tracing::error!("note element: {err}"),
-        }
+        elements.push(chrome_at(
+            scene.indexed,
+            &p.tex,
+            Point::<i32, Logical>::from((rect.x, rect.y)),
+        ));
     }
     layer_elements(renderer, &layer_map, Layer::Top, &None, &mut elements);
     for &fw in scene.float_stack {
@@ -142,23 +198,18 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
         let loc = (Point::<i32, Logical>::from((f.x, f.y)) - window.geometry().loc).to_physical(1);
         elements.extend(window.render_elements::<OutputElement>(renderer, loc, 1.0.into(), 1.0));
         let rect = f.frame_rect();
-        match MemoryRenderBufferRenderElement::from_buffer(
-            renderer,
-            (f64::from(rect.x), f64::from(rect.y)),
-            &f.frame_buf,
-            None,
-            None,
-            None,
-            smithay::backend::renderer::element::Kind::Unspecified,
-        ) {
-            Ok(el) => elements.push(OutputElement::Chrome(el)),
-            Err(err) => tracing::error!("float frame element: {err}"),
+        if let Some(tex) = &f.frame_tex {
+            elements.push(chrome_at(
+                scene.indexed,
+                tex,
+                Point::<i32, Logical>::from((rect.x, rect.y)),
+            ));
         }
     }
     // The Space's windows in stacking order, via the region renderer —
     // NOT space_render_elements, which draws every layer surface itself
     // (in an order that buries Overlay under floats and puts Background
-    // over the chrome underlay) and locks the LayerMap this function
+    // over the chrome pieces) and locks the LayerMap this function
     // already holds.
     if let Some(geo) = scene.space.output_geometry(scene.output) {
         elements.extend(
@@ -174,12 +225,12 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
             (Point::<i32, Logical>::from((rect.x, rect.y)) - window.geometry().loc).to_physical(1);
         elements.extend(window.render_elements::<OutputElement>(renderer, loc, 1.0.into(), 1.0));
     }
-    // Bottom layer surfaces (cozyui's native sidebar) sit above the
-    // chrome underlay: the wallpaper is baked into that opaque buffer, so
-    // "above the wallpaper, below the windows" can only mean above the
-    // whole underlay. The dock panel among them rides the canvas scroll
-    // (`layer_dock`), parked past its right end like the XWayland dock,
-    // so columns scrolled over it cover it and scrolling right reveals it.
+    // Bottom layer surfaces (cozyui's native sidebar) sit above the chrome
+    // pieces: the wallpaper is the opaque back of the group, so "above the
+    // wallpaper, below the windows" can only mean above the whole group.
+    // The dock panel among them rides the canvas scroll (`layer_dock`),
+    // parked past its right end like the XWayland dock, so columns scrolled
+    // over it cover it and scrolling right reveals it.
     layer_elements(
         renderer,
         &layer_map,
@@ -187,23 +238,49 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
         scene.layer_dock,
         &mut elements,
     );
-    match MemoryRenderBufferRenderElement::from_buffer(
-        renderer,
-        (0.0, 0.0),
-        scene.chrome_buf,
-        None,
-        None,
-        None,
-        smithay::backend::renderer::element::Kind::Unspecified,
-    ) {
-        Ok(el) => elements.push(OutputElement::Chrome(el)),
-        Err(err) => tracing::error!("chrome element: {err}"),
+    // The focus outline traces just inside the focused frame, over the leaf
+    // frames but under every client window (already stacked above). Its own
+    // solid elements move with the focused rect, so a focus switch never
+    // re-uploads a texture.
+    elements.extend(
+        scene
+            .focus_outline
+            .iter()
+            .cloned()
+            .map(OutputElement::Solid),
+    );
+    // The taskbar draws in front of the leaf frames (the old single buffer
+    // drew it last, so its pixels won any overlap with a leaf frame reaching
+    // into the bottom strip).
+    if let Some((loc, tex)) = scene.taskbar {
+        elements.push(chrome_at(scene.indexed, tex, loc));
     }
-    // The chrome underlay's wallpaper is this session's background layer;
-    // a foreign Background surface (a wallpaper client) stacks behind the
-    // opaque underlay, occluded, rather than being allowed to cover the
-    // leaf frames and taskbar drawn into the same buffer.
-    layer_elements(renderer, &layer_map, Layer::Background, &None, &mut elements);
+    // Plus buttons sit in the gaps between frames; they never overlap a
+    // frame, so their order relative to the leaf group is cosmetic.
+    for (loc, tex) in scene.plus {
+        elements.push(chrome_at(scene.indexed, tex, *loc));
+    }
+    // Leaf frames: non-overlapping, so relative order is free.
+    for (loc, tex) in scene.leaf_chrome {
+        elements.push(chrome_at(scene.indexed, tex, *loc));
+    }
+    // The wallpaper is this session's opaque background; a foreign
+    // Background surface (a wallpaper client) stacks behind it, occluded,
+    // rather than being allowed to cover the leaf frames and taskbar.
+    if let Some(tex) = scene.wallpaper {
+        elements.push(chrome_at(
+            scene.indexed,
+            tex,
+            Point::<i32, Logical>::from((0, 0)),
+        ));
+    }
+    layer_elements(
+        renderer,
+        &layer_map,
+        Layer::Background,
+        &None,
+        &mut elements,
+    );
     elements
 }
 
@@ -215,13 +292,9 @@ fn ease_out_back(t: f32) -> f32 {
     (t * t).mul_add(inner, 1.0)
 }
 
-fn lerp_rect(
-    a: crate::widgets::FrameRect,
-    b: crate::widgets::FrameRect,
-    p: f32,
-) -> crate::widgets::FrameRect {
+fn lerp_rect(a: FrameRect, b: FrameRect, p: f32) -> FrameRect {
     let l = |s: i32, e: i32| s + ((e - s) as f32 * p) as i32;
-    crate::widgets::FrameRect {
+    FrameRect {
         x: l(a.x, b.x),
         y: l(a.y, b.y),
         w: l(a.w, b.w).max(1),
@@ -234,91 +307,536 @@ const ANIM_DURATION: std::time::Duration = std::time::Duration::from_millis(280)
 
 /// An in-flight layout animation, stepped by the redraw tick (~60 Hz).
 /// Client windows are already at their final rects (placed by the arrange
-/// that started this); only the composited chrome interpolates.
+/// that started this); only the composited chrome interpolates — each leaf
+/// frame's full rect eases from its start toward its target, re-rendering at
+/// the interpolated size each tick so its borders scale without blurring.
 pub struct LayoutAnim {
     pub start: std::time::Instant,
     /// Each animated leaf's start rect paired with its target placement.
-    pub placed: Vec<(crate::widgets::FrameRect, Placement)>,
+    pub placed: Vec<(FrameRect, Placement)>,
+}
+
+/// The independently-cached ex-underlay pieces (see the module docs). Each
+/// piece re-renders and re-uploads only when its own content fingerprint
+/// changes; positions are pure element placement in `redraw`.
+#[derive(Default)]
+pub struct ChromePieces {
+    wallpaper: WallpaperPiece,
+    /// One texture per placed leaf, keyed by leaf id; stale entries are
+    /// dropped as leaves vanish.
+    leaves: HashMap<NodeId, (LeafKey, IndexedTexture)>,
+    /// One texture per distinct "+" square size (all edge/gap plus buttons
+    /// of a size share it).
+    plus: HashMap<i32, IndexedTexture>,
+    taskbar: TaskbarPiece,
+}
+
+impl ChromePieces {
+    /// The wallpaper element's texture (bottom of the group).
+    pub fn wallpaper_element(&self) -> Option<&IndexedTexture> {
+        self.wallpaper.tex.as_ref()
+    }
+
+    /// Each placed leaf's cached texture paired with its origin from
+    /// `tick_layout` (interpolated mid-slide, settled otherwise).
+    pub fn leaf_elements<'a>(
+        &'a self,
+        positions: &[(NodeId, Point<i32, Logical>)],
+    ) -> Vec<(Point<i32, Logical>, &'a IndexedTexture)> {
+        positions
+            .iter()
+            .filter_map(|(leaf, loc)| self.leaves.get(leaf).map(|(_, t)| (*loc, t)))
+            .collect()
+    }
+
+    /// The plus-button elements at their gap/edge origins, or none while an
+    /// animation runs (the old buffer omitted the insert glyphs mid-slide).
+    pub fn plus_elements(
+        &self,
+        plus_regions: &[(FrameRect, crate::state::InsertAt)],
+        animating: bool,
+    ) -> Vec<(Point<i32, Logical>, &IndexedTexture)> {
+        if animating {
+            return Vec::new();
+        }
+        plus_regions
+            .iter()
+            .filter_map(|(r, _)| {
+                self.plus
+                    .get(&r.w.max(1))
+                    .map(|t| (Point::<i32, Logical>::from((r.x, r.y)), t))
+            })
+            .collect()
+    }
+
+    /// The taskbar strip element: its texture with its top-left origin.
+    pub fn taskbar_element(&self) -> Option<(Point<i32, Logical>, &IndexedTexture)> {
+        self.taskbar
+            .tex
+            .as_ref()
+            .map(|t| (Point::<i32, Logical>::from(self.taskbar.origin), t))
+    }
+}
+
+/// The full-output opaque wallpaper texture and the size it was built for;
+/// an output resize (which also rescales the image) rebuilds it.
+#[derive(Default)]
+struct WallpaperPiece {
+    tex: Option<IndexedTexture>,
+    size: (i32, i32),
+}
+
+/// The taskbar strip texture with its fingerprint and top-left origin.
+#[derive(Default)]
+struct TaskbarPiece {
+    key: Option<TaskbarKey>,
+    tex: Option<IndexedTexture>,
+    origin: (i32, i32),
+}
+
+/// One leaf's frame draw data: the border/titlebar view plus the baked
+/// split-control buttons (kept visible during a slide — a 280ms cosmetic
+/// difference, cheaper than re-rendering buttonless per tick).
+struct LeafPaint {
+    w: i32,
+    h: i32,
+    accent: Index,
+    minimized: bool,
+    title: Option<TitlePaint>,
+    buttons: Vec<BtnPaint>,
+}
+
+/// A leaf titlebar's contents (drawn only when unminimized and occupied).
+struct TitlePaint {
+    label: char,
+    icon: Option<Rc<Icon>>,
+    title: Rc<str>,
+}
+
+/// One baked split-control button, its centre relative to the leaf origin.
+struct BtnPaint {
+    cx: i32,
+    cy: i32,
+    icon: BtnIcon,
+    disabled: bool,
+    accent: Index,
+}
+
+/// A leaf's content fingerprint: the derived key deciding whether its
+/// texture must be re-rendered. Everything `draw_leaf` and the baked buttons
+/// consult appears here; positions within the leaf follow from `w`/`h` and
+/// so aren't listed separately. Icons compare by their process-unique id and
+/// titles by their string contents.
+#[derive(PartialEq)]
+struct LeafKey {
+    w: i32,
+    h: i32,
+    accent: Index,
+    minimized: bool,
+    title: Option<(char, Option<u64>, Rc<str>)>,
+    buttons: Vec<(i32, i32, BtnIcon, bool, Index)>,
+}
+
+impl LeafPaint {
+    fn key(&self) -> LeafKey {
+        LeafKey {
+            w: self.w,
+            h: self.h,
+            accent: self.accent,
+            minimized: self.minimized,
+            title: self
+                .title
+                .as_ref()
+                .map(|t| (t.label, t.icon.as_ref().map(|i| i.id()), t.title.clone())),
+            buttons: self
+                .buttons
+                .iter()
+                .map(|b| (b.cx, b.cy, b.icon, b.disabled, b.accent))
+                .collect(),
+        }
+    }
+
+    fn view(&self) -> LeafView {
+        LeafView {
+            w: self.w,
+            h: self.h,
+            tb_h: theme::tb_h(),
+            bw: theme::BORDER_LEFT,
+            accent_index: self.accent,
+            titlebar: self.title.as_ref().map(|t| TitleInfo {
+                label: t.label,
+                icon: t.icon.clone(),
+                title: t.title.clone(),
+            }),
+            minimized: self.minimized,
+            buttons: true,
+        }
+    }
+}
+
+/// The taskbar strip's draw data: the tiles, separator and quick-launch
+/// icons, in output-space coordinates.
+struct TaskbarPaint {
+    w: i32,
+    h: i32,
+    origin: (i32, i32),
+    tiles: Vec<TilePaint>,
+    sep: Option<FrameRect>,
+    quick: Vec<QuickPaint>,
+}
+
+struct TilePaint {
+    rect: FrameRect,
+    close: FrameRect,
+    icon: Option<Rc<Icon>>,
+    label: char,
+    accent: Index,
+    in_split: bool,
+}
+
+struct QuickPaint {
+    rect: FrameRect,
+    icon: Option<Rc<Icon>>,
+    label: char,
+}
+
+/// The taskbar's content fingerprint (mirrors `LeafKey`'s role): window
+/// set/order, per-tile accent/highlight/icon, the separator, and the visible
+/// quick-launch entries.
+#[derive(PartialEq)]
+struct TaskbarKey {
+    w: i32,
+    h: i32,
+    origin: (i32, i32),
+    tiles: Vec<(FrameRect, FrameRect, Option<u64>, char, Index, bool)>,
+    sep: Option<FrameRect>,
+    quick: Vec<(FrameRect, Option<u64>, char)>,
+}
+
+impl TaskbarPaint {
+    fn key(&self) -> TaskbarKey {
+        TaskbarKey {
+            w: self.w,
+            h: self.h,
+            origin: self.origin,
+            tiles: self
+                .tiles
+                .iter()
+                .map(|t| {
+                    (
+                        t.rect,
+                        t.close,
+                        t.icon.as_ref().map(|i| i.id()),
+                        t.label,
+                        t.accent,
+                        t.in_split,
+                    )
+                })
+                .collect(),
+            sep: self.sep,
+            quick: self
+                .quick
+                .iter()
+                .map(|q| (q.rect, q.icon.as_ref().map(|i| i.id()), q.label))
+                .collect(),
+        }
+    }
+}
+
+/// Render `paint` into a leaf-sized indexed framebuffer and upload it,
+/// reusing the cached texture when the content fingerprint is unchanged.
+fn render_leaf(
+    chrome: &Renderer,
+    indexed: &mut IndexedProgram,
+    renderer: &mut GlesRenderer,
+    cache: &mut HashMap<NodeId, (LeafKey, IndexedTexture)>,
+    leaf: NodeId,
+    paint: &LeafPaint,
+) {
+    let key = paint.key();
+    if cache.get(&leaf).is_some_and(|(k, _)| *k == key) {
+        return;
+    }
+    // Transparent so the border's rounded (TRANSPARENT-indexed) corners let
+    // the wallpaper show through, and a minimized leaf's restore strip sits
+    // on the wallpaper rather than a filled rect.
+    let mut fb = Framebuffer::new(
+        paint.w.max(1) as usize,
+        paint.h.max(1) as usize,
+        pixel_graphics::TRANSPARENT,
+    );
+    chrome.draw_leaf(&mut fb, 0, 0, &paint.view());
+    for b in &paint.buttons {
+        chrome.draw_button(&mut fb, b.cx, b.cy, b.icon, b.disabled, b.accent);
+    }
+    // Reuse the previous texture's GL storage when the size matches.
+    let mut tex = cache.remove(&leaf).map(|(_, t)| t);
+    indexed.upload(renderer, &mut tex, &fb, false);
+    cache.insert(leaf, (key, tex.expect("leaf texture uploaded")));
+}
+
+/// Render one "+" insert button of side `sz` into its shared texture (once
+/// per distinct size).
+fn render_plus(
+    indexed: &mut IndexedProgram,
+    renderer: &mut GlesRenderer,
+    cache: &mut HashMap<i32, IndexedTexture>,
+    sz: i32,
+) {
+    if cache.contains_key(&sz) {
+        return;
+    }
+    let s = sz.max(1) as usize;
+    let mut fb = Framebuffer::new(s, s, pixel_graphics::TRANSPARENT);
+    crate::render::draw_plus(&mut fb, sz / 2, sz / 2, sz);
+    let mut tex = None;
+    indexed.upload(renderer, &mut tex, &fb, false);
+    cache.insert(sz, tex.expect("plus texture uploaded"));
+}
+
+/// Render the taskbar strip into its texture, reusing it when the
+/// fingerprint is unchanged. The strip starts transparent so the wallpaper
+/// shows between tiles.
+fn render_taskbar(
+    chrome: &Renderer,
+    indexed: &mut IndexedProgram,
+    renderer: &mut GlesRenderer,
+    piece: &mut TaskbarPiece,
+    paint: &TaskbarPaint,
+) {
+    let key = paint.key();
+    piece.origin = paint.origin;
+    if piece.tex.is_some() && piece.key.as_ref() == Some(&key) {
+        return;
+    }
+    let mut fb = Framebuffer::new(
+        paint.w.max(1) as usize,
+        paint.h.max(1) as usize,
+        pixel_graphics::TRANSPARENT,
+    );
+    let oy = paint.origin.1;
+    let shift = |r: FrameRect| FrameRect {
+        x: r.x,
+        y: r.y - oy,
+        w: r.w,
+        h: r.h,
+    };
+    for t in &paint.tiles {
+        chrome.draw_taskbar_item(
+            &mut fb,
+            shift(t.rect),
+            t.icon.as_deref(),
+            t.label,
+            t.accent,
+            t.in_split,
+        );
+        let c = shift(t.close);
+        crate::render::draw_close_badge(&mut fb, c.x, c.y, c.w);
+    }
+    if let Some(sep) = paint.sep {
+        crate::render::draw_taskbar_sep(&mut fb, shift(sep));
+    }
+    for q in &paint.quick {
+        chrome.draw_taskbar_item(
+            &mut fb,
+            shift(q.rect),
+            q.icon.as_deref(),
+            q.label,
+            theme::palette_color::CREAM,
+            false,
+        );
+    }
+    indexed.upload(renderer, &mut piece.tex, &fb, false);
+    piece.key = Some(key);
 }
 
 impl Comp {
-    /// Redraw the underlay for the current placements. Runs only when
-    /// something chrome-visible changed (`chrome_dirty`), not per frame.
-    pub fn compose_chrome(&mut self) {
-        let placed = self.placed.clone();
-        self.compose_frame(&placed, true);
+    /// Advance any in-flight layout animation and report this frame's leaf
+    /// rects: each placed leaf's full draw rect, interpolated toward its
+    /// target (position and size, ease-out-back) while the animation runs,
+    /// else its settled rect. The animating leaves' frames re-render at these
+    /// sizes in `update_chrome_pieces`, so borders stay crisp as the frame
+    /// scales. Also updates `focus_rect` so the outline rides the focused
+    /// leaf's current interpolated rect.
+    pub fn tick_layout(&mut self) -> Vec<(NodeId, FrameRect)> {
+        let anim_result = self.anim.as_ref().map(|anim| {
+            let t = (anim.start.elapsed().as_secs_f32() / ANIM_DURATION.as_secs_f32()).min(1.0);
+            if t >= 1.0 {
+                return (true, Vec::new(), None);
+            }
+            let e = ease_out_back(t);
+            let mut rects = Vec::with_capacity(anim.placed.len());
+            let mut focus = None;
+            for &(from, p) in &anim.placed {
+                let r = lerp_rect(from, p.target, e);
+                rects.push((p.leaf, r));
+                if p.focused {
+                    focus = Some(r);
+                }
+            }
+            (false, rects, focus)
+        });
+        if let Some((done, rects, focus)) = anim_result {
+            if done {
+                self.anim = None;
+            } else {
+                self.focus_rect = focus;
+                return rects;
+            }
+        }
+        self.focus_rect = self.placed.iter().find(|p| p.focused).map(|p| p.target);
+        self.placed.iter().map(|p| (p.leaf, p.target)).collect()
     }
 
-    /// Advance the in-flight layout animation by wall-clock time (called
-    /// once per redraw tick). The final frame recomposes with widgets,
-    /// matching what a non-animated arrange would have left.
-    pub fn step_animation(&mut self) {
-        let Some(anim) = &self.anim else {
-            return;
-        };
-        let t = (anim.start.elapsed().as_secs_f32() / ANIM_DURATION.as_secs_f32()).min(1.0);
-        if t >= 1.0 {
-            self.finish_animation();
-            return;
-        }
-        let e = ease_out_back(t);
-        let interp: Vec<Placement> = anim
-            .placed
+    /// Snap an in-flight animation to its end state: the next frame's leaf
+    /// origins settle on their targets. Used when a click must land on the
+    /// final layout the user is aiming at.
+    pub fn finish_animation(&mut self) {
+        self.anim = None;
+    }
+
+    /// Drop every cached chrome texture so the next `update_chrome_pieces`
+    /// re-renders and re-uploads all of them. Called after a VT switch, whose
+    /// device re-activation can lose the GL textures.
+    #[cfg_attr(not(feature = "tty"), allow(dead_code))]
+    pub fn invalidate_chrome(&mut self) {
+        self.pieces = ChromePieces::default();
+    }
+
+    /// Re-render any chrome piece whose content fingerprint changed and drop
+    /// the textures of leaves/plus sizes that vanished. `leaf_rects` are this
+    /// frame's leaf rects from `tick_layout` (interpolated mid-animation,
+    /// settled otherwise); a leaf whose rect actually changed re-renders at
+    /// the new size (its `LeafKey` carries w/h), while an unchanged rect hits
+    /// the cache — so a scroll, or a leaf idle during another's animation,
+    /// repaints nothing. The wallpaper and taskbar depend on the output size
+    /// and settled widgets, not `leaf_rects`, so they never churn per tick.
+    pub fn update_chrome_pieces(&mut self, leaf_rects: &[(NodeId, FrameRect)]) {
+        let size = self.output_size();
+        let (ow, oh) = (size.w.max(1), size.h.max(1));
+
+        // Gather (immutable) before any texture upload borrows the pieces.
+        // Each leaf paints at its rect for this frame, pairing it with the
+        // placement for the client/title/parent lookups its content needs.
+        let leaf_paints: Vec<(NodeId, LeafPaint)> = leaf_rects
             .iter()
-            .map(|&(from, p)| Placement {
-                target: lerp_rect(from, p.target, e),
-                ..p
+            .filter_map(|&(leaf, rect)| {
+                self.placed
+                    .iter()
+                    .find(|p| p.leaf == leaf)
+                    .map(|p| (leaf, self.leaf_paint(p, rect)))
             })
             .collect();
-        self.compose_frame(&interp, false);
+        let plus_sizes: Vec<i32> = self
+            .widgets
+            .plus_regions
+            .iter()
+            .map(|(r, _)| r.w.max(1))
+            .collect();
+        let taskbar_paint = self.taskbar_paint(ow, oh);
+
+        // Wallpaper: only on load / resize.
+        if self.pieces.wallpaper.tex.is_none() || self.pieces.wallpaper.size != (ow, oh) {
+            let fb = self.chrome.wallpaper_base(ow as u32, oh as u32);
+            self.indexed.upload(
+                self.backend.renderer(),
+                &mut self.pieces.wallpaper.tex,
+                &fb,
+                true,
+            );
+            self.pieces.wallpaper.size = (ow, oh);
+        }
+
+        // Leaves: re-render changed ones, drop vanished ones.
+        for (leaf, paint) in &leaf_paints {
+            render_leaf(
+                &self.chrome,
+                &mut self.indexed,
+                self.backend.renderer(),
+                &mut self.pieces.leaves,
+                *leaf,
+                paint,
+            );
+        }
+        let live: std::collections::HashSet<NodeId> = leaf_paints.iter().map(|(l, _)| *l).collect();
+        self.pieces.leaves.retain(|l, _| live.contains(l));
+
+        // Plus buttons: one texture per distinct size.
+        for &sz in &plus_sizes {
+            render_plus(
+                &mut self.indexed,
+                self.backend.renderer(),
+                &mut self.pieces.plus,
+                sz,
+            );
+        }
+        let live_sz: std::collections::HashSet<i32> = plus_sizes.iter().copied().collect();
+        self.pieces.plus.retain(|s, _| live_sz.contains(s));
+
+        // Taskbar strip.
+        render_taskbar(
+            &self.chrome,
+            &mut self.indexed,
+            self.backend.renderer(),
+            &mut self.pieces.taskbar,
+            &taskbar_paint,
+        );
     }
 
-    /// Snap an in-flight animation to its end state (chrome with widgets).
-    pub fn finish_animation(&mut self) {
-        if self.anim.take().is_some() {
-            self.compose_chrome();
+    /// One leaf's frame draw data at `rect` (its interpolated rect
+    /// mid-animation, `p.target` otherwise): accent, title (only when
+    /// unminimized and occupied), minimized state and the baked split-control
+    /// buttons. The frame paints at `rect`'s size, so borders and titlebar
+    /// re-render crisp as the frame scales during a layout transition.
+    fn leaf_paint(&self, p: &Placement, rect: FrameRect) -> LeafPaint {
+        let minimized = self.state.tree.leaf(p.leaf).is_some_and(|l| l.minimized);
+        let accent = crate::widgets::leaf_color_index(&self.state.tree, p.leaf);
+        let title = if minimized {
+            None
+        } else {
+            p.active_client
+                .and_then(|c| self.managed.get(c).map(|w| (c, w)))
+                .map(|(c, window)| TitlePaint {
+                    label: crate::widgets::label_from_class(&crate::shell::toplevel_app_id(window)),
+                    icon: self.icon_for(c),
+                    title: crate::shell::toplevel_title(window),
+                })
+        };
+        LeafPaint {
+            w: rect.w,
+            h: rect.h,
+            accent,
+            minimized,
+            title,
+            buttons: self.leaf_buttons(p.leaf, rect, minimized, accent),
         }
     }
 
-    /// Composite the wallpaper, every placed leaf's chrome, the taskbar,
-    /// and (unless mid-animation) the widgets, into the chrome buffer.
-    fn compose_frame(&mut self, placed: &[Placement], widgets: bool) {
-        let size = self.output_size();
-        let (w, h) = (size.w.max(1), size.h.max(1));
-
-        let mut fb = self.chrome.take_screen_base(w as u32, h as u32);
-        for p in placed {
-            let view = self.leaf_view(p);
-            self.chrome
-                .draw_leaf(&mut fb, p.target.x, p.target.y, &view);
-            if p.focused {
-                self.chrome
-                    .draw_focus_outline(&mut fb, p.target.x, p.target.y, p.target.w, p.target.h);
-            }
+    /// The split-control buttons baked into a leaf's titlebar: right-aligned
+    /// in `rect` (the shared `leaf_btn_rects` geometry the hit-regions use, so
+    /// a click lands where the button drew), their icon and enabled state from
+    /// `leaf_meta`. Positioned relative to `rect`'s origin, so mid-animation
+    /// they ride the interpolated titlebar. A minimized leaf draws none — its
+    /// whole restore strip is the button.
+    fn leaf_buttons(
+        &self,
+        leaf: NodeId,
+        rect: FrameRect,
+        minimized: bool,
+        accent: Index,
+    ) -> Vec<BtnPaint> {
+        if minimized {
+            return Vec::new();
         }
-
-        if widgets {
-            // "+" insert buttons in the gaps and at the canvas edges.
-            for (r, _) in &self.widgets.plus_regions {
-                crate::render::draw_plus(&mut fb, r.x + r.w / 2, r.y + r.h / 2, r.w);
-            }
-
-            // Split-control buttons over each titlebar. A minimized leaf's
-            // region is the whole frame (a single restore button); draw_leaf's
-            // winmin art already shows it, so no glyph is drawn on top.
-            for (r, leaf, kind) in &self.widgets.btn_regions {
-                let Some(p) = placed.iter().find(|p| p.leaf == *leaf) else {
-                    continue;
-                };
-                let meta = leaf_meta(
-                    &self.state.tree,
-                    self.parents.get(leaf).copied(),
-                    *leaf,
-                    p.target,
-                );
-                if meta.minimized {
-                    continue;
-                }
+        let meta = leaf_meta(
+            &self.state.tree,
+            self.parents.get(&leaf).copied(),
+            leaf,
+            rect,
+        );
+        crate::widgets::leaf_btn_rects(rect)
+            .into_iter()
+            .map(|(kind, r)| {
                 let (icon, disabled) = match kind {
                     // A V-branch parent means this leaf collapses to a row
                     // (short/wide) when minimized, so its button previews that
@@ -341,90 +859,57 @@ impl Comp {
                     ),
                     BtnKind::Close => (BtnIcon::Close, meta.parent_dir.is_none()),
                 };
-                self.chrome.draw_button(
-                    &mut fb,
-                    r.x + r.w / 2,
-                    r.y + r.h / 2,
+                BtnPaint {
+                    cx: r.x + r.w / 2 - rect.x,
+                    cy: r.y + r.h / 2 - rect.y,
                     icon,
                     disabled,
-                    crate::widgets::leaf_color_index(&self.state.tree, *leaf),
-                );
-            }
-        }
-
-        // Bottom bar: one tile per managed window; split-visible windows
-        // get an accent highlight box, and every tile carries a corner
-        // close badge. Icons arrive in M8; the class-initial glyph stands
-        // in meanwhile.
-        for t in &self.widgets.taskbar_regions {
-            let label = self.managed.get(t.win).map_or('?', |w| {
-                crate::widgets::label_from_class(&crate::shell::toplevel_app_id(w))
-            });
-            let icon = self.icon_for(t.win);
-            self.chrome.draw_taskbar_item(
-                &mut fb,
-                t.rect,
-                icon.as_deref(),
-                label,
-                t.accent,
-                t.in_split,
-            );
-            crate::render::draw_close_badge(&mut fb, t.close.x, t.close.y, t.close.w);
-        }
-        if let Some(sep) = self.widgets.taskbar_sep {
-            crate::render::draw_taskbar_sep(&mut fb, sep);
-        }
-        for &(r, i) in &self.widgets.quick_regions {
-            let Some(q) = self.quick.get(i) else {
-                continue;
-            };
-            self.chrome.draw_taskbar_item(
-                &mut fb,
-                r,
-                q.icon.as_deref(),
-                q.label,
-                theme::palette_color::CREAM,
-                false,
-            );
-        }
-
-        if self.chrome_size != (w, h) {
-            self.chrome_buf =
-                MemoryRenderBuffer::new(Fourcc::Argb8888, (w, h), 1, Transform::Normal, None);
-            self.chrome_size = (w, h);
-        }
-        let full: Rectangle<i32, BufferCoords> = Rectangle::from_size((w, h).into());
-        let chrome = &self.chrome;
-        self.chrome_buf
-            .render()
-            .draw(|buf| {
-                chrome.present_into_slice(&fb, buf);
-                Ok::<_, std::convert::Infallible>(vec![full])
+                    accent,
+                }
             })
-            .expect("present chrome into memory buffer");
-        self.chrome.retire_frame(fb);
+            .collect()
     }
 
-    /// What a leaf's chrome shows: accent, title, minimized state. Icons
-    /// arrive in M8 (`TitleInfo.icon` stays `None` until then).
-    fn leaf_view(&self, p: &Placement) -> LeafView {
-        let titlebar = p
-            .active_client
-            .and_then(|c| self.managed.get(c).map(|w| (c, w)))
-            .map(|(c, window)| TitleInfo {
-                label: crate::widgets::label_from_class(&crate::shell::toplevel_app_id(window)),
-                icon: self.icon_for(c),
-                title: crate::shell::toplevel_title(window),
-            });
-        LeafView {
-            w: p.target.w,
-            h: p.target.h,
-            tb_h: theme::tb_h(),
-            bw: theme::BORDER_LEFT,
-            accent_index: crate::widgets::leaf_color_index(&self.state.tree, p.leaf),
-            titlebar,
-            minimized: self.state.tree.leaf(p.leaf).is_some_and(|l| l.minimized),
-            buttons: true,
+    /// The taskbar strip's draw data: one tile per managed window (accent
+    /// highlight when in a split, corner close badge), the separator, and the
+    /// visible quick-launch icons. The strip spans the full output width and
+    /// the bottom `theme::TASKBAR_H` pixels.
+    fn taskbar_paint(&self, ow: i32, oh: i32) -> TaskbarPaint {
+        let origin_y = (oh - theme::TASKBAR_H).max(0);
+        let tiles = self
+            .widgets
+            .taskbar_regions
+            .iter()
+            .map(|t| TilePaint {
+                rect: t.rect,
+                close: t.close,
+                icon: self.icon_for(t.win),
+                label: self.managed.get(t.win).map_or('?', |w| {
+                    crate::widgets::label_from_class(&crate::shell::toplevel_app_id(w))
+                }),
+                accent: t.accent,
+                in_split: t.in_split,
+            })
+            .collect();
+        let quick = self
+            .widgets
+            .quick_regions
+            .iter()
+            .filter_map(|&(r, i)| {
+                self.quick.get(i).map(|q| QuickPaint {
+                    rect: r,
+                    icon: q.icon.clone(),
+                    label: q.label,
+                })
+            })
+            .collect();
+        TaskbarPaint {
+            w: ow,
+            h: theme::TASKBAR_H,
+            origin: (0, origin_y),
+            tiles,
+            sep: self.widgets.taskbar_sep,
+            quick,
         }
     }
 }

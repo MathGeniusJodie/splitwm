@@ -333,7 +333,7 @@ impl Comp {
         }
         match self.hit_test(mx, my) {
             Hit::Btn(leaf, kind) => {
-                // Mirror compose_frame's enabled/disabled choice for the
+                // Mirror `leaf_buttons`' enabled/disabled choice for the
                 // button art (a minimized leaf's whole-frame region is
                 // always a live restore button).
                 if let Some(&frame) = self.prev_frame_rect.get(&leaf) {

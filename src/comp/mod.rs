@@ -11,6 +11,7 @@ pub mod cursor;
 pub mod debug;
 pub mod handlers;
 pub mod icons;
+pub mod indexed;
 pub mod input;
 pub mod layers;
 pub mod manage;
@@ -22,9 +23,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use smithay::backend::egl::EGLDevice;
+use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
+use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{Color32F, ImportDma as _};
 use smithay::desktop::{PopupManager, Space, Window};
-use smithay::input::pointer::CursorImageStatus;
+use smithay::input::pointer::CursorIcon;
 use smithay::input::{Seat, SeatState};
 use smithay::output::{Mode, Output};
 use smithay::reexports::calloop;
@@ -32,7 +35,7 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, LoopHandle, LoopSignal, PostAction};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
-use smithay::utils::{Logical, Physical, Point, Rectangle, Size, Transform};
+use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufState};
@@ -61,22 +64,27 @@ pub struct Comp {
     pub output: Output,
     /// Gap background (na16 gunmetal), resolved once from the baked palette.
     pub clear: Color32F,
-    /// What the seat's pointer wants shown: a client-committed cursor
-    /// surface, a named shape (from chrome hover feedback or a client's
-    /// cursor-shape-v1 request), or hidden. The tty backend composites it;
-    /// nested sessions map named shapes onto the host's hardware cursor
-    /// and composite only cursor surfaces.
-    pub cursor_status: CursorImageStatus,
+    /// The named shape the seat's pointer shows, or `None` when a client
+    /// hid the pointer with a null-surface `set_cursor`. Set from chrome
+    /// hover feedback and clients' cursor-shape-v1 requests; a legacy
+    /// client committing its own cursor pixels gets our arrow instead. The
+    /// tty and winit backends both composite it over a hidden host cursor.
+    pub cursor_status: Option<CursorIcon>,
     /// Lazily-uploaded named cursor images: master's hand-drawn sprites
-    /// plus xcursor-theme lookups (see `comp::cursor`).
+    /// (see `comp::cursor`).
     pub cursors: cursor::CursorCache,
 
     // Software-rendered chrome (the ported pixel-art renderer) and its
     // GPU-side buffer.
     pub chrome: crate::render::Renderer,
-    pub chrome_buf: smithay::backend::renderer::element::memory::MemoryRenderBuffer,
-    pub chrome_size: (i32, i32),
-    pub chrome_dirty: bool,
+    /// The palette shader and its reused upload staging, shared by every
+    /// software-drawn chrome buffer on their way to the GPU.
+    pub indexed: indexed::IndexedProgram,
+    /// The independently-textured ex-underlay pieces (wallpaper, per-leaf
+    /// frames, plus buttons, taskbar); each re-renders only when its own
+    /// content fingerprint changes, so scrolling and animation are pure
+    /// element placement (see `comp::chrome`).
+    pub pieces: chrome::ChromePieces,
     /// On-screen leaves as of the last arrange (chrome + hit regions).
     pub placed: Vec<crate::widgets::Placement>,
     /// Every hit-testable widget rect for the current layout, rebuilt as
@@ -106,6 +114,15 @@ pub struct Comp {
     /// Every leaf's frame rect from the last arrange, on-screen or not —
     /// animation start rects and the empty-leaf-body hit region.
     pub prev_frame_rect: std::collections::HashMap<crate::tree::NodeId, crate::widgets::FrameRect>,
+    /// The rect the focus outline currently traces: the focused split's
+    /// frame, or its interpolated frame mid-animation. `None` when no leaf
+    /// holds focus. Tracked outside the underlay so a focus switch moves the
+    /// outline without recompositing.
+    pub focus_rect: Option<crate::widgets::FrameRect>,
+    /// The four persistent solid-colour buffers (top, bottom, left, right)
+    /// the focus outline's GPU strips draw from; their stable ids let the
+    /// damage tracker follow each strip as the focused rect moves.
+    pub focus_outline: [SolidColorBuffer; 4],
 
     // Wayland plumbing.
     pub dh: DisplayHandle,
@@ -280,7 +297,13 @@ impl Comp {
             .expect("insert notification channel source");
         let note_dismiss_tx = crate::notify::spawn(note_tx);
 
+        let indexed = indexed::IndexedProgram::new(backend.renderer());
+
         let mut chrome = crate::render::Renderer::new();
+        // The outline colour never changes; bake it into each strip buffer
+        // once so a focus move only resizes/relocates them.
+        let outline_color = Color32F::from(chrome.focus_color());
+        let focus_outline = std::array::from_fn(|_| SolidColorBuffer::new((0, 0), outline_color));
         let wallpaper_path = std::env::var("SPLITWM_WALLPAPER").ok();
         if let Some(path) = &wallpaper_path {
             let size = output.current_mode().expect("output has a mode").size;
@@ -319,18 +342,13 @@ impl Comp {
             backend,
             output,
             clear,
-            cursor_status: CursorImageStatus::default_named(),
+            cursor_status: Some(CursorIcon::Default),
             cursors: cursor::CursorCache::new(),
             chrome,
-            chrome_buf: smithay::backend::renderer::element::memory::MemoryRenderBuffer::new(
-                smithay::backend::allocator::Fourcc::Argb8888,
-                (1, 1),
-                1,
-                Transform::Normal,
-                None,
-            ),
-            chrome_size: (0, 0),
-            chrome_dirty: true,
+            indexed,
+            pieces: chrome::ChromePieces::default(),
+            focus_rect: None,
+            focus_outline,
             placed: Vec::new(),
             widgets: crate::widgets::Widgets::default(),
             quick,
@@ -674,8 +692,11 @@ impl Comp {
                 placed: placed_from,
             });
         } else {
+            // A non-animated arrange cancels any transition in flight; the
+            // per-piece fingerprints (`update_chrome_pieces`) decide what
+            // actually re-renders, so a rebuild that only re-aimed focus or
+            // only scrolled positions repaints nothing.
             self.anim = None;
-            self.chrome_dirty = true;
         }
         self.prev_frame_rect = frame_rects;
         self.refocus();
@@ -727,7 +748,43 @@ impl Comp {
             self.chrome.set_wallpaper(&path, mode.size.w, mode.size.h);
         }
         self.arrange();
-        self.chrome_dirty = true;
+        // The wallpaper piece rebuilds on the size change, and every leaf /
+        // taskbar fingerprint carries the new size, so `update_chrome_pieces`
+        // repaints them on the next redraw with no extra flag.
+    }
+
+    /// The focus outline's four solid strips (top, bottom, left, right) for
+    /// the current `focus_rect`, or empty when no leaf holds focus. Each
+    /// strip resizes its persistent buffer (bumping its damage on a size
+    /// change) and draws at scale 1; the buffers' stable ids let the damage
+    /// tracker track a strip across frames as the focused rect moves.
+    fn focus_outline_elements(&mut self) -> Vec<SolidColorRenderElement> {
+        let Some(r) = self.focus_rect else {
+            return Vec::new();
+        };
+        const T: i32 = 2;
+        // Traced on the frame's edges (top and bottom full width, sides
+        // between them), matching the strips the underlay used to paint.
+        let strips = [
+            (r.x, r.y, r.w, T),
+            (r.x, r.y + r.h - T, r.w, T),
+            (r.x, r.y + T, T, r.h - 2 * T),
+            (r.x + r.w - T, r.y + T, T, r.h - 2 * T),
+        ];
+        self.focus_outline
+            .iter_mut()
+            .zip(strips)
+            .map(|(buf, (x, y, w, h))| {
+                buf.resize((w.max(0), h.max(0)));
+                SolidColorRenderElement::from_buffer(
+                    buf,
+                    Point::<i32, Logical>::from((x, y)).to_physical(1),
+                    1.0,
+                    1.0,
+                    Kind::Unspecified,
+                )
+            })
+            .collect()
     }
 
     /// Composite one frame and pace clients' frame callbacks.
@@ -737,13 +794,18 @@ impl Comp {
             self.state.step_scroll();
             self.arrange();
         }
-        if self.anim.is_some() {
-            self.step_animation();
-            self.chrome_dirty = false;
-        } else if self.chrome_dirty {
-            self.compose_chrome();
-            self.chrome_dirty = false;
-        }
+        // Advance any layout animation and take this frame's leaf rects
+        // (interpolated mid-slide, settled otherwise); `tick_layout` also
+        // updates `focus_rect` to ride the focused leaf.
+        let leaf_rects = self.tick_layout();
+        // Re-render any chrome piece whose content changed, including the
+        // animating leaves at their interpolated sizes; unchanged pieces
+        // (scroll, idle leaves, wallpaper, taskbar) hit the cache.
+        self.update_chrome_pieces(&leaf_rects);
+        let leaf_positions: Vec<(crate::tree::NodeId, Point<i32, Logical>)> = leaf_rects
+            .iter()
+            .map(|&(leaf, r)| (leaf, Point::from((r.x, r.y))))
+            .collect();
         // Float frames whose content changed since last frame.
         let dirty_frames: Vec<crate::tree::Win> = self
             .managed
@@ -771,6 +833,20 @@ impl Comp {
             .expect("seat has a pointer")
             .current_location();
 
+        // Built before the Scene's shared borrows: it mutates the outline
+        // buffers, and the owned elements outlive that borrow.
+        let focus_outline = self.focus_outline_elements();
+
+        // The ex-underlay pieces as positioned elements, built from the
+        // caches `update_chrome_pieces` just refreshed. These borrow only
+        // `self.pieces`, disjoint from the backend the scene renders through.
+        let leaf_chrome = self.pieces.leaf_elements(&leaf_positions);
+        let plus = self
+            .pieces
+            .plus_elements(&self.widgets.plus_regions, self.anim.is_some());
+        let taskbar = self.pieces.taskbar_element();
+        let wallpaper = self.pieces.wallpaper_element();
+
         // Scene borrows and the backend borrow are disjoint `Comp` fields,
         // so the backend can consume the scene while borrowed mutably.
         let scene = chrome::Scene {
@@ -783,14 +859,15 @@ impl Comp {
             output: &self.output,
             dock_place: &dock_place,
             layer_dock: &layer_dock,
-            chrome_buf: &self.chrome_buf,
+            indexed: &self.indexed,
+            wallpaper,
+            leaf_chrome: &leaf_chrome,
+            plus: &plus,
+            taskbar,
+            focus_outline: &focus_outline,
         };
         match &mut self.backend {
             crate::backend::Backend::Winit(w) => {
-                // Named shapes ride the host's hardware cursor (zero
-                // latency); a client-committed cursor surface has no host
-                // analog, so it composites like on tty.
-                let composite_cursor = w.apply_cursor(&self.cursor_status);
                 let size = w.backend.window_size();
                 let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
                 let rendered = {
@@ -801,16 +878,13 @@ impl Comp {
                     else {
                         return;
                     };
-                    let mut elements = if composite_cursor {
-                        cursor::cursor_elements(
-                            renderer,
-                            pointer_loc,
-                            &self.cursor_status,
-                            &mut self.cursors,
-                        )
-                    } else {
-                        Vec::new()
-                    };
+                    let mut elements = cursor::cursor_elements(
+                        renderer,
+                        scene.indexed,
+                        pointer_loc,
+                        self.cursor_status,
+                        &mut self.cursors,
+                    );
                     elements.extend(chrome::output_elements(renderer, &scene));
                     w.damage_tracker
                         .render_output(renderer, &mut fb, 0, &elements, self.clear)
@@ -829,7 +903,7 @@ impl Comp {
                 t.render(
                     &scene,
                     pointer_loc,
-                    &self.cursor_status,
+                    self.cursor_status,
                     &mut self.cursors,
                     self.clear,
                 );

@@ -3,10 +3,7 @@
 //! parent / size hints after role creation, so classifying at
 //! `new_toplevel` time would misfile nearly everything).
 
-use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::element::memory::MemoryRenderBuffer;
 use smithay::desktop::Window;
-use smithay::utils::Transform;
 
 use super::Comp;
 use crate::render::{LeafView, TitleInfo};
@@ -136,13 +133,7 @@ impl Comp {
             w,
             h,
             accent,
-            frame_buf: MemoryRenderBuffer::new(
-                Fourcc::Argb8888,
-                (1, 1),
-                1,
-                Transform::Normal,
-                None,
-            ),
+            frame_tex: None,
             frame_dirty: true,
         };
         let class = crate::shell::toplevel_app_id(&window);
@@ -285,28 +276,11 @@ impl Comp {
             pixel_graphics::TRANSPARENT,
         );
         self.chrome.draw_leaf(&mut fb, 0, 0, &view);
-        let buf = MemoryRenderBuffer::new(
-            Fourcc::Argb8888,
-            (rect.w.max(1), rect.h.max(1)),
-            1,
-            Transform::Normal,
-            None,
-        );
-        {
-            let mut ctx_buf = buf.clone();
-            let full: smithay::utils::Rectangle<i32, smithay::utils::Buffer> =
-                smithay::utils::Rectangle::from_size((rect.w.max(1), rect.h.max(1)).into());
-            let chrome = &self.chrome;
-            ctx_buf
-                .render()
-                .draw(|out| {
-                    chrome.present_into_slice(&fb, out);
-                    Ok::<_, std::convert::Infallible>(vec![full])
-                })
-                .expect("present float frame");
-        }
+        // The frame's border corners are TRANSPARENT-indexed, so the buffer
+        // has holes: it is not opaque.
         if let Some((_, f)) = self.managed.float_mut(win) {
-            f.frame_buf = buf;
+            self.indexed
+                .upload(self.backend.renderer(), &mut f.frame_tex, &fb, false);
             f.frame_dirty = false;
         }
     }

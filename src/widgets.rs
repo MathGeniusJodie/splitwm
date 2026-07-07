@@ -309,53 +309,58 @@ pub fn compute_leaf_widgets(widgets: &mut Widgets, tree: &Tree, placed: &[Placem
                 p.leaf,
             ));
         }
-        compute_btn_regions(widgets, p, tb_h, bw, minimized);
+        compute_btn_regions(widgets, p, minimized);
     }
 }
 
-/// Split-control buttons on the right of a leaf's titlebar; a minimized
-/// leaf instead gets one full-frame region (the whole bitmap is the
-/// restore button, drawn by `draw_leaf`).
-fn compute_btn_regions(widgets: &mut Widgets, p: &Placement, tb_h: i32, bw: i32, minimized: bool) {
-    if minimized {
-        widgets
-            .btn_regions
-            .push((p.target, p.leaf, BtnKind::Minimize));
-        return;
-    }
+/// The split-control button rects for an unminimized leaf occupying
+/// `frame`, right-aligned in its titlebar (a too-narrow leaf keeps only a
+/// centred minimize button). The single source of button geometry: both the
+/// hit-regions (`compute_btn_regions`) and the baked chrome
+/// (`Comp::leaf_buttons`, which re-derives them at each interpolated size
+/// mid-animation) read it, so a click always lands where a button drew.
+pub fn leaf_btn_rects(frame: FrameRect) -> Vec<(BtnKind, FrameRect)> {
     let bsz = theme::BTN_SIZE;
     let bsp = theme::BTN_SPACING;
-    let bcy = p.target.y + tb_h / 2 + theme::BTN_Y_OFFSET;
-    if p.target.w >= theme::min_split_w() {
-        let right = theme::btn_strip_right(p.target.x, p.target.w, bw);
-        for (i, kind) in [BtnKind::Close, BtnKind::Split, BtnKind::Minimize]
-            .into_iter()
-            .enumerate()
-        {
-            let bcx = right - bsz / 2 - i32::try_from(i).unwrap_or(0) * (bsz + bsp);
-            widgets.btn_regions.push((
-                FrameRect {
-                    x: bcx - bsz / 2,
-                    y: bcy - bsz / 2,
-                    w: bsz,
-                    h: bsz,
-                },
-                p.leaf,
-                kind,
-            ));
-        }
-    } else {
-        let bcx = p.target.x + p.target.w / 2;
-        widgets.btn_regions.push((
+    let bcy = frame.y + theme::tb_h() / 2 + theme::BTN_Y_OFFSET;
+    let at = |bcx: i32, kind: BtnKind| {
+        (
+            kind,
             FrameRect {
                 x: bcx - bsz / 2,
                 y: bcy - bsz / 2,
                 w: bsz,
                 h: bsz,
             },
-            p.leaf,
-            BtnKind::Minimize,
-        ));
+        )
+    };
+    if frame.w >= theme::min_split_w() {
+        let right = theme::btn_strip_right(frame.x, frame.w, theme::BORDER_LEFT);
+        [BtnKind::Close, BtnKind::Split, BtnKind::Minimize]
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| {
+                let bcx = right - bsz / 2 - i32::try_from(i).unwrap_or(0) * (bsz + bsp);
+                at(bcx, kind)
+            })
+            .collect()
+    } else {
+        vec![at(frame.x + frame.w / 2, BtnKind::Minimize)]
+    }
+}
+
+/// Split-control buttons on the right of a leaf's titlebar; a minimized
+/// leaf instead gets one full-frame region (the whole bitmap is the
+/// restore button, drawn by `draw_leaf`).
+fn compute_btn_regions(widgets: &mut Widgets, p: &Placement, minimized: bool) {
+    if minimized {
+        widgets
+            .btn_regions
+            .push((p.target, p.leaf, BtnKind::Minimize));
+        return;
+    }
+    for (kind, rect) in leaf_btn_rects(p.target) {
+        widgets.btn_regions.push((rect, p.leaf, kind));
     }
 }
 

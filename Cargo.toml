@@ -37,9 +37,6 @@ zbus = "5"
 # Smithay logs through tracing; RUST_LOG-style filtering for debugging.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# xcursor-theme parsing for the composited cursor's named shapes beyond the
-# hand-drawn sprites (shapes clients request via cursor-shape-v1).
-xcursor = "0.3"
 
 [features]
 # Real-session backend (DRM/GBM scanout, libinput, libseat session). Off by

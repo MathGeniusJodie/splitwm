@@ -23,7 +23,7 @@ use smithay::backend::renderer::Color32F;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session as _};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
-use smithay::input::pointer::CursorImageStatus;
+use smithay::input::pointer::CursorIcon;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
@@ -87,7 +87,7 @@ impl Tty {
         &mut self,
         scene: &chrome::Scene<'_>,
         pointer_loc: Point<f64, Logical>,
-        cursor_status: &CursorImageStatus,
+        cursor_icon: Option<CursorIcon>,
         cursors: &mut CursorCache,
         clear: Color32F,
     ) {
@@ -97,7 +97,8 @@ impl Tty {
         let Some(out) = self.scanout.as_mut() else {
             return;
         };
-        let mut elements = cursor_elements(&mut self.renderer, pointer_loc, cursor_status, cursors);
+        let mut elements =
+            cursor_elements(&mut self.renderer, scene.indexed, pointer_loc, cursor_icon, cursors);
         elements.extend(chrome::output_elements(&mut self.renderer, scene));
         match out.render_frame(&mut self.renderer, &elements, clear, FrameFlags::DEFAULT) {
             Ok(res) => {
@@ -287,7 +288,9 @@ pub fn run() {
                 // without this the next press of the same key would be
                 // swallowed as a "repeat" of a chord still thought held.
                 comp.held_bound_keys.clear();
-                comp.chrome_dirty = true;
+                // Re-activating the DRM device can lose the GL textures, so
+                // drop every cached chrome piece for a full re-upload.
+                comp.invalidate_chrome();
                 comp.redraw();
             }
         })

@@ -1,212 +1,115 @@
-//! The compositor-drawn pointer. Master's hand-drawn `cursor_*` sprites
-//! cover the shapes splitwm itself shows (arrow, hand, disabled, text);
-//! every other shape a client can name through cursor-shape-v1 resolves
-//! through the xcursor theme, falling back to the sprite arrow so the
-//! pointer never vanishes. Images upload lazily, once per shape.
+//! The compositor-drawn pointer. Every named shape resolves to one of
+//! master's four hand-drawn `cursor_*` sprites — arrow, hand, disabled,
+//! I-beam — grouped by intent, so the pointer is splitwm's own art
+//! whatever a client requests through cursor-shape-v1. Images upload
+//! lazily, once per shape, as indexed `R8` textures like all chrome.
 //!
-//! Consumed by the backends that composite the cursor themselves: tty
-//! always, winit only for client-committed cursor surfaces (named shapes
-//! ride the host's hardware cursor there). Headless renders no cursor, so
-//! harness screenshots stay pointer-free.
+//! Consumed by the backends that composite the cursor themselves: tty and
+//! winit both draw the sprite into the frame over a hidden host cursor.
+//! Headless renders no cursor, so harness screenshots stay pointer-free.
 
 use std::collections::HashMap;
 
-use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::element::memory::{
-    MemoryRenderBuffer, MemoryRenderBufferRenderElement,
-};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceData};
-use smithay::utils::{IsAlive as _, Logical, Point, Transform};
+use smithay::input::pointer::CursorIcon;
+use smithay::utils::{Logical, Point};
 
 use super::chrome::OutputElement;
+use super::indexed::{IndexedProgram, IndexedTexture};
 
-/// One uploadable cursor image and its hotspot.
-type CursorBuf = (MemoryRenderBuffer, Point<i32, Logical>);
+/// One uploaded cursor image and its hotspot.
+type CursorBuf = (IndexedTexture, Point<i32, Logical>);
 
+/// Named shapes uploaded so far, each keyed by the `CursorIcon` that named
+/// it (icons sharing a sprite still upload once apiece — the cache is by
+/// name, not by sprite).
 pub struct CursorCache {
-    /// `XCURSOR_SIZE`, for picking the closest theme image.
-    size: i32,
-    /// `XCURSOR_THEME` (its index is read once; icon files load on demand).
-    theme: xcursor::CursorTheme,
-    /// Shapes resolved so far; `None` records a miss so a shape absent
-    /// from the theme isn't re-searched every frame.
-    cache: HashMap<CursorIcon, Option<CursorBuf>>,
+    cache: HashMap<CursorIcon, CursorBuf>,
 }
 
 impl CursorCache {
     pub fn new() -> CursorCache {
-        let size = std::env::var("XCURSOR_SIZE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(24);
-        let theme = std::env::var("XCURSOR_THEME").unwrap_or_else(|_| "default".into());
         CursorCache {
-            size,
-            theme: xcursor::CursorTheme::load(&theme),
             cache: HashMap::new(),
         }
     }
 
-    /// The image for a named shape: the hand-drawn sprite where one
-    /// exists, the xcursor theme otherwise, the sprite arrow as the last
-    /// resort (`None` never happens in practice — the sprites are baked
-    /// into the binary).
-    pub fn get(&mut self, icon: CursorIcon) -> Option<&CursorBuf> {
-        self.ensure(icon);
-        if self.cache.get(&icon).expect("ensured above").is_some() {
-            return self.cache.get(&icon).expect("ensured above").as_ref();
-        }
-        self.ensure(CursorIcon::Default);
+    /// The image for a named shape, uploading it on first request. Every
+    /// shape maps onto a baked sprite, so this always yields an image.
+    pub fn get(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        indexed: &IndexedProgram,
+        icon: CursorIcon,
+    ) -> &CursorBuf {
         self.cache
-            .get(&CursorIcon::Default)
-            .expect("ensured above")
-            .as_ref()
-    }
-
-    fn ensure(&mut self, icon: CursorIcon) {
-        if !self.cache.contains_key(&icon) {
-            let buf = sprite_buf(icon).or_else(|| self.theme_buf(icon));
-            self.cache.insert(icon, buf);
-        }
-    }
-
-    /// Load a shape from the xcursor theme, trying the CSS name first and
-    /// the pre-CSS aliases after (modern themes symlink the CSS names;
-    /// older ones only carry the classics).
-    fn theme_buf(&self, icon: CursorIcon) -> Option<CursorBuf> {
-        let path = std::iter::once(icon.name())
-            .chain(legacy_names(icon).iter().copied())
-            .find_map(|name| self.theme.load_icon(name))?;
-        let data = std::fs::read(path).ok()?;
-        let images = xcursor::parser::parse_xcursor(&data)?;
-        let img = images
-            .into_iter()
-            .min_by_key(|i| (i.size as i32 - self.size).abs())?;
-        let buffer = MemoryRenderBuffer::from_slice(
-            &img.pixels_rgba,
-            Fourcc::Abgr8888,
-            (img.width as i32, img.height as i32),
-            1,
-            Transform::Normal,
-            None,
-        );
-        Some((buffer, (img.xhot as i32, img.yhot as i32).into()))
+            .entry(icon)
+            .or_insert_with(|| sprite_buf(renderer, indexed, icon))
     }
 }
 
-/// The hand-drawn cursor art, palette-indexed like all chrome. Hotspots:
+/// The hand-drawn cursor art, palette-indexed like all chrome, keyed by
+/// intent onto the four sprites: I-beam for text, hand for links and
+/// drags, circle-slash for refusals, arrow for everything else. Hotspots:
 /// arrow tip, fingertip, circle center, I-beam center — matching master's
 /// RENDER cursors.
-fn sprite_buf(icon: CursorIcon) -> Option<CursorBuf> {
+fn sprite_buf(
+    renderer: &mut GlesRenderer,
+    indexed: &IndexedProgram,
+    icon: CursorIcon,
+) -> CursorBuf {
     let (sprite, hot) = match icon {
-        CursorIcon::Default => (crate::assets::cursor_pointer(), Some((4, 0))),
-        CursorIcon::Pointer => (crate::assets::cursor_hand(), Some((11, 0))),
-        CursorIcon::NotAllowed => (crate::assets::cursor_disabled(), Some((12, 12))),
-        CursorIcon::Text => (crate::assets::cursor_text(), None),
-        _ => return None,
+        // Selectable text: the I-beam, hot-spotted at its center.
+        CursorIcon::Text | CursorIcon::VerticalText => (crate::assets::cursor_text(), None),
+        // Links, grabs, and drags: the pointing/grabbing hand.
+        CursorIcon::Pointer
+        | CursorIcon::Grab
+        | CursorIcon::Grabbing
+        | CursorIcon::Move
+        | CursorIcon::AllScroll => (crate::assets::cursor_hand(), Some((11, 0))),
+        // A refused action: the circle with a line through it.
+        CursorIcon::NotAllowed | CursorIcon::NoDrop => {
+            (crate::assets::cursor_disabled(), Some((12, 12)))
+        }
+        // The arrow covers the rest: the default, resize edges and corners,
+        // wait/progress, crosshair, zoom, and the badge cursors.
+        _ => (crate::assets::cursor_pointer(), Some((4, 0))),
     };
     let hot = hot.unwrap_or((sprite.width as i32 / 2, sprite.height as i32 / 2));
     let palette = crate::assets::palette();
-    let mut data = Vec::with_capacity(sprite.width * sprite.height * 4);
-    for y in 0..sprite.height {
-        for x in 0..sprite.width {
-            let index = sprite.at(x, y);
-            if index == pixel_graphics::TRANSPARENT {
-                data.extend_from_slice(&[0, 0, 0, 0]);
-            } else {
-                let c = palette.color(index);
-                data.extend_from_slice(&[c.r, c.g, c.b, 0xFF]);
-            }
-        }
-    }
-    let buffer = MemoryRenderBuffer::from_slice(
-        &data,
-        Fourcc::Abgr8888,
-        (sprite.width as i32, sprite.height as i32),
-        1,
-        Transform::Normal,
-        None,
-    );
-    Some((buffer, hot.into()))
+    // The sprite's holes are TRANSPARENT-indexed; a fresh framebuffer starts
+    // transparent and `draw_sprite` leaves those texels untouched, so the
+    // indexed buffer carries the sprite's own transparency to the shader.
+    let mut fb =
+        pixel_graphics::Framebuffer::new(sprite.width, sprite.height, pixel_graphics::TRANSPARENT);
+    fb.draw_sprite(&sprite, 0, 0, &palette);
+    let mut tex = None;
+    indexed.upload_owned(renderer, &mut tex, &fb, false);
+    (tex.expect("cursor sprite uploaded"), hot.into())
 }
 
-/// Pre-CSS xcursor names for the shapes likely to be requested or shown.
-fn legacy_names(icon: CursorIcon) -> &'static [&'static str] {
-    match icon {
-        CursorIcon::Default => &["left_ptr"],
-        CursorIcon::Pointer => &["hand2", "hand1"],
-        CursorIcon::Text => &["xterm"],
-        CursorIcon::EwResize => &["sb_h_double_arrow", "h_double_arrow"],
-        CursorIcon::NsResize => &["sb_v_double_arrow", "v_double_arrow"],
-        CursorIcon::NeswResize => &["fd_double_arrow"],
-        CursorIcon::NwseResize => &["bd_double_arrow"],
-        CursorIcon::Crosshair => &["cross"],
-        CursorIcon::Wait => &["watch"],
-        CursorIcon::Progress => &["left_ptr_watch"],
-        CursorIcon::Grab => &["openhand"],
-        CursorIcon::Grabbing => &["closedhand"],
-        CursorIcon::Move => &["fleur"],
-        CursorIcon::NotAllowed => &["crossed_circle"],
-        _ => &[],
-    }
-}
-
-/// The composited cursor's render elements: the client's committed cursor
-/// surface when one applies, else the named shape's image. Cursor-kind
-/// elements let the DRM compositor place them on the hardware cursor
-/// plane.
+/// The composited cursor's render elements: the named shape's sprite, or
+/// nothing when the pointer is hidden. Cursor-kind elements let the DRM
+/// compositor place them on the hardware cursor plane.
 pub fn cursor_elements(
     renderer: &mut GlesRenderer,
+    indexed: &IndexedProgram,
     loc: Point<f64, Logical>,
-    status: &CursorImageStatus,
+    icon: Option<CursorIcon>,
     cache: &mut CursorCache,
 ) -> Vec<OutputElement> {
-    let icon = match status {
-        CursorImageStatus::Hidden => return Vec::new(),
-        CursorImageStatus::Surface(surface) if surface.alive() => {
-            let hotspot = smithay::wayland::compositor::with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<CursorImageSurfaceData>()
-                    .map_or_else(Point::default, |data| data.lock().unwrap().hotspot)
-            });
-            return smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
-                renderer,
-                surface,
-                (loc.to_i32_round() - hotspot).to_physical(1),
-                1.0,
-                1.0,
-                Kind::Cursor,
-            )
-            .into_iter()
-            .map(OutputElement::Float)
-            .collect();
-        }
-        // A dead cursor surface: back to the arrow.
-        CursorImageStatus::Surface(_) => CursorIcon::Default,
-        CursorImageStatus::Named(icon) => *icon,
-    };
-    let Some((buf, hotspot)) = cache.get(icon) else {
+    let Some(icon) = icon else {
         return Vec::new();
     };
-    match MemoryRenderBufferRenderElement::from_buffer(
-        renderer,
-        (
-            loc.x - f64::from(hotspot.x),
-            loc.y - f64::from(hotspot.y),
-        ),
-        buf,
-        None,
-        None,
-        None,
+    let (tex, hotspot) = cache.get(renderer, indexed, icon);
+    let loc = Point::<i32, Logical>::from((
+        (loc.x - f64::from(hotspot.x)).round() as i32,
+        (loc.y - f64::from(hotspot.y)).round() as i32,
+    ));
+    vec![OutputElement::Chrome(indexed.element(
+        tex,
+        loc.to_physical(1),
         Kind::Cursor,
-    ) {
-        Ok(el) => vec![OutputElement::Chrome(el)],
-        Err(err) => {
-            tracing::error!("cursor element: {err}");
-            Vec::new()
-        }
-    }
+    ))]
 }
