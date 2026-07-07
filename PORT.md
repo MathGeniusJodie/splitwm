@@ -18,44 +18,39 @@ this port must reproduce unless a deviation is listed below.
 - Priorities: thorough testing from the start, invalid states
   unrepresentable, never block the event loop, no per-frame malloc/clone.
 
-## Approved deviations from X11 behavior
+## Approved deviations & settled design (Jodie, 2026-07-06/07)
 
-- Default terminal: **alacritty** (was xterm) — `$TERMINAL` still wins.
+- Default terminal: **alacritty** (was xterm) — `$TERMINAL` still wins;
+  `theme::QUICK` terminal default likewise.
 - Launcher stays `rofi -show combi`, running as an X11 client under
   XWayland (override-redirect float). No layer-shell in v1.
-
-## Open questions for Jodie (batch, don't block)
-
-- **Quit path**: X11 splitwm exits only via `--replace`/SIGTERM. A Wayland
-  compositor on a TTY has no `--replace` analog; exiting means the session
-  ends. Keep "no quit binding" (kill from another VT), or add a chord?
-- `theme::QUICK` terminal entry default also xterm → alacritty?
-- Env var names: keep `SPLITWM_WALLPAPER` / `SPLITWM_DOCK_TITLE` /
-  `SPLITWM_DEBUG_SCROLL` as-is (assumed yes).
-- Decoration policy: implement xdg-decoration and force server-side
-  (clients told not to draw their own titlebars) — assumed yes, matches
-  the X11 look; some GTK apps will keep CSD regardless (they don't
-  implement the protocol) and will get chrome drawn around their shadows
-  unless we special-case. Nitpick pending real testing.
-- App icons: Wayland has no `_NET_WM_ICON`. Plan: `xdg_toplevel_icon_v1`
-  protocol + `.desktop`/icon-theme lookup fallback (keyed on app_id), and
-  real `_NET_WM_ICON` for XWayland clients. Hue-rotation disambiguation
-  unchanged. OK?
-- Notifications: reimplement the daemon on **zbus** (pure Rust, async,
-  driven by calloop — no libdbus, no dedicated thread, nothing blocks).
-  Same org.freedesktop.Notifications surface incl. close reasons,
-  replaces_id rules, foreign-daemon fallback.
+- **No quit binding**, faithful to master: SIGTERM (another VT / remote
+  shell) is the only way out, on every backend.
+- **Icons**: xdg-toplevel-icon protocol when offered → freedesktop
+  icon-theme lookup keyed on app_id → XWayland `_NET_WM_ICON`.
+  Hue-rotation disambiguation unchanged.
+- **Notifications on zbus** driven by calloop (no libdbus, no thread).
+- **Volume keys are single-shot per press** (deviation: X11 auto-repeat
+  used to make holding the key keep adjusting; no compositor-side repeat
+  timer).
+- xdg-decoration forces ServerSide on every toplevel (implemented in M4);
+  clients that ignore the protocol keep their CSD and that's accepted.
+- Env var names unchanged: `SPLITWM_WALLPAPER`/`SPLITWM_DOCK_TITLE`/
+  `SPLITWM_DEBUG_SCROLL`.
+- Key repeats: chords the compositor intercepts swallow their repeats and
+  release; volume single-shot covers the only hold-relevant case.
 
 ## Milestones
 
-- [ ] **M0** scaffold: winit window, GLES clear, calloop loop, clean exit
-- [ ] **M1** protocol core: compositor/xdg-shell/shm/dmabuf/seat/output/
+- [x] **M0** scaffold: winit window, GLES clear, calloop loop, clean exit
+- [x] **M1** protocol core: compositor/xdg-shell/shm/dmabuf/seat/output/
       data-device; alacritty runs with keyboard focus
-- [ ] **M2** pure core ported with tests: theme, tree, layout state, oklch
+- [x] **M2** pure core ported with tests: theme, tree, layout state, oklch
 - [ ] **M3** chrome rendering: pixel-graphics → GLES textures (borders,
       titlebars, buttons, taskbar, wallpaper); reused buffers
-- [ ] **M4** tiling behavior: splits ↔ windows, focus, all keybindings,
-      taskbar stash/cycle, titlebar buttons, close protocol
+- [~] **M4** tiling behavior: keyboard tiling core DONE (splits ↔ windows,
+      manage/displace, stash cycle, focus, resize, spawn, xdg-decoration
+      SSD); taskbar visuals + titlebar buttons land with M3/M5
 - [ ] **M5** pointer: handle/edge drags, '+' insertion, canvas scroll +
       glide, Mod4+swipe over windows, ease-out-back animations
 - [ ] **M6** floats, fullscreen, dock (DOCK_TITLE/DOCK_OVERLAP)

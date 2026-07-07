@@ -6,6 +6,7 @@
 //! focus. The split-tree layout replaces the naive Space placement in M4.
 
 pub mod actions;
+pub mod chrome;
 pub mod handlers;
 pub mod input;
 
@@ -14,7 +15,6 @@ use std::time::Duration;
 
 use smithay::backend::egl::EGLDevice;
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{Color32F, ImportDma as _};
 use smithay::backend::winit::WinitGraphicsBackend;
@@ -54,6 +54,15 @@ pub struct Comp {
     pub damage_tracker: OutputDamageTracker,
     /// Gap background (na16 gunmetal), resolved once from the baked palette.
     pub clear: Color32F,
+
+    // Software-rendered chrome (the ported pixel-art renderer) and its
+    // GPU-side buffer.
+    pub chrome: crate::render::Renderer,
+    pub chrome_buf: smithay::backend::renderer::element::memory::MemoryRenderBuffer,
+    pub chrome_size: (i32, i32),
+    pub chrome_dirty: bool,
+    /// On-screen leaves as of the last arrange (chrome + hit regions).
+    pub placed: Vec<chrome::Placement>,
 
     // Wayland plumbing.
     pub dh: DisplayHandle,
@@ -168,6 +177,17 @@ impl Comp {
             output,
             damage_tracker,
             clear,
+            chrome: crate::render::Renderer::new(),
+            chrome_buf: smithay::backend::renderer::element::memory::MemoryRenderBuffer::new(
+                smithay::backend::allocator::Fourcc::Argb8888,
+                (1, 1),
+                1,
+                Transform::Normal,
+                None,
+            ),
+            chrome_size: (0, 0),
+            chrome_dirty: true,
+            placed: Vec::new(),
             dh,
             handle,
             signal: event_loop.get_signal(),
@@ -270,7 +290,12 @@ impl Comp {
         self.state.update_canvas(wa, 0);
         let geos = self.state.compute(wa);
         let scroll_x = self.state.scroll_x();
+        let focused = self.state.focused_leaf_valid();
 
+        // Every on-screen leaf gets a placement (chrome draws empty and
+        // minimized frames too); only occupied, unminimized ones map a
+        // window.
+        self.placed.clear();
         let mut shown: Vec<crate::tree::Win> = Vec::new();
         for leaf in self.state.tree.collect_leaves() {
             let Some(geo) = geos.get(&leaf).copied() else {
@@ -282,13 +307,22 @@ impl Comp {
                 w: geo.w.max(1),
                 h: geo.h.max(1),
             };
+            if frame.x + frame.w <= wa.x || frame.x >= wa.x + wa.w {
+                continue;
+            }
             let leaf_data = self.state.tree.leaf(leaf);
             let minimized = leaf_data.is_some_and(|l| l.minimized);
-            let Some(c) = leaf_data.and_then(|l| l.client) else {
+            let client = leaf_data.and_then(|l| l.client);
+            self.placed.push(chrome::Placement {
+                leaf,
+                frame,
+                client,
+                focused: focused == leaf,
+            });
+            let Some(c) = client else {
                 continue;
             };
-            let off_screen = frame.x + frame.w <= wa.x || frame.x >= wa.x + wa.w;
-            if minimized || off_screen {
+            if minimized {
                 continue;
             }
             let Some(window) = self.managed.get(c).cloned() else {
@@ -302,6 +336,7 @@ impl Comp {
             self.space.map_element(window, (cx, cy), false);
             shown.push(c);
         }
+        self.chrome_dirty = true;
 
         let to_hide: Vec<Window> = self
             .managed
@@ -347,6 +382,10 @@ impl Comp {
 
     /// Composite one frame and pace clients' frame callbacks.
     pub fn redraw(&mut self) {
+        if self.chrome_dirty {
+            self.compose_chrome();
+            self.chrome_dirty = false;
+        }
         let size = self.backend.window_size();
         let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
         let rendered = {
@@ -357,19 +396,38 @@ impl Comp {
             else {
                 return;
             };
-            smithay::desktop::space::render_output::<_, WaylandSurfaceRenderElement<GlesRenderer>, _, _>(
-                &self.output,
+            // Front-to-back: client windows (and popups), then the chrome
+            // underlay behind everything.
+            let mut elements: Vec<chrome::OutputElement> =
+                smithay::desktop::space::space_render_elements::<_, Window, _>(
+                    renderer,
+                    [&self.space],
+                    &self.output,
+                    1.0,
+                )
+                .map_or_else(
+                    |err| {
+                        tracing::error!("space elements: {err:?}");
+                        Vec::new()
+                    },
+                    |els| els.into_iter().map(chrome::OutputElement::Window).collect(),
+                );
+            match smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement::from_buffer(
                 renderer,
-                &mut fb,
-                1.0,
-                0,
-                [&self.space],
-                &[],
-                &mut self.damage_tracker,
-                self.clear,
-            )
-            .inspect_err(|err| tracing::error!("render: {err}"))
-            .is_ok()
+                (0.0, 0.0),
+                &self.chrome_buf,
+                None,
+                None,
+                None,
+                smithay::backend::renderer::element::Kind::Unspecified,
+            ) {
+                Ok(el) => elements.push(chrome::OutputElement::Chrome(el)),
+                Err(err) => tracing::error!("chrome element: {err}"),
+            }
+            self.damage_tracker
+                .render_output(renderer, &mut fb, 0, &elements, self.clear)
+                .inspect_err(|err| tracing::error!("render: {err:?}"))
+                .is_ok()
         };
         if rendered {
             if let Err(err) = self.backend.submit(Some(&[full])) {

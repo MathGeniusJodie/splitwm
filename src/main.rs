@@ -13,7 +13,11 @@ mod comp;
 // the layout core's scroll/boundary/taskbar surface until M3/M5 wire the
 // chrome renderer and pointer interactions up to it.
 #[allow(dead_code)]
+mod icon;
+#[allow(dead_code)]
 mod oklch;
+#[allow(dead_code)]
+mod render;
 mod shell;
 #[allow(dead_code)]
 mod state;
