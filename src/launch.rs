@@ -26,7 +26,7 @@ pub(crate) fn shell_quote(s: &str) -> String {
 /// names are looked up through the configured icon theme and its
 /// inheritance chain, then hicolor and `pixmaps`. Any format the lookup
 /// returns (PNG, SVG, XPM) is fine: `icon::load_image` converts non-PNG
-/// files through ImageMagick.
+/// files through `ImageMagick`.
 pub fn find_icon_file(icon: &str) -> Option<std::path::PathBuf> {
     // Repeated lookups re-resolve the same icon names, so cache results
     // keyed by the raw `icon` string. Hits are trusted forever (nothing

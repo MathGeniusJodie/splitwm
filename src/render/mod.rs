@@ -49,7 +49,7 @@ pub struct Renderer {
     /// degrades to a no-op instead of refusing to start the WM.
     font: Option<BitmapFont>,
     /// The na16 palette all art/indices resolve through, paired with its
-    /// precomputed OKLab coordinates for perceptual nearest-colour snapping.
+    /// precomputed `OKLab` coordinates for perceptual nearest-colour snapping.
     palette: OklabPalette,
     /// Index -> BGRX output table used by `present`.
     lut: Box<PresentLut>,

@@ -356,7 +356,7 @@ pub const BINDINGS: &[(u16, u32, Action)] = &[
 // --- taskbar quick-launch entries ---
 
 /// When a quick-launch icon is present in the taskbar, keyed on whether a
-/// managed window's WM_CLASS matches (case-insensitively).
+/// managed window's `WM_CLASS` matches (case-insensitively).
 #[derive(Clone, Copy)]
 pub enum ShowWhen {
     Always,

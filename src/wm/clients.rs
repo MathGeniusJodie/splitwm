@@ -1,6 +1,6 @@
 //! Tiled-client window lifecycle for `Wm`: adopting/managing/unmanaging
-//! windows, focus, spawning, and the small ICCCM/EWMH surface (WM_STATE,
-//! WM_DELETE_WINDOW, _NET_CLIENT_LIST, _NET_ACTIVE_WINDOW). Floats live in
+//! windows, focus, spawning, and the small ICCCM/EWMH surface (`WM_STATE`,
+//! `WM_DELETE_WINDOW`, `_NET_CLIENT_LIST`, `_NET_ACTIVE_WINDOW`). Floats live in
 //! `floats`, the docked sidebar in `dock`, notifications in `notifications`,
 //! and the icon cache in `icons` — this module dispatches to all four from
 //! `manage`/`forget_client` but otherwise only owns tiled clients.
@@ -35,7 +35,7 @@ impl Wm {
     /// Adopt windows already mapped on the root when splitwm starts, so
     /// taking over from a previous window manager doesn't lose whatever was
     /// on screen. A well-behaved WM adds every client it reparents to its
-    /// SaveSet, so once it exits (releasing `SUBSTRUCTURE_REDIRECT`, which
+    /// `SaveSet`, so once it exits (releasing `SUBSTRUCTURE_REDIRECT`, which
     /// is what let us become the WM in the first place) the X server
     /// auto-reparents surviving client windows back onto root, still
     /// mapped — exactly what a normal `MapRequest` handles, just batched
@@ -228,7 +228,7 @@ impl Wm {
     }
 
     /// Whether `win`'s `_NET_WM_STATE` *property* (set before mapping, per
-    /// EWMH) already asks for fullscreen — the ClientMessage path only
+    /// EWMH) already asks for fullscreen — the `ClientMessage` path only
     /// covers requests made after the window is managed.
     pub(crate) fn wants_fullscreen(&self, win: Win) -> bool {
         self.prop_atoms(win, self.atoms.net_wm_state)
@@ -264,7 +264,7 @@ impl Wm {
     pub(crate) fn forget_client(&mut self, win: Win) -> R<()> {
         let known = self.remove_client(win).is_some();
         // A window can occupy a leaf/stash slot without an entry in
-        // `clients` if `manage` errored out partway (it pins into the tree
+        // `managed` if `manage` errored out partway (it pins into the tree
         // before its X requests); clean the layout up regardless, or the
         // split shows a phantom occupant forever.
         let in_layout = self.state.tree.find_leaf_for_client(win).is_some()
@@ -283,7 +283,7 @@ impl Wm {
     }
 
     /// The bookkeeping `forget_client` and `on_dock_identity_change` both
-    /// need to drop `win` from every tracking structure outside `clients`
+    /// need to drop `win` from every tracking structure outside `managed`
     /// itself (bar order, fullscreen state, ignored-unmap suppression,
     /// pins, `_NET_CLIENT_LIST`). Callers that immediately reclassify `win`
     /// into a different `WindowKind` run this instead of `forget_client` so
@@ -360,9 +360,9 @@ impl Wm {
     }
 
     /// Mark a window Withdrawn (ICCCM) on its way out of management. The
-    /// write races the window's own destruction — an UnmapNotify can come
-    /// from the client quitting outright, with the DestroyNotify already
-    /// behind it on the wire — so the request is checked and a BadWindow
+    /// write races the window's own destruction — an `UnmapNotify` can come
+    /// from the client quitting outright, with the `DestroyNotify` already
+    /// behind it on the wire — so the request is checked and a `BadWindow`
     /// deliberately swallowed: it only means there is no window left to
     /// mark. Every other error still surfaces.
     pub(crate) fn withdraw_wm_state(&self, win: Win) -> R<()> {
@@ -427,8 +427,8 @@ impl Wm {
     /// fallback, and same-app hue-rotation grouping (`assign_icon_slot`/
     /// `refresh_icon_rotations`) stuck on whatever `manage`/`manage_float`
     /// guessed from an empty/placeholder class at map time. No-ops when the
-    /// identity is unchanged — terminals never touch WM_CLASS, but
-    /// PropertyNotify can fire without a real change regardless.
+    /// identity is unchanged — terminals never touch `WM_CLASS`, but
+    /// `PropertyNotify` can fire without a real change regardless.
     pub(crate) fn on_class_change(&mut self, win: Win) -> R<()> {
         let new_class = self.client_identity(win);
         match self.kind_of(win) {
@@ -547,7 +547,7 @@ impl Wm {
             self.arrange()?;
             if on {
                 // Hide the chrome frame; the client alone covers the screen.
-                if let Some(f) = self.floats_iter().find(|f| f.win == win) {
+                if let Some(f) = self.float_get(win) {
                     self.conn.unmap_window(f.frame)?;
                 }
             }
@@ -559,7 +559,7 @@ impl Wm {
     /// Re-show a float's chrome frame and restore its remembered geometry
     /// after leaving fullscreen. No-op for windows that aren't floats.
     fn restore_float_geometry(&mut self, win: Win) -> R<()> {
-        let Some(f) = self.floats_iter().find(|f| f.win == win) else {
+        let Some(f) = self.float_get(win) else {
             return Ok(());
         };
         let (frame, x, y, w, h) = (f.frame, f.x, f.y, f.w, f.h);
@@ -572,7 +572,7 @@ impl Wm {
 
     /// Mirror our fullscreen bookkeeping onto the client's `_NET_WM_STATE`
     /// property. Only the fullscreen atom is ours to add or remove: states
-    /// the client set itself (MODAL, SKIP_TASKBAR, ABOVE, …) must survive
+    /// the client set itself (MODAL, `SKIP_TASKBAR`, ABOVE, …) must survive
     /// the rewrite, or pagers reading the property see them vanish.
     fn set_net_wm_state_fullscreen(&self, win: Win, on: bool) -> R<()> {
         let fs = self.atoms.net_wm_state_fullscreen;
@@ -627,7 +627,7 @@ impl Wm {
 
     /// A guaranteed-fresh server timestamp: append zero bytes to a property
     /// on our never-mapped selection owner (which has `PROPERTY_CHANGE`
-    /// selected) and read the time off the resulting PropertyNotify — the
+    /// selected) and read the time off the resulting `PropertyNotify` — the
     /// standard ICCCM trick. Events drained while waiting are stashed in
     /// `pending_events` for the main loop, preserving their order.
     fn fresh_timestamp(&mut self) -> R<u32> {
@@ -702,24 +702,21 @@ impl Wm {
     }
 
     pub(crate) fn focus(&mut self, win: Option<Win>) -> R<()> {
-        match win.and_then(|w| self.tiled_get(w).map(|c| (w, c.focus))) {
-            Some((w, model)) => {
-                self.clear_focused_float();
-                self.give_focus(w, model)?;
-                // Raising the focused client puts it above everything;
-                // re-apply the shared stacking policy above it.
-                self.conn
-                    .configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
-                self.apply_stacking()?;
-                self.set_net_active_window(w)?;
-            }
-            _ => {
-                self.clear_focused_float();
-                let time = self.focus_timestamp()?;
-                self.conn
-                    .set_input_focus(InputFocus::POINTER_ROOT, self.root, time)?;
-                self.set_net_active_window(x11rb::NONE)?;
-            }
+        if let Some((w, model)) = win.and_then(|w| self.tiled_get(w).map(|c| (w, c.focus))) {
+            self.clear_focused_float();
+            self.give_focus(w, model)?;
+            // Raising the focused client puts it above everything;
+            // re-apply the shared stacking policy above it.
+            self.conn
+                .configure_window(w, &ConfigureWindowAux::new().stack_mode(StackMode::ABOVE))?;
+            self.apply_stacking()?;
+            self.set_net_active_window(w)?;
+        } else {
+            self.clear_focused_float();
+            let time = self.focus_timestamp()?;
+            self.conn
+                .set_input_focus(InputFocus::POINTER_ROOT, self.root, time)?;
+            self.set_net_active_window(x11rb::NONE)?;
         }
         Ok(())
     }
@@ -760,7 +757,7 @@ impl Wm {
     /// When systemd-run is available the command is placed in its own
     /// transient scope under app.slice, like a desktop-environment launcher
     /// would; Chromium/Electron apps otherwise try to move themselves out of
-    /// the shared session scope and log a spurious UnitExists error.
+    /// the shared session scope and log a spurious `UnitExists` error.
     #[allow(clippy::unused_self)]
     pub(crate) fn spawn(&self, cmd: &str) {
         // Both paths hand `cmd` to `/bin/sh -c` as one quoted word, so a
@@ -796,15 +793,46 @@ impl Wm {
     /// Checked once and cached; false on non-systemd setups or bare X
     /// sessions. The probe is a synchronous D-Bus round trip, so `run`
     /// warms it at startup rather than letting the first launch pay for it
-    /// inside the event loop.
+    /// inside the event loop — which is exactly why it must be
+    /// deadline-bounded: the warming call sits on the startup path, and a
+    /// wedged user manager (a hung D-Bus socket answers nothing, ever)
+    /// would otherwise hang the WM before it manages a single window. A
+    /// timed-out probe counts as "no systemd-run"; launches then skip the
+    /// transient scope, the same degradation as any non-systemd session.
     pub(crate) fn have_systemd_run() -> bool {
         use std::sync::OnceLock;
         static HAVE: OnceLock<bool> = OnceLock::new();
         *HAVE.get_or_init(|| {
-            std::process::Command::new("systemd-run")
+            const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+            let Ok(mut child) = std::process::Command::new("systemd-run")
                 .args(["--user", "--scope", "--collect", "--quiet", "--", "true"])
-                .status()
-                .is_ok_and(|s| s.success())
+                .spawn()
+            else {
+                // No systemd-run binary at all.
+                return false;
+            };
+            // std has no wait-with-timeout, so poll `try_wait` against a
+            // deadline. 10ms granularity is plenty: a healthy probe answers
+            // in single-digit milliseconds, and only startup ever blocks on
+            // this.
+            let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => return status.success(),
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    // Deadline passed (manager wedged) or the child is
+                    // unwaitable: kill and reap what we can, then report no
+                    // systemd — a launch degraded to plain `sh` beats a WM
+                    // that never starts.
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return false;
+                    }
+                }
+            }
         })
     }
 }

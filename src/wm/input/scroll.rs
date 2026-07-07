@@ -1,4 +1,4 @@
-//! Trackpad/wheel horizontal-scroll canvas panning: XInput2 raw-motion
+//! Trackpad/wheel horizontal-scroll canvas panning: `XInput2` raw-motion
 //! valuator discovery and the accumulated-delta-to-pixel conversion. There
 //! is no vertical scroll behaviour of our own (see `super::events`'s legacy
 //! wheel-click handling for why vertical ticks are simply dropped).

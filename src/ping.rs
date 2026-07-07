@@ -1,6 +1,6 @@
 //! Wakes the WM's blocking event loop from a background thread by sending a
-//! ClientMessage to root (delivered to the WM's own connection via the
-//! SUBSTRUCTURE_REDIRECT selection only a WM holds). Shared by the
+//! `ClientMessage` to root (delivered to the WM's own connection via the
+//! `SUBSTRUCTURE_REDIRECT` selection only a WM holds). Shared by the
 //! notification-daemon thread (`crate::notify`) and background theme-icon
 //! fetch threads (`crate::wm::icons`) so a fresh connect/auth handshake is
 //! paid once for the process rather than once per thread or per ping.
@@ -28,7 +28,7 @@ struct PingConn {
 /// handshake for no better outcome isn't worth it.
 static PING: std::sync::OnceLock<Option<PingConn>> = std::sync::OnceLock::new();
 
-/// Wake the WM's blocking event loop by sending `atom` as a ClientMessage to
+/// Wake the WM's blocking event loop by sending `atom` as a `ClientMessage` to
 /// root. Best-effort: a failed ping (whether the connect on first use or this
 /// send) only delays whatever the caller already queued elsewhere (an mpsc
 /// message, a D-Bus reply) until the WM's next natural wakeup, so failures

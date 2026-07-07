@@ -124,7 +124,7 @@ impl Wm {
 
     /// Make sure the SHM segment exists and each of its two halves holds at
     /// least `len` bytes, creating it on first use and recreating it when a
-    /// frame outgrows it (RandR growth). There is no fallback: a server
+    /// frame outgrows it (`RandR` growth). There is no fallback: a server
     /// without MIT-SHM 1.2 fd-passing can't run splitwm, and the error from
     /// the session's first blit (inside the startup arrange) is what says
     /// so and exits.
@@ -152,7 +152,7 @@ impl Wm {
 
     /// Create a memfd-backed shared segment of `len` bytes, map it, and
     /// attach it to the server with `ShmAttachFd` (MIT-SHM 1.2's fd-passing
-    /// attach: no SysV shm ids, no /dev/shm files to leak). The fd is owned
+    /// attach: no `SysV` shm ids, no /dev/shm files to leak). The fd is owned
     /// by the attach request once sent; the local mapping stays valid.
     fn create_shm(&self, len: usize) -> R<ShmSeg> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};

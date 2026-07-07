@@ -1,5 +1,5 @@
 //! App-icon subsystem: the `_NET_WM_ICON` cache, icon-theme fallback fetches
-//! (run on a background thread since they can shell out to ImageMagick), and
+//! (run on a background thread since they can shell out to `ImageMagick`), and
 //! the hue-rotation slots that keep same-app windows visually distinct.
 
 use std::rc::Rc;
@@ -101,7 +101,7 @@ impl Wm {
             .collect()
     }
 
-    /// WM_CLASS's class string (second of the "instance\0class\0" pair),
+    /// `WM_CLASS`'s class string (second of the "instance\0class\0" pair),
     /// used both as the taskbar label's source letter and to group windows
     /// of the same app for icon color-rotation (`assign_icon_slot`).
     pub(crate) fn client_identity(&self, win: Win) -> Rc<str> {
@@ -229,7 +229,7 @@ impl Wm {
     /// App icon from `_NET_WM_ICON`, falling back to the icon theme for
     /// clients that don't provide it (some apps, e.g. Electron ones, set the
     /// property late or not at all — see `on_icon_change` for the late
-    /// case). The theme lookup can shell out to ImageMagick, which must not
+    /// case). The theme lookup can shell out to `ImageMagick`, which must not
     /// block the event loop, so a missing `_NET_WM_ICON` leaves `icon: None`
     /// for now and starts a background fetch (`spawn_theme_icon_fetch`),
     /// filled in later by `on_icon_ping` if/when it succeeds.
@@ -243,7 +243,7 @@ impl Wm {
 
     /// Resolve `class`'s theme icon off the event loop: `find_icon_file` can
     /// stat an NFS-backed icon theme directory and `icon::load_image` shells
-    /// out to ImageMagick and waits on it (see `icon::magick_decode_rgba`) —
+    /// out to `ImageMagick` and waits on it (see `icon::magick_decode_rgba`) —
     /// both slow enough that running them inline in `manage` would stall
     /// every window map and all input handling for as long as they take.
     /// Runs the same theme lookup `resolve_icon` used to do inline, just
@@ -269,60 +269,46 @@ impl Wm {
     /// `_NET_WM_ICON` changed on a managed window: refetch and redraw. Apps
     /// that set the property only after mapping (Electron, notably) would
     /// otherwise keep whatever `manage`/`manage_float` resolved at map time.
-    /// Dispatches on `kind_of` since tiled clients and floats keep their
-    /// `icon_fresh` bookkeeping and repaint (`repaint_chrome` vs.
-    /// `paint_float_frame`) in different places.
+    /// Tiled clients and floats share the throttle (`Wm::icon_fresh_mut`)
+    /// and the fetch; only the apply differs — a tiled client's titlebar
+    /// lives in the shared composite (and its rotated same-app variant must
+    /// be re-rendered), a float repaints just its own chrome frame.
     pub(crate) fn on_icon_change(&mut self, win: Win) -> R<()> {
+        let now = std::time::Instant::now();
+        // Docks, notifications and unmanaged windows keep no icon at all.
+        let Some(fresh) = self.icon_fresh_mut(win) else {
+            return Ok(());
+        };
+        if fresh.throttled(now) {
+            self.icons_stale = true;
+            return Ok(());
+        }
+        let Some(icon) = self.fetch_icon(win) else {
+            return Ok(());
+        };
         match self.kind_of(win) {
-            Some(WindowKind::Tiled) => self.on_icon_change_tiled(win),
-            Some(WindowKind::Float) => self.on_icon_change_float(win),
+            Some(WindowKind::Tiled) => {
+                let client = self
+                    .client_mut(win)
+                    .expect("kind checked; fetch_icon doesn't unmanage");
+                client.icon = Some(icon);
+                client.icon_rotated = None;
+                let class = client.class.clone();
+                self.refresh_icon_rotations(&class);
+                self.repaint_chrome()
+            }
+            Some(WindowKind::Float) => {
+                let float = self
+                    .float_mut(win)
+                    .expect("kind checked; fetch_icon doesn't unmanage");
+                float.icon = Some(icon);
+                let frame = float.frame;
+                self.paint_float_frame(frame)
+            }
+            // Unreachable given `icon_fresh_mut` matched above, but a plain
+            // no-op costs nothing and keeps this match total.
             Some(WindowKind::Dock | WindowKind::Notification) | None => Ok(()),
         }
-    }
-
-    fn on_icon_change_tiled(&mut self, win: Win) -> R<()> {
-        let now = std::time::Instant::now();
-        let Some(client) = self.client_mut(win) else {
-            return Ok(());
-        };
-        if client.icon_fresh.throttled(now) {
-            self.icons_stale = true;
-            return Ok(());
-        }
-        let class = client.class.clone();
-        let Some(icon) = self.fetch_icon(win) else {
-            return Ok(());
-        };
-        let client = self
-            .client_mut(win)
-            .expect("present above; fetch_icon doesn't unmanage");
-        client.icon = Some(icon);
-        client.icon_rotated = None;
-        self.refresh_icon_rotations(&class);
-        self.repaint_chrome()
-    }
-
-    /// Float counterpart of `on_icon_change_tiled`: same `IconFreshness`
-    /// mechanics on `FloatWin`'s own field, but repaints just this float's
-    /// chrome frame instead of the shared tiled composite.
-    fn on_icon_change_float(&mut self, win: Win) -> R<()> {
-        let now = std::time::Instant::now();
-        let Some(float) = self.float_mut(win) else {
-            return Ok(());
-        };
-        if float.icon_fresh.throttled(now) {
-            self.icons_stale = true;
-            return Ok(());
-        }
-        let Some(icon) = self.fetch_icon(win) else {
-            return Ok(());
-        };
-        let Some(float) = self.float_mut(win) else {
-            return Ok(());
-        };
-        float.icon = Some(icon);
-        let frame = float.frame;
-        self.paint_float_frame(frame)
     }
 
     /// Re-fetch icons whose refresh was deferred by `on_icon_change`'s

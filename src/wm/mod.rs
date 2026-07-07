@@ -75,9 +75,9 @@ fn install_term_handler() {
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = on_term_signal as *const () as libc::sighandler_t;
-        libc::sigemptyset(&mut sa.sa_mask);
+        libc::sigemptyset(&raw mut sa.sa_mask);
         for sig in [libc::SIGTERM, libc::SIGINT] {
-            libc::sigaction(sig, &sa, std::ptr::null_mut());
+            libc::sigaction(sig, &raw const sa, std::ptr::null_mut());
         }
     }
 }
@@ -94,11 +94,11 @@ fn block_term_signals() -> libc::sigset_t {
     // thread only; `old` is populated by `pthread_sigmask` before use.
     unsafe {
         let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        libc::sigaddset(&mut set, libc::SIGTERM);
-        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::sigemptyset(&raw mut set);
+        libc::sigaddset(&raw mut set, libc::SIGTERM);
+        libc::sigaddset(&raw mut set, libc::SIGINT);
         let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &raw const set, &raw mut old);
         old
     }
 }
@@ -113,7 +113,7 @@ impl Drop for RestoreSigmask {
         // SAFETY: restores a previously-captured valid sigset_t for this
         // thread only.
         unsafe {
-            libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut());
+            libc::pthread_sigmask(libc::SIG_SETMASK, &raw const self.0, std::ptr::null_mut());
         }
     }
 }
@@ -170,7 +170,7 @@ pub(crate) fn wait_event_deadline(
             events: libc::POLLIN,
             revents: 0,
         };
-        let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        let r = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
         if r < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::Interrupted {
@@ -195,7 +195,7 @@ fn fp3232_to_f64(v: xinput::Fp3232) -> f64 {
 
 /// Pick out the raw-event valuator numbered `number` from `axisvalues`,
 /// which holds one entry per set bit in `mask` (in bit order, low to high,
-/// spanning as many `u32` words as needed) — the wire format XInput2 raw
+/// spanning as many `u32` words as needed) — the wire format `XInput2` raw
 /// events use to report only the axes that moved.
 fn valuator_value(mask: &[u32], axisvalues: &[xinput::Fp3232], number: u16) -> Option<f64> {
     let number = usize::from(number);
@@ -410,7 +410,7 @@ pub fn run(replace: bool) -> R<()> {
 }
 
 /// Refuse to start on a root visual the renderer can't present to. Every
-/// frame blit assumes a depth-24 TrueColor visual with 0xff0000/0xff00/0xff
+/// frame blit assumes a depth-24 `TrueColor` visual with 0xff0000/0xff00/0xff
 /// channel masks (the BGRX byte layout `Renderer::present` emits); on any
 /// other visual class, depth or mask layout the blits would render garbage
 /// or be rejected outright, so failing loudly here beats an unusable session.
@@ -447,9 +447,9 @@ fn check_root_visual(screen: &x11rb::protocol::xproto::Screen) -> R<()> {
 }
 
 /// Ask the server for XKB's detectable-autorepeat mode: with it on, a held
-/// key generates consecutive KeyPress events with no intervening
-/// KeyRelease, instead of the traditional same-timestamp KeyRelease+
-/// KeyPress pair. Either way `Wm::key_is_repeating` recognises the repeat:
+/// key generates consecutive `KeyPress` events with no intervening
+/// `KeyRelease`, instead of the traditional same-timestamp `KeyRelease`+
+/// `KeyPress` pair. Either way `Wm::key_is_repeating` recognises the repeat:
 /// detectable mode leaves the keycode's `layout_key_state` entry `Held` (no
 /// release arrived), classic mode's same-timestamp release/press pair is
 /// matched via its `ReleasedAt` entry. So this call is a pure optimisation
@@ -473,8 +473,8 @@ fn enable_detectable_autorepeat(conn: &x11rb::rust_connection::RustConnection) -
     Ok(())
 }
 
-/// Become the window manager. STRUCTURE_NOTIFY is included so the root's
-/// own ConfigureNotify reports screen (RandR) resizes.
+/// Become the window manager. `STRUCTURE_NOTIFY` is included so the root's
+/// own `ConfigureNotify` reports screen (`RandR`) resizes.
 fn grab_substructure_redirect(
     conn: &x11rb::rust_connection::RustConnection,
     root: Window,
@@ -498,7 +498,7 @@ fn grab_substructure_redirect(
 }
 
 /// Minimal EWMH presence: announce what we support, and point
-/// _NET_SUPPORTING_WM_CHECK at the (never-mapped) selection-owner window
+/// `_NET_SUPPORTING_WM_CHECK` at the (never-mapped) selection-owner window
 /// so pagers/panels recognise a live EWMH WM.
 fn publish_ewmh(
     conn: &x11rb::rust_connection::RustConnection,
@@ -582,9 +582,9 @@ fn publish_ewmh(
 /// the root's cursor). The arrow/hand/disabled cursors are the hand-drawn
 /// `cursor_*` sprites, built as ARGB cursors via RENDER; the core "cursor"
 /// font supplies the resize arrows (no drawn art) and the fallbacks when the
-/// server lacks RENDER cursors (glyph 68 = XC_left_ptr, 108 =
-/// XC_sb_h_double_arrow, 116 = XC_sb_v_double_arrow, 60 = XC_hand2, 0 =
-/// XC_X_cursor; a glyph's mask is always the next glyph).
+/// server lacks RENDER cursors (glyph 68 = `XC_left_ptr`, 108 =
+/// `XC_sb_h_double_arrow`, 116 = `XC_sb_v_double_arrow`, 60 = `XC_hand2`, 0 =
+/// `XC_X_cursor`; a glyph's mask is always the next glyph).
 fn setup_cursors_and_root_style(
     conn: &x11rb::rust_connection::RustConnection,
     screen: &x11rb::protocol::xproto::Screen,
@@ -726,7 +726,7 @@ fn create_underlay(
 /// (startup) rather than per frame. A missing icon falls back to the
 /// entry's first label letter, like a taskbar tile with no `_NET_WM_ICON`.
 ///
-/// Each entry's lookup (a filesystem walk) and decode (an ImageMagick
+/// Each entry's lookup (a filesystem walk) and decode (an `ImageMagick`
 /// subprocess round trip) is independent of the others, so they run on
 /// their own scoped thread rather than one after another on the startup
 /// path. `find_icon_file` and `load_image` only touch the filesystem and
@@ -748,7 +748,16 @@ fn quick_slots(renderer: &Renderer) -> Vec<QuickSlot> {
             })
             .collect::<Vec<_>>()
             .into_iter()
-            .map(|h| h.join().unwrap_or(None))
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
+                    // A panicked lookup thread degrades to the label glyph
+                    // like any other missing icon — but say so, or a broken
+                    // icon pipeline (ImageMagick, a corrupt theme) is
+                    // indistinguishable from icons that simply don't exist.
+                    eprintln!("splitwm: quick-launch icon lookup thread panicked");
+                    None
+                })
+            })
             .collect()
     });
 
@@ -768,7 +777,7 @@ fn quick_slots(renderer: &Renderer) -> Vec<QuickSlot> {
 }
 
 /// Finish startup once `wm` is fully constructed: wire up keybindings,
-/// EWMH workarea/wallpaper, XInput2 (best-effort), adopt any windows a
+/// EWMH workarea/wallpaper, `XInput2` (best-effort), adopt any windows a
 /// previous WM left on screen, autostart the dock, and run the first
 /// arrange.
 fn startup_adopt_and_arrange(wm: &mut Wm, root: Window) -> R<()> {
@@ -825,7 +834,7 @@ fn startup_adopt_and_arrange(wm: &mut Wm, root: Window) -> R<()> {
 /// (window, sequence) exactly like `Wm::on_unmap`'s `Wm::take_ignored_unmap`,
 /// but via `Wm::is_ignored_unmap` so checking here doesn't itself consume
 /// the record before `handle_batch` gets to it; both delivered copies (root
-/// SubstructureNotify and the client's own StructureNotify) carry the same
+/// `SubstructureNotify` and the client's own `StructureNotify`) carry the same
 /// pair, so both are exempted.
 fn cuts_animation(wm: &Wm, ev: &Event) -> bool {
     match ev {
@@ -990,7 +999,7 @@ impl Wm {
         }
     }
 
-    /// The full-screen workarea, cached (refreshed by root ConfigureNotify) —
+    /// The full-screen workarea, cached (refreshed by root `ConfigureNotify`) —
     /// `arrange` needs it several times per frame, so it must not cost a
     /// `GetGeometry` round trip.
     pub(crate) const fn wa(&self) -> Rect {
@@ -1087,7 +1096,7 @@ impl Wm {
         Ok(())
     }
 
-    /// Negotiate XInput2 and select the raw-motion/hierarchy events driving
+    /// Negotiate `XInput2` and select the raw-motion/hierarchy events driving
     /// smooth horizontal-scroll panning. Errors here (extension missing,
     /// version too old) are non-fatal: the caller just runs without it.
     fn setup_xinput(&mut self, root: Window) -> R<()> {

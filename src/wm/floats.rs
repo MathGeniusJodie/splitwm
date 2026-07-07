@@ -18,7 +18,7 @@ use crate::tree::Win;
 
 /// A floating window: a dialog/transient (`WM_TRANSIENT_FOR` or
 /// `_NET_WM_WINDOW_TYPE_DIALOG`) or a fixed-size client (min == max in
-/// `WM_NORMAL_HINTS`). Never in `clients`/the split tree/taskbar: shown at
+/// `WM_NORMAL_HINTS`). Never in the split tree/taskbar: shown at
 /// its requested size, centered over its parent's split (or the workarea),
 /// stacked above every tiled client, focused on map and click but not part
 /// of Mod4+Tab cycling.
@@ -206,7 +206,7 @@ impl Wm {
     /// Configure a float pair to its tracked geometry: the client window at
     /// `(x, y, w, h)` and the chrome frame around it, extended by
     /// `float_insets`. The single geometry formula behind float manage,
-    /// self-resize (ConfigureRequest) and fullscreen restore.
+    /// self-resize (`ConfigureRequest`) and fullscreen restore.
     pub(crate) fn configure_float_frame(
         &self,
         win: Win,
@@ -239,7 +239,7 @@ impl Wm {
 
     /// Raise a float as a unit: frame to the top, client just above it.
     pub(crate) fn restack_float(&self, win: Win) -> R<()> {
-        let Some(f) = self.floats_iter().find(|f| f.win == win) else {
+        let Some(f) = self.float_get(win) else {
             return Ok(());
         };
         self.conn.configure_window(
@@ -320,10 +320,11 @@ impl Wm {
 
     /// Give input focus to a float and remember it as the keyboard target.
     pub(crate) fn focus_float(&mut self, win: Win) -> R<()> {
-        let Some(f) = self.floats_iter().find(|f| f.win == win) else {
+        let Some(f) = self.float_get(win) else {
             return Ok(());
         };
-        self.give_focus(win, f.focus)?;
+        let focus = f.focus;
+        self.give_focus(win, focus)?;
         self.set_focused_float(win);
         self.restack_float(win)?;
         self.set_net_active_window(win)

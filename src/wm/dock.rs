@@ -1,7 +1,7 @@
 //! The docked sidebar: a single identified window (matched by `WM_CLASS`,
 //! title as a classless fallback) pinned past the right end of the
 //! scrolling canvas, revealed by scrolling all the way right. Lives outside
-//! `clients`/the split tree/taskbar entirely — no chrome, no taskbar entry,
+//! the tiled-client world entirely — no split, no chrome, no taskbar entry,
 //! not part of focus cycling — so normal tiled columns never lay out under
 //! it.
 
@@ -18,7 +18,7 @@ use crate::tree::Win;
 pub struct DockState {
     /// The window pinned past the right end of the scrolling canvas, only
     /// revealed by scrolling all the way right (see `DockState::title`),
-    /// if one is currently mapped. It lives outside `clients`/the split
+    /// if one is currently mapped. It lives outside the split
     /// tree/`bar_order` entirely: no chrome, no taskbar entry, not part of
     /// focus cycling, and normal tiled columns never lay out under it. Its
     /// own payload (the width captured at manage time) lives in `Wm::managed`
@@ -67,10 +67,10 @@ impl Wm {
         self.client_title(win).as_ref() == self.dock.title
     }
 
-    /// Pin `win` (`Wm::dock_title`) as a borderless window parked past
-    /// the right end of the scrolling canvas, revealed by scrolling all the
-    /// way right (see `place_dock`/`State::dock_extra`): it never enters
-    /// `clients`/the split tree/taskbar, so it gets none of their chrome or
+    /// Pin `win` (identified per `DockState::title`) as a borderless window
+    /// parked past the right end of the scrolling canvas, revealed by
+    /// scrolling all the way right (see `place_dock`/`State::dock_extra`):
+    /// it never enters the split tree/taskbar, so it gets none of their chrome or
     /// focus cycling, and normal tiled columns never lay out under it. Its
     /// size is whatever it asked for at creation time, kept fixed for the
     /// rest of the session.
@@ -146,7 +146,7 @@ impl Wm {
     /// trimmed for the bottom taskbar) — the dock spans the entire screen,
     /// overlapping the taskbar strip in its column. The single formula
     /// behind `place_dock` (configuring) and `tracked_geometry` (answering
-    /// denied ConfigureRequests).
+    /// denied `ConfigureRequests`).
     pub(crate) fn dock_geometry(&self, d: Dock) -> (i32, i32, i32, i32) {
         let wa = self.la();
         let full = self.wa();

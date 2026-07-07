@@ -32,7 +32,7 @@ pub struct NotePopup {
 }
 
 impl Wm {
-    /// The daemon thread's ClientMessage wakeup: drain the channel and
+    /// The daemon thread's `ClientMessage` wakeup: drain the channel and
     /// bring the popup pile up to date.
     pub(crate) fn on_note_ping(&mut self) -> R<()> {
         // Contain per-item errors: the channel has no other wakeup, so an
@@ -75,56 +75,53 @@ impl Wm {
             .renderer
             .draw_note(&note.summary, &note.body, note.urgency >= 2);
         let (w, h) = (fb.width as i32, fb.height as i32);
-        let win = match self.notes.popups.iter_mut().find(|p| p.note.id == note.id) {
-            Some(p) => {
-                p.note = note;
-                (p.w, p.h) = (w, h);
-                self.conn.configure_window(
-                    p.win,
-                    &ConfigureWindowAux::new().width(w as u32).height(h as u32),
-                )?;
-                p.win
+        let win = if let Some(p) = self.notes.popups.iter_mut().find(|p| p.note.id == note.id) {
+            p.note = note;
+            (p.w, p.h) = (w, h);
+            self.conn.configure_window(
+                p.win,
+                &ConfigureWindowAux::new().width(w as u32).height(h as u32),
+            )?;
+            p.win
+        } else {
+            let win = self.conn.generate_id()?;
+            self.conn.create_window(
+                self.depth,
+                win,
+                self.root,
+                0,
+                0,
+                w as u16,
+                h as u16,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0, // CopyFromParent
+                &CreateWindowAux::new()
+                    .override_redirect(1)
+                    .cursor(self.cursors.hand)
+                    .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
+            )?;
+            self.notes.popups.push(NotePopup { win, note, w, h });
+            self.conn.map_window(win)?;
+            // Cap live popups: the daemon caps outstanding notifications
+            // too (see `notify::MAX_NOTES`), but a burst can still land
+            // more `Show`s here before an eviction round-trips back —
+            // drop our own oldest rather than let the pile grow. Report
+            // the eviction back to the daemon like a click-dismissal:
+            // otherwise it keeps the id outstanding forever (a
+            // never-expiring note has no other way out) and the sender
+            // still believes its notification is on screen. Reported
+            // with the "undefined" reason (matching the daemon's own
+            // evictions), not as a user dismissal — it wasn't one.
+            if self.notes.popups.len() > MAX_NOTE_POPUPS {
+                let evicted = self.notes.popups.remove(0);
+                let _ = self
+                    .notes
+                    .dismiss
+                    .send((evicted.note.id, crate::notify::CloseReason::Undefined));
+                self.conn.destroy_window(evicted.win)?;
             }
-            None => {
-                let win = self.conn.generate_id()?;
-                self.conn.create_window(
-                    self.depth,
-                    win,
-                    self.root,
-                    0,
-                    0,
-                    w as u16,
-                    h as u16,
-                    0,
-                    WindowClass::INPUT_OUTPUT,
-                    0, // CopyFromParent
-                    &CreateWindowAux::new()
-                        .override_redirect(1)
-                        .cursor(self.cursors.hand)
-                        .event_mask(EventMask::EXPOSURE | EventMask::BUTTON_PRESS),
-                )?;
-                self.notes.popups.push(NotePopup { win, note, w, h });
-                self.conn.map_window(win)?;
-                // Cap live popups: the daemon caps outstanding notifications
-                // too (see `notify::MAX_NOTES`), but a burst can still land
-                // more `Show`s here before an eviction round-trips back —
-                // drop our own oldest rather than let the pile grow. Report
-                // the eviction back to the daemon like a click-dismissal:
-                // otherwise it keeps the id outstanding forever (a
-                // never-expiring note has no other way out) and the sender
-                // still believes its notification is on screen. Reported
-                // with the "undefined" reason (matching the daemon's own
-                // evictions), not as a user dismissal — it wasn't one.
-                if self.notes.popups.len() > MAX_NOTE_POPUPS {
-                    let evicted = self.notes.popups.remove(0);
-                    let _ = self
-                        .notes
-                        .dismiss
-                        .send((evicted.note.id, crate::notify::CloseReason::Undefined));
-                    self.conn.destroy_window(evicted.win)?;
-                }
-                win
-            }
+            win
         };
         self.shape_to_opaque(win, &fb)?;
         self.blit_fb(win, &fb)?;

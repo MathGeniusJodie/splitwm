@@ -1,11 +1,11 @@
 //! Bakes the chrome art PNGs (crate root, alongside Cargo.toml) into
 //! palette-indexed binaries at compile time, so the binary embeds raw index
 //! data instead of PNGs and does no decoding or quantization at startup.
-//! Decoded via ImageMagick (`pixel_graphics::magick_decode_rgba`), the same
+//! Decoded via `ImageMagick` (`pixel_graphics::magick_decode_rgba`), the same
 //! path `src/icon.rs` uses at runtime for user wallpapers and theme icons —
 //! this crate has no Rust PNG decoder of its own.
 //!
-//! Outputs in OUT_DIR:
+//! Outputs in `OUT_DIR`:
 //! - `palette.bin`: RGB triples of the na16 palette
 //! - `<name>.bin`: row-major palette indices per sprite
 //! - `baked_assets.rs`: accessors, included by `src/assets.rs`

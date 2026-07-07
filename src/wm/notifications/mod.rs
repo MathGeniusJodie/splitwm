@@ -2,7 +2,7 @@
 //! Notifications`: other apps' notification windows (`foreign`) and the
 //! speech-bubble popups splitwm draws for notifications it serves itself as
 //! the session daemon (`popups`, backed by the D-Bus thread in
-//! `crate::notify`). Both kinds live outside `clients`/the split tree/
+//! `crate::notify`). Both kinds live outside the split tree/
 //! taskbar and share one bottom-right stack (oldest at the bottom), so the
 //! stacking/placement that spans both piles lives here rather than in
 //! either submodule.
@@ -19,13 +19,13 @@ use super::types::{Wm, R};
 
 /// Foreign notification windows and our own served-notification popups.
 /// Notification windows (`_NET_WM_WINDOW_TYPE_NOTIFICATION`) themselves live
-/// outside `NoteState`: like the dock window, they live outside `clients`/
+/// outside `NoteState`: like the dock window, they live outside
 /// the split tree/`bar_order` (no chrome, no taskbar entry, no focus
 /// cycling), and their payload — the size they requested, tracked here
-/// (updated on ConfigureRequest) so restacking the pile doesn't cost a
+/// (updated on `ConfigureRequest`) so restacking the pile doesn't cost a
 /// `GetGeometry` round trip per window — lives in `Wm::managed` as
 /// `ManagedWindow::Notification`, iterated in pile order via
-/// `Wm::foreign_iter`/`Wm::foreign_iter_mut`.
+/// `Wm::foreign_iter`/`Wm::foreign_mut`.
 pub struct NoteState {
     /// Speech-bubble popups for notifications *we* serve as the session's
     /// `org.freedesktop.Notifications` daemon (see `crate::notify` and
@@ -56,7 +56,7 @@ impl Wm {
     }
 
     /// Restack every notification to the top, preserving their relative
-    /// order — arrange()/focus() raise tiled clients, so notifications must
+    /// order — `arrange()/focus()` raise tiled clients, so notifications must
     /// be re-raised afterwards to stay on top of everything.
     pub(crate) fn raise_notifications(&self) -> R<()> {
         for n in self.foreign_iter() {

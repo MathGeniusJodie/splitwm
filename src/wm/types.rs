@@ -203,7 +203,7 @@ pub struct Client {
     /// `Wm::refresh_icon_rotations`) — the per-pixel OKLCH rotation is far
     /// too heavy to run per frame. `None` for hue slot 0 (a 0° rotation).
     pub icon_rotated: Option<Rc<Icon>>,
-    /// WM_CLASS class string, used to group windows of the same app for
+    /// `WM_CLASS` class string, used to group windows of the same app for
     /// icon color-rotation.
     pub class: Rc<str>,
     /// Persistent icon hue-rotation slot (see `theme::icon_hue_rotation`),
@@ -328,7 +328,7 @@ pub struct Wm {
     /// actions that target "the focused window" (close) act on this before
     /// falling back to the focused split's client. Cleared whenever focus
     /// moves back into the tree. Private: can dangle if the float it names
-    /// is removed from `floats` without this being cleared too, so all
+    /// is removed from `managed` without this being cleared too, so all
     /// reads/writes go through `Wm::focused_float`/`Wm::set_focused_float`/
     /// `Wm::clear_focused_float`, which keep the two in sync.
     focused_float: Option<Win>,
@@ -360,13 +360,13 @@ pub struct Wm {
     /// Wall-clock moment `VolumeDown`/`VolumeUp` (index 0/1) last actually
     /// spawned a command, tracked separately per direction so a tap of one
     /// doesn't throttle an unrelated tap of the other. Unlike
-    /// `held_layout_keys`, volume repeats are meant to keep landing while the
+    /// `layout_key_state`, volume repeats are meant to keep landing while the
     /// key is held — it's a "resize by feel" action, not a discrete mutation
     /// — so a repeat isn't swallowed outright, just rate-limited: a
     /// `KeyPress` less than `VOLUME_SPAWN_INTERVAL` after this is skipped.
     /// That structural distinction doesn't apply here (there's nothing to
     /// "release back to fresh"), so this is the one place a wall-clock
-    /// heuristic is the right tool rather than the KeyRelease bookkeeping
+    /// heuristic is the right tool rather than the `KeyRelease` bookkeeping
     /// above.
     pub last_volume_spawn: [Option<std::time::Instant>; 2],
     /// Parent lookup for every node, rebuilt from one arena walk per
@@ -374,7 +374,7 @@ pub struct Wm {
     /// read this instead of paying `Tree::find_parent`'s full arena scan.
     pub parents: HashMap<NodeId, (NodeId, usize)>,
     /// Events drained while waiting for something specific (currently only
-    /// `Wm::fresh_timestamp`'s PropertyNotify); the main loop consumes these
+    /// `Wm::fresh_timestamp`'s `PropertyNotify`); the main loop consumes these
     /// before blocking for new ones, preserving their order.
     pub pending_events: Vec<x11rb::protocol::Event>,
     /// Stable insertion order of managed windows, for the bottom bar.
@@ -390,7 +390,7 @@ pub struct Wm {
     /// itself (no black flash while a shaped client moves over it).
     pub underlay_pix: Pixmap,
     /// Current size of `underlay_pix`; recreated by `compose` on mismatch
-    /// (RandR resize).
+    /// (`RandR` resize).
     pub underlay_pix_size: (u16, u16),
     /// Never-mapped window owning the ICCCM `WM_S<n>` manager selection for
     /// the whole process lifetime; a `SelectionClear` naming it means
@@ -404,7 +404,7 @@ pub struct Wm {
     pub running: bool,
     pub atoms: Atoms,
     /// Root geometry, cached at startup and refreshed by the root's own
-    /// `ConfigureNotify` (RandR resize) — `arrange` consults it several
+    /// `ConfigureNotify` (`RandR` resize) — `arrange` consults it several
     /// times per frame, so it must not cost a server round trip.
     pub workarea: Rect,
     /// `SPLITWM_WALLPAPER`, kept so a root resize can rescale the wallpaper.
@@ -631,8 +631,8 @@ impl Wm {
     /// the rest as disjoint — a method call for each would look like a
     /// whole-`self` borrow from the caller's side and collide with it; the
     /// small per-arrange `Vec` this allocates is the cost of that (`managed`
-    /// interleaves every kind, so there's no contiguous tiled-only slice to
-    /// borrow directly the way `clients` once was).
+    /// interleaves every kind, so there is no contiguous tiled-only slice
+    /// to borrow directly).
     pub(crate) fn taskbar_compute_parts(&mut self) -> TaskbarParts<'_> {
         let tiled = self
             .managed
@@ -694,6 +694,16 @@ impl Wm {
         })
     }
 
+    /// Read-only access to one float, if `win` is one — the float analogue
+    /// of `tiled_get`, for callers that need a field or two off a known
+    /// float without scanning `floats_iter` for it.
+    pub(crate) fn float_get(&self, win: Win) -> Option<&FloatWin> {
+        match self.managed.get(&win) {
+            Some(ManagedWindow::Float(f)) => Some(f),
+            _ => None,
+        }
+    }
+
     /// Mutable access to one float's fields in place, if `win` is one.
     /// Doesn't expose the map itself, so it can't be used to insert or
     /// remove an entry — `add_float`/`remove_float` are still the only way
@@ -750,6 +760,19 @@ impl Wm {
         let removed = self.take_managed(win, ManagedWindow::into_notification)?;
         self.foreign_order.retain(|&w| w != win);
         Some(removed)
+    }
+
+    /// Mutable `_NET_WM_ICON` freshness bookkeeping for `win`, whichever of
+    /// the two icon-carrying kinds it is. Tiled clients and floats run the
+    /// exact same fetch cooldown, just stored on their own payloads, so
+    /// `Wm::on_icon_change` throttles both through this one lookup instead
+    /// of dispatching on kind before it even knows a throttle applies.
+    pub(crate) fn icon_fresh_mut(&mut self, win: Win) -> Option<&mut IconFreshness> {
+        match self.managed.get_mut(&win) {
+            Some(ManagedWindow::Tiled(c)) => Some(&mut c.icon_fresh),
+            Some(ManagedWindow::Float(f)) => Some(&mut f.icon_fresh),
+            _ => None,
+        }
     }
 
     /// The docked window's payload, if one is currently docked — self-healing
@@ -899,7 +922,7 @@ pub fn clamp_dim(v: i32) -> u32 {
 /// `WM_NORMAL_HINTS` minimum (the split clips instead of handing the app
 /// geometry it can't honour). The single inset formula behind both
 /// `Wm::place_clients` (configuring) and `Wm::tracked_geometry` (answering
-/// denied ConfigureRequests), so the two can't drift apart.
+/// denied `ConfigureRequests`), so the two can't drift apart.
 pub fn client_rect_in_frame(r: FrameRect, (min_w, min_h): (i32, i32)) -> (i32, i32, i32, i32) {
     let (bw, tb) = (crate::theme::BORDER_LEFT, crate::theme::tb_h());
     (
@@ -937,7 +960,7 @@ mod tests {
 
     /// Sequences only ever increase, so a record numerically behind `seq`
     /// (within half the u16 space, per the wraparound comparison) can never
-    /// arrive as its own UnmapNotify and is pruned as stale even though it
+    /// arrive as its own `UnmapNotify` and is pruned as stale even though it
     /// isn't an exact match.
     #[test]
     fn stale_record_behind_current_seq_is_pruned_without_matching() {

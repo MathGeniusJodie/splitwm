@@ -573,7 +573,7 @@ impl Wm {
     /// Composite one interpolated animation frame (chrome only, no widgets).
     /// Only the chrome animates: client windows were configured once, at
     /// their final rect, by the arrange that started the animation — moving
-    /// them per frame delivered ~17 ConfigureNotifys per transition, and
+    /// them per frame delivered ~17 `ConfigureNotifys` per transition, and
     /// real apps re-layout and repaint on every one.
     fn anim_frame(&mut self, t: f32) -> R<()> {
         let Some(anim) = &self.anim else {

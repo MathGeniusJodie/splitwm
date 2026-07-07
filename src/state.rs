@@ -162,8 +162,7 @@ impl State {
 
     /// Put `c` into leaf `dst`, displacing the existing occupant to the stash.
     /// `c` is first detached from its previous home. The destination is
-    /// un-minimized: showing a window in a leaf means the user wants to see
-    /// it, and a minimized leaf's window is never mapped.
+    /// un-minimized by `Leaf::show`, which owns that invariant.
     pub fn assign_to_leaf(&mut self, c: Win, dst: NodeId) {
         if !self.tree.is_leaf(dst) {
             return;
@@ -217,11 +216,10 @@ impl State {
 
     /// Focus whatever split currently shows `c`, un-minimizing it —
     /// activation means the user (or a pager) wants the window visible, and
-    /// a minimized leaf's window is never mapped, so focusing one without
-    /// restoring it would target an unviewable window. Reports whether that
-    /// changed anything a redraw would show, so callers can skip animating a
-    /// transition that moves no rects (a plain refocus of an already-visible
-    /// window).
+    /// a minimized leaf can't hold focus (see `focused_client` for why).
+    /// Reports whether that changed anything a redraw would show, so callers
+    /// can skip animating a transition that moves no rects (a plain refocus
+    /// of an already-visible window).
     pub fn activate_client(&mut self, c: Win) -> Activation {
         let Some(lid) = self.tree.find_leaf_for_client(c) else {
             return Activation::NotFound;
@@ -241,7 +239,7 @@ impl State {
     /// Currently *shown* client of the focused leaf. A minimized leaf shows
     /// nothing — its window is unmapped, and handing it out as a focus
     /// target would mean `SetInputFocus` on an unviewable window (a
-    /// BadMatch) and a `_NET_ACTIVE_WINDOW` naming an invisible one.
+    /// `BadMatch`) and a `_NET_ACTIVE_WINDOW` naming an invisible one.
     pub fn focused_client(&self) -> Option<Win> {
         let l = self.tree.leaf(self.focused_leaf_valid())?;
         if l.minimized {
@@ -1252,7 +1250,7 @@ mod tests {
     /// Activating a client whose leaf is minimized must restore the leaf:
     /// its window is unmapped while minimized, so focusing without
     /// restoring would target an unviewable window (`SetInputFocus` on one
-    /// is a BadMatch). Assignment into a minimized leaf restores it too.
+    /// is a `BadMatch`). Assignment into a minimized leaf restores it too.
     #[test]
     fn activation_unminimizes_the_leaf() {
         let mut s = State::new();

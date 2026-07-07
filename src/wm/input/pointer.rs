@@ -253,7 +253,7 @@ impl Wm {
                     self.raise_notifications()?;
                 }
                 Some(WindowKind::Dock) => {
-                    // Outside the tree/`clients`, so `focus()` (which only
+                    // Outside the split tree, so `focus()` (which only
                     // knows tiled windows) can't take it; set input focus
                     // directly. The press's own timestamp, not CURRENT_TIME
                     // — same race `give_focus` guards against.

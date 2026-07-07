@@ -11,7 +11,7 @@ use super::Renderer;
 
 /// A loaded wallpaper together with the (path, w, h) it was produced from,
 /// so `Renderer::set_wallpaper` can recognise a repeat request (e.g. a
-/// same-size root ConfigureNotify) and skip the decode+dither pass.
+/// same-size root `ConfigureNotify`) and skip the decode+dither pass.
 pub(super) struct Wallpaper {
     pub(super) src: (String, i32, i32),
     pub(super) fb: Framebuffer,
@@ -20,7 +20,7 @@ pub(super) struct Wallpaper {
 impl Renderer {
     /// Load+scale a PNG wallpaper to cover `w`x`h`, quantized onto the na16
     /// palette. Returns whether it loaded. No-op when the same wallpaper is
-    /// already loaded at this size (e.g. a same-size root ConfigureNotify).
+    /// already loaded at this size (e.g. a same-size root `ConfigureNotify`).
     pub fn set_wallpaper(&mut self, path: &str, w: i32, h: i32) -> bool {
         let src = (path.to_string(), w, h);
         if self.wallpaper.as_ref().is_some_and(|wp| wp.src == src) {
@@ -151,7 +151,7 @@ impl Renderer {
         Some(indices)
     }
 
-    /// Decode a wallpaper image (any format ImageMagick reads) into RGBA
+    /// Decode a wallpaper image (any format `ImageMagick` reads) into RGBA
     /// pixels via `pixel_graphics::magick_decode_rgba`.
     fn decode_image(path: &str) -> Option<(usize, usize, Vec<Rgba>)> {
         // Widest wallpaper dimension worth keeping: caps the pixel buffer

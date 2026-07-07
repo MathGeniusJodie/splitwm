@@ -75,7 +75,12 @@ impl Wm {
         }
         // Deliberate focus movement returns the keyboard to the tree: it
         // must also clear a focused dialog's keyboard-target bookkeeping,
-        // or `commit_layout` would hand focus straight back to it.
+        // or `commit_layout` would hand focus straight back to it. Whether a
+        // dialog actually held the keyboard is remembered: taking it back is
+        // a real change even when the layout action itself is refused
+        // (Mod4+Tab with a single split), so the commit epilogue must still
+        // run to re-deliver focus in that case.
+        let mut focus_returned = false;
         if matches!(
             action,
             Action::FocusNext
@@ -85,6 +90,7 @@ impl Wm {
                 | Action::MoveWindowNext
                 | Action::MoveWindowPrev
         ) {
+            focus_returned = self.focused_float().is_some();
             self.clear_focused_float();
         }
         // Layout-changing actions get an animated transition.
@@ -107,11 +113,11 @@ impl Wm {
                     .copied()
             })
             .flatten();
-        // A refused mutation (root-leaf close, resize at its clamp, no
-        // adjacent split) cancels the queued animation: there is nothing to
-        // slide, and a no-op transition still costs 280 ms of frame-paced
-        // full-screen recomposites.
-        match action {
+        // Each arm reports whether it changed anything the commit epilogue
+        // below could act on; a refused mutation (root-leaf close, resize at
+        // its clamp, no adjacent split, empty stash) skips the epilogue
+        // entirely — see the gate after the match.
+        let changed = match action {
             // Volume keys auto-repeat while held, and nothing in the layout
             // changes: skip the commit epilogue rather than recomposite ~20
             // times a second for a held key.
@@ -138,31 +144,27 @@ impl Wm {
                 }
                 return Ok(());
             }
-            Action::SpawnTerminal => self.spawn_terminal(),
-            Action::SpawnLauncher => self.spawn(theme::LAUNCHER_CMD),
+            // Spawns change no layout state; the spawned window arrives
+            // later as its own MapRequest, which runs the full manage path.
+            Action::SpawnTerminal => {
+                self.spawn_terminal();
+                return Ok(());
+            }
+            Action::SpawnLauncher => {
+                self.spawn(theme::LAUNCHER_CMD);
+                return Ok(());
+            }
             Action::SplitH => self.try_split(Dir::H),
             Action::SplitV => self.try_split(Dir::V),
-            Action::Close => self.animate &= self.state.close_focused(),
-            Action::FocusNext => {
-                self.state.focus_direction(true);
-            }
-            Action::FocusPrev => {
-                self.state.focus_direction(false);
-            }
-            Action::StashNext => {
-                self.state.cycle_stash(true);
-            }
-            Action::StashPrev => {
-                self.state.cycle_stash(false);
-            }
-            Action::MoveWindowNext => {
-                self.animate &= self.state.move_window_to_direction(true).is_some();
-            }
-            Action::MoveWindowPrev => {
-                self.animate &= self.state.move_window_to_direction(false).is_some();
-            }
-            Action::Grow => self.animate &= self.state.resize_focused(theme::RESIZE_STEP),
-            Action::Shrink => self.animate &= self.state.resize_focused(-theme::RESIZE_STEP),
+            Action::Close => self.state.close_focused(),
+            Action::FocusNext => self.state.focus_direction(true),
+            Action::FocusPrev => self.state.focus_direction(false),
+            Action::StashNext => self.state.cycle_stash(true).is_some(),
+            Action::StashPrev => self.state.cycle_stash(false).is_some(),
+            Action::MoveWindowNext => self.state.move_window_to_direction(true).is_some(),
+            Action::MoveWindowPrev => self.state.move_window_to_direction(false).is_some(),
+            Action::Grow => self.state.resize_focused(theme::RESIZE_STEP),
+            Action::Shrink => self.state.resize_focused(-theme::RESIZE_STEP),
             Action::CloseWindow => {
                 // The fullscreen window covers everything, so it's the one
                 // the user means regardless of where tree focus sits; then a
@@ -182,7 +184,22 @@ impl Wm {
                 // returns without committing for the same reason.)
                 return Ok(());
             }
+        };
+        // A refused mutation leaves nothing for the commit epilogue to
+        // arrange, animate, or refocus — and refusals are hot: resize keys
+        // deliberately autorepeat, so holding Grow with the neighbour at its
+        // clamp would otherwise recomposite the full screen ~20 times a
+        // second for a no-op. The one exception is a focus action that took
+        // the keyboard back from a dialog (`focus_returned`): the layout
+        // didn't move, but focus must still be re-delivered to the tree.
+        // `animate` can't simply be left set on either path: `arrange`
+        // consumes it, so a leaked flag would animate the next unrelated
+        // arrange.
+        if !changed && !focus_returned {
+            self.animate = false;
+            return Ok(());
         }
+        self.animate &= changed;
         if let Some(rect) = pre_split {
             self.prev_frame_rect
                 .insert(self.state.focused_leaf_valid(), rect);
@@ -220,15 +237,12 @@ impl Wm {
         key_is_repeating(&mut self.layout_key_state, detail, time)
     }
 
-    /// Split the focused leaf in `dir` if it's eligible; otherwise cancel
-    /// the animation queued for the action. `can_split_focused` screens out
-    /// frames too small for the direction (whose windows would overhang and
-    /// paint over neighbours); `State::split_focused` itself refuses a
-    /// minimized leaf, so its `false` return also cancels the animation here.
-    fn try_split(&mut self, dir: Dir) {
-        if !self.can_split_focused(dir) || !self.state.split_focused(dir) {
-            self.animate = false;
-        }
+    /// Split the focused leaf in `dir` if it's eligible; whether it
+    /// happened. `can_split_focused` screens out frames too small for the
+    /// direction (whose windows would overhang and paint over neighbours);
+    /// `State::split_focused` itself refuses a minimized leaf.
+    fn try_split(&mut self, dir: Dir) -> bool {
+        self.can_split_focused(dir) && self.state.split_focused(dir)
     }
 
     /// Whether the focused leaf's frame is big enough to split in `dir` (the
@@ -332,19 +346,16 @@ impl Wm {
 /// out of `Wm::key_is_repeating` since the logic is pure `Vec` bookkeeping
 /// with no need for `self`.
 fn key_is_repeating(state: &mut Vec<(u8, KeyRepeatState)>, detail: u8, time: u32) -> bool {
-    match state.iter_mut().find(|(kc, _)| *kc == detail) {
-        Some((_, s)) => {
-            let repeating = match *s {
-                KeyRepeatState::Held => true,
-                KeyRepeatState::ReleasedAt(t) => t == time,
-            };
-            *s = KeyRepeatState::Held;
-            repeating
-        }
-        None => {
-            state.push((detail, KeyRepeatState::Held));
-            false
-        }
+    if let Some((_, s)) = state.iter_mut().find(|(kc, _)| *kc == detail) {
+        let repeating = match *s {
+            KeyRepeatState::Held => true,
+            KeyRepeatState::ReleasedAt(t) => t == time,
+        };
+        *s = KeyRepeatState::Held;
+        repeating
+    } else {
+        state.push((detail, KeyRepeatState::Held));
+        false
     }
 }
 

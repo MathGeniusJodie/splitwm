@@ -1,19 +1,20 @@
 //! OKLab/OKLCH <-> sRGB conversions (Björn Ottosson's matrices), and the
 //! palette wrapper that snaps colours perceptually (Euclidean distance in
-//! OKLab rather than raw sRGB component distance).
+//! `OKLab` rather than raw sRGB component distance).
 //!
 //! Also hosts the OKLCH hue rotation used on app icon bitmaps for same-app
-//! window disambiguation (`theme::icon_hue_rotation`, `Wm::icon_hue`) — a
-//! real per-pixel hue shift of the icon's own colors, not a swatch/overlay.
+//! window disambiguation (`theme::icon_hue_rotation`,
+//! `Wm::refresh_icon_rotations`) — a real per-pixel hue shift of the icon's
+//! own colors, not a swatch/overlay.
 
 use pixel_graphics::{Palette, Rgb};
 
 use crate::Index;
 
-/// A colour in OKLab: `[L, a, b]`.
+/// A colour in `OKLab`: `[L, a, b]`.
 type Oklab = [f32; 3];
 
-/// A palette paired with its entries' precomputed OKLab coordinates, so
+/// A palette paired with its entries' precomputed `OKLab` coordinates, so
 /// `nearest_index` matches perceptually without re-converting 16 palette
 /// colours on every one of the millions of pixels a wallpaper dither snaps.
 pub struct OklabPalette {
@@ -29,7 +30,7 @@ impl OklabPalette {
         Self { palette, oklab }
     }
 
-    /// The palette index whose colour is perceptually closest (OKLab
+    /// The palette index whose colour is perceptually closest (`OKLab`
     /// Euclidean distance) to `color`.
     pub fn nearest_index(&self, color: Rgb) -> Index {
         let want = srgb8_to_oklab(color);
@@ -93,7 +94,7 @@ fn oklab_to_linear(lab: Oklab) -> (f32, f32, f32) {
     )
 }
 
-/// An 8-bit sRGB colour in OKLab. Goes through a per-byte linearisation
+/// An 8-bit sRGB colour in `OKLab`. Goes through a per-byte linearisation
 /// table because this runs per pixel when dithering full-screen images —
 /// three `powf(2.4)` calls per pixel would dominate that loop.
 fn srgb8_to_oklab(c: Rgb) -> Oklab {

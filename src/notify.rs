@@ -5,8 +5,8 @@
 //!
 //! Runs on its own thread (libdbus is blocking); talks to the WM thread over
 //! an mpsc channel and wakes its X event loop by sending a `SPLITWM_NOTE`
-//! ClientMessage to the root window (delivered to us via the
-//! SUBSTRUCTURE_REDIRECT selection only a WM holds). The WM reports
+//! `ClientMessage` to the root window (delivered to us via the
+//! `SUBSTRUCTURE_REDIRECT` selection only a WM holds). The WM reports
 //! user-dismissed popups back over a second channel so the
 //! `NotificationClosed` signal can be emitted from the thread that owns the
 //! bus connection.
@@ -177,7 +177,7 @@ struct Outstanding {
     /// guessing its (small, sequential) id. Keying by unique name means an
     /// app that drops off the bus and reconnects cannot replace its own
     /// still-live notification; accepted, since matching on well-known
-    /// names or app_name would reopen the spoofing hole.
+    /// names or `app_name` would reopen the spoofing hole.
     owner: String,
     /// When the note auto-closes; `None` never expires (timeout 0, or
     /// critical urgency per spec).
@@ -582,7 +582,7 @@ fn decode_entities(s: &str) -> String {
                 .iter()
                 .take(MAX_ENTITY_LEN - 1)
                 .position(|&b| b == b';');
-            if let Some((e, ch)) = semi.and_then(|e| entity_char(&rest[1..1 + e]).map(|ch| (e, ch)))
+            if let Some((e, ch)) = semi.and_then(|e| entity_char(&rest[1..=e]).map(|ch| (e, ch)))
             {
                 out.push(ch);
                 i += 1 + e + 1;

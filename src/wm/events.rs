@@ -19,7 +19,7 @@ impl Wm {
     // --- event dispatch ---
 
     /// Record `t` as the last real server timestamp seen, for ICCCM focus
-    /// handoffs (`Wm::give_focus` wants a real time, not CURRENT_TIME).
+    /// handoffs (`Wm::give_focus` wants a real time, not `CURRENT_TIME`).
     /// `last_event_instant` records the harvest so `give_focus` can tell
     /// when even this has gone stale.
     fn harvest_time(&mut self, t: u32) {
@@ -313,25 +313,22 @@ impl Wm {
     }
 
     /// Echo a managed window's current geometry back as a synthetic
-    /// ConfigureNotify (ICCCM 4.1.5, for denied ConfigureRequests).
+    /// `ConfigureNotify` (ICCCM 4.1.5, for denied `ConfigureRequests`).
     /// Answered from our own tracked geometry when we have it — some
-    /// toolkits fight a tiler with a stream of ConfigureRequests, and a
+    /// toolkits fight a tiler with a stream of `ConfigureRequests`, and a
     /// `GetGeometry` round trip per denial stalls the event loop — falling
     /// back to `GetGeometry` only for windows whose geometry we don't track
     /// (hidden/stashed clients). The window is a root child, so both
     /// sources are root-relative, as the synthetic event requires.
     fn send_synthetic_configure(&self, win: u32) -> R<()> {
-        let (x, y, w, h) = match self.tracked_geometry(win) {
-            Some(g) => g,
-            None => {
-                let g = self.conn.get_geometry(win)?.reply()?;
-                (
-                    i32::from(g.x),
-                    i32::from(g.y),
-                    i32::from(g.width),
-                    i32::from(g.height),
-                )
-            }
+        let (x, y, w, h) = if let Some(g) = self.tracked_geometry(win) { g } else {
+            let g = self.conn.get_geometry(win)?.reply()?;
+            (
+                i32::from(g.x),
+                i32::from(g.y),
+                i32::from(g.width),
+                i32::from(g.height),
+            )
         };
         let ev = ConfigureNotifyEvent {
             response_type: x11rb::protocol::xproto::CONFIGURE_NOTIFY_EVENT,
@@ -371,11 +368,11 @@ impl Wm {
             return Some((full.x, full.y, full.w.max(1), full.h.max(1)));
         }
         // Floats: `f.x`/`f.y` are the client window's root coordinates (the
-        // frame is a sibling underneath, not a reparent). Falls through to
-        // the tiled-tree lookup below rather than returning `None` outright
-        // if `win` isn't actually in `floats` (a `kind_of`/`floats` desync).
+        // frame is a sibling underneath, not a reparent). `kind_of` and
+        // `float_get` read the same `managed` entry, so a `Float` kind
+        // always resolves here.
         if kind == Some(WindowKind::Float) {
-            if let Some(f) = self.floats_iter().find(|f| f.win == win) {
+            if let Some(f) = self.float_get(win) {
                 return Some((f.x, f.y, f.w.max(1), f.h.max(1)));
             }
         }
@@ -505,7 +502,7 @@ impl Wm {
     /// Bring a managed tiled window into view and focus it: into its split
     /// if it has one, otherwise into the focused split. The shared policy
     /// behind `_NET_ACTIVE_WINDOW` activation and ICCCM deiconify
-    /// MapRequests. It takes focus, so a focused dialog yields the keyboard.
+    /// `MapRequests`. It takes focus, so a focused dialog yields the keyboard.
     /// `animate` requests a transition, but only when rects actually moved
     /// (a taskbar-tile click skips it for a window already shown and
     /// focused); it must be set before `commit_layout` runs `arrange`, which
@@ -528,7 +525,7 @@ impl Wm {
         self.commit_layout()
     }
 
-    /// `_NET_ACTIVE_WINDOW` ClientMessage: bring the window into view and
+    /// `_NET_ACTIVE_WINDOW` `ClientMessage`: bring the window into view and
     /// focus it (see `bring_into_layout`); floats just take focus.
     fn on_activate_request(&mut self, win: u32) -> R<()> {
         match self.kind_of(win) {
@@ -638,7 +635,7 @@ impl Wm {
 }
 
 /// Contain a non-fatal error (logged, tagged with `what`) so surrounding
-/// work still runs: aborting an event batch can drop a queued ButtonRelease
+/// work still runs: aborting an event batch can drop a queued `ButtonRelease`
 /// and leave a drag armed with no button held (hover motion then keeps
 /// resizing a boundary). Fatal (connection) errors still propagate — the
 /// loop must exit on those.
