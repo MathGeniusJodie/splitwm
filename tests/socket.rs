@@ -68,13 +68,37 @@ impl Wm {
         }
     }
 
-    /// Dispatch a bound chord through the debug channel and wait for its
-    /// ack, so the action has run (not merely been sent) on return.
+    /// Send a debug-channel command and wait for its ack, so the action
+    /// has run (not merely been sent) on return. Skips announcement lines
+    /// (`DISPLAY=…` arrives whenever XWayland gets ready).
+    fn cmd(&mut self, line: &str) {
+        writeln!(self.stdin, "{line}").expect("write debug channel");
+        loop {
+            let mut ack = String::new();
+            let n = self.stdout.read_line(&mut ack).expect("read ack");
+            assert!(n > 0, "compositor exited awaiting ack for: {line}");
+            if ack.starts_with("ok ") || ack.starts_with("err ") {
+                assert_eq!(ack.trim(), format!("ok {line}"));
+                return;
+            }
+        }
+    }
+
+    /// Block until the compositor announces its XWayland DISPLAY — X11
+    /// clients launched earlier would race the server's startup.
+    fn await_xwayland(&mut self) {
+        loop {
+            let mut line = String::new();
+            let n = self.stdout.read_line(&mut line).expect("read stdout");
+            assert!(n > 0, "compositor exited before XWayland became ready");
+            if line.starts_with("DISPLAY=") {
+                return;
+            }
+        }
+    }
+
     fn key(&mut self, chord: &str) {
-        writeln!(self.stdin, "key {chord}").expect("write debug channel");
-        let mut ack = String::new();
-        self.stdout.read_line(&mut ack).expect("read ack");
-        assert_eq!(ack.trim(), format!("ok key {chord}"));
+        self.cmd(&format!("key {chord}"));
     }
 }
 
@@ -401,6 +425,44 @@ fn socket_lifecycle() {
     s.wm.key("super+Left");
     s.wait_until("focus moves back to w2", |app| {
         app.wins[b].activated && app.focus_is(b)
+    });
+}
+
+#[test]
+fn override_redirect_keyboard_focus() {
+    // The launcher path: rofi runs under XWayland as an override-redirect
+    // window, holds the keyboard while mapped, and — after a click stole
+    // the focus — gets it back by being clicked. Observed from the tiled
+    // client's side as keyboard leave/enter/leave.
+    let mut s = Session::boot();
+    let a = s.open_window();
+    s.wait_until("client holds the keyboard", |app| app.focus_is(a));
+
+    // Launched like LAUNCHER_CMD (WAYLAND_DISPLAY scrubbed, so rofi runs
+    // under XWayland), but with a private pidfile: rofi's default is one
+    // global instance per user, and the test must neither block nor be
+    // blocked by a launcher on the live session.
+    s.wm.await_xwayland();
+    s.wm.cmd(&format!(
+        "spawn env -u WAYLAND_DISPLAY rofi -show drun -pid /tmp/splitwm-test-rofi-{}.pid",
+        std::process::id()
+    ));
+    s.wait_until("rofi maps and takes the keyboard", |app| {
+        app.focused.is_none()
+    });
+
+    // Rofi centers on the 1280x800 output; a corner click misses it and
+    // click-to-focus returns the keyboard to the tiled client.
+    s.wm.cmd("click 40 40");
+    s.wait_until("click on the client takes the keyboard back", |app| {
+        app.focus_is(a)
+    });
+
+    // Clicking rofi must re-grant it the keyboard (its X-side grab is
+    // dead while XWayland doesn't hold our focus).
+    s.wm.cmd("click 640 400");
+    s.wait_until("click on rofi returns it the keyboard", |app| {
+        app.focused.is_none()
     });
 }
 

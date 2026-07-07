@@ -64,6 +64,12 @@ impl Backend {
 /// The backend-independent tail of a session: XWayland, the launch probe,
 /// exporting the socket, and parking in the event loop until SIGTERM.
 fn run(mut event_loop: smithay::reexports::calloop::EventLoop<'static, Comp>, mut comp: Comp) {
+    // A nested session inherited the host's DISPLAY (the winit backend
+    // needed it; it's connected by now). Drop it so a child spawned before
+    // XWayland reports Ready can't open windows on the host's X server —
+    // X11-pinned children must reach our XWayland or nothing.
+    std::env::remove_var("DISPLAY");
+
     // X11 clients (rofi, legacy apps) arrive via XWayland; DISPLAY is set
     // once the server reports Ready.
     comp.start_xwayland();

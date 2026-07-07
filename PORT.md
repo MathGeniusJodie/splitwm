@@ -106,8 +106,16 @@ this port must reproduce unless a deviation is listed below.
       o-r keyboard focus granted at map time, before XWayland
       associates the wl_surface, so rofi typed into nothing (now
       granted in surface_associated); clicks on o-r surfaces falling
-      through to the chrome hit-test. Rofi input+centering re-verified
-      nested; VT re-test pending. Gaps: named cursor shapes
+      through to the chrome hit-test. From Jodie's VT re-test (2026-07-07),
+      fixed and harness-verified: o-r windows rendered at a stale rect
+      (smithay's XWM drops the pre-map ConfigureNotify of a window that
+      gains the o-r flag after creation — rofi — so its geometry stayed at
+      the creation rect; the true rect is now fetched over a dedicated X11
+      query connection at map and tracked via configure_notify), and
+      clicking an o-r window now re-grants it the keyboard after a click
+      elsewhere stole it (its X-side grab is dead while XWayland doesn't
+      hold our focus). VT re-verify of both still pending. Gaps: named
+      cursor shapes
       beyond the arrow (hover feedback still absent, see M5); output
       name fixed at startup even if the connector swaps; mode changes on
       an unchanged connector ignored; libinput devices run defaults
@@ -123,9 +131,9 @@ this port must reproduce unless a deviation is listed below.
       `drive.sh` (reborn, invisible — no Xephyr) walks the old X11 drive
       sequence and screenshots 12 steps into /tmp/splitshots. Verified:
       both feature sets green, drive shots eyeballed (content-sampled
-      accent, icon hue rotation, canvas pan). Gaps: no pointer injection
-      (chrome clicks/drags/hover ride manual nested runs), no XWayland
-      client in the socket tests, output size fixed.
+      accent, icon hue rotation, canvas pan). Gaps: pointer injection
+      stops at motion + left click (drags and hover feedback still ride
+      manual nested runs), output size fixed.
 
 ## Architecture (new src/)
 
@@ -187,9 +195,13 @@ Mapping notes vs X11:
   instead of squatting a refusal bubble in every shot.
 - Debug channel protocol (stdin, `SPLITWM_DEBUG_CHANNEL=1`, any
   backend): `key <chord>` resolves through the same `binding_action`
-  table as the keyboard; `spawn <cmd>`; `scroll <clicks>`; `shot <path>`
-  (headless only). Every command acks on stdout — drivers synchronize on
-  acks, not sleeps.
+  table as the keyboard; `spawn <cmd>`; `motion <x> <y>` and
+  `click <x> <y>` drive the real pointer paths; `scroll <clicks>`;
+  `shot <path>` (headless only). Every command acks on stdout — drivers
+  synchronize on acks, not sleeps. Startup announces `WAYLAND_DISPLAY=`
+  and, once XWayland is up, `DISPLAY=` on stdout; wait for the latter
+  before spawning X11 clients (an early spawn used to inherit the *host's*
+  DISPLAY in nested runs — the session now scrubs it until Ready).
 - Real VT (tty backend): `./vttest.sh` from a VT login builds with the
   `tty` feature, scrubs leaked `DISPLAY` vars, and takes the seat;
   `./vttest.sh kill` from X ends it by recorded pid (never pkill — the

@@ -125,86 +125,7 @@ impl Comp {
                 self.pointer_moved(pos, event.time_msec());
             }
             InputEvent::PointerButton { event } => {
-                const BTN_LEFT: u32 = 0x110;
-                const BTN_RIGHT: u32 = 0x111;
-                let pointer = self.seat.get_pointer().expect("seat has a pointer");
-                let serial = SERIAL_COUNTER.next_serial();
-                let pos = pointer.current_location();
-
-                let mut consumed = false;
-                if event.state() == ButtonState::Released {
-                    self.end_drag();
-                    // The release of a press we consumed must not leak to a
-                    // client that never saw the press.
-                    consumed = std::mem::take(&mut self.chrome_press);
-                } else if !pointer.is_grabbed() {
-                    // Any click on a notification bubble dismisses it,
-                    // before everything else (they render topmost).
-                    if self.dismiss_note_at(pos) {
-                        self.chrome_press = true;
-                        consumed = true;
-                    } else
-                    // Float chrome frames overlap client surfaces beneath
-                    // them; they win the press outright.
-                    if event.button_code() == BTN_LEFT && self.float_frame_at(pos).is_some()
-                    {
-                        self.on_chrome_button(pos, false);
-                        self.chrome_press = true;
-                        consumed = true;
-                    } else {
-                        let under = self.surface_under(pos);
-                        // A surface that maps to no managed window is an
-                        // override-redirect X11 window (rofi): the click
-                        // must forward to it, not hit-test the chrome
-                        // underneath.
-                        let over_unmanaged = under.is_some();
-                        let clicked = under.and_then(|(s, _)| self.managed.win_for_surface(&s));
-                        match clicked {
-                            Some(win) if event.button_code() == BTN_LEFT => {
-                                match self.managed.kind_of(win) {
-                                    // Click-to-focus through the layout, like
-                                    // master's activate_client.
-                                    Some(crate::shell::Kind::Tiled) => {
-                                        self.clear_focused_float();
-                                        self.state.activate_client(win);
-                                        self.arrange();
-                                    }
-                                    Some(crate::shell::Kind::Float(_)) => self.focus_float(win),
-                                    // The dock holds the keyboard until the next
-                                    // deliberate focus move.
-                                    Some(crate::shell::Kind::Dock(_)) => self.focus_override(win),
-                                    None => {}
-                                }
-                            }
-                            Some(_) => {}
-                            // Chrome click: hit-test dispatch (buttons, tiles,
-                            // handles, "+", titles, float frames...). Only
-                            // where no surface is under the pointer at all.
-                            None if !over_unmanaged
-                                && matches!(event.button_code(), BTN_LEFT | BTN_RIGHT) =>
-                            {
-                                if self.on_chrome_button(pos, event.button_code() == BTN_RIGHT) {
-                                    self.chrome_press = true;
-                                    consumed = true;
-                                }
-                            }
-                            None => {}
-                        }
-                    }
-                }
-
-                if !consumed {
-                    pointer.button(
-                        self,
-                        &ButtonEvent {
-                            button: event.button_code(),
-                            state: event.state(),
-                            serial,
-                            time: event.time_msec(),
-                        },
-                    );
-                    pointer.frame(self);
-                }
+                self.pointer_button(event.button_code(), event.state(), event.time_msec());
             }
             InputEvent::PointerAxis { event } => {
                 let pointer = self.seat.get_pointer().expect("seat has a pointer");
@@ -263,9 +184,109 @@ impl Comp {
         }
     }
 
+    /// A pointer button at the current pointer position: chrome hit-tests,
+    /// click-to-focus, and forwarding. One path for every source — winit,
+    /// libinput, and the harness's debug channel.
+    pub fn pointer_button(&mut self, button: u32, state: ButtonState, time_msec: u32) {
+        const BTN_LEFT: u32 = 0x110;
+        const BTN_RIGHT: u32 = 0x111;
+        let pointer = self.seat.get_pointer().expect("seat has a pointer");
+        let serial = SERIAL_COUNTER.next_serial();
+        let pos = pointer.current_location();
+
+        let mut consumed = false;
+        if state == ButtonState::Released {
+            self.end_drag();
+            // The release of a press we consumed must not leak to a
+            // client that never saw the press.
+            consumed = std::mem::take(&mut self.chrome_press);
+        } else if !pointer.is_grabbed() {
+            // Any click on a notification bubble dismisses it,
+            // before everything else (they render topmost).
+            if self.dismiss_note_at(pos) {
+                self.chrome_press = true;
+                consumed = true;
+            } else
+            // Float chrome frames overlap client surfaces beneath
+            // them; they win the press outright.
+            if button == BTN_LEFT && self.float_frame_at(pos).is_some() {
+                self.on_chrome_button(pos, false);
+                self.chrome_press = true;
+                consumed = true;
+            } else {
+                let under = self.surface_under(pos).map(|(s, _)| s);
+                // A surface that maps to no managed window is an
+                // override-redirect X11 window (rofi): the click
+                // must forward to it, not hit-test the chrome
+                // underneath.
+                let over_unmanaged = under.is_some();
+                let clicked = under
+                    .as_ref()
+                    .and_then(|s| self.managed.win_for_surface(s));
+                match clicked {
+                    Some(win) if button == BTN_LEFT => {
+                        match self.managed.kind_of(win) {
+                            // Click-to-focus through the layout, like
+                            // master's activate_client.
+                            Some(crate::shell::Kind::Tiled) => {
+                                self.clear_focused_float();
+                                self.state.activate_client(win);
+                                self.arrange();
+                            }
+                            Some(crate::shell::Kind::Float(_)) => self.focus_float(win),
+                            // The dock holds the keyboard until the next
+                            // deliberate focus move.
+                            Some(crate::shell::Kind::Dock(_)) => self.focus_override(win),
+                            None => {}
+                        }
+                    }
+                    Some(_) => {}
+                    // Chrome click: hit-test dispatch (buttons, tiles,
+                    // handles, "+", titles, float frames...). Only
+                    // where no surface is under the pointer at all.
+                    None if !over_unmanaged && matches!(button, BTN_LEFT | BTN_RIGHT) => {
+                        if self.on_chrome_button(pos, button == BTN_RIGHT) {
+                            self.chrome_press = true;
+                            consumed = true;
+                        }
+                    }
+                    // Click on an o-r window: re-grant it the keyboard
+                    // before forwarding the button — its X-side grab only
+                    // works while XWayland holds our focus, and a click
+                    // elsewhere may have moved the focus off it.
+                    None => {
+                        if let Some(s) = under.as_ref().filter(|s| {
+                            self.or_windows
+                                .iter()
+                                .any(|o| o.surface.wl_surface().as_ref() == Some(s))
+                        }) {
+                            let keyboard =
+                                self.seat.get_keyboard().expect("seat has a keyboard");
+                            keyboard.set_focus(self, Some(s.clone()), serial);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !consumed {
+            pointer.button(
+                self,
+                &ButtonEvent {
+                    button,
+                    state,
+                    serial,
+                    time: time_msec,
+                },
+            );
+            pointer.frame(self);
+        }
+    }
+
     /// Deliver a pointer position to the seat, shared by the absolute
-    /// (winit) and relative (libinput) motion paths.
-    fn pointer_moved(&mut self, pos: Point<f64, Logical>, time_msec: u32) {
+    /// (winit) and relative (libinput) motion paths — and the harness's
+    /// debug channel.
+    pub fn pointer_moved(&mut self, pos: Point<f64, Logical>, time_msec: u32) {
         let serial = SERIAL_COUNTER.next_serial();
         // An active gap/edge drag consumes motion: the pointer still moves
         // (for the drag math) but no client gets enter/motion until the

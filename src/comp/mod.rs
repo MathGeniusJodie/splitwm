@@ -151,7 +151,10 @@ pub struct Comp {
     // XWayland: the WM connection (once Ready) and unmanaged
     // override-redirect windows (rofi, menus), topmost last.
     pub xwm: Option<smithay::xwayland::X11Wm>,
-    pub or_windows: Vec<smithay::xwayland::X11Surface>,
+    pub or_windows: Vec<xwayland::OrWindow>,
+    /// Plain X11 client connection for queries the WM connection doesn't
+    /// expose (o-r geometry at map, see `xwayland::OrWindow`).
+    pub x11_query: Option<smithay::reexports::x11rb::rust_connection::RustConnection>,
     pub xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
 
     // Protocol globals.
@@ -330,6 +333,7 @@ impl Comp {
             note_dismiss_tx,
             xwm: None,
             or_windows: Vec::new(),
+            x11_query: None,
             xwayland_shell_state,
             compositor_state,
             xdg_shell_state,
@@ -761,7 +765,7 @@ impl Comp {
             });
         }
         for or in &self.or_windows {
-            if let Some(surface) = or.wl_surface() {
+            if let Some(surface) = or.surface.wl_surface() {
                 smithay::desktop::utils::send_frames_surface_tree(
                     &surface,
                     &output,

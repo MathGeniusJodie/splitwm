@@ -37,7 +37,7 @@ render_elements! {
 /// hand the scene to a backend while that backend is itself mutably
 /// borrowed out of `Comp`.
 pub struct Scene<'a> {
-    pub or_windows: &'a [smithay::xwayland::X11Surface],
+    pub or_windows: &'a [crate::comp::xwayland::OrWindow],
     pub note_popups: &'a [super::notifications::NotePopup],
     pub note_rects: &'a [(u32, crate::widgets::FrameRect)],
     pub float_stack: &'a [crate::tree::Win],
@@ -58,10 +58,10 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
 
     let mut elements: Vec<OutputElement> = Vec::new();
     for or in scene.or_windows.iter().rev() {
-        let Some(surface) = or.wl_surface() else {
+        let Some(surface) = or.surface.wl_surface() else {
             continue;
         };
-        let loc = or.geometry().loc.to_physical(1);
+        let loc = or.rect.loc.to_physical(1);
         elements.extend(
             smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
                 renderer,

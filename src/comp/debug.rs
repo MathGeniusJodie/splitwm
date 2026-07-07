@@ -11,6 +11,10 @@
 //!   chords exist here (there is nothing to forward a plain key *to*).
 //! - `spawn <cmd>` — launch a client the way quick-launch would, for
 //!   drives that need something other than `$TERMINAL`.
+//! - `motion <x> <y>` — move the pointer, with enter/leave and hit
+//!   tracking as if the mouse moved there.
+//! - `click <x> <y>` — motion there, then a full left press+release
+//!   through the same dispatch as a real button.
 //! - `scroll <clicks>` — pan the canvas by wheel clicks (the Mod4+wheel
 //!   path), positive scrolls right.
 //! - `shot <path>` — write the next composited frame to `path`
@@ -18,9 +22,11 @@
 
 use std::io::Read as _;
 
+use smithay::backend::input::ButtonState;
 use smithay::input::keyboard::{xkb, ModifiersState};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
+use smithay::utils::{Logical, Point};
 
 use super::Comp;
 
@@ -72,6 +78,24 @@ fn command(comp: &mut Comp, line: &str) {
             crate::launch::spawn(cmd);
             println!("ok spawn {cmd}");
         }
+        Some(("motion", xy)) => match parse_xy(xy) {
+            Some(pos) => {
+                comp.pointer_moved(pos, comp.start.elapsed().as_millis() as u32);
+                println!("ok motion {xy}");
+            }
+            None => println!("err motion {xy}: want <x> <y>"),
+        },
+        Some(("click", xy)) => match parse_xy(xy) {
+            Some(pos) => {
+                const BTN_LEFT: u32 = 0x110;
+                let time = comp.start.elapsed().as_millis() as u32;
+                comp.pointer_moved(pos, time);
+                comp.pointer_button(BTN_LEFT, ButtonState::Pressed, time);
+                comp.pointer_button(BTN_LEFT, ButtonState::Released, time);
+                println!("ok click {xy}");
+            }
+            None => println!("err click {xy}: want <x> <y>"),
+        },
         Some(("scroll", clicks)) => match clicks.parse::<f64>() {
             Ok(clicks) => {
                 comp.apply_hscroll(clicks);
@@ -88,6 +112,11 @@ fn command(comp: &mut Comp, line: &str) {
         }
         _ => println!("err {line}: unknown command"),
     }
+}
+
+fn parse_xy(xy: &str) -> Option<Point<f64, Logical>> {
+    let (x, y) = xy.split_once(' ')?;
+    Some((x.trim().parse::<f64>().ok()?, y.trim().parse::<f64>().ok()?).into())
 }
 
 /// Resolve `super+shift+c`-style chords against `theme::BINDINGS`, through

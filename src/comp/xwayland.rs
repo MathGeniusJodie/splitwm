@@ -17,6 +17,18 @@ use smithay::{
 use super::Comp;
 use crate::shell::Kind;
 
+/// A mapped override-redirect X11 window (rofi, menus) with its true
+/// root-relative geometry. `X11Surface::geometry()` cannot be trusted for
+/// these: a client that gains the override-redirect flag after creation
+/// (rofi does) has its pre-map ConfigureNotify dropped by smithay's XWM,
+/// which leaves the cached geometry at the creation rect. `rect` is
+/// fetched from the X server at map time and tracked through
+/// `configure_notify` afterwards.
+pub struct OrWindow {
+    pub surface: X11Surface,
+    pub rect: Rectangle<i32, Logical>,
+}
+
 impl Comp {
     /// Spawn the XWayland server; the WM connection arrives via the Ready
     /// event once it is up. `DISPLAY` is set then, so children spawned by
@@ -52,6 +64,20 @@ impl Comp {
                         }
                     }
                     std::env::set_var("DISPLAY", format!(":{display_number}"));
+                    // Announced like WAYLAND_DISPLAY at startup: harness
+                    // drivers synchronize on this before launching X11
+                    // clients.
+                    println!("DISPLAY=:{display_number}");
+                    // A plain client connection for queries the WM
+                    // connection doesn't expose (o-r geometry at map time,
+                    // see OrWindow). Local Xwayland: roundtrips are cheap
+                    // and only happen per o-r map.
+                    match smithay::reexports::x11rb::rust_connection::RustConnection::connect(
+                        Some(&format!(":{display_number}")),
+                    ) {
+                        Ok((conn, _)) => comp.x11_query = Some(conn),
+                        Err(err) => tracing::warn!("x11 query connection failed: {err}"),
+                    }
                     tracing::info!("XWayland ready on DISPLAY=:{display_number}");
                 }
                 XWaylandEvent::Error => {
@@ -69,7 +95,7 @@ impl Comp {
         if let Some(idx) = self
             .or_windows
             .iter()
-            .position(|s| s.window_id() == surface.window_id())
+            .position(|o| o.surface.window_id() == surface.window_id())
         {
             self.or_windows.remove(idx);
             self.refocus();
@@ -120,7 +146,7 @@ impl XWaylandShellHandler for Comp {
         if self
             .or_windows
             .iter()
-            .any(|s| s.window_id() == window.window_id())
+            .any(|o| o.surface.window_id() == window.window_id())
         {
             let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
@@ -151,7 +177,24 @@ impl smithay::xwayland::XwmHandler for Comp {
     /// mapped (rofi grabs the keyboard X11-side, but that grab only works
     /// while XWayland holds our keyboard focus).
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
-        self.or_windows.push(window.clone());
+        // The one place the cached geometry may be stale (see OrWindow):
+        // ask the server where the window really is.
+        let rect = self
+            .x11_query
+            .as_ref()
+            .and_then(|conn| {
+                use smithay::reexports::x11rb::protocol::xproto::ConnectionExt as _;
+                let geo = conn.get_geometry(window.window_id()).ok()?.reply().ok()?;
+                Some(Rectangle::new(
+                    (i32::from(geo.x), i32::from(geo.y)).into(),
+                    (i32::from(geo.width), i32::from(geo.height)).into(),
+                ))
+            })
+            .unwrap_or_else(|| window.geometry());
+        self.or_windows.push(OrWindow {
+            surface: window.clone(),
+            rect,
+        });
         if let Some(surface) = window.wl_surface() {
             let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
@@ -233,13 +276,22 @@ impl smithay::xwayland::XwmHandler for Comp {
         }
     }
 
+    /// Post-map moves of override-redirect windows (a menu tracking its
+    /// parent) land here; managed windows' geometry is the layout's.
     fn configure_notify(
         &mut self,
         _xwm: XwmId,
-        _window: X11Surface,
-        _geometry: Rectangle<i32, Logical>,
+        window: X11Surface,
+        geometry: Rectangle<i32, Logical>,
         _above: Option<smithay::reexports::x11rb::protocol::xproto::Window>,
     ) {
+        if let Some(o) = self
+            .or_windows
+            .iter_mut()
+            .find(|o| o.surface.window_id() == window.window_id())
+        {
+            o.rect = geometry;
+        }
     }
 
     fn resize_request(
@@ -259,17 +311,17 @@ impl smithay::xwayland::XwmHandler for Comp {
 
 /// The topmost override-redirect window's surface under `pos`, if any.
 pub fn or_surface_under(
-    or_windows: &[X11Surface],
+    or_windows: &[OrWindow],
     pos: smithay::utils::Point<f64, Logical>,
 ) -> Option<(WlSurface, smithay::utils::Point<f64, Logical>)> {
-    for window in or_windows.iter().rev() {
-        let geo = window.geometry();
+    for o in or_windows.iter().rev() {
+        let geo = o.rect;
         if pos.x >= f64::from(geo.loc.x)
             && pos.x < f64::from(geo.loc.x + geo.size.w)
             && pos.y >= f64::from(geo.loc.y)
             && pos.y < f64::from(geo.loc.y + geo.size.h)
         {
-            if let Some(surface) = window.wl_surface() {
+            if let Some(surface) = o.surface.wl_surface() {
                 return Some((surface, geo.loc.to_f64()));
             }
         }
