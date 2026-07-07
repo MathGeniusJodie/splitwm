@@ -11,6 +11,9 @@ edition = "2021"
 smithay = { version = "0.7", default-features = false, features = [
     "backend_winit",
     "backend_egl",
+    # DrmNode plumbing for dmabuf feedback (render-node discovery); the
+    # actual DRM output backend stays behind `tty`.
+    "backend_drm",
     "renderer_gl",
     "desktop",
     "wayland_frontend",
