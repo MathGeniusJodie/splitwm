@@ -103,42 +103,66 @@ impl Comp {
                 let serial = SERIAL_COUNTER.next_serial();
                 let pos = pointer.current_location();
 
+                let mut consumed = false;
                 if event.state() == ButtonState::Released {
                     self.end_drag();
+                    // The release of a press we consumed must not leak to a
+                    // client that never saw the press.
+                    consumed = std::mem::take(&mut self.chrome_press);
                 } else if !pointer.is_grabbed() {
-                    let clicked = self
-                        .space
-                        .element_under(pos)
-                        .map(|(w, _)| w.clone())
-                        .and_then(|w| self.managed.win_for_window(&w));
-                    match clicked {
-                        // Click-to-focus on a client window (button 1),
-                        // through the layout like master's activate_client.
-                        Some(win) => {
-                            if event.button_code() == BTN_LEFT {
-                                self.state.activate_client(win);
-                                self.arrange();
+                    // Float chrome frames overlap client surfaces beneath
+                    // them; they win the press outright.
+                    if event.button_code() == BTN_LEFT && self.float_frame_at(pos).is_some() {
+                        self.on_chrome_button(pos, false);
+                        self.chrome_press = true;
+                        consumed = true;
+                    } else {
+                        let clicked = self
+                            .surface_under(pos)
+                            .and_then(|(s, _)| self.managed.win_for_surface(&s));
+                        match clicked {
+                            Some(win) if event.button_code() == BTN_LEFT => {
+                                match self.managed.kind_of(win) {
+                                    // Click-to-focus through the layout, like
+                                    // master's activate_client.
+                                    Some(crate::shell::Kind::Tiled) => {
+                                        self.clear_focused_float();
+                                        self.state.activate_client(win);
+                                        self.arrange();
+                                    }
+                                    Some(crate::shell::Kind::Float(_)) => self.focus_float(win),
+                                    // The dock holds the keyboard until the next
+                                    // deliberate focus move.
+                                    Some(crate::shell::Kind::Dock(_)) => self.focus_override(win),
+                                    None => {}
+                                }
                             }
+                            Some(_) => {}
+                            // Chrome click: hit-test dispatch (buttons, tiles,
+                            // handles, "+", titles, float frames...).
+                            None if matches!(event.button_code(), BTN_LEFT | BTN_RIGHT) => {
+                                if self.on_chrome_button(pos, event.button_code() == BTN_RIGHT) {
+                                    self.chrome_press = true;
+                                    consumed = true;
+                                }
+                            }
+                            None => {}
                         }
-                        // Chrome click: hit-test dispatch (buttons, tiles,
-                        // handles, "+", titles...).
-                        None if matches!(event.button_code(), BTN_LEFT | BTN_RIGHT) => {
-                            self.on_chrome_button(pos, event.button_code() == BTN_RIGHT);
-                        }
-                        None => {}
                     }
                 }
 
-                pointer.button(
-                    self,
-                    &ButtonEvent {
-                        button: event.button_code(),
-                        state: event.state(),
-                        serial,
-                        time: event.time_msec(),
-                    },
-                );
-                pointer.frame(self);
+                if !consumed {
+                    pointer.button(
+                        self,
+                        &ButtonEvent {
+                            button: event.button_code(),
+                            state: event.state(),
+                            serial,
+                            time: event.time_msec(),
+                        },
+                    );
+                    pointer.frame(self);
+                }
             }
             InputEvent::PointerAxis { event } => {
                 let pointer = self.seat.get_pointer().expect("seat has a pointer");

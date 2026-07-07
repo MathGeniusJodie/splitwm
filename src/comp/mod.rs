@@ -9,6 +9,7 @@ pub mod actions;
 pub mod chrome;
 pub mod handlers;
 pub mod input;
+pub mod manage;
 pub mod pointer;
 
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use std::time::Duration;
 
 use smithay::backend::egl::EGLDevice;
 use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::element::AsRenderElements as _;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{Color32F, ImportDma as _};
 use smithay::backend::winit::WinitGraphicsBackend;
@@ -78,6 +80,9 @@ pub struct Comp {
 
     // Pointer interaction state (see comp::pointer).
     pub drag: Option<pointer::ActiveDrag>,
+    /// A button press the chrome consumed: its release must be swallowed
+    /// too, so no client sees half a click.
+    pub chrome_press: bool,
     /// Sub-pixel scroll remainder carried between axis events.
     pub hscroll_frac: f64,
     /// Set by an action that wants its layout change animated; consumed by
@@ -106,6 +111,24 @@ pub struct Comp {
     // bridge it drives.
     pub state: crate::state::State,
     pub managed: crate::shell::Managed,
+    /// Toplevels between role creation and their first buffer commit;
+    /// classified (tiled/float/dock) only once mapped, since Wayland
+    /// clients set app_id/parent/size hints after creating the role.
+    pub pending: Vec<Window>,
+    /// Float stacking, topmost first.
+    pub float_stack: Vec<crate::tree::Win>,
+    /// Private invariant: reads go through `Comp::focused_float()`, which
+    /// re-validates against the store, so a dangling record is never
+    /// handed out.
+    focused_float: Option<crate::tree::Win>,
+    /// The fullscreen tiled client, covering the whole output above every
+    /// tiled window (floats still render above it).
+    pub fullscreen: Option<crate::tree::Win>,
+    /// Surfaces that requested fullscreen while still pending (clients ask
+    /// before their first commit); honored at classify time, master's
+    /// pre-map `_NET_WM_STATE` behavior.
+    pub pending_fullscreen:
+        Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
     /// Keycodes whose press we intercepted for a binding: their repeats are
     /// swallowed (a nested winit session auto-repeats; libinput doesn't)
     /// and their release must not leak to the client that never saw the
@@ -244,6 +267,7 @@ impl Comp {
             parents: std::collections::HashMap::new(),
             wallpaper_path,
             drag: None,
+            chrome_press: false,
             hscroll_frac: 0.0,
             animate: false,
             anim: None,
@@ -258,6 +282,11 @@ impl Comp {
             start: std::time::Instant::now(),
             state: crate::state::State::new(),
             managed: crate::shell::Managed::default(),
+            pending: Vec::new(),
+            float_stack: Vec::new(),
+            focused_float: None,
+            fullscreen: None,
+            pending_fullscreen: Vec::new(),
             held_bound_keys: Vec::new(),
             compositor_state,
             xdg_shell_state,
@@ -318,7 +347,22 @@ impl Comp {
         smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
         Point<f64, Logical>,
     )> {
-        self.space
+        // Stacking order: floats (top of stack first), then the tiled/
+        // fullscreen Space, then the dock at the bottom.
+        for &fw in &self.float_stack {
+            let Some((window, f)) = self.managed.float(fw) else {
+                continue;
+            };
+            let loc = Point::<i32, Logical>::from((f.x, f.y)) - window.geometry().loc;
+            if let Some(hit) = window
+                .surface_under(pos - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
+                .map(|(s, p)| (s, p.to_f64() + loc.to_f64()))
+            {
+                return Some(hit);
+            }
+        }
+        if let Some(hit) = self
+            .space
             .element_under(pos)
             .and_then(|(window, location)| {
                 window
@@ -328,6 +372,15 @@ impl Comp {
                     )
                     .map(|(s, p)| (s, (p.to_f64() + location.to_f64())))
             })
+        {
+            return Some(hit);
+        }
+        let (_, window, d) = self.managed.dock()?;
+        let rect = self.dock_geometry(d);
+        let loc = Point::<i32, Logical>::from((rect.x, rect.y)) - window.geometry().loc;
+        window
+            .surface_under(pos - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
+            .map(|(s, p)| (s, p.to_f64() + loc.to_f64()))
     }
 
     /// The split-layout area: the output minus the bottom taskbar strip
@@ -354,8 +407,8 @@ impl Comp {
     pub fn arrange(&mut self) {
         let wa = self.layout_area();
         // Canvas width / dock scroll room are State's own invariants; the
-        // dock contributes from M6.
-        self.state.update_canvas(wa, 0);
+        // compositor only supplies the inputs it alone knows.
+        self.state.update_canvas(wa, self.dock_extra());
         let geos = self.state.compute(wa);
         let scroll_x = self.state.scroll_x();
         let focused = self.state.focused_leaf_valid();
@@ -397,7 +450,9 @@ impl Comp {
             let Some(c) = client else {
                 continue;
             };
-            if minimized {
+            // The fullscreen client is configured below, over the whole
+            // output; don't fight it with split geometry.
+            if minimized || Some(c) == self.fullscreen {
                 continue;
             }
             let Some(window) = self.managed.get(c).cloned() else {
@@ -411,9 +466,27 @@ impl Comp {
             self.space.map_element(window, (cx, cy), false);
             shown.push(c);
         }
+
+        // The fullscreen client covers the whole output above every tiled
+        // client, regardless of where (or whether) its split is on screen.
+        if let Some(fs) = self.fullscreen {
+            if let Some(window) = self.managed.get(fs).cloned() {
+                let size = self
+                    .output
+                    .current_mode()
+                    .map(|m| m.size)
+                    .unwrap_or_else(|| self.backend.window_size());
+                if let Some(toplevel) = window.toplevel() {
+                    toplevel.with_pending_state(|s| s.size = Some((size.w, size.h).into()));
+                    toplevel.send_pending_configure();
+                }
+                self.space.map_element(window, (0, 0), true);
+                shown.push(fs);
+            }
+        }
         let to_hide: Vec<Window> = self
             .managed
-            .iter()
+            .tiled_iter()
             .filter(|(w, _)| !shown.contains(w))
             .map(|(_, window)| window.clone())
             .collect();
@@ -434,12 +507,12 @@ impl Comp {
         };
         let app_ids: Vec<(crate::tree::Win, String)> = self
             .managed
-            .iter()
+            .tiled_iter()
             .map(|(w, window)| (w, crate::shell::toplevel_app_id(window)))
             .collect();
         let classes: Vec<(crate::tree::Win, &str)> =
             app_ids.iter().map(|(w, s)| (*w, s.as_str())).collect();
-        let bar_order: Vec<crate::tree::Win> = self.managed.iter().map(|(w, _)| w).collect();
+        let bar_order: Vec<crate::tree::Win> = self.managed.tiled_iter().map(|(w, _)| w).collect();
         let leaves = self.state.tree.collect_leaves();
         crate::widgets::compute_taskbar(
             &mut self.widgets,
@@ -485,15 +558,25 @@ impl Comp {
         self.refocus();
     }
 
-    /// Point keyboard focus (and xdg activated state) at the layout's
-    /// focused client, or nothing when the focused leaf is empty.
+    /// Point keyboard focus (and xdg activated state) at the focused
+    /// float when one holds the keyboard, else the layout's focused
+    /// client, else nothing.
     pub fn refocus(&mut self) {
-        let focused = self.state.focused_client();
-        for (win, window) in self.managed.iter() {
-            if window.set_activated(focused == Some(win)) {
-                if let Some(toplevel) = window.toplevel() {
-                    toplevel.send_pending_configure();
-                }
+        let focused = self
+            .keyboard_override()
+            .or_else(|| self.state.focused_client());
+        let updates: Vec<Window> = self
+            .managed
+            .windows()
+            .filter(|window| {
+                let win = self.managed.win_for_window(window);
+                window.set_activated(win.is_some() && win == focused)
+            })
+            .cloned()
+            .collect();
+        for window in updates {
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.send_pending_configure();
             }
         }
         let target = focused
@@ -532,6 +615,22 @@ impl Comp {
             self.compose_chrome();
             self.chrome_dirty = false;
         }
+        // Float frames whose content changed since last frame.
+        let dirty_frames: Vec<crate::tree::Win> = self
+            .managed
+            .float_iter()
+            .filter(|(_, _, f)| f.frame_dirty)
+            .map(|(w, _, _)| w)
+            .collect();
+        for win in dirty_frames {
+            self.paint_float_frame(win);
+        }
+        // Dock element inputs, resolved before the renderer borrow below.
+        let dock_place = self
+            .managed
+            .dock()
+            .map(|(_, window, d)| (window.clone(), self.dock_geometry(d)));
+
         let size = self.backend.window_size();
         let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
         let rendered = {
@@ -542,22 +641,55 @@ impl Comp {
             else {
                 return;
             };
-            // Front-to-back: client windows (and popups), then the chrome
-            // underlay behind everything.
-            let mut elements: Vec<chrome::OutputElement> =
-                smithay::desktop::space::space_render_elements::<_, Window, _>(
+            // Front-to-back: floats (top of stack first) with their frame
+            // chrome, tiled clients, the dock, the chrome underlay behind
+            // everything.
+            let mut elements: Vec<chrome::OutputElement> = Vec::new();
+            for &fw in &self.float_stack {
+                let Some((window, f)) = self.managed.float(fw) else {
+                    continue;
+                };
+                let loc = (Point::<i32, Logical>::from((f.x, f.y)) - window.geometry().loc)
+                    .to_physical(1);
+                elements.extend(window.render_elements::<chrome::OutputElement>(
                     renderer,
-                    [&self.space],
-                    &self.output,
+                    loc,
+                    1.0.into(),
                     1.0,
-                )
-                .map_or_else(
-                    |err| {
-                        tracing::error!("space elements: {err:?}");
-                        Vec::new()
-                    },
-                    |els| els.into_iter().map(chrome::OutputElement::Window).collect(),
-                );
+                ));
+                let rect = f.frame_rect();
+                match smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement::from_buffer(
+                    renderer,
+                    (f64::from(rect.x), f64::from(rect.y)),
+                    &f.frame_buf,
+                    None,
+                    None,
+                    None,
+                    smithay::backend::renderer::element::Kind::Unspecified,
+                ) {
+                    Ok(el) => elements.push(chrome::OutputElement::Chrome(el)),
+                    Err(err) => tracing::error!("float frame element: {err}"),
+                }
+            }
+            match smithay::desktop::space::space_render_elements::<_, Window, _>(
+                renderer,
+                [&self.space],
+                &self.output,
+                1.0,
+            ) {
+                Ok(els) => elements.extend(els.into_iter().map(chrome::OutputElement::Window)),
+                Err(err) => tracing::error!("space elements: {err:?}"),
+            }
+            if let Some((window, rect)) = &dock_place {
+                let loc = (Point::<i32, Logical>::from((rect.x, rect.y)) - window.geometry().loc)
+                    .to_physical(1);
+                elements.extend(window.render_elements::<chrome::OutputElement>(
+                    renderer,
+                    loc,
+                    1.0.into(),
+                    1.0,
+                ));
+            }
             match smithay::backend::renderer::element::memory::MemoryRenderBufferRenderElement::from_buffer(
                 renderer,
                 (0.0, 0.0),
@@ -582,10 +714,11 @@ impl Comp {
         }
 
         // Frame callbacks let clients produce their next buffer; throttle to
-        // once per redraw cycle.
+        // once per redraw cycle. Every managed kind gets one (floats and
+        // the dock live outside the Space).
         let output = self.output.clone();
         let elapsed = self.start.elapsed();
-        for window in self.space.elements() {
+        for window in self.managed.windows() {
             window.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
                 Some(output.clone())
             });

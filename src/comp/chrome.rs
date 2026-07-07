@@ -24,9 +24,11 @@ use smithay::render_elements;
 use smithay::utils::{Buffer as BufferCoords, Rectangle, Transform};
 
 render_elements! {
-    /// Everything one output frame is made of, front-to-back: client
-    /// surfaces (with their popups) above, the chrome underlay below.
+    /// Everything one output frame is made of, front-to-back: floats (and
+    /// the dock, rendered with the same variant) with their frame chrome,
+    /// tiled client surfaces, the chrome underlay at the back.
     pub OutputElement<=GlesRenderer>;
+    Float=WaylandSurfaceRenderElement<GlesRenderer>,
     Window=SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
     Chrome=MemoryRenderBufferRenderElement<GlesRenderer>,
 }

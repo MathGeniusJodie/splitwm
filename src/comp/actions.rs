@@ -51,15 +51,18 @@ impl Comp {
                 }
             }
             Action::FocusNext | Action::FocusPrev => {
+                // Deliberate focus moves take the keyboard off any float.
+                self.clear_focused_float();
                 if self
                     .state
                     .focus_direction(matches!(action, Action::FocusNext))
                 {
                     self.scroll_focus_into_view();
-                    self.arrange();
                 }
+                self.arrange();
             }
             Action::StashNext | Action::StashPrev => {
+                self.clear_focused_float();
                 if self
                     .state
                     .cycle_stash(matches!(action, Action::StashNext))
@@ -69,6 +72,7 @@ impl Comp {
                 }
             }
             Action::MoveWindowNext | Action::MoveWindowPrev => {
+                self.clear_focused_float();
                 if self
                     .state
                     .move_window_to_direction(matches!(action, Action::MoveWindowNext))
@@ -118,11 +122,13 @@ impl Comp {
         }
     }
 
-    /// Politely ask the focused window to close. There is no force-kill
-    /// fallback for Wayland clients (the connection is theirs); XWayland
-    /// windows get the WM_DELETE/XKillClient treatment in M7.
+    /// Politely ask the focused window to close — a focused float before
+    /// the focused split's client, so Mod4+Shift+C closes the dialog the
+    /// user is looking at. There is no force-kill fallback for Wayland
+    /// clients (the connection is theirs); XWayland windows get the
+    /// WM_DELETE/XKillClient treatment in M7.
     fn close_focused_window(&mut self) {
-        let Some(win) = self.state.focused_client() else {
+        let Some(win) = self.focused_float().or_else(|| self.state.focused_client()) else {
             return;
         };
         if let Some(toplevel) = self.managed.get(win).and_then(|w| w.toplevel()) {

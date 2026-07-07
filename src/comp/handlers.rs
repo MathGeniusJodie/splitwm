@@ -26,6 +26,7 @@ use smithay::wayland::shell::xdg::{
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_output, delegate_seat,
@@ -53,15 +54,49 @@ impl CompositorHandler for Comp {
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
-            if let Some(window) = self
-                .space
-                .elements()
+            let window = self
+                .managed
+                .windows()
+                .chain(self.pending.iter())
                 .find(|w| w.toplevel().is_some_and(|t| *t.wl_surface() == root))
-            {
+                .cloned();
+            if let Some(window) = window {
                 window.on_commit();
             }
         }
         self.ensure_initial_configure(surface);
+
+        // A pending toplevel's first buffer commit maps it: classify and
+        // manage (tiled/float/dock).
+        let has_buffer =
+            smithay::backend::renderer::utils::with_renderer_surface_state(surface, |state| {
+                state.buffer().is_some()
+            })
+            .unwrap_or(false);
+        if has_buffer {
+            if let Some(idx) = self
+                .pending
+                .iter()
+                .position(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
+            {
+                let window = self.pending.remove(idx);
+                self.classify_and_manage(window);
+            } else if let Some(win) = self.managed.win_for_surface(surface) {
+                // A float resizing itself: track the new size and repaint
+                // its frame around it.
+                let geo = self.managed.get(win).map(|w| w.geometry().size);
+                if let Some((_, f)) = self.managed.float_mut(win) {
+                    if let Some(size) = geo {
+                        if (f.w, f.h) != (size.w, size.h) {
+                            f.w = size.w.max(1);
+                            f.h = size.h.max(1);
+                            f.frame_dirty = true;
+                        }
+                    }
+                }
+            }
+        }
+
         self.popups.commit(surface);
     }
 }
@@ -72,8 +107,9 @@ impl Comp {
     /// on the surface's first commit.
     fn ensure_initial_configure(&mut self, surface: &WlSurface) {
         if let Some(window) = self
-            .space
-            .elements()
+            .pending
+            .iter()
+            .chain(self.managed.windows())
             .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
         {
             let toplevel = window.toplevel().expect("matched on toplevel above");
@@ -111,23 +147,67 @@ impl XdgShellHandler for Comp {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
-        // Manage: the new window takes the focused split; whatever occupied
-        // it is displaced to the stash (master's pin_client semantics).
-        let window = Window::new_wayland_window(surface);
-        let win = self.managed.insert(window);
-        self.state.pin_client(win);
-        self.arrange();
+        // Wayland clients set app_id/parent/size hints after creating the
+        // role; classification (tiled/float/dock) waits for the first
+        // buffer commit (see `Comp::classify_and_manage`).
+        self.pending.push(Window::new_wayland_window(surface));
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        self.pending
+            .retain(|w| w.toplevel().is_none_or(|t| *t != surface));
         let Some(win) = self.managed.win_for_surface(surface.wl_surface()) else {
             return;
         };
-        if let Some(window) = self.managed.remove(win) {
-            self.space.unmap_elem(&window);
+        if self.fullscreen == Some(win) {
+            self.fullscreen = None;
         }
-        self.state.unpin_client(win);
-        // arrange refocuses, so focus never rests on a dead client.
+        match self.managed.kind_of(win) {
+            Some(crate::shell::Kind::Tiled) => {
+                if let Some(m) = self.managed.remove(win) {
+                    self.space.unmap_elem(&m.window);
+                }
+                self.state.unpin_client(win);
+                // arrange refocuses, so focus never rests on a dead client.
+                self.arrange();
+            }
+            Some(crate::shell::Kind::Float(_)) => self.forget_float(win),
+            Some(crate::shell::Kind::Dock(_)) => {
+                self.managed.remove(win);
+                // Re-clamp now that the scroll headroom it needed is gone.
+                let wa = self.layout_area();
+                self.state.clamp_scroll(wa, 0);
+                self.arrange();
+            }
+            None => {}
+        }
+    }
+
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _output: Option<smithay::reexports::wayland_server::protocol::wl_output::WlOutput>,
+    ) {
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Fullscreen);
+        });
+        if let Some(win) = self.managed.win_for_surface(surface.wl_surface()) {
+            self.fullscreen = Some(win);
+            self.arrange();
+        } else {
+            // Requested before the first commit (a startup-fullscreen
+            // client); honored once the window is classified.
+            self.pending_fullscreen.push(surface.wl_surface().clone());
+        }
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        surface.with_pending_state(|state| {
+            state.states.unset(xdg_toplevel::State::Fullscreen);
+        });
+        if self.fullscreen == self.managed.win_for_surface(surface.wl_surface()) {
+            self.fullscreen = None;
+        }
         self.arrange();
     }
 

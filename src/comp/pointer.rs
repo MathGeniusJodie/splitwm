@@ -12,11 +12,22 @@ use crate::theme;
 use crate::tree::{Boundary, Dir, NodeId, Win};
 use crate::widgets::{leaf_meta, BtnKind, FrameRect};
 
-/// An in-progress drag, keyed off button-1 press on a handle/edge.
+/// An in-progress drag, keyed off button-1 press on a handle/edge/float
+/// frame.
 #[derive(Clone, Copy)]
 pub enum ActiveDrag {
     Split(SplitDrag),
     Edge(EdgeDrag),
+    Float(FloatDrag),
+}
+
+/// Moving a float by its chrome frame: the pointer's offset into the
+/// client rect is pinned for the whole gesture.
+#[derive(Clone, Copy)]
+pub struct FloatDrag {
+    pub win: Win,
+    pub dx: i32,
+    pub dy: i32,
 }
 
 /// Dragging the boundary between two children of `parent`: fraction =
@@ -61,13 +72,33 @@ impl Comp {
     /// A button-1/3 press that landed on the chrome (no client surface
     /// under the pointer). Returns `true` when the press was consumed.
     pub fn on_chrome_button(&mut self, pos: Point<f64, Logical>, secondary: bool) -> bool {
+        let (mx, my) = (pos.x as i32, pos.y as i32);
+        // Button 1 on a float's frame border (a press inside the client
+        // area never reaches here — the surface catches it): focus the
+        // float and start moving it.
+        if !secondary {
+            let hit = self.float_stack.iter().copied().find(|&fw| {
+                self.managed
+                    .float(fw)
+                    .is_some_and(|(_, f)| rect_contains(f.frame_rect(), mx, my))
+            });
+            if let Some(fw) = hit {
+                let (dx, dy) = self
+                    .managed
+                    .float(fw)
+                    .map(|(_, f)| (mx - f.x, my - f.y))
+                    .expect("found above");
+                self.drag = Some(ActiveDrag::Float(FloatDrag { win: fw, dx, dy }));
+                self.focus_float(fw);
+                return true;
+            }
+        }
         // Hit regions describe the final layout, but an animation may still
         // be drawing chrome mid-slide; snap it so the click lands on what
         // the user sees.
         if self.anim.is_some() {
             self.finish_animation();
         }
-        let (mx, my) = (pos.x as i32, pos.y as i32);
         match self.hit_test(mx, my) {
             // The split button takes left and right click (right picks the
             // opposite direction); everything else is left only.
@@ -133,6 +164,10 @@ impl Comp {
     /// also see it).
     pub fn on_drag_motion(&mut self, pos: Point<f64, Logical>) -> bool {
         match self.drag {
+            Some(ActiveDrag::Float(fd)) => {
+                self.move_float(fd.win, pos.x as i32 - fd.dx, pos.y as i32 - fd.dy);
+                true
+            }
             Some(ActiveDrag::Edge(ed)) => {
                 let wa = self.layout_area();
                 let mouse_x = pos.x as i32;
@@ -175,6 +210,20 @@ impl Comp {
 
     pub fn end_drag(&mut self) {
         self.drag = None;
+    }
+
+    /// The topmost float whose chrome frame band (frame rect minus client
+    /// rect) contains `pos`. Frames overlap whatever lies beneath them, so
+    /// the button handler must check this before surface routing — the
+    /// press would otherwise fall through to the client underneath.
+    pub fn float_frame_at(&self, pos: Point<f64, Logical>) -> Option<Win> {
+        let (mx, my) = (pos.x as i32, pos.y as i32);
+        self.float_stack.iter().copied().find(|&fw| {
+            self.managed.float(fw).is_some_and(|(_, f)| {
+                rect_contains(f.frame_rect(), mx, my)
+                    && !(mx >= f.x && mx < f.x + f.w && my >= f.y && my < f.y + f.h)
+            })
+        })
     }
 
     /// Priority-ordered hit-test of everything clickable on the chrome,
