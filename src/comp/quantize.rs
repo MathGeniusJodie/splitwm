@@ -502,22 +502,22 @@ fn na16_colors() -> Vec<Rgb> {
 /// order is an artifact of the asset build.
 const PALETTE_LUT: [[[u32; 2]; 4]; 3] = [
     [
-        [0x1f0e1c, 0x3e2137],
-        [0x005500, 0x17434b],
-        [0x647d34, 0x34859d],
-        [0x00ff00, 0x7ec4c1],
+        [0x1f0e1c, 0x000080],
+        [0x004000, 0x17434b],
+        [0x008000, 0x34859d],
+        [0x00bf00, 0x00bf80],
     ],
     [
+        [0x3e2137, 0x584563],
         [0x9d303b, 0x70377f],
-        [0x9a6348, 0x584563],
-        [0xc0c741, 0x8c8fae],
-        [0x80ff00, 0x80ff80],
+        [0x647d34, 0x8c8fae],
+        [0x80bf00, 0x7ec4c1],
     ],
     [
         [0xff0000, 0xff0080],
-        [0xff5500, 0xd26471],
+        [0x9a6348, 0xd26471],
         [0xe4943a, 0xd79b7d],
-        [0xffff00, 0xf5edba],
+        [0xc0c741, 0xf5edba],
     ],
 ];
 
