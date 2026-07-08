@@ -255,7 +255,8 @@ pub fn toplevel_title(window: &Window) -> std::rc::Rc<str> {
     if let Some(x11) = window.x11_surface() {
         return x11.title().into();
     }
-    read_toplevel_data(window, |d| d.title.clone()).into()
+    read_toplevel_data(window, |d| d.title.as_deref().map(std::rc::Rc::from))
+        .unwrap_or_else(|| "".into())
 }
 
 /// The window's class identity (xdg app_id / X11 `WM_CLASS` class half),
@@ -264,7 +265,7 @@ pub fn toplevel_app_id(window: &Window) -> String {
     if let Some(x11) = window.x11_surface() {
         return x11.class();
     }
-    read_toplevel_data(window, |d| d.app_id.clone())
+    read_toplevel_data(window, |d| d.app_id.clone()).unwrap_or_default()
 }
 
 /// Politely ask a window to close, whichever backend it speaks.
@@ -310,21 +311,18 @@ pub fn toplevel_fixed_size(window: &Window) -> bool {
         .unwrap_or(false)
 }
 
-fn read_toplevel_data(
+fn read_toplevel_data<R>(
     window: &Window,
-    f: impl Fn(&smithay::wayland::shell::xdg::XdgToplevelSurfaceRoleAttributes) -> Option<String>,
-) -> String {
-    window
-        .toplevel()
-        .and_then(|t| {
-            smithay::wayland::compositor::with_states(t.wl_surface(), |states| {
-                states
-                    .data_map
-                    .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
-                    .and_then(|d| d.lock().ok().and_then(|d| f(&d)))
-            })
+    f: impl Fn(&smithay::wayland::shell::xdg::XdgToplevelSurfaceRoleAttributes) -> Option<R>,
+) -> Option<R> {
+    window.toplevel().and_then(|t| {
+        smithay::wayland::compositor::with_states(t.wl_surface(), |states| {
+            states
+                .data_map
+                .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                .and_then(|d| d.lock().ok().and_then(|d| f(&d)))
         })
-        .unwrap_or_default()
+    })
 }
 
 /// Client-area rect inside a leaf's chrome frame: below the titlebar,

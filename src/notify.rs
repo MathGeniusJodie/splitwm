@@ -248,8 +248,9 @@ fn serve(
 
     // Everything time- and relay-shaped, at master's <=250ms cadence:
     // expiries, compositor-reported dismissals, queued Closed signals.
+    let mut signals: Vec<(u32, CloseReason)> = Vec::new();
+    let mut expired: Vec<u32> = Vec::new();
     loop {
-        let mut signals: Vec<(u32, CloseReason)> = Vec::new();
         {
             let mut guard = iface.get_mut();
             while let Ok((id, reason)) = dismissed.try_recv() {
@@ -257,20 +258,19 @@ fn serve(
                 signals.push((id, reason));
             }
             let now = Instant::now();
-            let mut expired: Vec<u32> = Vec::new();
             for n in &guard.notes {
                 if n.expiry.is_some_and(|t| t <= now) {
                     expired.push(n.id);
                 }
             }
-            for id in expired {
+            for id in expired.drain(..) {
                 guard.notes.retain(|n| n.id != id);
                 let _ = guard.to_comp.send(NoteMsg::Close(id));
                 signals.push((id, CloseReason::Expired));
             }
             signals.append(&mut guard.pending_closed);
         }
-        for (id, reason) in signals {
+        for (id, reason) in signals.drain(..) {
             let _ = zbus::block_on(Notifications::notification_closed(
                 iface.signal_emitter(),
                 id,

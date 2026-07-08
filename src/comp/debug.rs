@@ -59,8 +59,8 @@ pub fn insert_channel(handle: &LoopHandle<'static, Comp>) {
                 }
                 pending.extend_from_slice(&chunk[..n]);
                 while let Some(eol) = pending.iter().position(|&b| b == b'\n') {
-                    let line: Vec<u8> = pending.drain(..=eol).collect();
-                    command(comp, String::from_utf8_lossy(&line).trim());
+                    command(comp, String::from_utf8_lossy(&pending[..eol]).trim());
+                    pending.drain(..=eol);
                 }
                 Ok(PostAction::Continue)
             },

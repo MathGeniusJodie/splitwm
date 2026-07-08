@@ -171,7 +171,7 @@ pub fn label_from_class(class: &str) -> char {
 pub fn compute_taskbar(
     widgets: &mut Widgets,
     tree: &Tree,
-    clients: &[(Win, &str)],
+    clients: &[(Win, String)],
     quick: &[QuickSlot],
     bar_order: &[Win],
     wa: Rect,
@@ -546,7 +546,7 @@ mod tests {
     #[test]
     fn taskbar_stride_never_overlaps_within_available_width() {
         let tree = crate::tree::Tree::new();
-        let clients: Vec<(Win, &str)> = Vec::new();
+        let clients: Vec<(Win, String)> = Vec::new();
         // A pathological number of windows: the stride must compress
         // (clamped at a floor of 10px) rather than run tiles off-screen or
         // silently drop any of them.
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn quick_launch_hidden_when_its_class_is_running() {
         let tree = crate::tree::Tree::new();
-        let clients: Vec<(Win, &str)> = vec![(1 as Win, "Firefox")];
+        let clients: Vec<(Win, String)> = vec![(1 as Win, "Firefox".to_string())];
         let quick = [QuickSlot {
             cmd: "firefox".into(),
             icon: None,
@@ -588,7 +588,7 @@ mod tests {
     #[test]
     fn quick_launch_shown_when_its_class_is_not_running() {
         let tree = crate::tree::Tree::new();
-        let clients: Vec<(Win, &str)> = Vec::new();
+        let clients: Vec<(Win, String)> = Vec::new();
         let quick = [QuickSlot {
             cmd: "firefox".into(),
             icon: None,

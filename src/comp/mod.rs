@@ -572,7 +572,8 @@ impl Comp {
             crate::widgets::FrameRect,
         > = std::collections::HashMap::new();
         let mut shown: Vec<crate::tree::Win> = Vec::new();
-        for leaf in self.state.tree.collect_leaves() {
+        let leaves = self.state.tree.collect_leaves();
+        for &leaf in &leaves {
             let Some(geo) = geos.get(&leaf).copied() else {
                 continue;
             };
@@ -674,14 +675,11 @@ impl Comp {
             .tiled_iter()
             .map(|(w, window)| (w, crate::shell::toplevel_app_id(window)))
             .collect();
-        let classes: Vec<(crate::tree::Win, &str)> =
-            app_ids.iter().map(|(w, s)| (*w, s.as_str())).collect();
         let bar_order: Vec<crate::tree::Win> = self.managed.tiled_iter().map(|(w, _)| w).collect();
-        let leaves = self.state.tree.collect_leaves();
         crate::widgets::compute_taskbar(
             &mut self.widgets,
             &self.state.tree,
-            &classes,
+            &app_ids,
             &self.quick,
             &bar_order,
             full,

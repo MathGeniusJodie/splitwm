@@ -759,8 +759,9 @@ impl Comp {
                 paint,
             );
         }
-        let live: std::collections::HashSet<NodeId> = leaf_paints.iter().map(|(l, _)| *l).collect();
-        self.pieces.leaves.retain(|l, _| live.contains(l));
+        self.pieces
+            .leaves
+            .retain(|l, _| leaf_paints.iter().any(|(p, _)| p == l));
 
         // Plus buttons: one texture per distinct size.
         for &sz in &plus_sizes {
@@ -771,8 +772,7 @@ impl Comp {
                 sz,
             );
         }
-        let live_sz: std::collections::HashSet<i32> = plus_sizes.iter().copied().collect();
-        self.pieces.plus.retain(|s, _| live_sz.contains(s));
+        self.pieces.plus.retain(|s, _| plus_sizes.contains(s));
 
         // Taskbar strip.
         render_taskbar(
