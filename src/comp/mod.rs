@@ -42,6 +42,7 @@ use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::selection::primary_selection::PrimarySelectionState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -206,6 +207,7 @@ pub struct Comp {
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Comp>,
     pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
     pub layer_shell_state: WlrLayerShellState,
     /// Never read, but dropping it would unpublish the cursor-shape-v1
     /// global (how clients name pointer shapes for us to draw).
@@ -247,6 +249,7 @@ impl Comp {
             smithay::wayland::xwayland_shell::XWaylandShellState::new::<Comp>(&dh);
         let mut seat_state = SeatState::new();
         let data_device_state = DataDeviceState::new::<Comp>(&dh);
+        let primary_selection_state = PrimarySelectionState::new::<Comp>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Comp>(&dh);
         let cursor_shape_state = CursorShapeManagerState::new::<Comp>(&dh);
 
@@ -397,6 +400,7 @@ impl Comp {
             output_manager_state,
             seat_state,
             data_device_state,
+            primary_selection_state,
             layer_shell_state,
             cursor_shape_state,
             dmabuf_state,

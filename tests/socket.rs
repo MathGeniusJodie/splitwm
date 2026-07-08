@@ -6,7 +6,8 @@
 //! the debug channel (`SPLITWM_DEBUG_CHANNEL=1`, stdin), which acks each
 //! command on stdout.
 
-use std::io::{BufRead as _, BufReader, Write as _};
+use std::collections::HashMap;
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -14,7 +15,8 @@ use std::time::{Duration, Instant};
 
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{
-    wl_buffer, wl_compositor, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
+    wl_data_source, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle, WEnum};
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
@@ -146,8 +148,15 @@ struct App {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     /// The wl_surface holding keyboard focus, by protocol id.
     focused: Option<wayland_client::backend::ObjectId>,
+    /// The serial of the last keyboard enter — what set_selection wants.
+    enter_serial: u32,
     /// zwlr_layer_surface configures seen (each acked on arrival).
     layer_configures: u32,
+    /// The current clipboard offer and the mime types seen per offer.
+    selection: Option<wl_data_offer::WlDataOffer>,
+    offer_mimes: HashMap<wayland_client::backend::ObjectId, Vec<String>>,
+    /// What our own wl_data_source answers Send events with.
+    paste_payload: String,
 }
 
 impl App {
@@ -258,9 +267,69 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for App {
         _: &QueueHandle<App>,
     ) {
         match event {
-            wl_keyboard::Event::Enter { surface, .. } => app.focused = Some(surface.id()),
+            wl_keyboard::Event::Enter {
+                surface, serial, ..
+            } => {
+                app.focused = Some(surface.id());
+                app.enter_serial = serial;
+            }
             wl_keyboard::Event::Leave { .. } => app.focused = None,
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_data_device::WlDataDevice, ()> for App {
+    fn event(
+        app: &mut App,
+        _: &wl_data_device::WlDataDevice,
+        event: wl_data_device::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        match event {
+            wl_data_device::Event::DataOffer { id } => {
+                app.offer_mimes.insert(id.id(), Vec::new());
+            }
+            wl_data_device::Event::Selection { id } => app.selection = id,
+            _ => {}
+        }
+    }
+
+    wayland_client::event_created_child!(App, wl_data_device::WlDataDevice, [
+        wl_data_device::EVT_DATA_OFFER_OPCODE => (wl_data_offer::WlDataOffer, ()),
+    ]);
+}
+
+impl Dispatch<wl_data_offer::WlDataOffer, ()> for App {
+    fn event(
+        app: &mut App,
+        offer: &wl_data_offer::WlDataOffer,
+        event: wl_data_offer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        if let wl_data_offer::Event::Offer { mime_type } = event {
+            app.offer_mimes.entry(offer.id()).or_default().push(mime_type);
+        }
+    }
+}
+
+impl Dispatch<wl_data_source::WlDataSource, ()> for App {
+    fn event(
+        app: &mut App,
+        _: &wl_data_source::WlDataSource,
+        event: wl_data_source::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        if let wl_data_source::Event::Send { fd, .. } = event {
+            let mut file = std::fs::File::from(fd);
+            file.write_all(app.paste_payload.as_bytes())
+                .expect("write selection payload");
         }
     }
 }
@@ -287,6 +356,7 @@ wayland_client::delegate_noop!(App: ignore wl_surface::WlSurface);
 wayland_client::delegate_noop!(App: ignore wl_shm::WlShm);
 wayland_client::delegate_noop!(App: ignore wl_shm_pool::WlShmPool);
 wayland_client::delegate_noop!(App: ignore wl_buffer::WlBuffer);
+wayland_client::delegate_noop!(App: ignore wl_data_device_manager::WlDataDeviceManager);
 
 /// A booted compositor plus one connected test client.
 struct Session {
@@ -297,6 +367,7 @@ struct Session {
     globals: wayland_client::globals::GlobalList,
     compositor: wl_compositor::WlCompositor,
     wm_base: xdg_wm_base::XdgWmBase,
+    seat: wl_seat::WlSeat,
     pool: wl_shm_pool::WlShmPool,
     /// Backs `pool`; the fd must outlive it.
     #[allow(dead_code)]
@@ -325,7 +396,7 @@ impl Session {
         let shm: wl_shm::WlShm = globals.bind(&qh, 1..=1, ()).expect("bind wl_shm");
         // Binding the seat starts capability events; the keyboard arrives
         // in the dispatch loop.
-        let _seat: wl_seat::WlSeat = globals.bind(&qh, 1..=5, ()).expect("bind wl_seat");
+        let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=5, ()).expect("bind wl_seat");
 
         let pool_file = tempfile::tempfile().expect("shm backing file");
         let pool_len = BUF * BUF * 4;
@@ -340,6 +411,7 @@ impl Session {
             globals,
             compositor,
             wm_base,
+            seat,
             pool,
             pool_file,
         }
@@ -834,6 +906,80 @@ fn dock_layer_panel_rides_the_canvas_scroll() {
     s.wait_until("tiled window kept the full slot throughout", |app| {
         app.wins[a].size == full
     });
+}
+
+#[test]
+fn clipboard_bridges_x11_and_wayland() {
+    // The selection bridge: an X client's CLIPBOARD arrives at the focused
+    // Wayland client as a wl_data_offer, and a Wayland client's selection
+    // is readable from X — but only while an X window holds the keyboard
+    // focus (X selection requests carry no identity to authorize by).
+    const UTF8: &str = "text/plain;charset=utf-8";
+    let mut s = Session::boot();
+    let a = s.open_window();
+    s.wait_until("keyboard on the window", |app| app.focus_is(a));
+
+    let ddm: wl_data_device_manager::WlDataDeviceManager = s
+        .globals
+        .bind(&s.qh, 1..=3, ())
+        .expect("bind wl_data_device_manager");
+    let device = ddm.get_data_device(&s.seat, &s.qh, ());
+
+    // --- X → Wayland: xclip takes the X CLIPBOARD (and lingers as its
+    // owner); the offer reaches the focused client with no focus change ---
+    s.wm.await_xwayland();
+    s.wm
+        .cmd("spawn printf from-x | xclip -selection clipboard -t UTF8_STRING");
+    s.wait_until("X selection offered to the client", |app| {
+        app.selection.as_ref().is_some_and(|o| {
+            app.offer_mimes
+                .get(&o.id())
+                .is_some_and(|mimes| mimes.iter().any(|m| m == UTF8))
+        })
+    });
+    let offer = s.app.selection.clone().expect("selection offer");
+    let (mut reader, writer) = std::io::pipe().expect("pipe");
+    offer.receive(UTF8.into(), writer.as_fd());
+    drop(writer);
+    s.queue.roundtrip(&mut s.app).expect("roundtrip");
+    let mut pasted = String::new();
+    reader.read_to_string(&mut pasted).expect("read the offer");
+    assert_eq!(pasted, "from-x", "X clipboard should paste into Wayland");
+
+    // --- Wayland → X: our data source takes the selection (replacing the
+    // X owner); with rofi focused, an X client may read it back ---
+    let source = ddm.create_data_source(&s.qh, ());
+    source.offer(UTF8.into());
+    s.app.paste_payload = "from-wayland".into();
+    device.set_selection(Some(&source), s.app.enter_serial);
+    s.queue.roundtrip(&mut s.app).expect("roundtrip");
+
+    s.wm.cmd(&format!(
+        "spawn env -u WAYLAND_DISPLAY rofi -show drun -pid /tmp/splitwm-test-rofi-clip-{}.pid",
+        std::process::id()
+    ));
+    s.wait_until("rofi maps and takes the keyboard", |app| {
+        app.focused.is_none()
+    });
+
+    let out = std::env::temp_dir().join(format!("splitwm-test-clip-{}.txt", std::process::id()));
+    let out = out.to_str().expect("utf-8 temp path").to_string();
+    s.wm
+        .cmd(&format!("spawn xclip -selection clipboard -t UTF8_STRING -o > {out}"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        // Keep pumping: the Send event arrives here and must be answered.
+        s.queue.roundtrip(&mut s.app).expect("roundtrip");
+        if std::fs::read_to_string(&out).is_ok_and(|c| c == "from-wayland") {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for X to read the Wayland selection"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    std::fs::remove_file(&out).ok();
 }
 
 #[test]

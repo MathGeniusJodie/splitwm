@@ -7,7 +7,7 @@ use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::Client;
+use smithay::reexports::wayland_server::{Client, Resource as _};
 use smithay::utils::Serial;
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -17,9 +17,13 @@ use smithay::wayland::compositor::{
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::selection::data_device::{
-    ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
+    set_data_device_focus, ClientDndGrabHandler, DataDeviceHandler, DataDeviceState,
+    ServerDndGrabHandler,
 };
-use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::primary_selection::{
+    set_primary_focus, PrimarySelectionHandler, PrimarySelectionState,
+};
+use smithay::wayland::selection::{SelectionHandler, SelectionSource, SelectionTarget};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
     XdgToplevelSurfaceData,
@@ -30,7 +34,8 @@ use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use smithay::{
     delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
-    delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_output, delegate_primary_selection, delegate_seat, delegate_shm,
+    delegate_xdg_decoration, delegate_xdg_shell,
 };
 
 use super::{ClientState, Comp};
@@ -312,7 +317,13 @@ impl SeatHandler for Comp {
         &mut self.seat_state
     }
 
-    fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+        // Selection offers follow keyboard focus: only the focused client
+        // is told what is on the clipboard and primary selections.
+        let client = focused.and_then(|s| self.dh.get_client(s.id()).ok());
+        set_data_device_focus(&self.dh, seat, client.clone());
+        set_primary_focus(&self.dh, seat, client);
+    }
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
         // The compositor owns the pointer image: a cursor-shape-v1 request
         // names the shape, a null-surface set_cursor hides it, and a legacy
@@ -333,8 +344,41 @@ delegate_seat!(Comp);
 impl smithay::wayland::tablet_manager::TabletSeatHandler for Comp {}
 delegate_cursor_shape!(Comp);
 
+// The Wayland half of the X11↔Wayland clipboard bridge: Wayland-side
+// selections are advertised to the XWM so X clients can paste them, and a
+// Wayland client pasting an X-owned selection has the data pumped from the
+// X owner (the XWM set that selection on the seat, see `XwmHandler`).
 impl SelectionHandler for Comp {
     type SelectionUserData = ();
+
+    fn new_selection(
+        &mut self,
+        ty: SelectionTarget,
+        source: Option<SelectionSource>,
+        _seat: Seat<Self>,
+    ) {
+        if let Some(xwm) = self.xwm.as_mut() {
+            if let Err(err) = xwm.new_selection(ty, source.map(|source| source.mime_types())) {
+                tracing::warn!("advertising selection to X11 failed: {err}");
+            }
+        }
+    }
+
+    fn send_selection(
+        &mut self,
+        ty: SelectionTarget,
+        mime_type: String,
+        fd: std::os::unix::io::OwnedFd,
+        _seat: Seat<Self>,
+        _user_data: &(),
+    ) {
+        let handle = self.handle.clone();
+        if let Some(xwm) = self.xwm.as_mut() {
+            if let Err(err) = xwm.send_selection(ty, mime_type, fd, handle) {
+                tracing::warn!("reading X11 selection failed: {err}");
+            }
+        }
+    }
 }
 
 impl DataDeviceHandler for Comp {
@@ -345,6 +389,13 @@ impl DataDeviceHandler for Comp {
 impl ClientDndGrabHandler for Comp {}
 impl ServerDndGrabHandler for Comp {}
 delegate_data_device!(Comp);
+
+impl PrimarySelectionHandler for Comp {
+    fn primary_selection_state(&self) -> &PrimarySelectionState {
+        &self.primary_selection_state
+    }
+}
+delegate_primary_selection!(Comp);
 
 impl OutputHandler for Comp {}
 delegate_output!(Comp);

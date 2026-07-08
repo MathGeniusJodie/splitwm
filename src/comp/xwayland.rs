@@ -3,10 +3,20 @@
 //! same classify/tile/float/dock lifecycle as Wayland toplevels — the
 //! `Window` abstraction hides which backend a client speaks.
 
+use std::os::unix::io::OwnedFd;
 use std::process::Stdio;
 
 use smithay::desktop::Window;
 use smithay::utils::{Logical, Rectangle};
+use smithay::wayland::selection::data_device::{
+    clear_data_device_selection, current_data_device_selection_userdata,
+    request_data_device_client_selection, set_data_device_selection,
+};
+use smithay::wayland::selection::primary_selection::{
+    clear_primary_selection, current_primary_selection_userdata, request_primary_client_selection,
+    set_primary_selection,
+};
+use smithay::wayland::selection::SelectionTarget;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{Reorder, ResizeEdge, XwmId};
 use smithay::xwayland::{X11Surface, X11Wm, XWayland, XWaylandEvent};
@@ -87,6 +97,23 @@ impl Comp {
         if let Err(err) = res {
             tracing::error!("insert xwayland source: {err}");
         }
+    }
+
+    /// Whether the keyboard focus is an X11 window's surface (managed or
+    /// override-redirect).
+    fn x11_holds_focus(&self) -> bool {
+        let Some(focus) = self.seat.get_keyboard().and_then(|k| k.current_focus()) else {
+            return false;
+        };
+        self.or_windows
+            .iter()
+            .map(|o| &o.surface)
+            .chain(
+                self.managed
+                    .entries_windows()
+                    .filter_map(|(_, w)| w.x11_surface()),
+            )
+            .any(|s| s.wl_surface().is_some_and(|ws| ws == focus))
     }
 
     /// An X11 window went away (unmap or destroy): drop it from whichever
@@ -310,6 +337,65 @@ impl smithay::xwayland::XwmHandler for Comp {
 
     fn move_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32) {
         // Floats move by their chrome frame; tiled windows don't move.
+    }
+
+    // The X11 half of the X11↔Wayland clipboard bridge (the Wayland half
+    // lives in `SelectionHandler`): X-owned selections are mirrored onto
+    // the seat as compositor selections, and X clients may read the
+    // Wayland selections while an X window holds keyboard focus — an X
+    // selection request carries no identity to authorize more finely.
+
+    fn allow_selection_access(&mut self, _xwm: XwmId, _selection: SelectionTarget) -> bool {
+        self.x11_holds_focus()
+    }
+
+    fn send_selection(
+        &mut self,
+        _xwm: XwmId,
+        selection: SelectionTarget,
+        mime_type: String,
+        fd: OwnedFd,
+    ) {
+        let res = match selection {
+            SelectionTarget::Clipboard => {
+                request_data_device_client_selection(&self.seat, mime_type, fd)
+                    .map_err(|err| err.to_string())
+            }
+            SelectionTarget::Primary => request_primary_client_selection(&self.seat, mime_type, fd)
+                .map_err(|err| err.to_string()),
+        };
+        if let Err(err) = res {
+            tracing::warn!("sending selection to X11 failed: {err}");
+        }
+    }
+
+    fn new_selection(&mut self, _xwm: XwmId, selection: SelectionTarget, mime_types: Vec<String>) {
+        match selection {
+            SelectionTarget::Clipboard => {
+                set_data_device_selection(&self.dh, &self.seat, mime_types, ());
+            }
+            SelectionTarget::Primary => {
+                set_primary_selection(&self.dh, &self.seat, mime_types, ());
+            }
+        }
+    }
+
+    fn cleared_selection(&mut self, _xwm: XwmId, selection: SelectionTarget) {
+        // Only clear a selection the XWM itself set (compositor-provided,
+        // `()` user data): a Wayland client may have taken the selection
+        // since, and the X clear arriving late must not wipe it.
+        match selection {
+            SelectionTarget::Clipboard => {
+                if current_data_device_selection_userdata(&self.seat).is_some() {
+                    clear_data_device_selection(&self.dh, &self.seat);
+                }
+            }
+            SelectionTarget::Primary => {
+                if current_primary_selection_userdata(&self.seat).is_some() {
+                    clear_primary_selection(&self.dh, &self.seat);
+                }
+            }
+        }
     }
 }
 
