@@ -5,13 +5,13 @@
 
 use std::rc::Rc;
 
-use pixel_graphics::{Framebuffer, Palette as PgPalette, Rect as PgRect, Sprite, Swap};
+use pixel_graphics::{Framebuffer, Palette as PgPalette, Sprite};
 
 use crate::icon::Icon;
 use crate::theme;
 use crate::Index;
 
-use super::{accent_swap, Renderer};
+use super::Renderer;
 
 pub struct TitleInfo {
     pub label: char,
@@ -41,64 +41,10 @@ pub struct LeafView {
     pub buttons: bool,
 }
 
-/// Tile `src` (a region of `sprite`) to exactly fill a `w`x`h` box at
-/// (ox, oy), one image pixel per screen pixel — no scaling, so pixel art
-/// stays crisp. When the box equals `src`'s size (e.g. a 9-slice corner),
-/// this draws the source exactly once.
-#[allow(clippy::too_many_arguments)]
-fn tile_swapped(
-    fb: &mut Framebuffer,
-    sprite: &Sprite,
-    src: PgRect,
-    ox: i32,
-    oy: i32,
-    w: i32,
-    h: i32,
-    palette: &PgPalette,
-    swap: &Swap,
-) {
-    if w <= 0 || h <= 0 || src.w == 0 || src.h == 0 {
-        return;
-    }
-    let cx0 = ox.max(0);
-    let cy0 = oy.max(0);
-    let cx1 = (ox + w).min(fb.width as i32);
-    let cy1 = (oy + h).min(fb.height as i32);
-    if cx0 >= cx1 || cy0 >= cy1 {
-        return;
-    }
-    let clip = PgRect::new(
-        cx0 as isize,
-        cy0 as isize,
-        (cx1 - cx0) as usize,
-        (cy1 - cy0) as usize,
-    );
-    // Start at the first tile that reaches the clip rect: a leaf mostly
-    // scrolled off-screen would otherwise walk (and fully clip) every
-    // off-screen tile.
-    let (sw_i, sh_i) = (src.w as i32, src.h as i32);
-    let x0 = ox + ((cx0 - ox) / sw_i).max(0) * sw_i;
-    let mut y = oy + ((cy0 - oy) / sh_i).max(0) * sh_i;
-    while y < oy + h {
-        let mut x = x0;
-        while x < ox + w {
-            fb.draw_sprite_full(
-                sprite,
-                src,
-                x as isize,
-                y as isize,
-                Some(clip),
-                palette,
-                Some(swap),
-            );
-            x += src.w as i32;
-        }
-        y += src.h as i32;
-    }
-}
-
-/// A bitmap 9-slice over one source sprite: 4 fixed corners plus 4 edges/a
-/// center that repeat to fill an arbitrary target rect at native resolution.
+/// The window-border sprite with its 9-slice geometry: 4 fixed corners plus
+/// edges/a center that tile to fill an arbitrary target rect at native
+/// resolution — resolved by the GPU nine-slice shader via `border_art`'s
+/// `SliceSpec`.
 pub(super) struct NineSlice {
     pub(super) sprite: Sprite,
     pub(super) l: i32,
@@ -115,211 +61,120 @@ impl NineSlice {
     /// between the corners (which would smear that art across the bar).
     const EDGE_SAMPLE_X0: usize = 20;
     const EDGE_SAMPLE_X1: usize = 180;
-
-    #[allow(clippy::too_many_arguments)]
-    fn draw(
-        &self,
-        fb: &mut Framebuffer,
-        palette: &PgPalette,
-        swap: &Swap,
-        ox: i32,
-        oy: i32,
-        w: i32,
-        h: i32,
-    ) {
-        let (l, t, r, b) = (self.l, self.t, self.r, self.b);
-        let (sw, sh) = (self.sprite.width, self.sprite.height);
-        // The sprite must cover its own configured insets or `sw - lu - ru`
-        // (etc.) below underflows mid-frame; a mismatched border asset
-        // should fail loudly in debug builds rather than panic on that
-        // subtraction.
-        debug_assert!(
-            sw >= l as usize + r as usize && sh >= t as usize + b as usize,
-            "NineSlice sprite ({sw}x{sh}) too small for insets l={l} t={t} r={r} b={b}"
-        );
-        // The edge-sample columns assume the art spans them; a narrower
-        // redrawn asset would otherwise just render quietly truncated tiles
-        // (`draw_sprite_full` clamps the source rect) with no loud failure.
-        debug_assert!(
-            sw >= Self::EDGE_SAMPLE_X1,
-            "NineSlice sprite ({sw}px wide) doesn't cover edge-sample columns \
-             {}..{}",
-            Self::EDGE_SAMPLE_X0,
-            Self::EDGE_SAMPLE_X1
-        );
-        if sw < l as usize + r as usize || sh < t as usize + b as usize {
-            // Release-build fallback: nothing sane to draw, skip rather than
-            // underflow.
-            return;
-        }
-        let (lu, tu, ru, bu) = (l as usize, t as usize, r as usize, b as usize);
-        let edge_x = Self::EDGE_SAMPLE_X0;
-        let edge_w = Self::EDGE_SAMPLE_X1 - Self::EDGE_SAMPLE_X0;
-        let mid_h_src = sh - tu - bu;
-        let mid_w = (w - l - r).max(1);
-        let mid_h = (h - t - b).max(1);
-
-        let mut part = |src: PgRect, x: i32, y: i32, dw: i32, dh: i32| {
-            tile_swapped(fb, &self.sprite, src, x, y, dw, dh, palette, swap);
-        };
-        part(PgRect::new(0, 0, lu, tu), ox, oy, l, t);
-        part(
-            PgRect::new((sw - ru) as isize, 0, ru, tu),
-            ox + w - r,
-            oy,
-            r,
-            t,
-        );
-        part(
-            PgRect::new(0, (sh - bu) as isize, lu, bu),
-            ox,
-            oy + h - b,
-            l,
-            b,
-        );
-        part(
-            PgRect::new((sw - ru) as isize, (sh - bu) as isize, ru, bu),
-            ox + w - r,
-            oy + h - b,
-            r,
-            b,
-        );
-        part(
-            PgRect::new(edge_x as isize, 0, edge_w, tu),
-            ox + l,
-            oy,
-            mid_w,
-            t,
-        );
-        part(
-            PgRect::new(edge_x as isize, (sh - bu) as isize, edge_w, bu),
-            ox + l,
-            oy + h - b,
-            mid_w,
-            b,
-        );
-        part(
-            PgRect::new(0, tu as isize, lu, mid_h_src),
-            ox,
-            oy + t,
-            l,
-            mid_h,
-        );
-        part(
-            PgRect::new((sw - ru) as isize, tu as isize, ru, mid_h_src),
-            ox + w - r,
-            oy + t,
-            r,
-            mid_h,
-        );
-        part(
-            PgRect::new(edge_x as isize, tu as isize, edge_w, mid_h_src),
-            ox + l,
-            oy + t,
-            mid_w,
-            mid_h,
-        );
-    }
 }
 
 /// The `winmin.png` vertical 3-slice caps / `winmin_h.png` horizontal ones.
 const MIN_CAP_H: usize = 18;
 const MIN_CAP_W: usize = 18;
 
+/// How a static frame sprite slices over an arbitrary destination rect, for
+/// the GPU nine-slice shader (`comp::indexed::NineSliceElement`): the fixed
+/// margins plus the source column range the horizontal middle tiles from
+/// (narrower than the span between the corners when decoration is baked
+/// there — see `NineSlice::EDGE_SAMPLE_*`). The vertical middle always tiles
+/// `t..height-b`. Mirrors what `NineSlice::draw`/`draw_minimized_axis` do on
+/// the CPU (still used for float frames).
+pub struct SliceSpec {
+    pub l: i32,
+    pub t: i32,
+    pub r: i32,
+    pub b: i32,
+    pub edge0: i32,
+    pub edge1: i32,
+}
+
+/// Rasterize `sprite` to an identity-indexed framebuffer (holes stay
+/// `TRANSPARENT`), ready to upload once as the shader's static art.
+fn sprite_fb(sprite: &Sprite, palette: &PgPalette) -> Framebuffer {
+    let mut fb = Framebuffer::new(sprite.width, sprite.height, pixel_graphics::TRANSPARENT);
+    fb.draw_sprite(sprite, 0, 0, palette);
+    fb
+}
+
 /// Gap between the window border and the titlebar's app icon/label, in px.
 const TITLEBAR_ICON_PAD: i32 = 4;
 
 impl Renderer {
-    /// Draw one leaf's chrome into the shared screen framebuffer at screen
-    /// offset (ox, oy): a minimized leaf is just the restore strip —
-    /// `winmin.png` for a minimized column (narrow, tall) or `winmin_h.png`
-    /// for a minimized row (short, wide), picked by the leaf's own aspect
-    /// ratio; otherwise the bitmap window border plus a full-width titlebar
-    /// holding the app icon/label.
-    pub fn draw_leaf(&self, fb: &mut Framebuffer, ox: i32, oy: i32, v: &LeafView) {
-        let swap = accent_swap(v.accent_index);
-        if v.minimized {
-            self.draw_minimized_axis(fb, &swap, ox, oy, v.w, v.h, v.w < v.h);
-            return;
-        }
-        self.border
-            .draw(fb, self.palette.inner(), &swap, ox, oy, v.w, v.h);
-        self.draw_titlebar(fb, ox, oy, v);
+    /// The window-border sprite as an uploadable framebuffer with its slice
+    /// spec, for the GPU nine-slice frames (uploaded once, shared by every
+    /// tiled leaf and float).
+    pub fn border_art(&self) -> (Framebuffer, SliceSpec) {
+        let b = &self.border;
+        // A redrawn asset too small for its own insets or edge-sample
+        // columns would render quietly wrong through the shader's clamped
+        // sampling; fail loudly in debug builds instead.
+        debug_assert!(
+            b.sprite.width >= (b.l + b.r) as usize
+                && b.sprite.height >= (b.t + b.b) as usize
+                && b.sprite.width >= NineSlice::EDGE_SAMPLE_X1,
+            "border sprite ({}x{}) too small for insets l={} t={} r={} b={} \
+             / edge-sample columns {}..{}",
+            b.sprite.width,
+            b.sprite.height,
+            b.l,
+            b.t,
+            b.r,
+            b.b,
+            NineSlice::EDGE_SAMPLE_X0,
+            NineSlice::EDGE_SAMPLE_X1
+        );
+        (
+            sprite_fb(&b.sprite, self.palette.inner()),
+            SliceSpec {
+                l: b.l,
+                t: b.t,
+                r: b.r,
+                b: b.b,
+                edge0: NineSlice::EDGE_SAMPLE_X0 as i32,
+                edge1: NineSlice::EDGE_SAMPLE_X1 as i32,
+            },
+        )
     }
 
-    /// A minimized leaf's restore-strip rendering: a 3-slice (rounded caps +
-    /// a stretchy body) along the strip's long axis, the whole strip a
-    /// single restore button. `vertical` selects the axis and, with it, the
-    /// sprite: `winmin.png`/`MIN_CAP_H` for a minimized column (narrow,
-    /// tall, caps stacked top/bottom) or `winmin_h.png`/`MIN_CAP_W` for a
-    /// minimized row (short, wide, caps side by side). The strip isn't a
-    /// tileable pattern along its short axis (it's a single pill), so it's
-    /// drawn at its exact native cross-axis size, centred in whatever space
-    /// the leaf collapsed to.
-    #[allow(clippy::too_many_arguments)]
-    fn draw_minimized_axis(
-        &self,
-        fb: &mut Framebuffer,
-        swap: &Swap,
-        ox: i32,
-        oy: i32,
-        w: i32,
-        h: i32,
-        vertical: bool,
-    ) {
-        let (s, cap) = if vertical {
-            (&self.minimized, MIN_CAP_H)
+    /// A minimized leaf's restore-strip sprite (`vertical` picks
+    /// `winmin.png` vs `winmin_h.png`) with its 3-slice spec: caps fixed
+    /// along the long axis, the pill body tiling between them, the cross
+    /// axis at native size (the strip element is created at exactly that
+    /// size, so its zero margins never stretch anything).
+    pub fn minimized_art(&self, vertical: bool) -> (Framebuffer, SliceSpec) {
+        let (sprite, spec) = if vertical {
+            let s = &self.minimized;
+            let cap = MIN_CAP_H as i32;
+            (
+                s,
+                SliceSpec {
+                    l: 0,
+                    t: cap,
+                    r: 0,
+                    b: cap,
+                    edge0: 0,
+                    edge1: s.width as i32,
+                },
+            )
         } else {
-            (&self.minimized_h, MIN_CAP_W)
+            let s = &self.minimized_h;
+            let cap = MIN_CAP_W as i32;
+            (
+                s,
+                SliceSpec {
+                    l: cap,
+                    t: 0,
+                    r: cap,
+                    b: 0,
+                    edge0: cap,
+                    edge1: s.width as i32 - cap,
+                },
+            )
         };
-        let (sw, sh) = (s.width, s.height);
-        let cap_i = cap as i32;
-        // (src rect, dest x, dest y, dest w, dest h) for the leading cap,
-        // trailing cap, and stretchy middle, laid out along the chosen axis.
-        let parts: [(PgRect, i32, i32, i32, i32); 3] = if vertical {
-            let mid_h = (h - 2 * cap_i).max(1);
-            let cx = ox + (w - sw as i32) / 2;
-            [
-                (PgRect::new(0, 0, sw, cap), cx, oy, sw as i32, cap_i),
-                (
-                    PgRect::new(0, (sh - cap) as isize, sw, cap),
-                    cx,
-                    oy + h - cap_i,
-                    sw as i32,
-                    cap_i,
-                ),
-                (
-                    PgRect::new(0, cap as isize, sw, sh - 2 * cap),
-                    cx,
-                    oy + cap_i,
-                    sw as i32,
-                    mid_h,
-                ),
-            ]
-        } else {
-            let mid_w = (w - 2 * cap_i).max(1);
-            let cy = oy + (h - sh as i32) / 2;
-            [
-                (PgRect::new(0, 0, cap, sh), ox, cy, cap_i, sh as i32),
-                (
-                    PgRect::new((sw - cap) as isize, 0, cap, sh),
-                    ox + w - cap_i,
-                    cy,
-                    cap_i,
-                    sh as i32,
-                ),
-                (
-                    PgRect::new(cap as isize, 0, sw - 2 * cap, sh),
-                    ox + cap_i,
-                    cy,
-                    mid_w,
-                    sh as i32,
-                ),
-            ]
-        };
-        for (src, x, y, dw, dh) in parts {
-            tile_swapped(fb, s, src, x, y, dw, dh, self.palette.inner(), swap);
-        }
+        (sprite_fb(sprite, self.palette.inner()), spec)
+    }
+
+    /// The titlebar's *contents* — app icon/label and title text, no border
+    /// art — drawn at (0, 0) into a `w`x`tb_h` strip buffer. The band fill
+    /// behind them comes from the nine-slice frame's top margin; split
+    /// buttons draw over via `draw_button`.
+    pub fn draw_titlebar_strip(&self, fb: &mut Framebuffer, v: &LeafView) {
+        self.draw_titlebar(fb, 0, 0, v);
     }
 
     fn draw_titlebar(&self, fb: &mut Framebuffer, ox: i32, oy: i32, v: &LeafView) {

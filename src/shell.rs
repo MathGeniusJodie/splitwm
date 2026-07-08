@@ -28,25 +28,34 @@ pub struct FloatData {
     pub w: i32,
     pub h: i32,
     /// Accent palette index for the chrome — the transient parent's split
-    /// colour when it has one, so the dialog visibly belongs to it.
+    /// colour when it has one, so the dialog visibly belongs to it. Fixed
+    /// for the float's life (set at manage, never reassigned), which is
+    /// what lets the border element keep a constant commit.
     pub accent: crate::Index,
-    /// The frame chrome's indexed GPU texture, rendered as its own element
-    /// just below the client surface; re-uploaded only when its content
-    /// (size/title/accent) changes — a drag just moves the element.
+    /// The titlebar contents' indexed GPU texture (icon + title on a
+    /// transparent `w`x`tb_h` strip), rendered as its own element just
+    /// below the client surface; re-uploaded only when its content
+    /// (size/title) changes — a drag just moves the element. The border
+    /// around it is not a texture at all: the shared border art sliced
+    /// over the frame rect by the GPU (see `comp::indexed`).
     pub frame: FrameTex,
+    /// The border element's persistent identity for the damage tracker.
+    /// Its commit never bumps: the accent is fixed and everything else
+    /// about the border is geometry, which the tracker sees itself.
+    pub frame_id: smithay::backend::renderer::element::Id,
 }
 
-/// A float frame's chrome texture and its freshness in one state: `Fresh`
-/// can only be built with a texture, so "no texture yet not due for a
-/// repaint" — a frame that would render as nothing forever — is
+/// A float titlebar strip's texture and its freshness in one state:
+/// `Fresh` can only be built with a texture, so "no texture yet not due
+/// for a repaint" — a strip that would render as nothing forever — is
 /// unrepresentable.
 pub enum FrameTex {
-    /// The frame's content (size/title/accent) changed since the held
-    /// texture (if any — a float starts with none) was uploaded; repainted
-    /// before the next composite, the old texture shown until then. The
-    /// texture rides along so the repaint can reuse its GPU allocation.
+    /// The strip's content (size/title) changed since the held texture (if
+    /// any — a float starts with none) was uploaded; repainted before the
+    /// next composite, the old texture shown until then. The texture rides
+    /// along so the repaint can reuse its GPU allocation.
     Stale(Option<crate::comp::indexed::IndexedTexture>),
-    /// The texture matches the frame's current content.
+    /// The texture matches the strip's current content.
     Fresh(crate::comp::indexed::IndexedTexture),
 }
 

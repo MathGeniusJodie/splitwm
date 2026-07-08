@@ -823,10 +823,6 @@ impl Comp {
         // animating leaves at their interpolated sizes; unchanged pieces
         // (scroll, idle leaves, wallpaper, taskbar) hit the cache.
         self.update_chrome_pieces(&leaf_rects);
-        let leaf_positions: Vec<(crate::tree::NodeId, Point<i32, Logical>)> = leaf_rects
-            .iter()
-            .map(|&(leaf, r)| (leaf, Point::from((r.x, r.y))))
-            .collect();
         // Float frames whose content changed since last frame.
         let dirty_frames: Vec<crate::tree::Win> = self
             .managed
@@ -857,7 +853,7 @@ impl Comp {
         // The ex-underlay pieces as positioned elements, built from the
         // caches `update_chrome_pieces` just refreshed. These borrow only
         // `self.pieces`, disjoint from the backend the scene renders through.
-        let leaf_chrome = self.pieces.leaf_elements(&leaf_positions);
+        let leaf_chrome = self.pieces.leaf_elements(&leaf_rects);
         let plus = self
             .pieces
             .plus_elements(&self.widgets.plus_regions, self.anim.is_some());
@@ -879,6 +875,7 @@ impl Comp {
             indexed: &self.indexed,
             wallpaper,
             leaf_chrome: &leaf_chrome,
+            frame_art: self.pieces.frame_art(),
             plus: &plus,
             taskbar,
             focus_outline: &focus_outline,

@@ -39,20 +39,21 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use super::indexed::{IndexedElement, IndexedProgram, IndexedTexture};
+use super::indexed::{IndexedElement, IndexedProgram, IndexedTexture, NineSliceElement};
 use super::Comp;
 use crate::icon::Icon;
-use crate::render::{BtnIcon, LeafView, Renderer, TitleInfo};
+use crate::render::{BtnIcon, LeafView, Renderer, SliceSpec, TitleInfo};
 use crate::theme;
 use crate::tree::{Dir, NodeId};
 use crate::widgets::{leaf_meta, BtnKind, FrameRect, Placement};
 use crate::Index;
 use pixel_graphics::Framebuffer;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::Kind;
+use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::utils::CommitCounter;
 use smithay::render_elements;
-use smithay::utils::{Logical, Point};
+use smithay::utils::{Logical, Point, Rectangle, Size};
 
 render_elements! {
     /// Everything one output frame is made of: client surfaces of every
@@ -64,6 +65,7 @@ render_elements! {
     pub OutputElement<=GlesRenderer>;
     Float=WaylandSurfaceRenderElement<GlesRenderer>,
     Chrome=IndexedElement,
+    Frame=NineSliceElement,
     Solid=smithay::backend::renderer::element::solid::SolidColorRenderElement,
     Quantize=super::quantize::QuantizeElement,
 }
@@ -91,9 +93,14 @@ pub struct Scene<'a> {
     /// group). `None` only before the first `update_chrome_pieces`, which
     /// every redraw runs before building the scene.
     pub wallpaper: Option<&'a IndexedTexture>,
-    /// Each placed leaf's frame texture with the origin it draws at this
-    /// frame (interpolated mid-animation, settled otherwise).
-    pub leaf_chrome: &'a [(Point<i32, Logical>, &'a IndexedTexture)],
+    /// Each placed leaf's frame draw data for this frame (rects interpolated
+    /// mid-animation, settled otherwise): the shared border art sliced over
+    /// the leaf rect by the GPU, plus its titlebar-contents strip texture.
+    pub leaf_chrome: &'a [LeafFrame<'a>],
+    /// The shared static frame art, for the float frames drawn inline in
+    /// `output_elements` (leaves resolve theirs in `leaf_elements`). `None`
+    /// only before the first `update_chrome_pieces`, like `wallpaper`.
+    pub frame_art: Option<&'a FrameArt>,
     /// The "+" insert-button textures with the gap/edge origins they draw
     /// at; empty while a layout animation runs.
     pub plus: &'a [(Point<i32, Logical>, &'a IndexedTexture)],
@@ -198,6 +205,8 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
         };
         let loc = (Point::<i32, Logical>::from((f.x, f.y)) - window.geometry().loc).to_physical(1);
         elements.extend(window.render_elements::<OutputElement>(renderer, loc, 1.0.into(), 1.0));
+        // The float's frame, like a leaf's: the titlebar strip texture in
+        // front, the shared border art sliced over the frame rect behind.
         let rect = f.frame_rect();
         if let Some(tex) = f.frame.texture() {
             elements.push(chrome_at(
@@ -205,6 +214,22 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
                 tex,
                 Point::<i32, Logical>::from((rect.x, rect.y)),
             ));
+        }
+        if let Some(art) = scene.frame_art {
+            let (btex, spec) = art.get(FrameMode::Border);
+            let dst = Rectangle::new(
+                Point::<i32, Logical>::from((rect.x, rect.y)).to_physical(1),
+                Size::from((rect.w.max(1), rect.h.max(1))),
+            );
+            elements.push(OutputElement::Frame(scene.indexed.nine_slice_element(
+                btex,
+                f.frame_id.clone(),
+                CommitCounter::default(),
+                dst,
+                spec,
+                crate::render::ACCENT_SWAP_FROM,
+                crate::render::accent_swap_to(f.accent),
+            )));
         }
     }
     // The Space's windows in stacking order, via the region renderer —
@@ -261,9 +286,26 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
     for (loc, tex) in scene.plus {
         elements.push(chrome_at(scene.indexed, tex, *loc));
     }
-    // Leaf frames: non-overlapping, so relative order is free.
-    for (loc, tex) in scene.leaf_chrome {
-        elements.push(chrome_at(scene.indexed, tex, *loc));
+    // Leaf frames: non-overlapping, so relative order is free. Each is the
+    // shared border art sliced over the leaf rect in the shader, with the
+    // titlebar-contents strip (icon, title, baked buttons) in front of it.
+    for f in scene.leaf_chrome {
+        if let Some((loc, tex)) = &f.titlebar {
+            elements.push(chrome_at(scene.indexed, tex, *loc));
+        }
+        let dst = Rectangle::new(
+            Point::<i32, Logical>::from((f.dst.x, f.dst.y)).to_physical(1),
+            Size::from((f.dst.w.max(1), f.dst.h.max(1))),
+        );
+        elements.push(OutputElement::Frame(scene.indexed.nine_slice_element(
+            f.art,
+            f.id.clone(),
+            f.commit,
+            dst,
+            f.spec,
+            crate::render::ACCENT_SWAP_FROM,
+            crate::render::accent_swap_to(f.accent),
+        )));
     }
     // The wallpaper is this session's opaque background; a foreign
     // Background surface (a wallpaper client) stacks behind it, occluded,
@@ -323,13 +365,75 @@ pub struct LayoutAnim {
 #[derive(Default)]
 pub struct ChromePieces {
     wallpaper: WallpaperPiece,
-    /// One texture per placed leaf, keyed by leaf id; stale entries are
-    /// dropped as leaves vanish.
-    leaves: HashMap<NodeId, (LeafKey, IndexedTexture)>,
+    /// The static frame sprites (border, both restore strips), uploaded once
+    /// and sliced over every leaf by the nine-slice shader.
+    art: Option<FrameArt>,
+    /// Per-leaf frame identity and titlebar-contents strip, keyed by leaf
+    /// id; stale entries are dropped as leaves vanish.
+    leaves: HashMap<NodeId, LeafPiece>,
     /// One texture per distinct "+" square size (all edge/gap plus buttons
     /// of a size share it).
     plus: HashMap<i32, IndexedTexture>,
     taskbar: TaskbarPiece,
+}
+
+/// The shared static frame art: each sprite uploaded once as an `R8`
+/// texture, paired with how it slices over a destination rect. Dropped by
+/// `invalidate_chrome` with everything else GL.
+pub struct FrameArt {
+    border: (IndexedTexture, SliceSpec),
+    min_v: (IndexedTexture, SliceSpec),
+    min_h: (IndexedTexture, SliceSpec),
+}
+
+/// Which static sprite a leaf's frame slices: the window border, or the
+/// restore strip along either axis when minimized.
+#[derive(Clone, Copy, PartialEq)]
+enum FrameMode {
+    Border,
+    MinV,
+    MinH,
+}
+
+impl FrameArt {
+    fn get(&self, mode: FrameMode) -> (&IndexedTexture, &SliceSpec) {
+        let (tex, spec) = match mode {
+            FrameMode::Border => &self.border,
+            FrameMode::MinV => &self.min_v,
+            FrameMode::MinH => &self.min_h,
+        };
+        (tex, spec)
+    }
+}
+
+/// One leaf's cached frame state: the identity its GPU-sliced frame element
+/// keeps across frames (so the damage tracker sees an unchanged leaf as
+/// undamaged; the commit bumps when a *uniform* changes — accent or sprite —
+/// which geometry tracking can't see), plus its titlebar-contents strip.
+struct LeafPiece {
+    id: Id,
+    commit: CommitCounter,
+    accent: Index,
+    mode: FrameMode,
+    /// The `w`x`tb_h` strip holding the icon/label, title text and baked
+    /// split buttons; `None` while minimized. The band fill behind it is
+    /// the frame's top margin.
+    titlebar: Option<(TitlebarKey, IndexedTexture)>,
+}
+
+/// One leaf's frame draw data for the scene: everything `output_elements`
+/// needs to build the nine-slice element and the titlebar strip element.
+pub struct LeafFrame<'a> {
+    /// The frame element's destination rect: the leaf rect, or the restore
+    /// strip centred in it when minimized.
+    pub dst: FrameRect,
+    pub art: &'a IndexedTexture,
+    pub spec: &'a SliceSpec,
+    pub id: Id,
+    pub commit: CommitCounter,
+    pub accent: Index,
+    /// The titlebar strip texture at its origin (the leaf's top-left).
+    pub titlebar: Option<(Point<i32, Logical>, &'a IndexedTexture)>,
 }
 
 impl ChromePieces {
@@ -338,15 +442,35 @@ impl ChromePieces {
         self.wallpaper.tex.as_ref()
     }
 
-    /// Each placed leaf's cached texture paired with its origin from
-    /// `tick_layout` (interpolated mid-slide, settled otherwise).
-    pub fn leaf_elements<'a>(
-        &'a self,
-        positions: &[(NodeId, Point<i32, Logical>)],
-    ) -> Vec<(Point<i32, Logical>, &'a IndexedTexture)> {
-        positions
+    /// The shared static frame art, for the scene's float frames.
+    pub fn frame_art(&self) -> Option<&FrameArt> {
+        self.art.as_ref()
+    }
+
+    /// Each placed leaf's frame draw data at its rect from `tick_layout`
+    /// (interpolated mid-slide, settled otherwise): the static art its
+    /// element slices, its persistent identity, and its titlebar strip.
+    pub fn leaf_elements<'a>(&'a self, rects: &[(NodeId, FrameRect)]) -> Vec<LeafFrame<'a>> {
+        let Some(art) = &self.art else {
+            return Vec::new();
+        };
+        rects
             .iter()
-            .filter_map(|(leaf, loc)| self.leaves.get(leaf).map(|(_, t)| (*loc, t)))
+            .filter_map(|(leaf, rect)| {
+                let piece = self.leaves.get(leaf)?;
+                let (tex, spec) = art.get(piece.mode);
+                Some(LeafFrame {
+                    dst: frame_dst(*rect, piece.mode, tex.size()),
+                    art: tex,
+                    spec,
+                    id: piece.id.clone(),
+                    commit: piece.commit,
+                    accent: piece.accent,
+                    titlebar: piece.titlebar.as_ref().map(|(_, t)| {
+                        (Point::<i32, Logical>::from((rect.x, rect.y)), t)
+                    }),
+                })
+            })
             .collect()
     }
 
@@ -376,6 +500,34 @@ impl ChromePieces {
             .tex
             .as_ref()
             .map(|t| (Point::<i32, Logical>::from(self.taskbar.origin), t))
+    }
+}
+
+/// Where a leaf's frame element actually draws within its rect: the whole
+/// rect for a bordered leaf; the restore strip centred across the short
+/// axis at the sprite's native size when minimized (clamped into the rect —
+/// the CPU renderer clipped to a leaf-sized buffer, elements don't clip).
+fn frame_dst(rect: FrameRect, mode: FrameMode, sprite: Size<i32, smithay::utils::Buffer>) -> FrameRect {
+    match mode {
+        FrameMode::Border => rect,
+        FrameMode::MinV => {
+            let w = sprite.w.min(rect.w);
+            FrameRect {
+                x: rect.x + (rect.w - w) / 2,
+                y: rect.y,
+                w,
+                h: rect.h,
+            }
+        }
+        FrameMode::MinH => {
+            let h = sprite.h.min(rect.h);
+            FrameRect {
+                x: rect.x,
+                y: rect.y + (rect.h - h) / 2,
+                w: rect.w,
+                h,
+            }
+        }
     }
 }
 
@@ -423,28 +575,23 @@ struct BtnPaint {
     accent: Index,
 }
 
-/// A leaf's content fingerprint: the derived key deciding whether its
-/// texture must be re-rendered. Everything `draw_leaf` and the baked buttons
-/// consult appears here; positions within the leaf follow from `w`/`h` and
-/// so aren't listed separately. Icons compare by their process-unique id and
-/// titles by their string contents.
+/// A titlebar strip's content fingerprint: the derived key deciding whether
+/// the strip must be re-rendered. Everything `draw_titlebar_strip` and the
+/// baked buttons consult appears here; the height is always `tb_h`. Icons
+/// compare by their process-unique id and titles by their string contents.
 #[derive(PartialEq)]
-struct LeafKey {
+struct TitlebarKey {
     w: i32,
-    h: i32,
     accent: Index,
-    minimized: bool,
     title: Option<(char, Option<u64>, Rc<str>)>,
     buttons: Vec<(i32, i32, BtnIcon, bool, Index)>,
 }
 
 impl LeafPaint {
-    fn key(&self) -> LeafKey {
-        LeafKey {
+    fn titlebar_key(&self) -> TitlebarKey {
+        TitlebarKey {
             w: self.w,
-            h: self.h,
             accent: self.accent,
-            minimized: self.minimized,
             title: self
                 .title
                 .as_ref()
@@ -454,6 +601,17 @@ impl LeafPaint {
                 .iter()
                 .map(|b| (b.cx, b.cy, b.icon, b.disabled, b.accent))
                 .collect(),
+        }
+    }
+
+    /// The sprite the frame slices at this paint's state.
+    fn mode(&self) -> FrameMode {
+        if !self.minimized {
+            FrameMode::Border
+        } else if self.w < self.h {
+            FrameMode::MinV
+        } else {
+            FrameMode::MinH
         }
     }
 
@@ -544,36 +702,56 @@ impl TaskbarPaint {
     }
 }
 
-/// Render `paint` into a leaf-sized indexed framebuffer and upload it,
-/// reusing the cached texture when the content fingerprint is unchanged.
-fn render_leaf(
+/// Refresh one leaf's cached frame state from `paint`: bump the frame
+/// element's commit when a shader uniform changes (accent or sprite — the
+/// damage tracker sees geometry itself), and re-render/re-upload the
+/// titlebar strip when its content fingerprint changes. No leaf-sized
+/// buffer exists anywhere: the frame is the shared art sliced on the GPU,
+/// and the strip is `w`x`tb_h`.
+fn update_leaf(
     chrome: &Renderer,
     indexed: &mut IndexedProgram,
     renderer: &mut GlesRenderer,
-    cache: &mut HashMap<NodeId, (LeafKey, IndexedTexture)>,
+    cache: &mut HashMap<NodeId, LeafPiece>,
     leaf: NodeId,
     paint: &LeafPaint,
 ) {
-    let key = paint.key();
-    if cache.get(&leaf).is_some_and(|(k, _)| *k == key) {
+    let mode = paint.mode();
+    let piece = cache.entry(leaf).or_insert_with(|| LeafPiece {
+        id: Id::new(),
+        commit: CommitCounter::default(),
+        accent: paint.accent,
+        mode,
+        titlebar: None,
+    });
+    if piece.accent != paint.accent || piece.mode != mode {
+        piece.accent = paint.accent;
+        piece.mode = mode;
+        piece.commit.increment();
+    }
+    if paint.minimized || (paint.title.is_none() && paint.buttons.is_empty()) {
+        piece.titlebar = None;
         return;
     }
-    // Transparent so the border's rounded (TRANSPARENT-indexed) corners let
-    // the wallpaper show through, and a minimized leaf's restore strip sits
-    // on the wallpaper rather than a filled rect.
+    let key = paint.titlebar_key();
+    if piece.titlebar.as_ref().is_some_and(|(k, _)| *k == key) {
+        return;
+    }
+    // Transparent so the frame's titlebar band (drawn behind by the sliced
+    // border element) shows through between the icon, text and buttons.
     let mut fb = Framebuffer::new(
         paint.w.max(1) as usize,
-        paint.h.max(1) as usize,
+        theme::tb_h().max(1) as usize,
         pixel_graphics::TRANSPARENT,
     );
-    chrome.draw_leaf(&mut fb, 0, 0, &paint.view());
+    chrome.draw_titlebar_strip(&mut fb, &paint.view());
     for b in &paint.buttons {
         chrome.draw_button(&mut fb, b.cx, b.cy, b.icon, b.disabled, b.accent);
     }
     // Reuse the previous texture's GL storage when the size matches.
-    let mut tex = cache.remove(&leaf).map(|(_, t)| t);
+    let mut tex = piece.titlebar.take().map(|(_, t)| t);
     indexed.upload(renderer, &mut tex, &fb, false);
-    cache.insert(leaf, (key, tex.expect("leaf texture uploaded")));
+    piece.titlebar = Some((key, tex.expect("titlebar strip uploaded")));
 }
 
 /// Render one "+" insert button of side `sz` into its shared texture (once
@@ -736,6 +914,24 @@ impl Comp {
             .collect();
         let taskbar_paint = self.taskbar_paint(ow, oh);
 
+        // The static frame sprites: once per GL lifetime (invalidate_chrome
+        // drops them with everything else).
+        if self.pieces.art.is_none() {
+            let mut upload = |fb: &Framebuffer| {
+                let mut tex = None;
+                self.indexed.upload(self.backend.renderer(), &mut tex, fb, false);
+                tex.expect("frame art uploaded")
+            };
+            let (border_fb, border_spec) = self.chrome.border_art();
+            let (min_v_fb, min_v_spec) = self.chrome.minimized_art(true);
+            let (min_h_fb, min_h_spec) = self.chrome.minimized_art(false);
+            self.pieces.art = Some(FrameArt {
+                border: (upload(&border_fb), border_spec),
+                min_v: (upload(&min_v_fb), min_v_spec),
+                min_h: (upload(&min_h_fb), min_h_spec),
+            });
+        }
+
         // Wallpaper: only on load / resize.
         if self.pieces.wallpaper.tex.is_none() || self.pieces.wallpaper.size != (ow, oh) {
             let fb = self.chrome.wallpaper_base(ow as u32, oh as u32);
@@ -748,9 +944,9 @@ impl Comp {
             self.pieces.wallpaper.size = (ow, oh);
         }
 
-        // Leaves: re-render changed ones, drop vanished ones.
+        // Leaves: refresh changed ones, drop vanished ones.
         for (leaf, paint) in &leaf_paints {
-            render_leaf(
+            update_leaf(
                 &self.chrome,
                 &mut self.indexed,
                 self.backend.renderer(),

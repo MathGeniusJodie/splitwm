@@ -133,6 +133,7 @@ impl Comp {
             h,
             accent,
             frame: crate::shell::FrameTex::Stale(None),
+            frame_id: smithay::backend::renderer::element::Id::new(),
         };
         let class = crate::shell::toplevel_app_id(&window);
         let win = self.managed.insert(window, Kind::Float(data));
@@ -245,8 +246,9 @@ impl Comp {
         }
     }
 
-    /// Repaint a float's chrome frame into its own buffer (rare: size,
-    /// title, or accent changed — never per frame or per drag step).
+    /// Repaint a float's titlebar strip into its own buffer (rare: size or
+    /// title changed — never per frame or per drag step). The border around
+    /// it is the shared art sliced on the GPU and never repaints.
     pub fn paint_float_frame(&mut self, win: Win) {
         let Some((window, f)) = self.managed.float(win) else {
             return;
@@ -255,27 +257,25 @@ impl Comp {
         let label = label_from_class(&crate::shell::toplevel_app_id(window));
         let icon = self.managed.entry(win).and_then(|m| m.icon.clone());
         let rect = f.frame_rect();
-        let accent = f.accent;
         let view = LeafView {
             w: rect.w,
             h: rect.h,
             tb_h: theme::tb_h(),
             bw: theme::BORDER_LEFT,
-            accent_index: accent,
+            accent_index: f.accent,
             titlebar: Some(TitleInfo { label, icon, title }),
             minimized: false,
             buttons: false,
         };
-        // A scratch frame-sized fb; float paints are rare enough that
-        // recycling machinery would outweigh the allocation.
+        // A scratch strip-sized fb; float paints are rare enough that
+        // recycling machinery would outweigh the allocation. Transparent so
+        // the frame's titlebar band shows through around the icon and text.
         let mut fb = pixel_graphics::Framebuffer::new(
             rect.w.max(1) as usize,
-            rect.h.max(1) as usize,
+            theme::tb_h().max(1) as usize,
             pixel_graphics::TRANSPARENT,
         );
-        self.chrome.draw_leaf(&mut fb, 0, 0, &view);
-        // The frame's border corners are TRANSPARENT-indexed, so the buffer
-        // has holes: it is not opaque.
+        self.chrome.draw_titlebar_strip(&mut fb, &view);
         if let Some((_, f)) = self.managed.float_mut(win) {
             let mut tex = f.frame.take();
             self.indexed

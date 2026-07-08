@@ -30,7 +30,7 @@ mod taskbar;
 mod wallpaper;
 
 pub use buttons::BtnIcon;
-pub use chrome::{LeafView, TitleInfo};
+pub use chrome::{LeafView, SliceSpec, TitleInfo};
 #[allow(unused_imports)] // consumed when the taskbar composes (M3-b)
 pub use taskbar::{draw_close_badge, draw_plus, draw_taskbar_sep};
 
@@ -114,6 +114,24 @@ fn fill(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, index: Index) {
 /// becomes its hand-picked darker counterpart (`theme::DARKER_INDEX`), and
 /// the highlight stroke (`CREAM`) becomes its hand-picked lighter
 /// counterpart (`theme::LIGHTER_INDEX`).
+/// The accent swap as index triples for the GPU nine-slice shader — the
+/// same three substitutions `accent_swap` bakes into a CPU `Swap`, spelled
+/// as data so the shader can apply them at draw time.
+pub const ACCENT_SWAP_FROM: [Index; 3] = [
+    palette_color::LAVENDER,
+    palette_color::PURPLE,
+    palette_color::CREAM,
+];
+
+/// What [`ACCENT_SWAP_FROM`] remaps to for a leaf accented `index`.
+pub fn accent_swap_to(index: Index) -> [Index; 3] {
+    [
+        index,
+        theme::darker_index(index),
+        theme::lighter_index(index),
+    ]
+}
+
 fn accent_swap(index: Index) -> Swap {
     Swap::identity()
         .set(

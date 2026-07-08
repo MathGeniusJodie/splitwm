@@ -40,6 +40,12 @@ const PALETTE_UNIT: i32 = 1;
 /// source uploads and draws through it.
 pub struct IndexedProgram {
     program: GlesTexProgram,
+    /// The nine-slice variant: same palette lookup, but the source texel is
+    /// picked by slicing the destination rect against `inset`/`edge`
+    /// uniforms and the indices in `swap_from` remap to `swap_to` before the
+    /// lookup — one small static border sprite serves every leaf at every
+    /// size and accent (see [`NineSliceElement`]).
+    nine: GlesTexProgram,
     /// 256x1 `RGBA` palette, index -> premultiplied colour, sampled by the
     /// shader on `PALETTE_UNIT`. Held as a `GlesTexture` so its GL id stays
     /// valid (and is freed) for the program's whole life.
@@ -75,8 +81,22 @@ impl IndexedProgram {
                 &[UniformName::new("palette", UniformType::_1i)],
             )
             .expect("compile palette shader");
+        let nine = renderer
+            .compile_custom_texture_shader(
+                NINE_SHADER_SOURCE,
+                &[
+                    UniformName::new("palette", UniformType::_1i),
+                    UniformName::new("dst_size", UniformType::_2f),
+                    UniformName::new("tex_size", UniformType::_2f),
+                    UniformName::new("inset", UniformType::_4f),
+                    UniformName::new("edge", UniformType::_2f),
+                    UniformName::new("swap_from", UniformType::_3f),
+                    UniformName::new("swap_to", UniformType::_3f),
+                ],
+            )
+            .expect("compile nine-slice palette shader");
         let data = palette_rgba();
-        let size = Size::<i32, Buffer>::from((256, 1));
+        let size = Size::<i32, Buffer>::from((PALETTE_TEX_W as i32, 1));
         let tex_id = renderer
             .with_context(|gl| unsafe { create_texture(gl, size, ffi::RGBA8, ffi::RGBA, &data) })
             .expect("create palette texture");
@@ -85,6 +105,7 @@ impl IndexedProgram {
             unsafe { GlesTexture::from_raw(renderer, Some(ffi::RGBA8), true, tex_id, size) };
         IndexedProgram {
             program,
+            nine,
             palette_tex,
             staging: Vec::new(),
         }
@@ -136,6 +157,49 @@ impl IndexedProgram {
             opaque: tex.opaque,
             kind,
         }
+    }
+
+    /// A render element slicing the small static sprite `art` over `dst`
+    /// per `spec`, with the accent swap `swap_from` -> `swap_to` applied in
+    /// the shader. `id`/`commit` are the *consumer's* identity (one per
+    /// leaf, bumped when its uniforms change), not the shared art's — many
+    /// elements slice one texture.
+    #[allow(clippy::too_many_arguments)]
+    pub fn nine_slice_element(
+        &self,
+        art: &IndexedTexture,
+        id: Id,
+        commit: CommitCounter,
+        dst: Rectangle<i32, Physical>,
+        spec: &crate::render::SliceSpec,
+        swap_from: [u8; 3],
+        swap_to: [u8; 3],
+    ) -> NineSliceElement {
+        NineSliceElement {
+            id,
+            texture: art.texture.clone(),
+            program: self.nine.clone(),
+            palette_tex: self.palette_tex.tex_id(),
+            commit,
+            dst,
+            tex_size: art.size,
+            inset: [
+                spec.l as f32,
+                spec.t as f32,
+                spec.r as f32,
+                spec.b as f32,
+            ],
+            edge: [spec.edge0 as f32, spec.edge1 as f32],
+            swap_from: swap_from.map(f32::from),
+            swap_to: swap_to.map(f32::from),
+        }
+    }
+}
+
+impl IndexedTexture {
+    /// The texture's pixel size (its framebuffer's, at upload).
+    pub fn size(&self) -> Size<i32, Buffer> {
+        self.size
     }
 }
 
@@ -347,19 +411,140 @@ impl RenderElement<GlesRenderer> for IndexedElement {
     }
 }
 
-/// The 256-entry palette as a row of premultiplied `RGBA` texels: index ->
-/// colour, index `TRANSPARENT` (255) -> a transparent texel. The palette is
-/// opaque, so opaque entries pass through and only the transparent slot is
-/// zeroed.
-fn palette_rgba() -> [u8; 256 * 4] {
+/// A leaf frame drawn by slicing the shared static border sprite: the
+/// element covers the whole frame rect, and the shader maps each output
+/// pixel back into the sprite (fixed corners, tiled edges/middle) and remaps
+/// the accent indices, so no leaf-sized texture ever exists. Never opaque —
+/// the sprite's interior and rounded corners are `TRANSPARENT`-indexed.
+pub struct NineSliceElement {
+    id: Id,
+    texture: GlesTexture,
+    program: GlesTexProgram,
+    /// The shared palette texture's GL id, bound on `PALETTE_UNIT` during
+    /// `draw` exactly as [`IndexedElement`] binds it.
+    palette_tex: u32,
+    commit: CommitCounter,
+    dst: Rectangle<i32, Physical>,
+    tex_size: Size<i32, Buffer>,
+    /// l, t, r, b: the fixed-size slice margins, in sprite (= output) px.
+    inset: [f32; 4],
+    /// The stretchable strip's source column range (x0, x1) for the
+    /// horizontal middle — narrower than the span between the corners when
+    /// the art bakes decoration there (`NineSlice::EDGE_SAMPLE_*`).
+    edge: [f32; 2],
+    /// Palette indices remapped in the shader before the palette lookup:
+    /// each texel equal to `swap_from[i]` reads as `swap_to[i]` — the accent
+    /// swap `render::accent_swap` applies on the CPU, moved to draw time.
+    swap_from: [f32; 3],
+    swap_to: [f32; 3],
+}
+
+impl Element for NineSliceElement {
+    fn id(&self) -> &Id {
+        &self.id
+    }
+
+    fn current_commit(&self) -> CommitCounter {
+        self.commit
+    }
+
+    fn src(&self) -> Rectangle<f64, Buffer> {
+        Rectangle::from_size(self.tex_size.to_f64())
+    }
+
+    fn transform(&self) -> Transform {
+        Transform::Normal
+    }
+
+    fn geometry(&self, _scale: Scale<f64>) -> Rectangle<i32, Physical> {
+        self.dst
+    }
+
+    fn kind(&self) -> Kind {
+        Kind::Unspecified
+    }
+}
+
+impl RenderElement<GlesRenderer> for NineSliceElement {
+    fn draw(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        opaque_regions: &[Rectangle<i32, Physical>],
+    ) -> Result<(), GlesError> {
+        // Palette on its unit, exactly as IndexedElement::draw.
+        let palette_tex = self.palette_tex;
+        frame.with_context(|gl| unsafe {
+            gl.ActiveTexture(ffi::TEXTURE0 + PALETTE_UNIT as u32);
+            gl.BindTexture(ffi::TEXTURE_2D, palette_tex);
+            gl.ActiveTexture(ffi::TEXTURE0);
+        })?;
+        // With `src` covering the whole sprite, the stock vertex shader's
+        // v_coords interpolate as the fraction of the *dst* rect — the
+        // fragment shader multiplies by `dst_size` to recover output pixels
+        // and does the slicing itself.
+        let result = frame.render_texture_from_to(
+            &self.texture,
+            src,
+            dst,
+            damage,
+            opaque_regions,
+            Transform::Normal,
+            1.0,
+            Some(&self.program),
+            &[
+                Uniform::new("palette", PALETTE_UNIT),
+                Uniform::new("dst_size", (dst.size.w as f32, dst.size.h as f32)),
+                Uniform::new(
+                    "tex_size",
+                    (self.tex_size.w as f32, self.tex_size.h as f32),
+                ),
+                Uniform::new(
+                    "inset",
+                    (self.inset[0], self.inset[1], self.inset[2], self.inset[3]),
+                ),
+                Uniform::new("edge", (self.edge[0], self.edge[1])),
+                Uniform::new(
+                    "swap_from",
+                    (self.swap_from[0], self.swap_from[1], self.swap_from[2]),
+                ),
+                Uniform::new(
+                    "swap_to",
+                    (self.swap_to[0], self.swap_to[1], self.swap_to[2]),
+                ),
+            ],
+        );
+        frame.with_context(|gl| unsafe {
+            gl.ActiveTexture(ffi::TEXTURE0 + PALETTE_UNIT as u32);
+            gl.BindTexture(ffi::TEXTURE_2D, 0);
+            gl.ActiveTexture(ffi::TEXTURE0);
+        })?;
+        result
+    }
+}
+
+/// The palette lookup texture's width: the palette's 16 real entries padded
+/// to a power of two with zeroed (transparent) texels. `TRANSPARENT` (255)
+/// needs no slot of its own — its lookup coordinate overshoots the texture
+/// and `CLAMP_TO_EDGE` lands it on the zeroed tail.
+const PALETTE_TEX_W: usize = 32;
+
+/// The palette as a row of premultiplied `RGBA` texels: index -> colour,
+/// every texel past the palette transparent. The palette is opaque, so
+/// opaque entries pass through and the tail is all zeros.
+fn palette_rgba() -> [u8; PALETTE_TEX_W * 4] {
     let palette = crate::assets::palette();
-    let mut data = [0u8; 256 * 4];
-    for (i, texel) in data.chunks_exact_mut(4).enumerate() {
-        let index = i as u8;
-        if index != pixel_graphics::TRANSPARENT {
-            let c = palette.color(index);
-            texel.copy_from_slice(&[c.r, c.g, c.b, 0xFF]);
-        }
+    assert!(
+        palette.len() <= PALETTE_TEX_W,
+        "palette ({} entries) outgrew its {PALETTE_TEX_W}-texel lookup texture",
+        palette.len()
+    );
+    let mut data = [0u8; PALETTE_TEX_W * 4];
+    for (i, texel) in data.chunks_exact_mut(4).enumerate().take(palette.len()) {
+        let c = palette.color(i as u8);
+        texel.copy_from_slice(&[c.r, c.g, c.b, 0xFF]);
     }
     data
 }
@@ -387,8 +572,70 @@ uniform float tint;
 
 void main() {
     float index = texture2D(tex, v_coords).r * 255.0;
-    vec2 lookup = vec2((index + 0.5) / 256.0, 0.5);
+    // Indices past the palette (TRANSPARENT is 255) overshoot the
+    // CLAMP_TO_EDGE texture and land on its zeroed tail.
+    vec2 lookup = vec2((index + 0.5) / 32.0, 0.5);
     vec4 color = texture2D(palette, lookup) * alpha;
+#if defined(DEBUG_FLAGS)
+    if (tint == 1.0)
+        color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
+#endif
+    gl_FragColor = color;
+}
+";
+
+/// The nine-slice palette shader: v_coords arrive as the fraction of the
+/// destination rect (the element's `src` covers the whole sprite), so
+/// `v_coords * dst_size` recovers the output pixel. Each axis then maps
+/// destination pixels to sprite texels — fixed margins near the rect's
+/// edges, the sample strip tiled across the middle — and the three
+/// `swap_from` indices remap to `swap_to` before the palette lookup (the
+/// accent swap, at draw time). highp where available: texel arithmetic on
+/// a 4K-wide rect exceeds mediump's guaranteed integer range.
+const NINE_SHADER_SOURCE: &str = "\
+#version 100
+
+//_DEFINES_
+
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D tex;
+uniform sampler2D palette;
+uniform float alpha;
+uniform vec2 dst_size;
+uniform vec2 tex_size;
+uniform vec4 inset;
+uniform vec2 edge;
+uniform vec3 swap_from;
+uniform vec3 swap_to;
+varying vec2 v_coords;
+
+#if defined(DEBUG_FLAGS)
+uniform float tint;
+#endif
+
+// One axis of the slice: destination pixel p (of d total) -> sprite texel
+// (of s total), with fixed margins lo/hi and the middle tiling the source
+// strip e0..e1. The far margin is tested first, matching the CPU renderer's
+// painter order when a tiny rect makes the margins overlap.
+float slice(float p, float d, float s, float lo, float hi, float e0, float e1) {
+    if (p >= d - hi) return s - (d - p);
+    if (p < lo) return p;
+    return e0 + mod(p - lo, e1 - e0);
+}
+
+void main() {
+    vec2 p = v_coords * dst_size;
+    float sx = slice(p.x, dst_size.x, tex_size.x, inset.x, inset.z, edge.x, edge.y);
+    float sy = slice(p.y, dst_size.y, tex_size.y, inset.y, inset.w, inset.y, tex_size.y - inset.w);
+    float index = texture2D(tex, vec2(sx, sy) / tex_size).r * 255.0;
+    if (abs(index - swap_from.x) < 0.5) index = swap_to.x;
+    else if (abs(index - swap_from.y) < 0.5) index = swap_to.y;
+    else if (abs(index - swap_from.z) < 0.5) index = swap_to.z;
+    vec4 color = texture2D(palette, vec2((index + 0.5) / 32.0, 0.5)) * alpha;
 #if defined(DEBUG_FLAGS)
     if (tint == 1.0)
         color = vec4(0.0, 0.2, 0.0, 0.2) + color * 0.8;
