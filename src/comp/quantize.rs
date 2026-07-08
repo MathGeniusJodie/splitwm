@@ -87,11 +87,22 @@ impl ColorMode {
 /// (`Quantize::wrap`).
 pub struct Quantize {
     mode: ColorMode,
-    /// GL program/LUTs/scene buffer, created on the first quantized frame.
-    gpu: Option<Gpu>,
+    gpu: GpuState,
+}
+
+/// The lazily-created GL objects' lifecycle. One enum rather than an
+/// `Option<Gpu>` + `unsupported` flag pair, so "unsupported yet holding GL
+/// objects" is unrepresentable and every consumer matches exactly one state.
+enum GpuState {
+    /// No quantized frame rendered yet; the first one compiles the shader.
+    Untried,
     /// The ESSL 3.00 compile failed (a GLES2-only context): quantized modes
-    /// are unavailable and `cycle` no-ops with a log.
-    unsupported: bool,
+    /// are unavailable and `cycle` no-ops with a log. Deliberately sticky —
+    /// `invalidate` doesn't clear it, since the compile failure is a
+    /// property of the driver, not of lost GL state.
+    Unsupported,
+    /// GL program/LUTs/scene buffer, ready to render.
+    Ready(Gpu),
 }
 
 /// The compiled program with its uniform locations and the vertex plumbing.
@@ -130,8 +141,7 @@ impl Quantize {
     pub fn new() -> Quantize {
         Quantize {
             mode: ColorMode::True,
-            gpu: None,
-            unsupported: false,
+            gpu: GpuState::Untried,
         }
     }
 
@@ -140,22 +150,28 @@ impl Quantize {
     /// between the two quantized modes, where the element is otherwise
     /// unchanged.
     pub fn cycle(&mut self) {
-        if self.unsupported {
+        if let GpuState::Unsupported = self.gpu {
             tracing::warn!("color mode cycle ignored: quantize shader unavailable");
             return;
         }
         self.mode = self.mode.next();
         tracing::info!("color mode: {:?}", self.mode);
-        if let Some(scene) = self.gpu.as_mut().and_then(|gpu| gpu.scene.as_mut()) {
+        if let GpuState::Ready(Gpu {
+            scene: Some(scene), ..
+        }) = &mut self.gpu
+        {
             scene.damage.reset();
         }
     }
 
     /// Drop the GL objects (VT re-activation may have lost texture
-    /// contents); everything is rebuilt on the next quantized frame.
+    /// contents); everything is rebuilt on the next quantized frame. An
+    /// `Unsupported` verdict stays.
     #[cfg_attr(not(feature = "tty"), allow(dead_code))]
     pub fn invalidate(&mut self) {
-        self.gpu = None;
+        if let GpuState::Ready(_) = self.gpu {
+            self.gpu = GpuState::Untried;
+        }
     }
 
     /// Route one frame's elements through the post-pass. In `True` mode (or
@@ -172,42 +188,26 @@ impl Quantize {
         let Some(levels) = self.mode.levels() else {
             return elements;
         };
-        if self.unsupported {
-            return elements;
-        }
-        if self.gpu.is_none() {
-            match Gpu::new(renderer) {
-                Ok(gpu) => self.gpu = Some(gpu),
+        if let GpuState::Untried = self.gpu {
+            self.gpu = match Gpu::new(renderer) {
+                Ok(gpu) => GpuState::Ready(gpu),
                 Err(err) => {
                     tracing::warn!("quantize shader unavailable, staying true-colour: {err}");
-                    self.unsupported = true;
-                    self.mode = ColorMode::True;
-                    return elements;
+                    GpuState::Unsupported
                 }
+            };
+        }
+        let remap = self.mode == ColorMode::Palette;
+        let GpuState::Ready(gpu) = &mut self.gpu else {
+            return elements;
+        };
+        match gpu.quantize_element(renderer, &elements, size, clear, levels, remap) {
+            Ok(element) => vec![OutputElement::Quantize(element)],
+            Err(err) => {
+                tracing::error!("quantize scene pass: {err}");
+                elements
             }
         }
-        let gpu = self.gpu.as_mut().expect("gpu just ensured");
-        if let Err(err) = gpu.render_scene(renderer, &elements, size, clear) {
-            tracing::error!("quantize scene pass: {err}");
-            return elements;
-        }
-        let scene = gpu.scene.as_ref().expect("scene just rendered");
-        vec![OutputElement::Quantize(QuantizeElement {
-            id: scene.id.clone(),
-            texture: scene.texture.clone(),
-            damage: scene.damage.snapshot(),
-            size: scene.size,
-            program: gpu.program,
-            u_proj: gpu.u_proj,
-            u_size: gpu.u_size,
-            u_levels: gpu.u_levels,
-            u_remap: gpu.u_remap,
-            lut: gpu.lut,
-            vao: gpu.vao,
-            vbo: gpu.vbo,
-            levels,
-            remap: self.mode == ColorMode::Palette,
-        })]
     }
 }
 
@@ -288,52 +288,36 @@ impl Gpu {
             .map_err(|err| format!("gl context: {err}"))?
     }
 
-    /// Pass A: composite `elements` into the scene texture, tracking damage.
-    fn render_scene(
+    /// Pass A: composite `elements` into the scene texture (recreated on a
+    /// size change), tracking damage — and describe the fullscreen pass-B
+    /// element that draws the result. Built here, where the scene buffer is
+    /// in scope by construction, rather than re-fetched from the `Option`
+    /// afterwards.
+    fn quantize_element(
         &mut self,
         renderer: &mut GlesRenderer,
         elements: &[OutputElement],
         size: Size<i32, Physical>,
         clear: Color32F,
-    ) -> Result<(), String> {
-        if self.scene.as_ref().is_none_or(|s| s.size != size) {
-            let texture: GlesTexture = renderer
-                .create_buffer(
-                    smithay::backend::allocator::Fourcc::Abgr8888,
-                    size.to_logical(1).to_buffer(1, Transform::Normal),
-                )
-                .map_err(|err| format!("scene texture: {err}"))?;
-            // 1:1 sampling; NEAREST keeps the quantize exact at the cost of
-            // nothing.
-            let tex_id = texture.tex_id();
-            renderer
-                .with_context(|gl| unsafe {
-                    gl.BindTexture(ffi::TEXTURE_2D, tex_id);
-                    gl.TexParameteri(
-                        ffi::TEXTURE_2D,
-                        ffi::TEXTURE_MIN_FILTER,
-                        ffi::NEAREST as i32,
-                    );
-                    gl.TexParameteri(
-                        ffi::TEXTURE_2D,
-                        ffi::TEXTURE_MAG_FILTER,
-                        ffi::NEAREST as i32,
-                    );
-                    gl.BindTexture(ffi::TEXTURE_2D, 0);
-                })
-                .map_err(|err| format!("scene texture params: {err}"))?;
-            self.scene = Some(SceneBuffer {
-                texture,
-                // Always `Normal`: the second pass applies the output
-                // transform when it projects the fullscreen quad.
-                tracker: OutputDamageTracker::new(size, 1.0, Transform::Normal),
-                size,
-                id: Id::new(),
-                damage: DamageBag::default(),
-                rendered: false,
-            });
-        }
-        let scene = self.scene.as_mut().expect("scene just ensured");
+        levels: [f32; 3],
+        remap: bool,
+    ) -> Result<QuantizeElement, String> {
+        // Plain copies of the GL handles, taken before `scene` borrows
+        // `self` for the rest of the pass.
+        let (program, u_proj, u_size, u_levels, u_remap, lut, vao, vbo) = (
+            self.program,
+            self.u_proj,
+            self.u_size,
+            self.u_levels,
+            self.u_remap,
+            self.lut,
+            self.vao,
+            self.vbo,
+        );
+        let scene = match self.scene.take().filter(|s| s.size == size) {
+            Some(scene) => self.scene.insert(scene),
+            None => self.scene.insert(Self::make_scene(renderer, size)?),
+        };
         let mut fb = renderer
             .bind(&mut scene.texture)
             .map_err(|err| format!("bind scene texture: {err}"))?;
@@ -342,11 +326,71 @@ impl Gpu {
             .tracker
             .render_output(renderer, &mut fb, age, elements, clear)
             .map_err(|err| format!("render: {err:?}"))?;
+        // Release the render target's borrow of the scene texture; the
+        // element below clones that texture.
+        drop(fb);
         scene.rendered = true;
         if let Some(damage) = res.damage {
             scene.damage.add(damage.iter().copied());
         }
-        Ok(())
+        Ok(QuantizeElement {
+            id: scene.id.clone(),
+            texture: scene.texture.clone(),
+            damage: scene.damage.snapshot(),
+            size: scene.size,
+            program,
+            u_proj,
+            u_size,
+            u_levels,
+            u_remap,
+            lut,
+            vao,
+            vbo,
+            levels,
+            remap,
+        })
+    }
+
+    /// A fresh scene buffer for pass A at `size`.
+    fn make_scene(
+        renderer: &mut GlesRenderer,
+        size: Size<i32, Physical>,
+    ) -> Result<SceneBuffer, String> {
+        let texture: GlesTexture = renderer
+            .create_buffer(
+                smithay::backend::allocator::Fourcc::Abgr8888,
+                size.to_logical(1).to_buffer(1, Transform::Normal),
+            )
+            .map_err(|err| format!("scene texture: {err}"))?;
+        // 1:1 sampling; NEAREST keeps the quantize exact at the cost of
+        // nothing.
+        let tex_id = texture.tex_id();
+        renderer
+            .with_context(|gl| unsafe {
+                gl.BindTexture(ffi::TEXTURE_2D, tex_id);
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_MIN_FILTER,
+                    ffi::NEAREST as i32,
+                );
+                gl.TexParameteri(
+                    ffi::TEXTURE_2D,
+                    ffi::TEXTURE_MAG_FILTER,
+                    ffi::NEAREST as i32,
+                );
+                gl.BindTexture(ffi::TEXTURE_2D, 0);
+            })
+            .map_err(|err| format!("scene texture params: {err}"))?;
+        Ok(SceneBuffer {
+            texture,
+            // Always `Normal`: the second pass applies the output
+            // transform when it projects the fullscreen quad.
+            tracker: OutputDamageTracker::new(size, 1.0, Transform::Normal),
+            size,
+            id: Id::new(),
+            damage: DamageBag::default(),
+            rendered: false,
+        })
     }
 }
 
@@ -453,7 +497,12 @@ impl RenderElement<GlesRenderer> for QuantizeElement {
             gl.UseProgram(self.program);
             gl.UniformMatrix3fv(self.u_proj, 1, ffi::FALSE, proj.as_ptr());
             gl.Uniform2f(self.u_size, self.size.w as f32, self.size.h as f32);
-            gl.Uniform3f(self.u_levels, self.levels[0], self.levels[1], self.levels[2]);
+            gl.Uniform3f(
+                self.u_levels,
+                self.levels[0],
+                self.levels[1],
+                self.levels[2],
+            );
             gl.Uniform1i(self.u_remap, i32::from(self.remap));
             gl.ActiveTexture(ffi::TEXTURE1);
             gl.BindTexture(ffi::TEXTURE_3D, self.lut);

@@ -38,7 +38,7 @@ impl Comp {
                 let time = event.time_msec();
                 let key_state = event.state();
                 let code = event.key_code();
-                let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
+                let keyboard = self.keyboard.clone();
                 // Bindings are matched on the level-0 keysym plus an exact
                 // modifier mask, before the client sees anything. A chord we
                 // intercept owns the whole key cycle: its auto-repeats (a
@@ -112,8 +112,7 @@ impl Comp {
                     .space
                     .output_geometry(&self.output)
                     .expect("output is mapped");
-                let pointer = self.seat.get_pointer().expect("seat has a pointer");
-                let mut pos = pointer.current_location() + event.delta();
+                let mut pos = self.pointer.current_location() + event.delta();
                 pos.x = pos.x.clamp(
                     f64::from(output_geo.loc.x),
                     f64::from(output_geo.loc.x + output_geo.size.w) - 1.0,
@@ -128,7 +127,7 @@ impl Comp {
                 self.pointer_button(event.button_code(), event.state(), event.time_msec());
             }
             InputEvent::PointerAxis { event } => {
-                let pointer = self.seat.get_pointer().expect("seat has a pointer");
+                let pointer = self.pointer.clone();
                 let horizontal = event.amount(Axis::Horizontal).unwrap_or_else(|| {
                     event.amount_v120(Axis::Horizontal).unwrap_or(0.0) * 15.0 / 120.0
                 });
@@ -190,7 +189,7 @@ impl Comp {
     pub fn pointer_button(&mut self, button: u32, state: ButtonState, time_msec: u32) {
         const BTN_LEFT: u32 = 0x110;
         const BTN_RIGHT: u32 = 0x111;
-        let pointer = self.seat.get_pointer().expect("seat has a pointer");
+        let pointer = self.pointer.clone();
         let serial = SERIAL_COUNTER.next_serial();
         let pos = pointer.current_location();
 
@@ -220,9 +219,7 @@ impl Comp {
                 // must forward to it, not hit-test the chrome
                 // underneath.
                 let over_unmanaged = under.is_some();
-                let clicked = under
-                    .as_ref()
-                    .and_then(|s| self.managed.win_for_surface(s));
+                let clicked = under.as_ref().and_then(|s| self.managed.win_for_surface(s));
                 match clicked {
                     Some(win) if button == BTN_LEFT => {
                         match self.managed.kind_of(win) {
@@ -263,16 +260,14 @@ impl Comp {
                                 .iter()
                                 .any(|o| o.surface.wl_surface().as_ref() == Some(s))
                         }) {
-                            let keyboard =
-                                self.seat.get_keyboard().expect("seat has a keyboard");
+                            let keyboard = self.keyboard.clone();
                             keyboard.set_focus(self, Some(s.clone()), serial);
                         } else if let Some(s) = under.as_ref() {
                             let focusable = smithay::desktop::layer_map_for_output(&self.output)
                                 .layer_for_surface(s, smithay::desktop::WindowSurfaceType::ALL)
                                 .is_some_and(|l| l.can_receive_keyboard_focus());
                             if focusable {
-                                let keyboard =
-                                    self.seat.get_keyboard().expect("seat has a keyboard");
+                                let keyboard = self.keyboard.clone();
                                 keyboard.set_focus(self, Some(s.clone()), serial);
                             }
                         }
@@ -327,7 +322,7 @@ impl Comp {
             };
             self.cursor_status = Some(icon);
         }
-        let pointer = self.seat.get_pointer().expect("seat has a pointer");
+        let pointer = self.pointer.clone();
         pointer.motion(
             self,
             under,

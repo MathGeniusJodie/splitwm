@@ -82,9 +82,9 @@ impl Comp {
                     // connection doesn't expose (o-r geometry at map time,
                     // see OrWindow). Local Xwayland: roundtrips are cheap
                     // and only happen per o-r map.
-                    match smithay::reexports::x11rb::rust_connection::RustConnection::connect(
-                        Some(&format!(":{display_number}")),
-                    ) {
+                    match smithay::reexports::x11rb::rust_connection::RustConnection::connect(Some(
+                        &format!(":{display_number}"),
+                    )) {
                         Ok((conn, _)) => comp.x11_query = Some(conn),
                         Err(err) => tracing::warn!("x11 query connection failed: {err}"),
                     }
@@ -102,7 +102,7 @@ impl Comp {
     /// Whether the keyboard focus is an X11 window's surface (managed or
     /// override-redirect).
     fn x11_holds_focus(&self) -> bool {
-        let Some(focus) = self.seat.get_keyboard().and_then(|k| k.current_focus()) else {
+        let Some(focus) = self.keyboard.current_focus() else {
             return false;
         };
         self.or_windows
@@ -177,7 +177,7 @@ impl XWaylandShellHandler for Comp {
             .iter()
             .any(|o| o.surface.window_id() == window.window_id())
         {
-            let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
+            let keyboard = self.keyboard.clone();
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             keyboard.set_focus(self, Some(wl_surface), serial);
         } else {
@@ -200,7 +200,9 @@ impl smithay::xwayland::XwmHandler for Comp {
             tracing::warn!("x11 set_mapped: {err}");
             return;
         }
-        self.classify_and_manage(Window::new_x11_window(window));
+        // X11 pre-map fullscreen arrives via `fullscreen_request` on the
+        // WM connection instead of a pending record.
+        self.classify_and_manage(Window::new_x11_window(window), false);
     }
 
     /// Override-redirect windows (rofi, menus) position themselves and are
@@ -227,7 +229,7 @@ impl smithay::xwayland::XwmHandler for Comp {
             rect,
         });
         if let Some(surface) = window.wl_surface() {
-            let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
+            let keyboard = self.keyboard.clone();
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             keyboard.set_focus(self, Some(surface), serial);
         }
@@ -279,7 +281,7 @@ impl smithay::xwayland::XwmHandler for Comp {
                     if (f.w, f.h) != (rect.size.w, rect.size.h) {
                         f.w = rect.size.w.max(1);
                         f.h = rect.size.h.max(1);
-                        f.frame_dirty = true;
+                        f.frame.mark_stale();
                     }
                 }
                 let _ = window.configure(rect);

@@ -14,14 +14,16 @@ use crate::widgets::label_from_class;
 
 impl Comp {
     /// First commit with a buffer (Wayland) or map request (X11): decide
-    /// what this window is and manage it accordingly.
-    pub fn classify_and_manage(&mut self, window: Window) {
+    /// what this window is and manage it accordingly. `fullscreen` is the
+    /// pre-map fullscreen request carried over from the pending record
+    /// (master's pre-map `_NET_WM_STATE` behavior), honored only for a
+    /// tiled window.
+    pub fn classify_and_manage(&mut self, window: Window, fullscreen: bool) {
         if self.matches_dock(&window) && self.managed.dock().is_none() {
             self.manage_dock(window);
         } else if self.wants_float(&window) {
             self.manage_float(window);
         } else {
-            let surface = window.toplevel().map(|t| t.wl_surface().clone());
             let class = crate::shell::toplevel_app_id(&window);
             let win = self.managed.insert(window, Kind::Tiled);
             let slot = self.assign_icon_slot(&class);
@@ -30,11 +32,8 @@ impl Comp {
             }
             self.spawn_icon_fetch(win, class);
             self.state.pin_client(win);
-            if let Some(surface) = surface {
-                if let Some(idx) = self.pending_fullscreen.iter().position(|s| *s == surface) {
-                    self.pending_fullscreen.swap_remove(idx);
-                    self.fullscreen = Some(win);
-                }
+            if fullscreen {
+                self.fullscreen = Some(win);
             }
             self.arrange();
         }
@@ -133,8 +132,7 @@ impl Comp {
             w,
             h,
             accent,
-            frame_tex: None,
-            frame_dirty: true,
+            frame: crate::shell::FrameTex::Stale(None),
         };
         let class = crate::shell::toplevel_app_id(&window);
         let win = self.managed.insert(window, Kind::Float(data));
@@ -279,9 +277,13 @@ impl Comp {
         // The frame's border corners are TRANSPARENT-indexed, so the buffer
         // has holes: it is not opaque.
         if let Some((_, f)) = self.managed.float_mut(win) {
+            let mut tex = f.frame.take();
             self.indexed
-                .upload(self.backend.renderer(), &mut f.frame_tex, &fb, false);
-            f.frame_dirty = false;
+                .upload(self.backend.renderer(), &mut tex, &fb, false);
+            f.frame = match tex {
+                Some(tex) => crate::shell::FrameTex::Fresh(tex),
+                None => crate::shell::FrameTex::Stale(None),
+            };
         }
     }
 }

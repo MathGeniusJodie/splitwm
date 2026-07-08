@@ -268,7 +268,10 @@ pub fn run() {
                     if device.config_tap_finger_count() > 0 {
                         let _ = device.config_tap_set_enabled(true);
                     }
-                    if device.config_click_methods().contains(&ClickMethod::Clickfinger) {
+                    if device
+                        .config_click_methods()
+                        .contains(&ClickMethod::Clickfinger)
+                    {
                         let _ = device.config_click_set_method(ClickMethod::Clickfinger);
                     }
                 }
@@ -456,4 +459,3 @@ fn reconnect(comp: &mut Comp) {
     comp.resize_output(wl_mode);
     comp.redraw();
 }
-

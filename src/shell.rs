@@ -32,10 +32,51 @@ pub struct FloatData {
     pub accent: crate::Index,
     /// The frame chrome's indexed GPU texture, rendered as its own element
     /// just below the client surface; re-uploaded only when its content
-    /// (size/title/accent) changes — a drag just moves the element. `None`
-    /// until the first paint, which happens before the float is first shown.
-    pub frame_tex: Option<crate::comp::indexed::IndexedTexture>,
-    pub frame_dirty: bool,
+    /// (size/title/accent) changes — a drag just moves the element.
+    pub frame: FrameTex,
+}
+
+/// A float frame's chrome texture and its freshness in one state: `Fresh`
+/// can only be built with a texture, so "no texture yet not due for a
+/// repaint" — a frame that would render as nothing forever — is
+/// unrepresentable.
+pub enum FrameTex {
+    /// The frame's content (size/title/accent) changed since the held
+    /// texture (if any — a float starts with none) was uploaded; repainted
+    /// before the next composite, the old texture shown until then. The
+    /// texture rides along so the repaint can reuse its GPU allocation.
+    Stale(Option<crate::comp::indexed::IndexedTexture>),
+    /// The texture matches the frame's current content.
+    Fresh(crate::comp::indexed::IndexedTexture),
+}
+
+impl FrameTex {
+    /// Whatever texture there is to draw, fresh or stale.
+    pub fn texture(&self) -> Option<&crate::comp::indexed::IndexedTexture> {
+        match self {
+            FrameTex::Stale(tex) => tex.as_ref(),
+            FrameTex::Fresh(tex) => Some(tex),
+        }
+    }
+
+    pub fn is_stale(&self) -> bool {
+        matches!(self, FrameTex::Stale(_))
+    }
+
+    /// Flag the frame for a repaint, keeping the texture to draw (and to
+    /// reuse for the re-upload) meanwhile.
+    pub fn mark_stale(&mut self) {
+        *self = FrameTex::Stale(self.take());
+    }
+
+    /// Pull the texture out (leaving `Stale(None)`), for handing its
+    /// allocation to an upload.
+    pub fn take(&mut self) -> Option<crate::comp::indexed::IndexedTexture> {
+        match std::mem::replace(self, FrameTex::Stale(None)) {
+            FrameTex::Fresh(tex) | FrameTex::Stale(Some(tex)) => Some(tex),
+            FrameTex::Stale(None) => None,
+        }
+    }
 }
 
 impl FloatData {

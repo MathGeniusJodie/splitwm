@@ -79,7 +79,7 @@ impl Comp {
             // re-renders just those pieces.
             self.refresh_icon_rotations(&class);
         } else if let Some((_, f)) = self.managed.float_mut(r.win) {
-            f.frame_dirty = true;
+            f.frame.mark_stale();
         }
     }
 

@@ -93,8 +93,9 @@ pub struct Child {
 /// A split branch. `children` is private so its "at least two children"
 /// invariant holds by construction: every constructor and mutation below
 /// preserves it, so consumers (`Tree::first_leaf`'s `children()[0]`,
-/// `State::close_focused`'s sibling lookup, `State::resize_focused`'s
-/// neighbour index) need no degenerate-branch guards.
+/// `State::relocate_closed_window`'s sibling lookup,
+/// `State::resize_focused`'s neighbour index) need no degenerate-branch
+/// guards.
 pub struct Branch {
     pub dir: Dir,
     children: Vec<Child>,
@@ -118,15 +119,15 @@ impl Branch {
         &mut self.children
     }
 
-    pub fn insert(&mut self, idx: usize, c: Child) {
+    fn insert(&mut self, idx: usize, c: Child) {
         self.children.insert(idx, c);
     }
 
     /// Remove one child. Only valid on branches keeping two or more children
     /// afterwards — a binary branch collapses via its parent instead
-    /// (`State::close_focused_binary`) — so a violation is a caller bug and
-    /// fails loudly rather than leaving a degenerate branch in the tree.
-    pub fn remove(&mut self, idx: usize) -> Child {
+    /// (`Tree::remove_leaf`'s binary path) — so a violation is a caller bug
+    /// and fails loudly rather than leaving a degenerate branch in the tree.
+    fn remove(&mut self, idx: usize) -> Child {
         assert!(
             self.children.len() > 2,
             "Branch::remove would leave a degenerate branch"
@@ -138,7 +139,7 @@ impl Branch {
     /// `Tree::flatten_same_dir` splices a dissolved same-dir branch's
     /// children into its parent). `replacement` comes from a live branch, so
     /// it holds at least two entries and arity only grows.
-    pub fn splice(&mut self, idx: usize, replacement: Vec<Child>) {
+    fn splice(&mut self, idx: usize, replacement: Vec<Child>) {
         assert!(
             !replacement.is_empty(),
             "Branch::splice with an empty replacement would shrink the branch"
@@ -186,7 +187,7 @@ impl Tree {
         NodeId(id)
     }
 
-    pub fn make_leaf(&mut self) -> NodeId {
+    fn make_leaf(&mut self) -> NodeId {
         let id = self.gen_id();
         self.nodes.insert(
             id,
@@ -214,7 +215,7 @@ impl Tree {
             .unwrap_or_else(|| crate::theme::cycled_leaf_color(id.0))
     }
 
-    pub fn make_branch(&mut self, dir: Dir, ratio: f64, a: NodeId, b: NodeId) -> NodeId {
+    fn make_branch(&mut self, dir: Dir, ratio: f64, a: NodeId, b: NodeId) -> NodeId {
         let id = self.gen_id();
         self.nodes.insert(
             id,
@@ -261,24 +262,191 @@ impl Tree {
         matches!(self.nodes.get(&id), Some(Node::Leaf(_)))
     }
 
-    pub fn insert_node(&mut self, node: Node) -> NodeId {
+    fn insert_node(&mut self, node: Node) -> NodeId {
         let id = self.gen_id();
         self.nodes.insert(id, node);
         id
     }
-    pub fn remove_node(&mut self, id: NodeId) {
+    fn remove_node(&mut self, id: NodeId) {
         self.nodes.remove(&id);
+    }
+
+    // Node creation and removal are private: every public mutation below
+    // attaches what it creates (and detaches only what it drops) before
+    // returning, so an orphan subtree — a node reachable from neither the
+    // root nor any branch — is unrepresentable and consumers
+    // (`State::close_focused`, focus resolution) need no reachability
+    // guards.
+
+    /// Split `leaf` in `dir`: its contents (window, accent colour,
+    /// displaced-window memory) move to a new first child holding fraction
+    /// `ratio` of the original span, and a fresh empty leaf becomes the
+    /// second. Splitting in the parent branch's own direction inserts the
+    /// pair as two more siblings instead of nesting a same-dir branch —
+    /// the entry-side half of the invariant `flatten_same_dir` maintains on
+    /// collapse. Returns the child that inherited the contents, or `None`
+    /// when `leaf` isn't a live leaf.
+    pub fn split_leaf(&mut self, leaf: NodeId, dir: Dir, ratio: f64) -> Option<NodeId> {
+        let leaf_data = self.leaf(leaf)?.clone();
+        // The first child keeps the original split's window *and* its accent
+        // colour, so colour stays with the content; the second gets a fresh
+        // colour.
+        let child_a = self.insert_node(Node::Leaf(leaf_data));
+        let child_b = self.make_leaf();
+        if let Some((parent, idx)) = self.find_parent(leaf) {
+            let same_dir = self.branch(parent).is_some_and(|b| b.dir == dir);
+            if same_dir {
+                if let Some(b) = self.branch_mut(parent) {
+                    let old_r = b.children()[idx].ratio;
+                    b.children_mut()[idx] = Child {
+                        node: child_a,
+                        ratio: old_r * ratio,
+                    };
+                    b.insert(
+                        idx + 1,
+                        Child {
+                            node: child_b,
+                            ratio: old_r * (1.0 - ratio),
+                        },
+                    );
+                }
+            } else {
+                let branch = self.make_branch(dir, ratio, child_a, child_b);
+                if let Some(b) = self.branch_mut(parent) {
+                    b.children_mut()[idx].node = branch;
+                }
+            }
+        } else {
+            // leaf is root
+            let branch = self.make_branch(dir, ratio, child_a, child_b);
+            self.root = branch;
+        }
+        // `leaf` is now replaced in the tree; drop it.
+        self.remove_node(leaf);
+        Some(child_a)
+    }
+
+    /// Insert a new empty leaf as a root-level column: before root child
+    /// `idx` (clamped), or after the last child for `None`. An H-branch root
+    /// takes it as one more child at the average ratio (all renormalised);
+    /// any other root (lone leaf or V-branch) is wrapped into a new H-branch
+    /// keeping the existing content the `ratio` share whichever side the new
+    /// column lands. Returns the new leaf.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn insert_leaf_at_root(&mut self, idx: Option<usize>, ratio: f64) -> NodeId {
+        let new = self.make_leaf();
+        let root = self.root;
+        let is_h = self.branch(root).is_some_and(|b| b.dir == Dir::H);
+        if is_h {
+            if let Some(b) = self.branch_mut(root) {
+                let n = b.children().len();
+                let avg = b.children().iter().map(|c| c.ratio).sum::<f64>() / n as f64;
+                let i = idx.map_or(n, |i| i.min(n));
+                b.insert(
+                    i,
+                    Child {
+                        node: new,
+                        ratio: avg,
+                    },
+                );
+                let s: f64 = b.children().iter().map(|c| c.ratio).sum();
+                for c in b.children_mut() {
+                    c.ratio /= s;
+                }
+            }
+        } else {
+            // The existing content keeps the larger `ratio` share on
+            // whichever side it lands; building the branch in its final
+            // order (rather than swapping children afterwards) keeps the
+            // ratios paired with the right children by construction.
+            let branch = if idx == Some(0) {
+                self.make_branch(Dir::H, 1.0 - ratio, new, root)
+            } else {
+                self.make_branch(Dir::H, ratio, root, new)
+            };
+            self.root = branch;
+        }
+        new
+    }
+
+    /// Remove the leaf at child `idx` of `parent` (as resolved by
+    /// `find_parent`), collapsing the structure around it: an n-ary parent
+    /// keeps its other children with the freed ratio redistributed among
+    /// them; a binary parent dissolves, the surviving sibling taking its
+    /// place. Returns the leaf focus should land on — the nearest surviving
+    /// neighbour's first leaf — or `None` (tree untouched) when
+    /// `parent`/`idx` don't name a leaf child of a live branch. A parent
+    /// that isn't the root always has a grandparent (every arena node is
+    /// attached), so there is no orphan case to refuse.
+    pub fn remove_leaf(&mut self, parent: NodeId, idx: usize) -> Option<NodeId> {
+        let (nchildren, leaf) = {
+            let b = self.branch(parent)?;
+            (b.children().len(), b.children().get(idx)?.node)
+        };
+        if !self.is_leaf(leaf) {
+            return None;
+        }
+
+        if nchildren > 2 {
+            // n-ary: remove this child, redistribute its ratio among the
+            // survivors.
+            let b = self.branch_mut(parent)?;
+            let removed = b.remove(idx).ratio;
+            let remaining: f64 = b.children().iter().map(|c| c.ratio).sum();
+            if remaining > 0.0 {
+                for c in b.children_mut() {
+                    c.ratio += removed * c.ratio / remaining;
+                }
+            }
+            let neighbour = b.children()[idx.min(b.children().len() - 1)].node;
+            self.remove_node(leaf);
+            return Some(self.first_leaf(neighbour));
+        }
+
+        // Binary: collapse `parent`, the surviving sibling takes its place.
+        let sibling = self.branch(parent)?.children()[usize::from(idx == 0)].node;
+        self.remove_node(leaf);
+        // Resolve focus before any flattening: the sibling *node* may be
+        // dissolved into the grandparent below, but its leaves survive.
+        let new_focus = self.first_leaf(sibling);
+        let attach = self.find_parent(parent);
+        self.remove_node(parent);
+        match attach {
+            None => {
+                // Parentless means `parent` was the root; the sibling is
+                // promoted in its place. The root leaf is never minimized:
+                // its whole-frame restore button is disabled (a root has
+                // nothing to collapse relative to), so a minimized leaf
+                // promoted to root would be a full-screen restore strip
+                // with no way back and its window unmapped. The promotion
+                // restores it instead.
+                self.root = sibling;
+                if let Some(l) = self.leaf_mut(sibling) {
+                    l.minimized = false;
+                }
+            }
+            Some((grand, pidx)) => {
+                if let Some(b) = self.branch_mut(grand) {
+                    b.children_mut()[pidx].node = sibling;
+                }
+                // The spliced-in sibling can be a branch in the
+                // grandparent's own direction; dissolve it so same-dir
+                // splits stay one flat n-ary branch.
+                self.flatten_same_dir(grand, pidx);
+            }
+        }
+        Some(new_focus)
     }
 
     /// If `parent.children[idx]` is a branch in the same direction as
     /// `parent`, splice its children (ratios scaled by the slot's ratio)
     /// into `parent` in its place and drop the dissolved branch node.
-    /// `State::split_node` maintains the no-nested-same-dir invariant on
-    /// the way in; this is the counterpart for collapse paths
-    /// (`State::close_focused`), which can splice a same-dir branch into a
-    /// grandparent — leaving it nested would demote its gaps from
-    /// root-level boundaries, silently losing their "+" insert buttons.
-    pub fn flatten_same_dir(&mut self, parent: NodeId, idx: usize) {
+    /// `split_leaf` maintains the no-nested-same-dir invariant on the way
+    /// in; this is the counterpart for collapse paths (`remove_leaf`),
+    /// which can splice a same-dir branch into a grandparent — leaving it
+    /// nested would demote its gaps from root-level boundaries, silently
+    /// losing their "+" insert buttons.
+    fn flatten_same_dir(&mut self, parent: NodeId, idx: usize) {
         let (pdir, slot) = match self.branch(parent) {
             Some(b) if idx < b.children().len() => (b.dir, b.children()[idx]),
             _ => return,

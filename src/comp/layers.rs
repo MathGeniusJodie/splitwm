@@ -148,16 +148,15 @@ impl Comp {
         else {
             return false;
         };
-        let initial_configure_sent =
-            smithay::wayland::compositor::with_states(surface, |states| {
-                states
-                    .data_map
-                    .get::<LayerSurfaceData>()
-                    .expect("layer surface data on layer surface")
-                    .lock()
-                    .expect("no poisoned layer data")
-                    .initial_configure_sent
-            });
+        let initial_configure_sent = smithay::wayland::compositor::with_states(surface, |states| {
+            states
+                .data_map
+                .get::<LayerSurfaceData>()
+                .expect("layer surface data on layer surface")
+                .lock()
+                .expect("no poisoned layer data")
+                .initial_configure_sent
+        });
         // The dock layer's zone add-back cancels out of the cached zone, so
         // its mapping/resizing never flips `sync_layer_zone` — compare the
         // scroll room it wants against what the canvas last granted too.
@@ -169,8 +168,7 @@ impl Comp {
         } else if self.exclusive_layer_surface().as_ref() == Some(surface) {
             // Layers commit per frame; only re-point the keyboard when
             // this surface is owed it and doesn't hold it yet.
-            let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
-            if keyboard.current_focus().as_ref() != Some(surface) {
+            if self.keyboard.current_focus().as_ref() != Some(surface) {
                 self.refocus();
             }
         }

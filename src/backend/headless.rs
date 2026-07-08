@@ -137,8 +137,7 @@ pub fn run() {
     // `Headless` for the whole session and nothing else touches this EGL
     // context (same containment as the tty backend).
     let mut renderer = unsafe {
-        let egl_display =
-            EGLDisplay::new(EGLSurfacelessDisplay).expect("surfaceless egl display");
+        let egl_display = EGLDisplay::new(EGLSurfacelessDisplay).expect("surfaceless egl display");
         let context = EGLContext::new(&egl_display).expect("egl context");
         GlesRenderer::new(context).expect("gles renderer")
     };
@@ -160,7 +159,12 @@ pub fn run() {
         size: SIZE.into(),
         refresh: 60_000,
     };
-    output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Normal),
+        None,
+        Some((0, 0).into()),
+    );
     output.set_preferred(mode);
     let damage_tracker = OutputDamageTracker::from_output(&output);
 

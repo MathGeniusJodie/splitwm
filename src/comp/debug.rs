@@ -117,7 +117,7 @@ fn command(comp: &mut Comp, line: &str) {
             }
         }
         None if line == "focus" => {
-            let focus = comp.seat.get_keyboard().and_then(|k| k.current_focus());
+            let focus = comp.keyboard.current_focus();
             let name = match &focus {
                 None => "none".into(),
                 Some(surface) => match comp.managed.win_for_surface(surface) {

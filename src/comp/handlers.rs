@@ -67,7 +67,7 @@ impl CompositorHandler for Comp {
             let window = self
                 .managed
                 .windows()
-                .chain(self.pending.iter())
+                .chain(self.pending.iter().map(|p| &p.window))
                 .find(|w| w.toplevel().is_some_and(|t| *t.wl_surface() == root))
                 .cloned();
             if let Some(window) = window {
@@ -84,13 +84,13 @@ impl CompositorHandler for Comp {
             })
             .unwrap_or(false);
         if has_buffer {
-            if let Some(idx) = self
-                .pending
-                .iter()
-                .position(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
-            {
-                let window = self.pending.remove(idx);
-                self.classify_and_manage(window);
+            if let Some(idx) = self.pending.iter().position(|p| {
+                p.window
+                    .toplevel()
+                    .is_some_and(|t| t.wl_surface() == surface)
+            }) {
+                let pending = self.pending.remove(idx);
+                self.classify_and_manage(pending.window, pending.fullscreen);
             } else if let Some(win) = self.managed.win_for_surface(surface) {
                 // A float resizing itself: track the new size and repaint
                 // its frame around it.
@@ -100,7 +100,7 @@ impl CompositorHandler for Comp {
                         if (f.w, f.h) != (size.w, size.h) {
                             f.w = size.w.max(1);
                             f.h = size.h.max(1);
-                            f.frame_dirty = true;
+                            f.frame.mark_stale();
                         }
                     }
                 }
@@ -114,12 +114,21 @@ impl CompositorHandler for Comp {
 delegate_compositor!(Comp);
 
 impl Comp {
+    /// The pending record of the not-yet-mapped toplevel `surface`, for
+    /// requests that arrive before the first commit.
+    fn find_pending_mut(&mut self, surface: &ToplevelSurface) -> Option<&mut super::PendingWindow> {
+        self.pending
+            .iter_mut()
+            .find(|p| p.window.toplevel().is_some_and(|t| *t == *surface))
+    }
+
     /// xdg surfaces may not be mapped before their first configure; send it
     /// on the surface's first commit.
     fn ensure_initial_configure(&mut self, surface: &WlSurface) {
         if let Some(window) = self
             .pending
             .iter()
+            .map(|p| &p.window)
             .chain(self.managed.windows())
             .find(|w| w.toplevel().is_some_and(|t| t.wl_surface() == surface))
         {
@@ -161,12 +170,15 @@ impl XdgShellHandler for Comp {
         // Wayland clients set app_id/parent/size hints after creating the
         // role; classification (tiled/float/dock) waits for the first
         // buffer commit (see `Comp::classify_and_manage`).
-        self.pending.push(Window::new_wayland_window(surface));
+        self.pending.push(super::PendingWindow {
+            window: Window::new_wayland_window(surface),
+            fullscreen: false,
+        });
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         self.pending
-            .retain(|w| w.toplevel().is_none_or(|t| *t != surface));
+            .retain(|p| p.window.toplevel().is_none_or(|t| *t != surface));
         let Some(win) = self.managed.win_for_surface(surface.wl_surface()) else {
             return;
         };
@@ -205,10 +217,10 @@ impl XdgShellHandler for Comp {
         if let Some(win) = self.managed.win_for_surface(surface.wl_surface()) {
             self.fullscreen = Some(win);
             self.arrange();
-        } else {
+        } else if let Some(p) = self.find_pending_mut(&surface) {
             // Requested before the first commit (a startup-fullscreen
             // client); honored once the window is classified.
-            self.pending_fullscreen.push(surface.wl_surface().clone());
+            p.fullscreen = true;
         }
     }
 
@@ -218,6 +230,9 @@ impl XdgShellHandler for Comp {
         });
         if self.fullscreen == self.managed.win_for_surface(surface.wl_surface()) {
             self.fullscreen = None;
+        }
+        if let Some(p) = self.find_pending_mut(&surface) {
+            p.fullscreen = false;
         }
         self.arrange();
     }

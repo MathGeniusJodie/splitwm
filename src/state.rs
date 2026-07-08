@@ -2,7 +2,7 @@
 //! scroll bookkeeping — there is exactly one layout (no workspaces/tags).
 
 use crate::theme;
-use crate::tree::{Boundary, Child, Dir, Node, NodeId, Rect, Tree, Win};
+use crate::tree::{Boundary, Dir, NodeId, Rect, Tree, Win};
 
 /// Where a "+" insert button adds a new root-level column.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -42,9 +42,10 @@ pub struct State {
     /// changes.
     scroll_x: i32,
     scroll_target: i32,
-    /// Canvas width, derived by `update_canvas` (0 until the first call;
-    /// read through `canvas_w()`, which falls back to the viewport width).
-    canvas_w: i32,
+    /// Canvas width, derived by `update_canvas` (`None` until the first
+    /// call; read through `canvas_w()`, which falls back to the viewport
+    /// width).
+    canvas_w: Option<i32>,
     /// Extra scrollable width past `canvas_w` reserved for the docked
     /// sidebar (see `Wm::manage_dock`), so scrolling all the way right
     /// reveals it even though it sits outside the split tree and doesn't
@@ -65,29 +66,7 @@ pub struct State {
     stash: Vec<Win>,
 }
 
-/// How a collapsing branch hangs in the tree: it is the root, or child
-/// `usize` of a grandparent branch. Resolved by `close_focused` *before*
-/// relocating any window, so an orphan subtree (a parent that is neither)
-/// is refused up front — there is deliberately no variant for one.
-enum Attach {
-    Root,
-    Child(NodeId, usize),
-}
-
 impl State {
-    /// `parent`'s attachment to the rest of the tree, or `None` if `parent`
-    /// is reachable from neither the root nor any branch (an orphan
-    /// subtree). `Attach` deliberately has no variant for that case.
-    fn attach_of(&self, parent: NodeId) -> Option<Attach> {
-        if parent == self.tree.root {
-            Some(Attach::Root)
-        } else {
-            self.tree
-                .find_parent(parent)
-                .map(|(grand, pidx)| Attach::Child(grand, pidx))
-        }
-    }
-
     pub fn new() -> Self {
         let tree = Tree::new();
         let root = tree.root;
@@ -96,7 +75,7 @@ impl State {
             focused_leaf: root,
             scroll_x: 0,
             scroll_target: 0,
-            canvas_w: 0,
+            canvas_w: None,
             dock_extra: 0,
             canvas_w_extra: 0,
             stash: Vec::new(),
@@ -332,79 +311,34 @@ impl State {
 
     // --- splitting ---
 
-    fn split_node(&mut self, leaf: NodeId, dir: Dir, child_a: NodeId, child_b: NodeId) {
-        if let Some((parent, idx)) = self.tree.find_parent(leaf) {
-            let same_dir = self.tree.branch(parent).is_some_and(|b| b.dir == dir);
-            if same_dir {
-                if let Some(b) = self.tree.branch_mut(parent) {
-                    let old_r = b.children()[idx].ratio;
-                    b.children_mut()[idx] = Child {
-                        node: child_a,
-                        ratio: old_r * theme::SPLIT_RATIO,
-                    };
-                    b.insert(
-                        idx + 1,
-                        Child {
-                            node: child_b,
-                            ratio: old_r * (1.0 - theme::SPLIT_RATIO),
-                        },
-                    );
-                }
-                return;
-            }
-            let branch = self
-                .tree
-                .make_branch(dir, theme::SPLIT_RATIO, child_a, child_b);
-            if let Some(b) = self.tree.branch_mut(parent) {
-                b.children_mut()[idx].node = branch;
-            }
-        } else {
-            // leaf is root
-            let branch = self
-                .tree
-                .make_branch(dir, theme::SPLIT_RATIO, child_a, child_b);
-            self.tree.root = branch;
-        }
-    }
-
-    /// Split the focused leaf; the existing window stays in `child_a` (now
-    /// focused) and `child_b` starts empty. Refused for a minimized leaf: a
-    /// minimized `child_a` cloned from it would be a split state the rest of
-    /// the system (titlebar Split button, keyboard split gate) treats as
-    /// impossible. Returns whether the split happened, so callers that queue
-    /// an animation for the action can cancel it on refusal.
+    /// Split the focused leaf; the existing window stays in the first child
+    /// (now focused) and the second starts empty. Refused for a minimized
+    /// leaf: a minimized child cloned from it would be a split state the
+    /// rest of the system (titlebar Split button, keyboard split gate)
+    /// treats as impossible. Returns whether the split happened, so callers
+    /// that queue an animation for the action can cancel it on refusal.
     pub fn split_focused(&mut self, dir: Dir) -> bool {
         let leaf = self.focused_leaf_valid();
-        // `focused_leaf_valid` only hands out live leaves, so this always
-        // resolves; a dangling id makes the split a no-op rather than a panic.
-        let Some(leaf_data) = self.tree.leaf(leaf).cloned() else {
-            return false;
-        };
-        if leaf_data.minimized {
+        if self.tree.leaf(leaf).is_none_or(|l| l.minimized) {
             return false;
         }
-        // child_a keeps the original split's window *and* its accent colour, so
-        // colour stays with the content; child_b gets a fresh colour.
-        let child_a = self.tree.insert_node(Node::Leaf(leaf_data));
-        let child_b = self.tree.make_leaf();
-        // Insert a branch in place of `leaf`, with child_a carrying the window.
-        self.split_node(leaf, dir, child_a, child_b);
-        // `leaf` is now detached from the tree; drop it.
-        self.tree.remove_node(leaf);
-        self.focus_leaf(child_a);
-        true
+        match self.tree.split_leaf(leaf, dir, theme::SPLIT_RATIO) {
+            Some(child_a) => {
+                self.focus_leaf(child_a);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Relocate `leaf`'s window: into the adjacent sibling's first leaf if it
     /// is empty, otherwise onto the stash. `idx` is `leaf`'s index among
     /// `parent`'s children.
-    fn relocate_closed_window(&mut self, parent: NodeId, idx: usize, leaf: NodeId) -> bool {
-        // Relocate this leaf's window: into the adjacent sibling's first leaf
-        // if it is empty, otherwise onto the stash.
+    fn relocate_closed_window(&mut self, parent: NodeId, idx: usize, leaf: NodeId) {
         let client = self.tree.leaf(leaf).and_then(|l| l.client);
         let dest_child = {
             let Some(b) = self.tree.branch(parent) else {
-                return false;
+                return;
             };
             // A branch always has a sibling to fall back to (`Branch` holds
             // at least two children by construction).
@@ -431,120 +365,26 @@ impl State {
                 self.push_stash(c);
             }
         }
-        true
-    }
-
-    /// n-ary close path: remove `leaf` (at index `idx` of `parent`'s
-    /// children), redistributing its ratio among the survivors, and refocus
-    /// the nearest surviving neighbour.
-    fn close_focused_nary(&mut self, parent: NodeId, idx: usize, leaf: NodeId) {
-        // n-ary: remove this child, redistribute its ratio. Resolving the
-        // branch up front keeps a bad `parent` a no-op — focus must never
-        // land on the removed leaf.
-        let Some(b) = self.tree.branch_mut(parent) else {
-            return;
-        };
-        let removed = b.remove(idx).ratio;
-        let remaining: f64 = b.children().iter().map(|c| c.ratio).sum();
-        if remaining > 0.0 {
-            for c in b.children_mut() {
-                c.ratio += removed * c.ratio / remaining;
-            }
-        }
-        let fb = idx.min(b.children().len() - 1);
-        let new_focus = b.children()[fb].node;
-        self.tree.remove_node(leaf);
-        let new_focus = self.tree.first_leaf(new_focus);
-        self.focus_leaf(new_focus);
-    }
-
-    /// Binary close path: collapse `parent`, the surviving sibling (at index
-    /// `idx`'s opposite) takes its place, and same-direction branches are
-    /// flattened back into the grandparent. `attach` is `parent`'s own
-    /// attachment, resolved by `close_focused` before any relocation.
-    fn close_focused_binary(&mut self, parent: NodeId, idx: usize, attach: Attach, leaf: NodeId) {
-        // binary: collapse parent, sibling takes its place.
-        let sibling = match self.tree.branch(parent) {
-            Some(b) => b.children()[usize::from(idx == 0)].node,
-            None => return,
-        };
-        self.tree.remove_node(leaf);
-        // Resolve focus before any flattening: the sibling *node* may
-        // be dissolved into the grandparent below, but its leaves
-        // survive.
-        let new_focus = self.tree.first_leaf(sibling);
-        self.tree.remove_node(parent);
-        match attach {
-            Attach::Root => {
-                self.tree.root = sibling;
-                // The root leaf is never minimized: its whole-frame restore
-                // button is disabled (a root has nothing to collapse
-                // relative to), so a minimized leaf promoted to root would
-                // be a full-screen restore strip with no way back and its
-                // window unmapped. The promotion restores it instead.
-                if let Some(l) = self.tree.leaf_mut(sibling) {
-                    l.minimized = false;
-                }
-            }
-            Attach::Child(grand, pidx) => {
-                if let Some(b) = self.tree.branch_mut(grand) {
-                    b.children_mut()[pidx].node = sibling;
-                }
-                // The spliced-in sibling can be a branch in the
-                // grandparent's own direction; dissolve it so same-dir
-                // splits stay one flat n-ary branch.
-                self.tree.flatten_same_dir(grand, pidx);
-            }
-        }
-        self.focus_leaf(new_focus);
     }
 
     /// Close the focused leaf. Its window moves into the adjacent sibling if
-    /// that split is empty, otherwise down to the stash.
+    /// that split is empty, otherwise down to the stash. Focus moves to the
+    /// nearest surviving neighbour — the closed leaf *was* the focused one,
+    /// and node ids are never reused, so it can't still be found anywhere in
+    /// the tree after removal.
     pub fn close_focused(&mut self) -> bool {
         let leaf = self.focused_leaf_valid();
         let Some((parent, idx)) = self.tree.find_parent(leaf) else {
             return false; // root leaf: nothing to close
         };
-
-        let Some(nchildren) = self.tree.branch(parent).map(|b| b.children().len()) else {
+        self.relocate_closed_window(parent, idx, leaf);
+        // `(parent, idx)` came from `find_parent`, so the removal always
+        // resolves — every arena node is attached (`Tree`'s mutation API
+        // never detaches one), leaving no orphan case to refuse.
+        let Some(new_focus) = self.tree.remove_leaf(parent, idx) else {
             return false;
         };
-
-        // Focus always moves to the nearest surviving neighbour: the closed
-        // leaf *was* the focused one (node ids are never reused, so it can't
-        // still be found anywhere in the tree after removal).
-        //
-        // Both paths below refuse to close inside an orphan subtree (a
-        // `parent` reachable from neither the root nor any branch) before
-        // mutating anything — see the binary path's comment for why.
-        if nchildren > 2 {
-            if self.attach_of(parent).is_none() {
-                return false;
-            }
-            if !self.relocate_closed_window(parent, idx, leaf) {
-                return false;
-            }
-            self.close_focused_nary(parent, idx, leaf);
-            return true;
-        }
-
-        // Binary: resolve `parent`'s attachment before relocating — a false
-        // return means the close did not happen, so no window may have been
-        // evicted from its leaf yet. A parent that is neither the root nor
-        // anyone's child is an orphan subtree; collapsing inside it would
-        // leave `focused_leaf` pointing at a leaf unreachable from the root
-        // (still a leaf by `is_leaf`, so `focused_leaf_valid` would keep
-        // returning it while `compute` never lays it out). Refuse instead —
-        // `Attach` deliberately has no variant for it.
-        let Some(attach) = self.attach_of(parent) else {
-            return false;
-        };
-
-        if !self.relocate_closed_window(parent, idx, leaf) {
-            return false;
-        }
-        self.close_focused_binary(parent, idx, attach, leaf);
+        self.focus_leaf(new_focus);
         true
     }
 
@@ -588,11 +428,7 @@ impl State {
     /// falls back to the viewport width, so pure-`State` callers (tests,
     /// pre-first-arrange paths) see sane geometry.
     pub fn canvas_w(&self, wa: Rect) -> i32 {
-        if self.canvas_w > 0 {
-            self.canvas_w
-        } else {
-            wa.w
-        }
+        self.canvas_w.unwrap_or(wa.w)
     }
 
     /// Recompute the canvas width for the current tree and viewport; called
@@ -618,7 +454,7 @@ impl State {
         let columns = self.tree.h_units().max(1);
         let min_col_w = (theme::min_split_w() + 2 * gap).max(wa.w / 3);
         let needed = columns.saturating_mul(min_col_w);
-        self.canvas_w = needed.max(wa.w) + self.canvas_w_extra;
+        self.canvas_w = Some(needed.max(wa.w) + self.canvas_w_extra);
         self.dock_extra = dock_extra;
     }
 
@@ -879,44 +715,12 @@ impl State {
 
     /// Insert a new empty leaf column at root-children index `at`, making the
     /// root an H-branch if it isn't one. The new leaf becomes focused.
-    #[allow(clippy::cast_precision_loss)]
     pub fn insert_at_root(&mut self, at: InsertAt) -> NodeId {
-        let new = self.tree.make_leaf();
-        let root = self.tree.root;
-        let is_h = self.tree.branch(root).is_some_and(|b| b.dir == Dir::H);
-        if is_h {
-            if let Some(b) = self.tree.branch_mut(root) {
-                let n = b.children().len();
-                let avg = b.children().iter().map(|c| c.ratio).sum::<f64>() / n as f64;
-                let i = match at {
-                    InsertAt::Index(i) => i.min(n),
-                    InsertAt::End => n,
-                };
-                b.insert(
-                    i,
-                    Child {
-                        node: new,
-                        ratio: avg,
-                    },
-                );
-                let s: f64 = b.children().iter().map(|c| c.ratio).sum();
-                for c in b.children_mut() {
-                    c.ratio /= s;
-                }
-            }
-        } else {
-            // The existing content keeps the larger `SPLIT_RATIO` share on
-            // whichever side it lands; building the branch in its final
-            // order (rather than swapping children afterwards) keeps the
-            // ratios paired with the right children by construction.
-            let branch = if at == InsertAt::Index(0) {
-                self.tree
-                    .make_branch(Dir::H, 1.0 - theme::SPLIT_RATIO, new, root)
-            } else {
-                self.tree.make_branch(Dir::H, theme::SPLIT_RATIO, root, new)
-            };
-            self.tree.root = branch;
-        }
+        let idx = match at {
+            InsertAt::Index(i) => Some(i),
+            InsertAt::End => None,
+        };
+        let new = self.tree.insert_leaf_at_root(idx, theme::SPLIT_RATIO);
         self.focus_leaf(new);
         new
     }
@@ -1346,49 +1150,6 @@ mod tests {
         assert!(s.close_focused());
         assert_eq!(s.stash, vec![1]);
         assert_eq!(s.focused_client(), Some(2));
-    }
-
-    /// Closing inside an orphan subtree (a branch reachable from neither the
-    /// root nor any other branch) must be refused: collapsing it would leave
-    /// `focused_leaf` pointing at a leaf `compute` never lays out.
-    #[test]
-    fn close_focused_refuses_orphan_subtree() {
-        let mut s = State::new();
-        let a = s.tree.make_leaf();
-        let b = s.tree.make_leaf();
-        let orphan = s.tree.make_branch(Dir::H, 0.5, a, b);
-        assert_ne!(orphan, s.tree.root);
-        s.focused_leaf = a;
-        assert!(!s.close_focused());
-        // Both orphan leaves survive; focus resolution stays inside leaves.
-        assert!(s.tree.is_leaf(a) && s.tree.is_leaf(b));
-    }
-
-    /// Same refusal as `close_focused_refuses_orphan_subtree`, but for the
-    /// n-ary path (`nchildren > 2`), which must enforce the same
-    /// reachability check as the binary path even though it never collapses
-    /// `parent` itself.
-    #[test]
-    fn close_focused_refuses_orphan_nary_subtree() {
-        let mut s = State::new();
-        let a = s.tree.make_leaf();
-        let b = s.tree.make_leaf();
-        let c = s.tree.make_leaf();
-        let orphan = s.tree.make_branch(Dir::H, 0.5, a, b);
-        assert_ne!(orphan, s.tree.root);
-        if let Some(branch) = s.tree.branch_mut(orphan) {
-            branch.insert(
-                2,
-                Child {
-                    node: c,
-                    ratio: 0.25,
-                },
-            );
-        }
-        s.focused_leaf = a;
-        assert!(!s.close_focused());
-        // All three orphan leaves survive; focus resolution stays inside leaves.
-        assert!(s.tree.is_leaf(a) && s.tree.is_leaf(b) && s.tree.is_leaf(c));
     }
 
     /// A minimized sibling promoted to root by a binary collapse must be

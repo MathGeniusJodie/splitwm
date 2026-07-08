@@ -41,7 +41,10 @@ impl Wm {
             .env("SPLITWM_HEADLESS", "1")
             .env("SPLITWM_DEBUG_CHANNEL", "1")
             // Never contend with the live session's notification daemon.
-            .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent-splitwm-test")
+            .env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                "unix:path=/nonexistent-splitwm-test",
+            )
             .env_remove("SPLITWM_WALLPAPER")
             .env_remove("SPLITWM_DOCK_TITLE")
             .stdin(Stdio::piped())
@@ -312,7 +315,10 @@ impl Dispatch<wl_data_offer::WlDataOffer, ()> for App {
         _: &QueueHandle<App>,
     ) {
         if let wl_data_offer::Event::Offer { mime_type } = event {
-            app.offer_mimes.entry(offer.id()).or_default().push(mime_type);
+            app.offer_mimes
+                .entry(offer.id())
+                .or_default()
+                .push(mime_type);
         }
     }
 }
@@ -453,9 +459,9 @@ impl Session {
             closed: false,
         });
         self.wait_until("initial configure", |app| app.wins[win].configures > 0);
-        let buffer = self
-            .pool
-            .create_buffer(0, BUF, BUF, BUF * 4, wl_shm::Format::Argb8888, &self.qh, ());
+        let buffer =
+            self.pool
+                .create_buffer(0, BUF, BUF, BUF * 4, wl_shm::Format::Argb8888, &self.qh, ());
         self.app.wins[win].surface.attach(Some(&buffer), 0, 0);
         self.app.wins[win].surface.commit();
         win
@@ -496,7 +502,10 @@ fn socket_lifecycle() {
         full.0 > OUTPUT_W * 3 / 4 && full.0 <= OUTPUT_W,
         "first window should fill the slot width, got {full:?}"
     );
-    assert!(full.1 > 500, "tiled height should be most of the output, got {full:?}");
+    assert!(
+        full.1 > 500,
+        "tiled height should be most of the output, got {full:?}"
+    );
     s.wait_until("keyboard enters w1", |app| app.focus_is(a));
 
     // --- displacement: a second client takes the slot; the first is
@@ -543,7 +552,10 @@ fn socket_lifecycle() {
     assert!(!s.app.wins[a].closed);
     s.wm.key("super+shift+c");
     s.wait_until("w1 received xdg_toplevel.close", |app| app.wins[a].closed);
-    assert!(!s.app.wins[b].closed, "only the focused window is asked to close");
+    assert!(
+        !s.app.wins[b].closed,
+        "only the focused window is asked to close"
+    );
     // Honour it. The emptied split keeps layout focus (as on master), so
     // nothing holds the keyboard until a deliberate move points it at w2.
     s.app.wins[a].toplevel.destroy();
@@ -609,8 +621,7 @@ fn x11_window_takes_keyboard_on_map() {
 
     // WAYLAND_DISPLAY is scrubbed to pin alacritty onto XWayland.
     s.wm.await_xwayland();
-    s.wm
-        .cmd("spawn env -u WAYLAND_DISPLAY alacritty --class splitwm-test-x11");
+    s.wm.cmd("spawn env -u WAYLAND_DISPLAY alacritty --class splitwm-test-x11");
     s.wait_until("keyboard leaves the wayland client", |app| {
         app.focused.is_none()
     });
@@ -787,7 +798,9 @@ fn bottom_layer_panel_visible_and_clickable() {
         app.focused.as_ref() == Some(&layer_id)
     });
     s.wm.cmd("click 40 40");
-    s.wait_until("keyboard returns to the tiled window", |app| app.focus_is(a));
+    s.wait_until("keyboard returns to the tiled window", |app| {
+        app.focus_is(a)
+    });
 }
 
 #[test]
@@ -879,7 +892,13 @@ fn dock_layer_panel_rides_the_canvas_scroll() {
 
     // Parked at scroll 0: the overlap strip pokes in at the right edge,
     // the zone's share stays past it, offscreen.
-    wait_pixel(&mut s, "overlap strip parked at the right edge", PARKED_X, SAMPLE_Y, true);
+    wait_pixel(
+        &mut s,
+        "overlap strip parked at the right edge",
+        PARKED_X,
+        SAMPLE_Y,
+        true,
+    );
     assert_ne!(
         s.pixel(REVEALED_X, SAMPLE_Y),
         RED,
@@ -889,20 +908,33 @@ fn dock_layer_panel_rides_the_canvas_scroll() {
     // Scrolling right (clamped to the dock's scroll room) glides the
     // panel into view.
     s.wm.cmd("scroll 50");
-    wait_pixel(&mut s, "right scroll reveals the panel", REVEALED_X, SAMPLE_Y, true);
+    wait_pixel(
+        &mut s,
+        "right scroll reveals the panel",
+        REVEALED_X,
+        SAMPLE_Y,
+        true,
+    );
 
     // Input follows the scrolled position: OnDemand click-to-focus works
     // where the panel now shows.
     let layer_id = surface.id();
     s.wm.cmd(&format!("click {REVEALED_X} {SAMPLE_Y}"));
-    s.wait_until("click at the scrolled position hands the panel the keyboard", |app| {
-        app.focused.as_ref() == Some(&layer_id)
-    });
+    s.wait_until(
+        "click at the scrolled position hands the panel the keyboard",
+        |app| app.focused.as_ref() == Some(&layer_id),
+    );
 
     // Scrolling back tucks it away again, and the layout never gave up
     // any width for it: the zone was scroll room, not a strut.
     s.wm.cmd("scroll -50");
-    wait_pixel(&mut s, "left scroll tucks the panel away", REVEALED_X, SAMPLE_Y, false);
+    wait_pixel(
+        &mut s,
+        "left scroll tucks the panel away",
+        REVEALED_X,
+        SAMPLE_Y,
+        false,
+    );
     s.wait_until("tiled window kept the full slot throughout", |app| {
         app.wins[a].size == full
     });
@@ -928,8 +960,7 @@ fn clipboard_bridges_x11_and_wayland() {
     // --- X → Wayland: xclip takes the X CLIPBOARD (and lingers as its
     // owner); the offer reaches the focused client with no focus change ---
     s.wm.await_xwayland();
-    s.wm
-        .cmd("spawn printf from-x | xclip -selection clipboard -t UTF8_STRING");
+    s.wm.cmd("spawn printf from-x | xclip -selection clipboard -t UTF8_STRING");
     s.wait_until("X selection offered to the client", |app| {
         app.selection.as_ref().is_some_and(|o| {
             app.offer_mimes
@@ -964,8 +995,9 @@ fn clipboard_bridges_x11_and_wayland() {
 
     let out = std::env::temp_dir().join(format!("splitwm-test-clip-{}.txt", std::process::id()));
     let out = out.to_str().expect("utf-8 temp path").to_string();
-    s.wm
-        .cmd(&format!("spawn xclip -selection clipboard -t UTF8_STRING -o > {out}"));
+    s.wm.cmd(&format!(
+        "spawn xclip -selection clipboard -t UTF8_STRING -o > {out}"
+    ));
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         // Keep pumping: the Send event arrives here and must be answered.
@@ -1002,4 +1034,3 @@ fn sigterm_ends_the_session() {
         std::thread::sleep(Duration::from_millis(50));
     }
 }
-

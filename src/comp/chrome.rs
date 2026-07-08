@@ -199,7 +199,7 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
         let loc = (Point::<i32, Logical>::from((f.x, f.y)) - window.geometry().loc).to_physical(1);
         elements.extend(window.render_elements::<OutputElement>(renderer, loc, 1.0.into(), 1.0));
         let rect = f.frame_rect();
-        if let Some(tex) = &f.frame_tex {
+        if let Some(tex) = f.frame.texture() {
             elements.push(chrome_at(
                 scene.indexed,
                 tex,

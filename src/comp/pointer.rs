@@ -501,8 +501,6 @@ impl Comp {
         if !over_client {
             return true;
         }
-        self.seat
-            .get_keyboard()
-            .is_some_and(|k| k.modifier_state().logo)
+        self.keyboard.modifier_state().logo
     }
 }

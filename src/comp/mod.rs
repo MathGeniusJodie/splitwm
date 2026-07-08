@@ -55,6 +55,16 @@ pub struct ClientState {
     pub compositor_state: CompositorClientState,
 }
 
+/// A toplevel between role creation and its first buffer commit, together
+/// with what it asked for while pending — one record per window, so a
+/// request can't outlive or miss the window it belongs to.
+pub struct PendingWindow {
+    pub window: Window,
+    /// The client requested fullscreen before mapping (a startup-fullscreen
+    /// client); honored once the window is classified.
+    pub fullscreen: bool,
+}
+
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
@@ -141,6 +151,12 @@ pub struct Comp {
     pub space: Space<Window>,
     pub popups: PopupManager,
     pub seat: Seat<Comp>,
+    /// The seat's keyboard/pointer capabilities, added once at construction
+    /// and never removed — held here so consumers don't re-prove their
+    /// existence through `Seat::get_keyboard`/`get_pointer`'s `Option` on
+    /// every use. The handles are cheap `Arc` clones of what the seat holds.
+    pub keyboard: smithay::input::keyboard::KeyboardHandle<Comp>,
+    pub pointer: smithay::input::pointer::PointerHandle<Comp>,
     pub start: std::time::Instant,
 
     // The layout core (pure, ported from master) and the Win <-> Window
@@ -150,7 +166,7 @@ pub struct Comp {
     /// Toplevels between role creation and their first buffer commit;
     /// classified (tiled/float/dock) only once mapped, since Wayland
     /// clients set app_id/parent/size hints after creating the role.
-    pub pending: Vec<Window>,
+    pub pending: Vec<PendingWindow>,
     /// Float stacking, topmost first.
     pub float_stack: Vec<crate::tree::Win>,
     /// Private invariant: reads go through `Comp::focused_float()`, which
@@ -160,11 +176,6 @@ pub struct Comp {
     /// The fullscreen tiled client, covering the whole output above every
     /// tiled window (floats still render above it).
     pub fullscreen: Option<crate::tree::Win>,
-    /// Surfaces that requested fullscreen while still pending (clients ask
-    /// before their first commit); honored at classify time, master's
-    /// pre-map `_NET_WM_STATE` behavior.
-    pub pending_fullscreen:
-        Vec<smithay::reexports::wayland_server::protocol::wl_surface::WlSurface>,
     /// Keycodes whose press we intercepted for a binding: their repeats are
     /// swallowed (a nested winit session auto-repeats; libinput doesn't)
     /// and their release must not leak to the client that never saw the
@@ -256,9 +267,10 @@ impl Comp {
         let mut seat: Seat<Comp> = seat_state.new_wl_seat(&dh, "seat-0");
         // xkb defaults come from the environment (XKB_DEFAULT_LAYOUT etc.),
         // matching how the X11 version inherited the server keymap.
-        seat.add_keyboard(Default::default(), 600, 25)
+        let keyboard = seat
+            .add_keyboard(Default::default(), 600, 25)
             .expect("keyboard with default xkb config");
-        seat.add_pointer();
+        let pointer = seat.add_pointer();
 
         // Advertise dmabuf so GL clients (alacritty) can hand us GPU
         // buffers: with a render node, v4 with default feedback; without
@@ -376,6 +388,8 @@ impl Comp {
             space,
             popups: PopupManager::default(),
             seat,
+            keyboard,
+            pointer,
             start: std::time::Instant::now(),
             state: crate::state::State::new(),
             managed: crate::shell::Managed::default(),
@@ -383,7 +397,6 @@ impl Comp {
             float_stack: Vec::new(),
             focused_float: None,
             fullscreen: None,
-            pending_fullscreen: Vec::new(),
             held_bound_keys: Vec::new(),
             icon_tx,
             note_popups: Vec::new(),
@@ -740,7 +753,7 @@ impl Comp {
                 smithay::wayland::seat::WaylandFocus::wl_surface(w).map(|s| s.into_owned())
             })
         });
-        let keyboard = self.seat.get_keyboard().expect("seat has a keyboard");
+        let keyboard = self.keyboard.clone();
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
         keyboard.set_focus(self, target, serial);
     }
@@ -820,7 +833,7 @@ impl Comp {
         let dirty_frames: Vec<crate::tree::Win> = self
             .managed
             .float_iter()
-            .filter(|(_, _, f)| f.frame_dirty)
+            .filter(|(_, _, f)| f.frame.is_stale())
             .map(|(w, _, _)| w)
             .collect();
         for win in dirty_frames {
@@ -837,11 +850,7 @@ impl Comp {
 
         // The seat pointer's spot, for wherever the cursor is composited
         // (tty always; winit for client cursor surfaces).
-        let pointer_loc = self
-            .seat
-            .get_pointer()
-            .expect("seat has a pointer")
-            .current_location();
+        let pointer_loc = self.pointer.current_location();
 
         // Built before the Scene's shared borrows: it mutates the outline
         // buffers, and the owned elements outlive that borrow.
