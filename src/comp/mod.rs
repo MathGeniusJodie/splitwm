@@ -93,7 +93,7 @@ pub struct Comp {
     /// software-drawn chrome buffer on their way to the GPU.
     pub indexed: indexed::IndexedProgram,
     /// The colour-depth post-pass (`Mod4+C`: true colour / dithered RGB332 /
-    /// dithered 24-colour palette); every backend routes its element list
+    /// dithered 18-colour palette); every backend routes its element list
     /// through it.
     pub quantize: quantize::Quantize,
     /// The independently-textured ex-underlay pieces (wallpaper, per-leaf

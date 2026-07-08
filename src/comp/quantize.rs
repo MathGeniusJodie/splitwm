@@ -1,5 +1,5 @@
 //! The colour-depth post-pass behind `Action::CycleColorMode`: the whole
-//! composited frame quantized to a 256-colour (RGB332) or 24-colour
+//! composited frame quantized to a 256-colour (RGB332) or 18-colour
 //! (palette) lattice with ordered dithering, as a GPU pass over a normal
 //! true-colour
 //! buffer — the retro look of a C8 framebuffer without asking KMS for an
@@ -13,16 +13,15 @@
 //! ordered-dithers each pixel against Jodie's analytic Bayer threshold
 //! (`dither256`) with the classic lattice dither for a bit-partitioned
 //! palette — wobble each channel by one lattice step and round it to the
-//! lattice — at the mode's channel level counts: 8-8-4 for RGB332, 3-4-2
+//! lattice — at the mode's channel level counts: 8-8-4 for RGB332, 3-3-2
 //! for the palette mode. The dither falls out of the lattice geometry with
 //! no tuned constants, and a pixel already exactly on an na16 colour passes
 //! through untouched in both modes — the WM's chrome and wallpaper are na16
 //! art, and re-dithering finished pixel art would dissolve it into moire
-//! noise. In the palette mode the lattice point is only an address: a 3x4x2
-//! 3D LUT ([`PALETTE_LUT`]) remaps each of the 24 lattice points to its
-//! assigned palette colour — the 16 na16 colours plus 8 saturated brights —
-//! so the mode lands on the WM's palette instead of the raw lattice
-//! primaries.
+//! noise. In the palette mode the lattice point is only an address: a 3x3x2
+//! 3D LUT ([`PALETTE_LUT`]) remaps each of the 18 lattice points to its
+//! assigned palette colour — the 16 na16 colours plus two extras — so the
+//! mode lands on the WM's palette instead of the raw lattice primaries.
 //! Scene damage flows through a [`DamageBag`] into the element's
 //! `damage_since`, so partial redraws survive the indirection.
 //!
@@ -56,9 +55,9 @@ pub enum ColorMode {
     /// The 256-colour RGB332 lattice, ordered-dithered per channel (plus
     /// exact na16 pixels passing through for the chrome).
     Rgb332,
-    /// The 24-colour mode: the same dither on a 3x4x2 lattice, then each
+    /// The 18-colour mode: the same dither on a 3x3x2 lattice, then each
     /// lattice point remapped to its assigned palette colour (na16 plus
-    /// eight saturated brights) through [`PALETTE_LUT`].
+    /// two extras) through [`PALETTE_LUT`].
     Palette,
 }
 
@@ -77,7 +76,7 @@ impl ColorMode {
         match self {
             ColorMode::True => None,
             ColorMode::Rgb332 => Some([7.0, 7.0, 3.0]),
-            ColorMode::Palette => Some([2.0, 3.0, 1.0]),
+            ColorMode::Palette => Some([2.0, 2.0, 1.0]),
         }
     }
 }
@@ -113,7 +112,7 @@ struct Gpu {
     u_size: i32,
     u_levels: i32,
     u_remap: i32,
-    /// The lattice→palette remap as a 3x4x2 3D texture (see
+    /// The lattice→palette remap as a 3x3x2 3D texture (see
     /// [`PALETTE_LUT`]).
     lut: u32,
     vao: u32,
@@ -242,7 +241,7 @@ impl Gpu {
                     0,
                     ffi::RGBA8 as i32,
                     3,
-                    4,
+                    3,
                     2,
                     0,
                     ffi::RGBA,
@@ -543,39 +542,36 @@ fn na16_colors() -> Vec<Rgb> {
 }
 
 /// The lattice→palette remap: the palette colour standing in for each of
-/// the 24 lattice points, indexed `[r][g][b]` at the mode's channel levels
-/// (r ∈ {0, ½, 1}; g ∈ {0, ⅓, ⅔, 1}; b ∈ {0, 1} of full scale). A superset
+/// the 18 lattice points, indexed `[r][g][b]` at the mode's channel levels
+/// (r ∈ {0, ½, 1}; g ∈ {0, ½, 1}; b ∈ {0, 1} of full scale). A superset
 /// of the na16 palette (asserted in tests): every na16 colour is reachable
-/// for the chrome, and the eight extra slots hold saturated brights the
-/// na16 gamut lacks. Spelled as colours because the baked palette's index
+/// for the chrome, and the two extra slots hold a navy and a bright yellow
+/// the na16 gamut lacks. Spelled as colours because the baked palette's index
 /// order is an artifact of the asset build.
-const PALETTE_LUT: [[[u32; 2]; 4]; 3] = [
+const PALETTE_LUT: [[[u32; 2]; 3]; 3] = [
     [
-        [0x1f0e1c, 0x000080],
-        [0x004000, 0x17434b],
-        [0x008000, 0x34859d],
-        [0x00bf00, 0x00bf80],
+        [0x1f0e1c, 0x293674],
+        [0x17434b, 0x584563],
+        [0x647d34, 0x34859d],
     ],
     [
-        [0x3e2137, 0x584563],
-        [0x9d303b, 0x70377f],
-        [0x647d34, 0x8c8fae],
-        [0x80bf00, 0x7ec4c1],
+        [0x3e2137, 0x70377f],
+        [0x9a6348, 0x8c8fae],
+        [0xc0c741, 0x7ec4c1],
     ],
     [
-        [0xff0000, 0xff0080],
-        [0x9a6348, 0xd26471],
+        [0x9d303b, 0xd26471],
         [0xe4943a, 0xd79b7d],
-        [0xc0c741, 0xf5edba],
+        [0xf5c84c, 0xf5edba],
     ],
 ];
 
-/// [`PALETTE_LUT`] as 3x4x2 RGBA8 texels — width R, height G, depth B, so
+/// [`PALETTE_LUT`] as 3x3x2 RGBA8 texels — width R, height G, depth B, so
 /// `texture(lut, q)` addresses it with the lattice colour directly.
-fn lut_texels() -> [u8; 3 * 4 * 2 * 4] {
-    let mut data = [0; 3 * 4 * 2 * 4];
+fn lut_texels() -> [u8; 3 * 3 * 2 * 4] {
+    let mut data = [0; 3 * 3 * 2 * 4];
     for (i, texel) in data.chunks_exact_mut(4).enumerate() {
-        let (r, g, b) = (i % 3, (i / 3) % 4, i / 12);
+        let (r, g, b) = (i % 3, (i / 3) % 3, i / 9);
         let rgb = PALETTE_LUT[r][g][b];
         texel.copy_from_slice(&[(rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8, 0xff]);
     }
@@ -610,9 +606,9 @@ precision highp float;
 precision highp int;
 uniform sampler2D scene;
 // The mode's per-channel lattice steps (levels minus one): RGB332 is
-// vec3(7, 7, 3), the palette mode is vec3(2, 3, 1).
+// vec3(7, 7, 3), the palette mode is vec3(2, 2, 1).
 uniform vec3 levels;
-// The lattice→palette remap (3x4x2, NEAREST): the palette colour assigned
+// The lattice→palette remap (3x3x2, NEAREST): the palette colour assigned
 // to each lattice point, addressed by the lattice colour itself.
 uniform lowp sampler3D lut;
 // Route lattice colours through the remap (palette mode only).
@@ -670,6 +666,11 @@ void main() {
             return;
         }
     }
+    // In the palette mode, boost saturation 2x around Rec. 709 luma before
+    // quantizing: the sparse lattice washes chroma out, so overshoot it
+    // going in. The overshoot may leave [0, 1]; lattice()'s clamp absorbs
+    // it.
+    if (remap) c = mix(vec3(dot(c, vec3(0.2126, 0.7152, 0.0722))), c, 2.0);
     float t = dither256(uvec2(gl_FragCoord.xy));
     vec3 q = lattice(c, t);
     // In the palette mode the lattice point is only an address: the LUT
