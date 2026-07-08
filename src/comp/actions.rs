@@ -101,6 +101,8 @@ impl Comp {
             Action::VolumeUp => self.spawn(theme::VOLUME_UP_CMD),
             Action::VolumeDown => self.spawn(theme::VOLUME_DOWN_CMD),
             Action::VolumeMuteToggle => self.spawn(theme::VOLUME_MUTE_CMD),
+            // The redraw timer picks the mode change up on its next tick.
+            Action::CycleColorMode => self.quantize.cycle(),
         }
     }
 

@@ -98,6 +98,7 @@ Mapping notes vs the X11 spec:
 | `Mod4+Shift+]` / `[` | move window to next / previous split |
 | `Mod4+l` / `=`       | grow split |
 | `Mod4+Shift+l` / `Mod4+-` | shrink split |
+| `Mod4+c`             | cycle output colour depth: true colour / dithered RGB332 / dithered 24-colour palette |
 | `Mod4+Shift+c`       | close focused window politely |
 | `XF86Audio{Raise,Lower}Volume` / `Mute` | volume via `wpctl` (single-shot per press) |
 | `Ctrl+Alt+F1..F12`   | VT switch (tty backend; the X server's job on master) |

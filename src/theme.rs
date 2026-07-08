@@ -312,6 +312,9 @@ pub enum Action {
     VolumeUp,
     VolumeDown,
     VolumeMuteToggle,
+    /// Cycle the output colour depth: true colour -> dithered RGB332 ->
+    /// dithered na16 (see `comp::quantize`).
+    CycleColorMode,
 }
 
 /// splitwm's own modifier bitmask (matched against the xkb modifier state
@@ -356,6 +359,7 @@ pub const BINDINGS: &[(u16, u32, Action)] = &[
     (MOD4 | SHIFT, ks::l, Action::Shrink),
     (MOD4, ks::equal, Action::Grow),
     (MOD4, ks::minus, Action::Shrink),
+    (MOD4, ks::c, Action::CycleColorMode),
     (MOD4 | SHIFT, ks::c, Action::CloseWindow),
     (MOD1, ks::F4, Action::CloseWindow),
     // Media keys carry no modifier: the keysym itself is the whole chord.

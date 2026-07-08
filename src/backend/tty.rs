@@ -90,6 +90,7 @@ impl Tty {
         cursor_icon: Option<CursorIcon>,
         cursors: &mut CursorCache,
         clear: Color32F,
+        quantize: &mut crate::comp::quantize::Quantize,
     ) {
         if self.paused || self.queued {
             return;
@@ -97,9 +98,20 @@ impl Tty {
         let Some(out) = self.scanout.as_mut() else {
             return;
         };
-        let mut elements =
-            cursor_elements(&mut self.renderer, scene.indexed, pointer_loc, cursor_icon, cursors);
+        let mut elements = cursor_elements(
+            &mut self.renderer,
+            scene.indexed,
+            pointer_loc,
+            cursor_icon,
+            cursors,
+        );
         elements.extend(chrome::output_elements(&mut self.renderer, scene));
+        let size = scene
+            .output
+            .current_mode()
+            .expect("tty output has a mode")
+            .size;
+        let elements = quantize.wrap(&mut self.renderer, elements, size, clear);
         match out.render_frame(&mut self.renderer, &elements, clear, FrameFlags::DEFAULT) {
             Ok(res) => {
                 if !res.is_empty {
@@ -291,6 +303,7 @@ pub fn run() {
                 // Re-activating the DRM device can lose the GL textures, so
                 // drop every cached chrome piece for a full re-upload.
                 comp.invalidate_chrome();
+                comp.quantize.invalidate();
                 comp.redraw();
             }
         })

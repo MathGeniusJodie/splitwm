@@ -33,16 +33,7 @@ impl OklabPalette {
     /// The palette index whose colour is perceptually closest (`OKLab`
     /// Euclidean distance) to `color`.
     pub fn nearest_index(&self, color: Rgb) -> Index {
-        let want = srgb8_to_oklab(color);
-        let dist_sq = |c: &Oklab| {
-            let (dl, da, db) = (c[0] - want[0], c[1] - want[1], c[2] - want[2]);
-            dl.mul_add(dl, da.mul_add(da, db * db))
-        };
-        self.oklab
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| dist_sq(a).total_cmp(&dist_sq(b)))
-            .map_or(0, |(index, _)| index as Index)
+        nearest_oklab(&self.oklab, srgb8_to_oklab(color)) as Index
     }
 
     /// The wrapped palette, for everything that isn't nearest-colour
@@ -50,6 +41,19 @@ impl OklabPalette {
     pub fn inner(&self) -> &Palette {
         &self.palette
     }
+}
+
+/// The position in `candidates` closest to `want` (Euclidean in `OKLab`).
+fn nearest_oklab(candidates: &[Oklab], want: Oklab) -> usize {
+    let dist_sq = |c: &Oklab| {
+        let (dl, da, db) = (c[0] - want[0], c[1] - want[1], c[2] - want[2]);
+        dl.mul_add(dl, da.mul_add(da, db * db))
+    };
+    candidates
+        .iter()
+        .enumerate()
+        .min_by(|(_, a), (_, b)| dist_sq(a).total_cmp(&dist_sq(b)))
+        .map_or(0, |(index, _)| index)
 }
 
 fn srgb_to_linear(c: f32) -> f32 {

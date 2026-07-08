@@ -65,6 +65,7 @@ render_elements! {
     Float=WaylandSurfaceRenderElement<GlesRenderer>,
     Chrome=IndexedElement,
     Solid=smithay::backend::renderer::element::solid::SolidColorRenderElement,
+    Quantize=super::quantize::QuantizeElement,
 }
 
 /// Borrows of everything `output_elements` composites, so `redraw` can hand
