@@ -3,9 +3,9 @@
 //! the pointer. Bindings, drags, and scroll physics land in M4/M5.
 
 use smithay::backend::input::{
-    AbsolutePositionEvent as _, Axis, AxisSource, ButtonState, Event as _, InputBackend,
-    InputEvent, KeyState, KeyboardKeyEvent as _, PointerAxisEvent as _, PointerButtonEvent as _,
-    PointerMotionEvent as _,
+    AbsolutePositionEvent as _, Axis, AxisSource, ButtonState, Event as _, GestureBeginEvent as _,
+    GestureSwipeUpdateEvent as _, InputBackend, InputEvent, KeyState, KeyboardKeyEvent as _,
+    PointerAxisEvent as _, PointerButtonEvent as _, PointerMotionEvent as _,
 };
 use smithay::input::keyboard::FilterResult;
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
@@ -179,6 +179,22 @@ impl Comp {
                     pointer.frame(self);
                 }
             }
+            // Touchpad swipe gestures (libinput only; winit never emits
+            // them). The pointer-gestures protocol isn't advertised, so no
+            // client can claim these: a three-finger horizontal swipe pans
+            // the canvas everywhere, no Mod4 needed. Other finger counts
+            // stay swallowed.
+            InputEvent::GestureSwipeBegin { event } => {
+                self.swipe_pan = event.fingers() == 3;
+            }
+            InputEvent::GestureSwipeUpdate { event } => {
+                if self.swipe_pan {
+                    // Same wheel-click conversion as continuous finger
+                    // scroll: ~15 axis units per click.
+                    self.apply_hscroll(event.delta_x() / 15.0);
+                }
+            }
+            InputEvent::GestureSwipeEnd { .. } => self.swipe_pan = false,
             _ => {}
         }
     }

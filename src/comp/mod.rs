@@ -122,6 +122,9 @@ pub struct Comp {
     pub chrome_press: bool,
     /// Sub-pixel scroll remainder carried between axis events.
     pub hscroll_frac: f64,
+    /// A three-finger touchpad swipe is in progress; its updates pan the
+    /// canvas.
+    pub swipe_pan: bool,
     /// Set by an action that wants its layout change animated; consumed by
     /// the next `arrange`.
     pub animate: bool,
@@ -378,6 +381,7 @@ impl Comp {
             drag: None,
             chrome_press: false,
             hscroll_frac: 0.0,
+            swipe_pan: false,
             animate: false,
             anim: None,
             prev_frame_rect: std::collections::HashMap::new(),
