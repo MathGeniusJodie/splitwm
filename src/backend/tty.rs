@@ -28,7 +28,7 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::drm::control::{connector, crtc, Device as _, ModeTypeFlags};
-use smithay::reexports::input::Libinput;
+use smithay::reexports::input::{ClickMethod, Libinput};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Logical, Point, Transform};
@@ -257,12 +257,19 @@ pub fn run() {
         .insert_source(
             LibinputInputBackend::new(libinput),
             |mut event, (), comp| {
-                // Devices run libinput defaults except scroll direction:
-                // natural scrolling to match Jodie's X session (the X server
-                // owned that knob on master).
+                // Devices run libinput defaults except: natural scrolling to
+                // match Jodie's X session (the X server owned that knob on
+                // master), and touchpads get tap-to-click plus clickfinger,
+                // so a two-finger tap or press is a right click.
                 if let smithay::backend::input::InputEvent::DeviceAdded { device } = &mut event {
                     if device.config_scroll_has_natural_scroll() {
                         let _ = device.config_scroll_set_natural_scroll_enabled(true);
+                    }
+                    if device.config_tap_finger_count() > 0 {
+                        let _ = device.config_tap_set_enabled(true);
+                    }
+                    if device.config_click_methods().contains(&ClickMethod::Clickfinger) {
+                        let _ = device.config_click_set_method(ClickMethod::Clickfinger);
                     }
                 }
                 comp.process_input_event(event);
