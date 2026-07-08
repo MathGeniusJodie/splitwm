@@ -21,6 +21,10 @@
 //!   (headless backend only).
 //! - `cursor` — report what the pointer shows right now: `hidden` or a
 //!   named shape (`default`, `ew-resize`, …).
+//! - `focus` — report who holds the keyboard: `none`, a managed window's
+//!   class/app_id, or `unmanaged` (o-r window, layer surface). Lets a
+//!   driver observe focus on clients that aren't the test's own Wayland
+//!   connection (XWayland windows).
 
 use std::io::Read as _;
 
@@ -111,6 +115,20 @@ fn command(comp: &mut Comp, line: &str) {
             if !comp.backend.request_shot(path) {
                 println!("err shot {path}: this backend cannot read frames back");
             }
+        }
+        None if line == "focus" => {
+            let focus = comp.seat.get_keyboard().and_then(|k| k.current_focus());
+            let name = match &focus {
+                None => "none".into(),
+                Some(surface) => match comp.managed.win_for_surface(surface) {
+                    Some(win) => comp
+                        .managed
+                        .get(win)
+                        .map_or_else(|| "unmanaged".into(), crate::shell::toplevel_app_id),
+                    None => "unmanaged".into(),
+                },
+            };
+            println!("ok focus {name}");
         }
         None if line == "cursor" => {
             let name = match comp.cursor_status {

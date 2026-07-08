@@ -524,6 +524,35 @@ fn override_redirect_keyboard_focus() {
 }
 
 #[test]
+fn x11_window_takes_keyboard_on_map() {
+    // A managed X11 window is arranged at map-request time, before
+    // XWayland associates its wl_surface — there is nothing to hand the
+    // keyboard to yet. Once the surface arrives the keyboard must land on
+    // it by itself: launching an X11 app should not need a click before
+    // typing works. Observed compositor-side via the `focus` query (the
+    // test's Wayland connection can't see another client's focus).
+    let mut s = Session::boot();
+    let a = s.open_window();
+    s.wait_until("client holds the keyboard", |app| app.focus_is(a));
+
+    // WAYLAND_DISPLAY is scrubbed to pin alacritty onto XWayland.
+    s.wm.await_xwayland();
+    s.wm
+        .cmd("spawn env -u WAYLAND_DISPLAY alacritty --class splitwm-test-x11");
+    s.wait_until("keyboard leaves the wayland client", |app| {
+        app.focused.is_none()
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while s.wm.query("focus") != "splitwm-test-x11" {
+        assert!(
+            Instant::now() < deadline,
+            "keyboard never landed on the mapped X11 window"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
 fn chrome_hover_cursor_shapes() {
     // Hover feedback over the chrome, observed through the debug
     // channel's `cursor` query: the arrow where nothing is clickable, the
