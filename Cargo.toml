@@ -33,7 +33,7 @@ freedesktop-desktop-entry = { version = "0.8.1", default-features = false }
 # Session-bus server for org.freedesktop.Notifications (the compositor
 # doubles as the notification daemon). Pure Rust; the interface runs on
 # zbus's executor, bridged to calloop over channels.
-zbus = "5"
+zbus = { version = "5", default-features = false, features = ["async-io", "blocking-api"] }
 # Smithay logs through tracing; RUST_LOG-style filtering for debugging.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -60,7 +60,12 @@ tempfile = "3"
 [build-dependencies]
 pixel-graphics = { path = "../pixel-graphics" }
 
+# Fast-iterating optimized profile; the installed binary is built with
+# `cargo build --profile dist` for full LTO.
 [profile.release]
 opt-level = 3
+
+[profile.dist]
+inherits = "release"
 lto = "thin"
 codegen-units = 1
