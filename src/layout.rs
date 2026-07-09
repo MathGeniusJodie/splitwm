@@ -603,6 +603,23 @@ impl Layout {
             .collect()
     }
 
+    /// Per-row pixel heights within column `ci` at column height `h`.
+    /// A minimized row collapses to the gap — except in a pinned column
+    /// (`col_pinned`), whose thin vertical strip spans the full height with
+    /// the rows sharing it by their fracs, so each renders as a tall
+    /// restore strip rather than a gap-sized square over bare wallpaper.
+    fn row_sizes(&self, ci: usize, h: i32, gap: i32) -> Vec<i32> {
+        let pinned = self.col_pinned(ci);
+        let meta: Vec<(bool, f64)> = self.columns[ci]
+            .rows
+            .iter()
+            .map(|r| (!pinned && r.leaf.minimized, r.frac))
+            .collect();
+        let n = i32::try_from(meta.len()).unwrap_or(i32::MAX);
+        let usable = (h - gap * (n - 1)).max(0);
+        child_sizes(&meta, usable, gap)
+    }
+
     /// Canvas-space rect of every split, keyed by id. `wa` is the
     /// *viewport* — the strip extends past its right edge and the caller
     /// applies the scroll offset.
@@ -610,14 +627,7 @@ impl Layout {
         let mut geos = HashMap::new();
         for (ci, col_rect) in self.col_rects(wa, gap).into_iter().enumerate() {
             let col = &self.columns[ci];
-            let meta: Vec<(bool, f64)> = col
-                .rows
-                .iter()
-                .map(|r| (r.leaf.minimized, r.frac))
-                .collect();
-            let n = i32::try_from(col.rows.len()).unwrap_or(i32::MAX);
-            let usable = (col_rect.h - gap * (n - 1)).max(0);
-            let sizes = child_sizes(&meta, usable, gap);
+            let sizes = self.row_sizes(ci, col_rect.h, gap);
             let mut y = col_rect.y;
             for (row, sz) in col.rows.iter().zip(&sizes) {
                 geos.insert(
@@ -654,15 +664,8 @@ impl Layout {
                     resizable: !self.col_pinned(i) && !self.col_pinned(i + 1),
                 });
             }
-            let col = &self.columns[i];
-            let meta: Vec<(bool, f64)> = col
-                .rows
-                .iter()
-                .map(|row| (row.leaf.minimized, row.frac))
-                .collect();
-            let n = i32::try_from(col.rows.len()).unwrap_or(i32::MAX);
-            let usable = (r.h - gap * (n - 1)).max(0);
-            let sizes = child_sizes(&meta, usable, gap);
+            let rows = &self.columns[i].rows;
+            let sizes = self.row_sizes(i, r.h, gap);
             let mut y = r.y;
             for (ri, sz) in sizes.iter().enumerate() {
                 if let Some(next) = sizes.get(ri + 1) {
@@ -674,7 +677,7 @@ impl Layout {
                         second: *next,
                         cross: r.x,
                         cross_len: r.w,
-                        resizable: !meta[ri].0 && !meta[ri + 1].0,
+                        resizable: !rows[ri].leaf.minimized && !rows[ri + 1].leaf.minimized,
                     });
                 }
                 y += sz + gap;
@@ -902,6 +905,26 @@ mod tests {
         assert!(b
             .iter()
             .all(|b| !matches!(b.at, GapAt::Col(_)) || !b.resizable));
+    }
+
+    #[test]
+    fn pinned_column_rows_span_the_full_height() {
+        let mut l = Layout::new();
+        let ids = columns(&mut l, 2);
+        let bottom = l.split_below(ids[0], 0.5).expect("splittable");
+        l.leaf_mut(ids[0]).expect("live").minimized = true;
+        l.leaf_mut(bottom).expect("live").minimized = true;
+        let geos = l.compute(WA, GAP);
+        let strip_h = WA.h - 2 * GAP;
+        assert_eq!(
+            geos[&ids[0]].h + geos[&bottom].h + GAP,
+            strip_h,
+            "rows share the column's full height"
+        );
+        // Taller than the gap-wide column, so each renders as the vertical
+        // restore strip (winmin.png), not the stacked-row one.
+        assert!(geos[&ids[0]].h > geos[&ids[0]].w);
+        assert!(geos[&bottom].h > geos[&bottom].w);
     }
 
     #[test]
