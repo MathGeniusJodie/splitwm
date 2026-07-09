@@ -393,6 +393,25 @@ impl State {
         self.insert_at(wa, Insert::Col(col + 1))
     }
 
+    /// Split the focused column into two side by side whose widths sum to
+    /// its current width — the titlebar ⊞'s wide-window action. The window
+    /// keeps the golden major share and the fresh placeholder to its right
+    /// takes the minor, so the pair occupies exactly the space the window
+    /// had. Both shares hold to the chrome minimum, at the cost of the sum
+    /// growing past the original when the column was too narrow to halve.
+    /// The placeholder becomes focused.
+    pub fn split_column_right(&mut self, wa: Rect) -> NodeId {
+        let col = self.focused_col();
+        let w = self.layout.widths(wa.w, theme::GAP)[col];
+        let minor =
+            ((f64::from(w) * (1.0 - theme::SPLIT_RATIO)).round() as i32).max(theme::min_split_w());
+        let major = (w - minor).max(theme::min_split_w());
+        self.layout.set_col_width(col, ColWidth::Px(major));
+        let new = self.layout.insert_column(col + 1, ColWidth::Px(minor));
+        self.focus_leaf(new);
+        new
+    }
+
     /// Remove `leaf` if it is an empty placeholder. An occupied split is
     /// never removed directly — it collapses when its window dies
     /// (`unpin_client`), so a window can't be left splitless. Refused for

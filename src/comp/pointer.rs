@@ -597,7 +597,7 @@ impl Comp {
                 self.state.focus_leaf(leaf);
                 self.animate = match dir {
                     Some(Dir::H) => {
-                        self.state.open_column_right(wa);
+                        self.state.split_column_right(wa);
                         true
                     }
                     Some(Dir::V) => self.state.split_focused(),
