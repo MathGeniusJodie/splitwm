@@ -138,10 +138,7 @@ impl Comp {
                 // Horizontal swipes pan the canvas (always over chrome,
                 // Mod4-gated over a client); a panned swipe is consumed,
                 // never also delivered to the client underneath.
-                let over_client = self
-                    .space
-                    .element_under(pointer.current_location())
-                    .is_some();
+                let over_client = self.tiled_under(pointer.current_location()).is_some();
                 let mut panned = false;
                 if horizontal != 0.0 && self.hscroll_allowed(over_client) {
                     // Wheel-click units: discrete steps when the device

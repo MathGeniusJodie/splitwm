@@ -499,19 +499,15 @@ impl Comp {
                 return Some(hit);
             }
         }
-        if let Some(hit) = self
-            .space
-            .element_under(pos)
-            .and_then(|(window, location)| {
-                window
-                    .surface_under(
-                        pos - location.to_f64(),
-                        smithay::desktop::WindowSurfaceType::ALL,
-                    )
-                    .map(|(s, p)| (s, (p.to_f64() + location.to_f64())))
-            })
-        {
-            return Some(hit);
+        if let Some(t) = self.tiled_under(pos) {
+            let loc = Point::<i32, Logical>::from((t.rect.x, t.rect.y)) - t.window.geometry().loc;
+            if let Some(hit) = t
+                .window
+                .surface_under(pos - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
+                .map(|(s, p)| (s, p.to_f64() + loc.to_f64()))
+            {
+                return Some(hit);
+            }
         }
         if let Some((_, window, d)) = self.managed.dock() {
             let rect = self.dock_geometry(d);
@@ -524,6 +520,21 @@ impl Comp {
             }
         }
         self.layer_surface_under(&[Layer::Bottom], pos)
+    }
+
+    /// The tiled/fullscreen window whose settled client rect covers `pos` —
+    /// the region it draws in (`Scene::tiled` crops its buffer to it), not
+    /// its buffer extent: a client whose resize waits for an animation's
+    /// end still holds an oversized buffer, which must not take input over
+    /// chrome it visibly no longer covers.
+    pub fn tiled_under(&self, pos: Point<f64, Logical>) -> Option<chrome::TiledPlace> {
+        let settled: Vec<_> = self.placed.iter().map(|p| (p.leaf, p.target)).collect();
+        self.tiled_places(&settled).into_iter().find(|t| {
+            pos.x >= f64::from(t.rect.x)
+                && pos.x < f64::from(t.rect.x + t.rect.w)
+                && pos.y >= f64::from(t.rect.y)
+                && pos.y < f64::from(t.rect.y + t.rect.h)
+        })
     }
 
     /// Current output size in pixels. The backend configures a mode before
@@ -568,6 +579,7 @@ impl Comp {
         // so a leaf scrolled out of view keeps a sane animation start /
         // hit rect when it returns.
         self.placed.clear();
+        let mut deferred: Vec<(crate::layout::Win, (i32, i32, i32, i32))> = Vec::new();
         let mut frame_rects: std::collections::HashMap<
             crate::layout::NodeId,
             crate::widgets::FrameRect,
@@ -609,7 +621,21 @@ impl Comp {
                 continue;
             };
             let (cx, cy, cw, ch) = crate::shell::client_rect_in_frame(frame, (1, 1));
-            if let Some(toplevel) = window.toplevel() {
+            // An animating client that shrinks keeps its current size until
+            // the slide settles (`finish_animation` sends this configure):
+            // resizing it now would reflow its content narrow while its
+            // frame is still wide. Growers configure immediately — their old
+            // buffer is clipped by the still-small frame, and the new size
+            // is ready as the frame arrives.
+            let cur = window.geometry().size;
+            if self.animate && (cw < cur.w || ch < cur.h) {
+                deferred.push((c, (cx, cy, cw, ch)));
+                // Only the resize waits; a hidden X11 window coming back
+                // must still map now.
+                if let Some(x11) = window.x11_surface() {
+                    let _ = x11.set_mapped(true);
+                }
+            } else if let Some(toplevel) = window.toplevel() {
                 toplevel.with_pending_state(|s| s.size = Some((cw, ch).into()));
                 toplevel.send_pending_configure();
             } else if let Some(x11) = window.x11_surface() {
@@ -704,11 +730,12 @@ impl Comp {
         );
 
         // Layout-changing actions animate: capture start rects and let the
-        // redraw tick interpolate the chrome. Client windows are already
-        // configured at their final rects above, so focus delivered right
-        // after this arrange targets a mapped window; only the composited
-        // chrome slides. A non-animated arrange cancels any transition in
-        // flight (it describes a newer layout).
+        // redraw tick interpolate the chrome and the client windows riding
+        // it (`tiled_places`). Growing clients are already configured at
+        // their final rects above; shrinking ones get theirs when the
+        // animation settles (`deferred`). A non-animated arrange cancels any
+        // transition in flight (it describes a newer layout, and configured
+        // every window itself just above).
         if std::mem::take(&mut self.animate) {
             let placed_from = self
                 .placed
@@ -742,6 +769,7 @@ impl Comp {
             self.anim = Some(chrome::LayoutAnim {
                 start: std::time::Instant::now(),
                 placed: placed_from,
+                deferred,
             });
         } else {
             // A non-animated arrange cancels any transition in flight; the
@@ -881,6 +909,10 @@ impl Comp {
         // buffers, and the owned elements outlive that borrow.
         let focus_outline = self.focus_outline_elements();
 
+        // Tiled/fullscreen windows at this frame's client rects (riding the
+        // interpolated leaf rects mid-animation).
+        let tiled = self.tiled_places(&leaf_rects);
+
         // The ex-underlay pieces as positioned elements, built from the
         // caches `update_chrome_pieces` just refreshed. These borrow only
         // `self.pieces`, disjoint from the backend the scene renders through.
@@ -899,7 +931,7 @@ impl Comp {
             note_rects: &note_rects,
             float_stack: &self.float_stack,
             managed: &self.managed,
-            space: &self.space,
+            tiled: &tiled,
             output: &self.output,
             dock_place: &dock_place,
             layer_dock: &layer_dock,

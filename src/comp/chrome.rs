@@ -29,7 +29,9 @@
 //! as the frame scales, which GPU texture scaling could not do; only the
 //! leaves actually resizing pay, idle leaves and steady-state frames stay
 //! cached. The focus outline (four GPU solid strips, above the leaf group)
-//! rides the focused leaf's interpolated rect.
+//! rides the focused leaf's interpolated rect, and each leaf's client window
+//! rides it too — anchored at the interpolated client rect, cropped to it,
+//! stretched when the rect outruns the buffer (see `TiledPlace`).
 //!
 //! Stacking within the ex-underlay's slot, front-to-back: the focus outline,
 //! the taskbar (in front of the leaf frames, as the old single buffer drew
@@ -42,18 +44,19 @@ use std::rc::Rc;
 use super::indexed::{IndexedElement, IndexedProgram, IndexedTexture, NineSliceElement};
 use super::Comp;
 use crate::icon::Icon;
-use crate::layout::{Dir, NodeId};
+use crate::layout::{Dir, NodeId, Win};
 use crate::render::{BtnIcon, LeafView, Renderer, SliceSpec, TitleInfo};
 use crate::theme;
 use crate::widgets::{leaf_meta, BtnKind, FrameRect, Placement};
 use crate::Index;
 use pixel_graphics::Framebuffer;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::utils::{CropRenderElement, RescaleRenderElement};
 use smithay::backend::renderer::element::{Id, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::utils::CommitCounter;
 use smithay::render_elements;
-use smithay::utils::{Logical, Point, Rectangle, Size};
+use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 render_elements! {
     /// Everything one output frame is made of: client surfaces of every
@@ -64,6 +67,7 @@ render_elements! {
     /// GPU solid strips.
     pub OutputElement<=GlesRenderer>;
     Float=WaylandSurfaceRenderElement<GlesRenderer>,
+    Tiled=CropRenderElement<RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>>,
     Chrome=IndexedElement,
     Frame=NineSliceElement,
     Solid=smithay::backend::renderer::element::solid::SolidColorRenderElement,
@@ -79,7 +83,11 @@ pub struct Scene<'a> {
     pub note_rects: &'a [(u32, crate::widgets::FrameRect)],
     pub float_stack: &'a [crate::layout::Win],
     pub managed: &'a crate::shell::Managed,
-    pub space: &'a smithay::desktop::Space<smithay::desktop::Window>,
+    /// Every visible tiled/fullscreen window at the client rect it paints in
+    /// this frame (interpolated mid-animation, settled otherwise), frontmost
+    /// first. Replaces rendering straight from the `Space`, whose locations
+    /// only know the settled layout.
+    pub tiled: &'a [TiledPlace],
     pub output: &'a smithay::output::Output,
     pub dock_place: &'a Option<(smithay::desktop::Window, crate::layout::Rect)>,
     /// The dock layer surface's scrolled position (`Comp::layer_dock_place`);
@@ -110,6 +118,18 @@ pub struct Scene<'a> {
     /// leaf holds focus), stacked just over the leaf group so a focus change
     /// moves them without re-uploading any texture.
     pub focus_outline: &'a [smithay::backend::renderer::element::solid::SolidColorRenderElement],
+}
+
+/// One tiled window's draw placement for a frame: the client rect its
+/// buffer paints in, anchored at the rect's origin and cropped to it. A
+/// buffer smaller than the rect (a grower mid-slide, or the ease-out-back
+/// overshoot carrying the rect past the final size) stretches to fill the
+/// rect instead of leaving a background sliver; a larger one (a shrinker
+/// whose configure is deferred to the animation's end) is only cropped,
+/// never squashed.
+pub struct TiledPlace {
+    pub window: smithay::desktop::Window,
+    pub rect: FrameRect,
 }
 
 /// Append render elements for every layer surface on `layer`, topmost
@@ -155,8 +175,8 @@ fn chrome_at(
 
 /// One frame's render elements, front-to-back: Overlay layer surfaces
 /// topmost, override-redirect X11 windows (rofi, menus), notification
-/// bubbles, the Top layer, floats with their frame chrome, the
-/// tiled/fullscreen Space, the dock, the Bottom layer, then the ex-underlay
+/// bubbles, the Top layer, floats with their frame chrome, the tiled and
+/// fullscreen windows, the dock, the Bottom layer, then the ex-underlay
 /// group — the focus outline, the taskbar, the plus buttons, the leaf
 /// frames, and the opaque wallpaper — and the Background layer behind
 /// everything.
@@ -232,18 +252,37 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
             )));
         }
     }
-    // The Space's windows in stacking order, via the region renderer —
-    // NOT space_render_elements, which draws every layer surface itself
-    // (in an order that buries Overlay under floats and puts Background
-    // over the chrome pieces) and locks the LayerMap this function
-    // already holds.
-    if let Some(geo) = scene.space.output_geometry(scene.output) {
+    // Tiled and fullscreen windows at their per-frame client rects (the
+    // Space still tracks them for input, but its locations only know the
+    // settled layout). Each buffer anchors at its rect's origin, stretches
+    // per-axis when the rect outgrows it, and crops to the rect — so a
+    // mid-animation buffer at the wrong size never spills over the frame
+    // borders or leaves a wallpaper sliver.
+    for t in scene.tiled {
+        let geo = t.window.geometry();
+        let origin = Point::<i32, Logical>::from((t.rect.x, t.rect.y));
+        let scale = Scale {
+            x: (t.rect.w as f64 / geo.size.w.max(1) as f64).max(1.0),
+            y: (t.rect.h as f64 / geo.size.h.max(1) as f64).max(1.0),
+        };
+        let crop = Rectangle::new(
+            origin.to_physical(1),
+            Size::from((t.rect.w.max(1), t.rect.h.max(1))),
+        );
         elements.extend(
-            scene
-                .space
-                .render_elements_for_region(renderer, &geo, 1.0, 1.0)
+            t.window
+                .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+                    renderer,
+                    (origin - geo.loc).to_physical(1),
+                    1.0.into(),
+                    1.0,
+                )
                 .into_iter()
-                .map(OutputElement::Float),
+                .filter_map(|e| {
+                    let scaled = RescaleRenderElement::from_element(e, origin.to_physical(1), scale);
+                    CropRenderElement::from_element(scaled, 1.0, crop)
+                })
+                .map(OutputElement::Tiled),
         );
     }
     if let Some((window, rect)) = scene.dock_place {
@@ -349,14 +388,22 @@ fn lerp_rect(a: FrameRect, b: FrameRect, p: f32) -> FrameRect {
 const ANIM_DURATION: std::time::Duration = std::time::Duration::from_millis(280);
 
 /// An in-flight layout animation, stepped by the redraw tick (~60 Hz).
-/// Client windows are already at their final rects (placed by the arrange
-/// that started this); only the composited chrome interpolates — each leaf
-/// frame's full rect eases from its start toward its target, re-rendering at
-/// the interpolated size each tick so its borders scale without blurring.
+/// Each leaf frame's full rect eases from its start toward its target,
+/// re-rendering at the interpolated size each tick so its borders scale
+/// without blurring, and the leaf's client window rides the interpolated
+/// rect (`Comp::tiled_places`). Growing clients are configured to their
+/// final size by the arrange that started this; shrinking ones keep their
+/// old size until the animation settles (`deferred`), so their content
+/// doesn't reflow narrow inside a still-wide frame.
 pub struct LayoutAnim {
     pub start: std::time::Instant,
     /// Each animated leaf's start rect paired with its target placement.
     pub placed: Vec<(FrameRect, Placement)>,
+    /// Configures withheld from shrinking clients, as the final client rect
+    /// each window gets when the animation ends. Dropped unsent if another
+    /// arrange replaces this animation — that arrange configures (or
+    /// re-defers) every tiled window itself.
+    pub deferred: Vec<(Win, (i32, i32, i32, i32))>,
 }
 
 /// The independently-cached ex-underlay pieces (see the module docs). Each
@@ -860,7 +907,7 @@ impl Comp {
         });
         if let Some((done, rects, focus)) = anim_result {
             if done {
-                self.anim = None;
+                self.finish_animation();
             } else {
                 self.focus_rect = focus;
                 return rects;
@@ -871,10 +918,75 @@ impl Comp {
     }
 
     /// Snap an in-flight animation to its end state: the next frame's leaf
-    /// origins settle on their targets. Used when a click must land on the
-    /// final layout the user is aiming at.
+    /// origins settle on their targets, and shrinking clients receive the
+    /// configures the animated arrange withheld. Also used when a click must
+    /// land on the final layout the user is aiming at.
     pub fn finish_animation(&mut self) {
-        self.anim = None;
+        let Some(anim) = self.anim.take() else {
+            return;
+        };
+        for (win, (cx, cy, cw, ch)) in anim.deferred {
+            let Some(window) = self.managed.get(win).cloned() else {
+                continue;
+            };
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|s| s.size = Some((cw, ch).into()));
+                toplevel.send_pending_configure();
+            } else if let Some(x11) = window.x11_surface() {
+                let _ = x11.configure(Rectangle::<i32, Logical>::new(
+                    (cx, cy).into(),
+                    (cw, ch).into(),
+                ));
+            }
+        }
+    }
+
+    /// Every visible tiled window's draw placement for this frame: the
+    /// fullscreen client over the whole output (frontmost), then each
+    /// placed, unminimized leaf's client at the client rect inside the
+    /// leaf's rect for this frame — interpolated mid-animation, settled
+    /// otherwise (`leaf_rects` comes from `tick_layout`).
+    pub fn tiled_places(&self, leaf_rects: &[(NodeId, FrameRect)]) -> Vec<TiledPlace> {
+        let mut out = Vec::new();
+        if let Some(fs) = self.fullscreen {
+            if let Some(window) = self.managed.get(fs) {
+                let size = self.output_size();
+                out.push(TiledPlace {
+                    window: window.clone(),
+                    rect: FrameRect {
+                        x: 0,
+                        y: 0,
+                        w: size.w,
+                        h: size.h,
+                    },
+                });
+            }
+        }
+        for &(leaf, rect) in leaf_rects {
+            let Some(l) = self.state.layout.leaf(leaf) else {
+                continue;
+            };
+            let Some(c) = l.client else {
+                continue;
+            };
+            if l.minimized || Some(c) == self.fullscreen {
+                continue;
+            }
+            let Some(window) = self.managed.get(c) else {
+                continue;
+            };
+            let (cx, cy, cw, ch) = crate::shell::client_rect_in_frame(rect, (1, 1));
+            out.push(TiledPlace {
+                window: window.clone(),
+                rect: FrameRect {
+                    x: cx,
+                    y: cy,
+                    w: cw,
+                    h: ch,
+                },
+            });
+        }
+        out
     }
 
     /// Drop every cached chrome texture so the next `update_chrome_pieces`
