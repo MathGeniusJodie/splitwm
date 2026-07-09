@@ -714,14 +714,28 @@ impl Comp {
                 .placed
                 .iter()
                 .map(|p| {
-                    let from = self.prev_frame_rect.get(&p.leaf).copied().unwrap_or(
+                    // A leaf with no previous rect just appeared: grow it
+                    // along the axis it split off — a row in a stack unfolds
+                    // vertically at full width, a new column horizontally at
+                    // full height.
+                    let from = self.prev_frame_rect.get(&p.leaf).copied().unwrap_or_else(|| {
+                        let stacked = self
+                            .state
+                            .layout
+                            .locate(p.leaf)
+                            .is_some_and(|pos| self.state.layout.col_len(pos.col) > 1);
+                        let (w, h) = if stacked {
+                            (p.target.w, 1)
+                        } else {
+                            (1, p.target.h)
+                        };
                         crate::widgets::FrameRect {
                             x: p.target.x,
                             y: p.target.y,
-                            w: 1,
-                            h: p.target.h,
-                        },
-                    );
+                            w,
+                            h,
+                        }
+                    });
                     (from, *p)
                 })
                 .collect();

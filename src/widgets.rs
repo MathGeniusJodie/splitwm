@@ -304,10 +304,10 @@ pub fn compute_leaf_widgets(widgets: &mut Widgets, layout: &Layout, placed: &[Pl
     let tb_h = theme::tb_h();
     let bw = theme::BORDER_LEFT;
     for p in placed {
-        let leaf = layout.leaf(p.leaf);
-        let has_client = leaf.is_some_and(|l| l.client.is_some());
-        let minimized = leaf.is_some_and(|l| l.minimized);
-        if has_client && !minimized {
+        let minimized = layout.leaf(p.leaf).is_some_and(|l| l.minimized);
+        // Placeholders get a title region too: an empty split's titlebar
+        // is grabbable for a move drag even though it paints no title.
+        if !minimized {
             widgets.title_regions.push((
                 FrameRect {
                     x: p.target.x + bw,
@@ -632,6 +632,20 @@ mod tests {
         let mut widgets = Widgets::default();
         compute_taskbar(&mut widgets, &layout, &clients, &quick, &[], WA);
         assert_eq!(widgets.quick_regions.len(), 1);
+    }
+
+    /// An empty placeholder's titlebar is a drag handle like any other:
+    /// it gets a title region even with no client, so a split-move drag
+    /// can start on it. Only minimizing removes the region.
+    #[test]
+    fn placeholder_titlebar_is_grabbable() {
+        let s = State::new(); // one empty placeholder leaf
+        let leaf = s.layout.first_leaf();
+        assert_eq!(s.layout.leaf(leaf).unwrap().client, None);
+        let placed = placement(&s, WA);
+        let mut widgets = Widgets::default();
+        compute_leaf_widgets(&mut widgets, &s.layout, &placed);
+        assert!(widgets.title_regions.iter().any(|&(_, l)| l == leaf));
     }
 
     #[test]
