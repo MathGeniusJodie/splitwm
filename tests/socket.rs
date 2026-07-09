@@ -140,6 +140,11 @@ struct Win {
     /// Latest xdg_toplevel.configure, applied on xdg_surface.configure.
     pending: (i32, i32, bool),
     size: (i32, i32),
+    /// Size of the buffer currently attached; when a configure names a
+    /// different size, `commit_configured_sizes` attaches a matching
+    /// buffer like a real client would — a stale oversized buffer keeps
+    /// covering (and stealing clicks from) chrome and panels.
+    attached: (i32, i32),
     activated: bool,
     configures: u32,
     closed: bool,
@@ -380,10 +385,15 @@ struct Session {
     pool_file: std::fs::File,
 }
 
-/// Buffer geometry for test windows: content is irrelevant (all zeroes),
-/// the commit just has to carry *a* buffer so the compositor maps and
-/// classifies the window.
+/// Buffer geometry for layer-surface test buffers: content is irrelevant
+/// (all zeroes), the commit just has to carry *a* buffer.
 const BUF: i32 = 64;
+
+/// Default buffer size for test toplevels. The first commit's size is the
+/// window's stated preference (the compositor sizes its column by it), so
+/// windows that should behave like the old full-slot bootstrap ask for at
+/// least the whole viewport strip.
+const WIN_BUF: (i32, i32) = (OUTPUT_W, 800);
 
 impl Session {
     fn boot() -> Session {
@@ -405,7 +415,7 @@ impl Session {
         let seat: wl_seat::WlSeat = globals.bind(&qh, 1..=5, ()).expect("bind wl_seat");
 
         let pool_file = tempfile::tempfile().expect("shm backing file");
-        let pool_len = BUF * BUF * 4;
+        let pool_len = WIN_BUF.0 * WIN_BUF.1 * 4;
         pool_file.set_len(pool_len as u64).expect("size shm file");
         let pool = shm.create_pool(pool_file.as_fd(), pool_len, &qh, ());
 
@@ -430,6 +440,7 @@ impl Session {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             self.queue.roundtrip(&mut self.app).expect("roundtrip");
+            self.commit_configured_sizes();
             if pred(&self.app) {
                 return;
             }
@@ -438,9 +449,35 @@ impl Session {
         }
     }
 
+    /// Honor configures like a real client: any window whose configured
+    /// size differs from its attached buffer gets a matching buffer
+    /// committed. Skips destroyed windows (`closed` is always seen before
+    /// the tests destroy one).
+    fn commit_configured_sizes(&mut self) {
+        for win in &mut self.app.wins {
+            let (w, h) = win.size;
+            if w > 0 && h > 0 && (w, h) != win.attached && !win.closed {
+                let buffer =
+                    self.pool
+                        .create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, &self.qh, ());
+                win.surface.attach(Some(&buffer), 0, 0);
+                win.surface.commit();
+                win.attached = (w, h);
+            }
+        }
+    }
+
     /// Create a toplevel and map it (initial commit, configure, buffer
     /// commit) — the standard xdg-shell dance every real client performs.
+    /// The default `WIN_BUF` first buffer asks for the whole viewport
+    /// strip, so the window fills the slot like the old bootstrap.
     fn open_window(&mut self) -> usize {
+        self.open_window_sized(WIN_BUF.0, WIN_BUF.1)
+    }
+
+    /// `open_window` with an explicit first-buffer size — the window's
+    /// stated preferred size, which the compositor opens its column at.
+    fn open_window_sized(&mut self, w: i32, h: i32) -> usize {
         let win = self.app.wins.len();
         let surface = self.compositor.create_surface(&self.qh, ());
         let xdg = self.wm_base.get_xdg_surface(&surface, &self.qh, win);
@@ -454,6 +491,7 @@ impl Session {
             toplevel,
             pending: (0, 0, false),
             size: (0, 0),
+            attached: (w, h),
             activated: false,
             configures: 0,
             closed: false,
@@ -461,7 +499,7 @@ impl Session {
         self.wait_until("initial configure", |app| app.wins[win].configures > 0);
         let buffer =
             self.pool
-                .create_buffer(0, BUF, BUF, BUF * 4, wl_shm::Format::Argb8888, &self.qh, ());
+                .create_buffer(0, w, h, w * 4, wl_shm::Format::Argb8888, &self.qh, ());
         self.app.wins[win].surface.attach(Some(&buffer), 0, 0);
         self.app.wins[win].surface.commit();
         win
@@ -509,10 +547,10 @@ fn socket_lifecycle() {
     s.wait_until("keyboard enters w1", |app| app.focus_is(a));
 
     // --- open-right: a second client gets its own fresh column to the
-    // right of the first, at the default column width; the sitting tenant
+    // right of the first, at its own preferred width; the sitting tenant
     // keeps its full width untouched (columns never resize each other —
     // the strip grows and scrolls instead) ---
-    let b = s.open_window();
+    let b = s.open_window_sized(400, 650);
     s.wait_until("w2 mapped in its own column and focused", |app| {
         app.wins[b].activated && app.wins[b].size.0 > 0 && app.wins[b].size.0 < full.0
     });
@@ -521,11 +559,9 @@ fn socket_lifecycle() {
     });
     s.wait_until("keyboard moves to w2", |app| app.focus_is(b));
     let minor_w = s.app.wins[b].size.0;
-    // A third of the viewport (`theme::default_col_w`), within
-    // chrome-inset slack.
-    assert!(
-        minor_w > OUTPUT_W / 5 && minor_w < OUTPUT_W / 2,
-        "new column opens at the default width, got {minor_w}"
+    assert_eq!(
+        minor_w, 400,
+        "new column opens at the window's preferred width"
     );
 
     // --- bracket cycling is focus cycling (everything is visible) ---
@@ -572,7 +608,15 @@ fn drag_reorders_splits_and_badge_close_leaves_placeholder() {
     let mut s = Session::boot();
     let mut wins = Vec::new();
     for i in 0..3 {
-        let w = s.open_window();
+        // The first window fills the slot; the others ask for the same
+        // width the default column used to open at (426 including the
+        // 12px of frame borders), keeping the coordinate math below
+        // identical to the pre-size-hint layout.
+        let w = if i == 0 {
+            s.open_window()
+        } else {
+            s.open_window_sized(414, 650)
+        };
         s.wait_until("window mapped and focused", |app| app.wins[w].activated);
         wins.push(w);
         assert_eq!(i, w);
@@ -884,8 +928,11 @@ fn dock_layer_panel_rides_the_canvas_scroll() {
     const RED: [u8; 4] = [255, 0, 0, 255];
     // Inside the parked overlap strip (right edge, scroll 0)…
     const PARKED_X: i32 = OUTPUT_W - 50;
-    // …and inside the zone that only a full right-scroll reveals.
-    const REVEALED_X: i32 = OUTPUT_W - ZONE - 30;
+    // …and inside the zone that only a full right-scroll reveals — right
+    // of the canvas end at full scroll (OUTPUT_W - ZONE), where the tiled
+    // window can no longer cover it: the panel renders above the chrome
+    // but below tiled windows, and clicks route the same way.
+    const REVEALED_X: i32 = OUTPUT_W - ZONE + 40;
     const SAMPLE_Y: i32 = OUTPUT_H / 2;
 
     fn wait_pixel(s: &mut Session, what: &str, x: i32, y: i32, want_red: bool) {
@@ -977,6 +1024,19 @@ fn dock_layer_panel_rides_the_canvas_scroll() {
         &mut s,
         "right scroll reveals the panel",
         REVEALED_X,
+        SAMPLE_Y,
+        true,
+    );
+
+    // Let the scroll glide land before clicking: mid-glide the tiled
+    // window's right edge still covers REVEALED_X and would swallow the
+    // click. The panel's left edge only reaches OUTPUT_W - PANEL_W at
+    // full scroll, so a red pixel just past that means the glide is (all
+    // but) done and the window is clear of REVEALED_X.
+    wait_pixel(
+        &mut s,
+        "scroll glide lands",
+        OUTPUT_W - PANEL_W + 5,
         SAMPLE_Y,
         true,
     );

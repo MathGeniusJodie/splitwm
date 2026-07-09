@@ -25,6 +25,15 @@ impl Comp {
             self.manage_float(window);
         } else {
             let class = crate::shell::toplevel_app_id(&window);
+            // Both backends state their preferred size before this point —
+            // the xdg initial configure names no size, so the first buffer
+            // is the client's own choice; an X11 window carries its map
+            // geometry — so the column opens at that width plus the frame
+            // borders rather than a default.
+            let want_w = match window.geometry().size.w {
+                w if w > 0 => Some(w + 2 * theme::BORDER_LEFT),
+                _ => None,
+            };
             let win = self.managed.insert(window, Kind::Tiled);
             let slot = self.assign_icon_slot(&class);
             if let Some(entry) = self.managed.entry_mut(win) {
@@ -36,7 +45,7 @@ impl Comp {
             // button would (see `State::place_new_window`). Animate the
             // new column sliding in and scroll it into view.
             let wa = self.layout_area();
-            self.state.place_new_window(wa, win);
+            self.state.place_new_window(wa, win, want_w);
             if fullscreen {
                 self.fullscreen = Some(win);
             }

@@ -100,25 +100,46 @@ impl State {
     /// waits for a window placed *into* it deliberately. Every window
     /// lives in exactly one split from map to destroy — there is no
     /// off-layout stash.
-    pub fn place_new_window(&mut self, wa: Rect, c: Win) {
+    ///
+    /// `want_w` is the frame width the window's own first-commit size asks
+    /// for (`None` when the client stated nothing). It sizes the fresh
+    /// column instead of `theme::default_col_w`, and re-sizes a lone
+    /// placeholder column the window fills — a stacked placeholder's width
+    /// is shared with its siblings, so their deliberate arrangement wins
+    /// there. Never below the chrome's minimum; a window asking for the
+    /// whole viewport strip (or more) gets `ColWidth::Viewport`, so it
+    /// keeps tracking the viewport like the bootstrap column — panels
+    /// reserving exclusive zones still resize it.
+    pub fn place_new_window(&mut self, wa: Rect, c: Win, want_w: Option<i32>) {
         if self.layout.find_leaf_for_client(c).is_some() {
             return;
         }
+        let max_w = (wa.w - 2 * theme::GAP).max(theme::min_split_w());
+        let want = want_w.map(|w| {
+            if w >= max_w {
+                ColWidth::Viewport
+            } else {
+                ColWidth::Px(w.max(theme::min_split_w()))
+            }
+        });
         let focused = self.focused_leaf_valid();
         if self
             .layout
             .leaf(focused)
             .is_some_and(|l| l.client.is_none())
         {
+            if let (Some(width), false) = (want, self.layout.stacked(focused)) {
+                let pos = self.layout.locate(focused).expect("focused leaf is live");
+                self.layout.set_col_width(pos.col, width);
+            }
             if let Some(l) = self.layout.leaf_mut(focused) {
                 l.show(c);
             }
             return;
         }
         let col = self.focused_col();
-        let new = self
-            .layout
-            .insert_column(col + 1, ColWidth::Px(theme::default_col_w(wa.w)));
+        let width = want.unwrap_or(ColWidth::Px(theme::default_col_w(wa.w)));
+        let new = self.layout.insert_column(col + 1, width);
         if let Some(l) = self.layout.leaf_mut(new) {
             l.show(c);
         }
@@ -425,7 +446,7 @@ impl State {
         if new_w == widths[pos.col] {
             return false;
         }
-        self.layout.set_col_width(pos.col, new_w);
+        self.layout.set_col_width(pos.col, ColWidth::Px(new_w));
         true
     }
 
@@ -457,7 +478,7 @@ impl State {
         match at {
             GapAt::Col(idx) => {
                 self.layout
-                    .set_col_width(idx, first_px.max(theme::min_split_w()));
+                    .set_col_width(idx, ColWidth::Px(first_px.max(theme::min_split_w())));
             }
             GapAt::Row { col, idx } => {
                 if combined_px <= 0 {
@@ -477,33 +498,37 @@ impl State {
         }
     }
 
-    /// Resize the leftmost or rightmost column to `target_w` pixels: the
-    /// column absorbs the whole delta and the strip grows/shrinks with it;
-    /// no sibling moves. Refused when that column is pinned (minimized) —
-    /// its visible width is the gap, not a real width, so the drag is
-    /// meaningless. Returns the applied delta.
+    /// Resize column `col` to `target_w` pixels: the column absorbs the
+    /// whole delta and the strip grows/shrinks with it; no sibling
+    /// resizes (later columns slide in canvas space). Refused when the
+    /// column is pinned (minimized) — its visible width is the gap, not a
+    /// real width, so the drag is meaningless. Returns the applied delta.
     ///
-    /// For the left edge specifically, the column's *start* is what's
-    /// meant to track the mouse (growing toward the screen edge), but the
-    /// strip is laid out left-to-right from a fixed origin — so growing
-    /// column 0 shifts every later column's canvas-space x right by the
-    /// delta. The caller (`Wm::on_motion`) nudges `scroll_x`/`scroll_target`
-    /// by the same delta so those columns stay put on screen and only the
-    /// dragged edge visibly moves.
-    pub fn resize_edge(&mut self, wa: Rect, left: bool, target_w: i32) -> i32 {
-        let widths = self.layout.widths(wa.w, theme::GAP);
-        let idx = if left { 0 } else { widths.len() - 1 };
-        if self.layout.col_pinned(idx) {
+    /// For a left-side drag, the column's *start* is what's meant to
+    /// track the mouse (growing toward the screen edge), but the strip is
+    /// laid out left-to-right from a fixed origin — so growing the column
+    /// shifts every later column's canvas-space x right by the delta. The
+    /// caller nudges `scroll_x`/`scroll_target` by the same delta so those
+    /// columns stay put on screen and only the dragged edge visibly moves.
+    pub fn resize_col(&mut self, wa: Rect, col: usize, target_w: i32) -> i32 {
+        if self.layout.col_pinned(col) {
             return 0;
         }
-        let old_w = widths[idx];
+        let old_w = self.layout.widths(wa.w, theme::GAP)[col];
         let new_w = target_w.max(theme::min_split_w());
         let delta = new_w - old_w;
         if delta == 0 {
             return 0;
         }
-        self.layout.set_col_width(idx, new_w);
+        self.layout.set_col_width(col, ColWidth::Px(new_w));
         delta
+    }
+
+    /// Resize the leftmost or rightmost column (the outer canvas-edge
+    /// handles' target) — see `resize_col`.
+    pub fn resize_edge(&mut self, wa: Rect, left: bool, target_w: i32) -> i32 {
+        let col = if left { 0 } else { self.layout.ncols() - 1 };
+        self.resize_col(wa, col, target_w)
     }
 
     // --- canvas ---
@@ -518,7 +543,7 @@ impl State {
     /// Record the extra scroll room the docked sidebar needs (zero when
     /// nothing is docked); called once per arrange. Scroll positions are
     /// deliberately *not* re-clamped here: an edge drag parks them outside
-    /// `[0, max_scroll]` to hold a wallpaper margin at the dragged edge
+    /// `[min_scroll, max_scroll]` to hold a wallpaper margin at the dragged edge
     /// (see `shift_scroll`), and this runs on every arrange, so clamping
     /// here would yank that margin shut on the next hover repaint.
     /// Mutations that change the scroll range out from under the user
@@ -528,7 +553,7 @@ impl State {
         self.dock_extra = dock_extra;
     }
 
-    /// Pull both scroll positions back into `[0, max_scroll]`. This is the
+    /// Pull both scroll positions back into `[min_scroll, max_scroll]`. This is the
     /// companion to `set_dock_extra` not clamping: structural layout
     /// changes, viewport resizes and dock removal shrink the scroll range
     /// and must not strand the viewport past the content, while edge-drag
@@ -536,9 +561,9 @@ impl State {
     /// doesn't call this.
     pub fn clamp_scroll(&mut self, wa: Rect, dock_extra: i32) {
         self.dock_extra = dock_extra;
-        let max_scroll = self.max_scroll(wa);
-        self.scroll_target = self.scroll_target.clamp(0, max_scroll);
-        self.scroll_x = self.scroll_x.clamp(0, max_scroll);
+        let (min_scroll, max_scroll) = (Self::min_scroll(wa), self.max_scroll(wa));
+        self.scroll_target = self.scroll_target.clamp(min_scroll, max_scroll);
+        self.scroll_x = self.scroll_x.clamp(min_scroll, max_scroll);
     }
 
     /// The dock scroll room last supplied to `set_dock_extra`.
@@ -593,30 +618,37 @@ impl State {
     }
 
     /// Shift both offsets by `delta` without clamping — used by the
-    /// left-edge resize drag to keep on-screen columns stationary while the
-    /// strip width changes underneath (the strip lays out from a fixed
-    /// origin, so resizing column 0 moves every other column in canvas
-    /// space). A left-edge shrink legitimately takes the scroll negative;
-    /// see `max_scroll` for what out-of-range scroll means.
+    /// left-side resize drags (canvas edge or window border) to keep
+    /// on-screen columns stationary while the strip width changes
+    /// underneath (the strip lays out from a fixed origin, so resizing a
+    /// column moves every later column in canvas space). A shrink can
+    /// legitimately take the scroll below `min_scroll`; see `max_scroll`
+    /// for what out-of-range scroll means.
     pub fn shift_scroll(&mut self, delta: i32) {
         self.scroll_x += delta;
         self.scroll_target += delta;
     }
 
-    /// Upper end of the *scrollable* range. The current scroll can sit
-    /// outside `[0, max_scroll]`, and that state is meaningful: negative
-    /// scroll is a wallpaper margin left of the strip (left-edge shrink,
-    /// via `shift_scroll`), scroll past `max_scroll` is margin right of it
-    /// (a right-edge shrink narrows the strip under an unmoved scroll).
-    /// Such a margin holds until a scroll gesture (`scroll_to` clamps) or
-    /// a range-shrinking mutation (`clamp_scroll`) repositions the
-    /// viewport.
+    /// Lower end of the *scrollable* range: wallpaper padding left of the
+    /// strip, nearly a viewport of it — at the limit the first column
+    /// starts exactly at the viewport's right edge, so the whole strip
+    /// can be panned out of view.
+    pub fn min_scroll(wa: Rect) -> i32 {
+        theme::GAP - wa.w
+    }
+
+    /// Upper end of the *scrollable* range. The current scroll can still
+    /// sit outside `[min_scroll, max_scroll]`: scroll past `max_scroll`
+    /// is margin right of the strip (a right-edge shrink narrows the
+    /// strip under an unmoved scroll, via `shift_scroll`). Such a margin
+    /// holds until a scroll gesture (`scroll_to` clamps) or a
+    /// range-shrinking mutation (`clamp_scroll`) repositions the viewport.
     pub fn max_scroll(&self, wa: Rect) -> i32 {
         (self.canvas_w(wa) + self.dock_extra - wa.w).max(0)
     }
 
     pub fn scroll_to(&mut self, wa: Rect, target: i32) {
-        self.scroll_target = target.clamp(0, self.max_scroll(wa));
+        self.scroll_target = target.clamp(Self::min_scroll(wa), self.max_scroll(wa));
     }
 
     pub fn scroll_delta(&mut self, wa: Rect, delta: i32) {
@@ -698,9 +730,54 @@ mod tests {
     #[test]
     fn place_fills_focused_empty_placeholder() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 1, None);
         assert_eq!(s.focused_client(), Some(1));
         assert_eq!(s.layout.collect_leaves().len(), 1, "no new column opened");
+    }
+
+    /// A stated preferred width sizes the window's column: the bootstrap
+    /// placeholder stops tracking the viewport, and a fresh column opens
+    /// at the hint instead of `default_col_w`.
+    #[test]
+    fn place_honors_the_windows_preferred_width() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1, Some(500));
+        assert_eq!(s.layout.widths(WA.w, GAP)[0], 500, "bootstrap fill");
+        s.place_new_window(WA, 2, Some(300));
+        assert_eq!(s.layout.widths(WA.w, GAP)[1], 300, "fresh column");
+    }
+
+    /// Preferred widths are clamped to sane bounds: a hint at (or past)
+    /// the viewport strip's width becomes `Viewport` — the column keeps
+    /// tracking viewport changes like the bootstrap one — and one below
+    /// the chrome's minimum is raised to it. No hint falls back to the
+    /// default width.
+    #[test]
+    fn place_clamps_preferred_width_and_defaults_without_one() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1, Some(5000));
+        assert_eq!(s.layout.widths(WA.w, GAP)[0], WA.w - 2 * GAP);
+        assert_eq!(s.layout.col_width(0), Some(ColWidth::Viewport));
+        s.place_new_window(WA, 2, Some(1));
+        assert_eq!(s.layout.widths(WA.w, GAP)[1], crate::theme::min_split_w());
+        s.place_new_window(WA, 3, None);
+        assert_eq!(
+            s.layout.widths(WA.w, GAP)[2],
+            crate::theme::default_col_w(WA.w)
+        );
+    }
+
+    /// A hint never resizes a stacked placeholder's column — its width is
+    /// shared with siblings the user already arranged.
+    #[test]
+    fn place_hint_leaves_stacked_placeholder_width_alone() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1, None);
+        s.split_focused(); // stack below window 1; placeholder focused
+        let before = s.layout.widths(WA.w, GAP)[0];
+        s.place_new_window(WA, 2, Some(300));
+        assert_eq!(s.layout.widths(WA.w, GAP)[0], before);
+        assert_eq!(s.focused_client(), Some(2), "still fills the placeholder");
     }
 
     /// An empty split that is *not* focused attracts nothing: the new
@@ -708,11 +785,11 @@ mod tests {
     #[test]
     fn place_ignores_unfocused_placeholders() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 1, None);
         s.insert_at(WA, Insert::Col(0)); // placeholder column, focused
         let placeholder = s.focused_leaf_valid();
         s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
-        s.place_new_window(WA, 2);
+        s.place_new_window(WA, 2, None);
         assert_eq!(s.layout.leaf(placeholder).unwrap().client, None);
         assert_eq!(s.focused_client(), Some(2));
         assert_eq!(leaf_clients(&s), vec![None, Some(1), Some(2)]);
@@ -724,14 +801,14 @@ mod tests {
     fn place_opens_a_column_right_of_the_focused_one() {
         let mut s = State::new();
         for w in [1, 2, 3] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         assert_eq!(leaf_clients(&s), vec![Some(1), Some(2), Some(3)]);
         assert_eq!(s.focused_client(), Some(3));
 
         // Opening from the middle lands between, not at the end.
         s.focus_leaf(s.layout.find_leaf_for_client(2).unwrap());
-        s.place_new_window(WA, 4);
+        s.place_new_window(WA, 4, None);
         assert_eq!(leaf_clients(&s), vec![Some(1), Some(2), Some(4), Some(3)]);
     }
 
@@ -741,18 +818,18 @@ mod tests {
     #[test]
     fn place_from_a_stacked_split_opens_a_column() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
-        s.place_new_window(WA, 2);
+        s.place_new_window(WA, 1, None);
+        s.place_new_window(WA, 2, None);
         s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
         s.split_focused(); // column 0 becomes a stack; its placeholder focused
-        s.place_new_window(WA, 3);
+        s.place_new_window(WA, 3, None);
         assert_eq!(
             s.layout.locate(s.layout.find_leaf_for_client(3).unwrap()),
             Some(Pos { col: 0, row: 1 }),
             "fills the placeholder the split just opened"
         );
         s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
-        s.place_new_window(WA, 4);
+        s.place_new_window(WA, 4, None);
         assert_eq!(s.layout.ncols(), 3, "new column, no stack growth");
         assert_eq!(
             s.layout.locate(s.layout.find_leaf_for_client(4).unwrap()),
@@ -768,7 +845,7 @@ mod tests {
     fn open_close_never_resizes_neighbours() {
         let mut s = State::new();
         for w in [1, 2, 3] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         let l2 = s.layout.find_leaf_for_client(2).unwrap();
         let before = s.compute(WA);
@@ -787,10 +864,10 @@ mod tests {
     #[test]
     fn unpin_in_a_stack_still_merges() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 1, None);
         s.split_focused();
         s.focus_leaf(s.layout.collect_leaves()[1]);
-        s.place_new_window(WA, 2); // fills the focused empty bottom row
+        s.place_new_window(WA, 2, None); // fills the focused empty bottom row
         let strip = s.canvas_w(WA);
         let full = {
             let g = s.compute(WA);
@@ -809,8 +886,8 @@ mod tests {
     #[test]
     fn unpin_collapses_the_split() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
-        s.place_new_window(WA, 2);
+        s.place_new_window(WA, 1, None);
+        s.place_new_window(WA, 2, None);
         assert!(s.unpin_client(2), "collapse is a layout change");
         assert_eq!(s.layout.collect_leaves().len(), 1);
         assert_eq!(s.focused_client(), Some(1));
@@ -820,7 +897,7 @@ mod tests {
     fn unpin_keeps_focus_when_it_was_elsewhere() {
         let mut s = State::new();
         for w in [1, 2, 3] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
         s.unpin_client(2);
@@ -831,7 +908,7 @@ mod tests {
     #[test]
     fn unpin_of_the_last_window_leaves_the_root_placeholder() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 1, None);
         assert!(!s.unpin_client(1), "no rect moved");
         assert_eq!(s.layout.collect_leaves().len(), 1);
         assert_eq!(s.focused_client(), None);
@@ -843,14 +920,14 @@ mod tests {
     #[test]
     fn retained_close_leaves_a_placeholder_once() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
-        s.place_new_window(WA, 2);
+        s.place_new_window(WA, 1, None);
+        s.place_new_window(WA, 2, None);
         s.retain_split_on_close(2);
         assert!(!s.unpin_client(2));
         assert_eq!(s.layout.collect_leaves().len(), 2, "placeholder kept");
         let placeholder = s.layout.collect_leaves()[1];
         s.focus_leaf(placeholder);
-        s.place_new_window(WA, 3);
+        s.place_new_window(WA, 3, None);
         assert_eq!(s.layout.leaf(placeholder).unwrap().client, Some(3));
         assert!(s.unpin_client(3), "the mark was consumed: collapse again");
         assert_eq!(s.layout.collect_leaves().len(), 1);
@@ -859,7 +936,7 @@ mod tests {
     #[test]
     fn remove_empty_leaf_refuses_occupied_and_sole() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 1, None);
         let occupied = s.focused_leaf_valid();
         assert!(!s.remove_empty_leaf(occupied), "occupied split");
         s.unpin_client(1);
@@ -872,7 +949,7 @@ mod tests {
     #[test]
     fn remove_empty_leaf_moves_focus_to_neighbour() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 1, None);
         s.insert_at(WA, Insert::ColEnd);
         assert!(s.remove_empty_leaf(s.focused_leaf_valid()));
         assert_eq!(s.focused_client(), Some(1));
@@ -883,7 +960,7 @@ mod tests {
     fn focus_direction_cycles_and_wraps() {
         let mut s = State::new();
         for w in [1, 2, 3] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         assert!(s.focus_direction(true));
         assert_eq!(s.focused_client(), Some(1), "wrapped past the end");
@@ -897,7 +974,7 @@ mod tests {
     fn move_focused_split_swaps_with_neighbour() {
         let mut s = State::new();
         for w in [1, 2, 3] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         s.focus_leaf(s.layout.find_leaf_for_client(2).unwrap());
         assert!(s.move_focused_split(WA, true));
@@ -912,10 +989,10 @@ mod tests {
     #[test]
     fn move_focused_split_reorders_within_a_stack() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 1, None);
         s.split_focused();
         s.focus_leaf(s.layout.collect_leaves()[1]);
-        s.place_new_window(WA, 2);
+        s.place_new_window(WA, 2, None);
         s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
         assert!(s.move_focused_split(WA, true));
         assert_eq!(s.layout.ncols(), 1, "stayed one column");
@@ -925,17 +1002,17 @@ mod tests {
     #[test]
     fn toggle_minimize_refuses_the_sole_split() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 1, None);
         assert!(!s.toggle_minimize(s.focused_leaf_valid()));
-        s.place_new_window(WA, 2);
+        s.place_new_window(WA, 2, None);
         assert!(s.toggle_minimize(s.focused_leaf_valid()));
     }
 
     #[test]
     fn split_focused_refuses_a_minimized_leaf() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
-        s.place_new_window(WA, 2);
+        s.place_new_window(WA, 1, None);
+        s.place_new_window(WA, 2, None);
         s.toggle_minimize(s.focused_leaf_valid());
         assert!(!s.split_focused());
         assert_eq!(s.layout.collect_leaves().len(), 2);
@@ -946,8 +1023,8 @@ mod tests {
     #[test]
     fn activate_unminimizes_and_focuses() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
-        s.place_new_window(WA, 2);
+        s.place_new_window(WA, 1, None);
+        s.place_new_window(WA, 2, None);
         let l2 = s.layout.find_leaf_for_client(2).unwrap();
         s.toggle_minimize(l2);
         assert_eq!(s.focused_client(), None, "minimized leaf shows nothing");
@@ -961,7 +1038,7 @@ mod tests {
     fn resize_focused_lone_column_moves_only_the_strip() {
         let mut s = State::new();
         for w in [1, 2] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         let l1 = s.layout.find_leaf_for_client(1).unwrap();
         let before = s.compute(WA);
@@ -980,7 +1057,7 @@ mod tests {
     #[test]
     fn resize_focused_stacked_conserves_the_pair() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 1, None);
         s.split_focused();
         let rows = s.layout.collect_leaves();
         s.focus_leaf(rows[0]);
@@ -996,7 +1073,7 @@ mod tests {
     #[test]
     fn resize_gap_preserves_row_sum() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 1, None);
         s.split_focused();
         let rows = s.layout.collect_leaves();
         let before = s.compute(WA);
@@ -1013,7 +1090,7 @@ mod tests {
     fn resize_gap_col_moves_only_the_left_column() {
         let mut s = State::new();
         for w in [1, 2] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         let l1 = s.layout.find_leaf_for_client(1).unwrap();
         let l2 = s.layout.find_leaf_for_client(2).unwrap();
@@ -1028,7 +1105,7 @@ mod tests {
     #[test]
     fn resize_edge_shrinks_lone_leaf() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 1, None);
         let target = WA.w / 2;
         let delta = s.resize_edge(WA, false, target);
         assert!(delta < 0);
@@ -1041,7 +1118,7 @@ mod tests {
     fn resize_edge_grows_left_column_and_strip() {
         let mut s = State::new();
         for w in [1, 2] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         let strip = s.canvas_w(WA);
         let (_, w0) = s.edge_span(WA, true).unwrap();
@@ -1058,7 +1135,7 @@ mod tests {
     fn resize_edge_leaves_minimized_column_alone() {
         let mut s = State::new();
         for w in [1, 2] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         s.toggle_minimize(s.focused_leaf_valid()); // rightmost pinned
         assert_eq!(s.resize_edge(WA, false, 500), 0);
@@ -1070,7 +1147,7 @@ mod tests {
     fn insert_at_places_and_focuses() {
         let mut s = State::new();
         for w in [1, 2] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         s.insert_at(WA, Insert::Col(1));
         assert_eq!(leaf_clients(&s), vec![Some(1), None, Some(2)]);
@@ -1090,8 +1167,8 @@ mod tests {
     #[test]
     fn open_column_right_lands_beside_the_stack() {
         let mut s = State::new();
-        s.place_new_window(WA, 1);
-        s.place_new_window(WA, 2);
+        s.place_new_window(WA, 1, None);
+        s.place_new_window(WA, 2, None);
         s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
         s.split_focused();
         let new = s.open_column_right(WA);
@@ -1105,7 +1182,7 @@ mod tests {
     fn step_scroll_approaches_target() {
         let mut s = State::new();
         for w in [1, 2, 3, 4, 5] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         s.scroll_to(WA, 200);
         assert!(s.step_scroll());
@@ -1116,7 +1193,7 @@ mod tests {
     fn step_scroll_snaps_within_threshold() {
         let mut s = State::new();
         for w in [1, 2, 3, 4, 5] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         s.scroll_to(WA, 1);
         assert!(!s.step_scroll(), "snapped: glide over");
@@ -1127,7 +1204,7 @@ mod tests {
     fn step_scroll_moving_target_reaims() {
         let mut s = State::new();
         for w in [1, 2, 3, 4, 5] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         s.scroll_to(WA, 200);
         s.step_scroll();
@@ -1150,7 +1227,7 @@ mod tests {
     fn ensure_in_view_reaches_the_focused_column() {
         let mut s = State::new();
         for w in [1, 2, 3, 4, 5, 6] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         s.land_scroll();
         s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
@@ -1161,13 +1238,48 @@ mod tests {
         assert!(geo.x - s.scroll_x() >= WA.x, "left edge visible");
     }
 
+    /// Scrolling to the far left parks the whole strip past the
+    /// viewport's right edge — the wallpaper padding left of the canvas.
+    #[test]
+    fn min_scroll_pans_the_strip_fully_out_of_view() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1, None);
+        s.scroll_to(WA, i32::MIN);
+        s.land_scroll();
+        assert_eq!(s.scroll_x(), State::min_scroll(WA));
+        let first = s.layout.first_leaf();
+        let geo = s.compute(WA)[&first];
+        assert!(
+            geo.x - s.scroll_x() >= WA.x + WA.w,
+            "first column starts past the right viewport edge"
+        );
+    }
+
+    /// A border drag resizes only the grabbed column: siblings keep their
+    /// widths and the strip absorbs the delta.
+    #[test]
+    fn resize_col_leaves_sibling_widths_alone() {
+        let mut s = State::new();
+        for w in [1, 2, 3] {
+            s.place_new_window(WA, w, None);
+        }
+        let strip = s.canvas_w(WA);
+        let before = s.layout.widths(WA.w, GAP);
+        let applied = s.resize_col(WA, 1, before[1] + 120);
+        assert_eq!(applied, 120);
+        let after = s.layout.widths(WA.w, GAP);
+        assert_eq!(after[1], before[1] + 120);
+        assert_eq!((after[0], after[2]), (before[0], before[2]));
+        assert_eq!(s.canvas_w(WA), strip + 120);
+    }
+
     /// clamp_scroll never strands the viewport past shrunken content, but
     /// an in-range scroll survives it untouched.
     #[test]
     fn clamp_scroll_pulls_back_into_range() {
         let mut s = State::new();
         for w in [1, 2, 3, 4, 5] {
-            s.place_new_window(WA, w);
+            s.place_new_window(WA, w, None);
         }
         let max = s.max_scroll(WA);
         assert!(max > 0);

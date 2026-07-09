@@ -19,6 +19,7 @@ use crate::widgets::{leaf_meta, BtnKind, FrameRect};
 pub enum ActiveDrag {
     Gap(GapDrag),
     Edge(EdgeDrag),
+    Border(BorderDrag),
     Float(FloatDrag),
     Move(MoveDrag),
 }
@@ -67,6 +68,17 @@ pub struct EdgeDrag {
     pub anchor_x: i32,
 }
 
+/// Dragging a window frame's left/right border band: only that column
+/// resizes — the strip grows/shrinks and siblings slide, unlike a gap
+/// drag, which moves the shared boundary between the pair. The column's
+/// far edge stays fixed at `anchor_x` (screen space), like an edge drag.
+#[derive(Clone, Copy)]
+pub struct BorderDrag {
+    pub leaf: NodeId,
+    pub left: bool,
+    pub anchor_x: i32,
+}
+
 /// What a click on the chrome resolved to, in priority order.
 enum Hit {
     Btn(NodeId, BtnKind),
@@ -77,6 +89,8 @@ enum Hit {
     Plus(Insert),
     Handle(Boundary),
     Edge(bool),
+    /// A window frame's left (`true`) / right border band.
+    Border(NodeId, bool),
     LeafBody(NodeId),
     Miss,
 }
@@ -190,6 +204,23 @@ impl Comp {
                     self.drag = Some(ActiveDrag::Edge(EdgeDrag { left, anchor_x }));
                 }
             }
+            Hit::Border(leaf, left) => {
+                self.state.focus_leaf(leaf);
+                self.state.land_scroll();
+                let wa = self.layout_area();
+                if let Some(&geo) = self.state.compute(wa).get(&leaf) {
+                    // Row geometry spans its whole column, so geo's x-span
+                    // is the column's regardless of stacking.
+                    let canvas_anchor = if left { geo.x + geo.w } else { geo.x };
+                    let anchor_x = canvas_anchor - self.state.scroll_x();
+                    self.drag = Some(ActiveDrag::Border(BorderDrag {
+                        leaf,
+                        left,
+                        anchor_x,
+                    }));
+                }
+                self.arrange();
+            }
             Hit::Miss => return false,
         }
         true
@@ -222,6 +253,29 @@ impl Comp {
                     self.state.shift_scroll(applied);
                 }
                 self.arrange();
+                true
+            }
+            Some(ActiveDrag::Border(bd)) => {
+                let wa = self.layout_area();
+                let mouse_x = pos.x as i32;
+                // anchor_x is the fixed far edge, so the gap to the mouse
+                // *is* the target width — width is scroll-invariant.
+                let target_w = if bd.left {
+                    bd.anchor_x - mouse_x
+                } else {
+                    mouse_x - bd.anchor_x
+                };
+                if let Some(pos) = self.state.layout.locate(bd.leaf) {
+                    let applied = self.state.resize_col(wa, pos.col, target_w);
+                    // Growing the column shifts every later column right in
+                    // canvas space; scroll by the same amount so the anchor
+                    // edge and everything right of it stay put and only the
+                    // dragged border (and columns left of it) visibly move.
+                    if bd.left && applied != 0 {
+                        self.state.shift_scroll(applied);
+                    }
+                    self.arrange();
+                }
                 true
             }
             Some(ActiveDrag::Gap(d)) => {
@@ -427,12 +481,21 @@ impl Comp {
         {
             return Hit::Edge(left);
         }
-        if let Some(leaf) = self
+        if let Some((leaf, frame)) = self
             .prev_frame_rect
             .iter()
             .find(|(l, r)| self.state.layout.is_leaf(**l) && rect_contains(**r, mx, my))
-            .map(|(l, _)| *l)
+            .map(|(l, r)| (*l, *r))
         {
+            // The frame's side border bands resize the column; anything
+            // else on the frame (a minimized leaf's whole frame is a
+            // button, caught above) is a plain body click.
+            if mx < frame.x + theme::BORDER_LEFT {
+                return Hit::Border(leaf, true);
+            }
+            if mx >= frame.x + frame.w - theme::BORDER_RIGHT {
+                return Hit::Border(leaf, false);
+            }
             return Hit::LeafBody(leaf);
         }
         Hit::Miss
@@ -487,6 +550,15 @@ impl Comp {
                 }
             }
             Hit::Edge(_) => CursorIcon::EwResize,
+            Hit::Border(leaf, _) => {
+                // A pinned (all-minimized) column refuses the resize; its
+                // frame is a restore button anyway, so this is belt and
+                // braces for the empty-band edges.
+                match self.state.layout.locate(leaf) {
+                    Some(p) if !self.state.layout.col_pinned(p.col) => CursorIcon::EwResize,
+                    _ => CursorIcon::Default,
+                }
+            }
             Hit::LeafBody(_) | Hit::Miss => CursorIcon::Default,
         }
     }

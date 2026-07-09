@@ -191,7 +191,7 @@ impl Comp {
                 if self.swipe_pan {
                     // Same wheel-click conversion as continuous finger
                     // scroll: ~15 axis units per click.
-                    self.apply_hscroll(event.delta_x() / 15.0);
+                    self.apply_hscroll(-event.delta_x() / 15.0);
                 }
             }
             InputEvent::GestureSwipeEnd { .. } => self.swipe_pan = false,
@@ -330,7 +330,8 @@ impl Comp {
                     crate::layout::Dir::V => CursorIcon::NsResize,
                     crate::layout::Dir::H => CursorIcon::EwResize,
                 },
-                Some(crate::comp::pointer::ActiveDrag::Edge(_)) => CursorIcon::EwResize,
+                Some(crate::comp::pointer::ActiveDrag::Edge(_))
+                | Some(crate::comp::pointer::ActiveDrag::Border(_)) => CursorIcon::EwResize,
                 Some(crate::comp::pointer::ActiveDrag::Float(_)) => CursorIcon::Pointer,
                 // An armed-but-unmoved titlebar/tile press still reads as a
                 // click; only real travel shows the grab.

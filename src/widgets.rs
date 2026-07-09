@@ -543,7 +543,7 @@ mod tests {
         s.insert_at(WA, Insert::ColEnd);
         s.insert_at(WA, Insert::Col(1));
         for col in 0..3 {
-            s.layout.set_col_width(col, 300);
+            s.layout.set_col_width(col, crate::layout::ColWidth::Px(300));
         }
         s
     }

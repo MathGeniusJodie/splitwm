@@ -444,9 +444,9 @@ impl Layout {
         true
     }
 
-    pub fn set_col_width(&mut self, col: usize, px: i32) {
+    pub fn set_col_width(&mut self, col: usize, width: ColWidth) {
         if let Some(c) = self.columns.get_mut(col) {
-            c.width = ColWidth::Px(px);
+            c.width = width;
         }
     }
 
@@ -849,7 +849,7 @@ mod tests {
     fn move_beside_column_reorders_and_carries_width() {
         let mut l = Layout::new();
         let ids = columns(&mut l, 3);
-        l.set_col_width(2, 555);
+        l.set_col_width(2, ColWidth::Px(555));
         assert!(l.move_beside_column(ids[2], ids[0], true, ColWidth::Px(1)));
         assert_eq!(l.collect_leaves(), vec![ids[2], ids[0], ids[1]]);
         assert_eq!(l.col_width(0), Some(ColWidth::Px(555)), "width travels");
