@@ -28,7 +28,7 @@ use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRen
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{Color32F, ImportDma as _};
 use smithay::desktop::{PopupManager, Space, Window};
-use smithay::input::pointer::CursorIcon;
+use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatState};
 use smithay::output::{Mode, Output};
 use smithay::reexports::calloop;
@@ -76,12 +76,13 @@ pub struct Comp {
     pub output: Output,
     /// Gap background (na16 gunmetal), resolved once from the baked palette.
     pub clear: Color32F,
-    /// The named shape the seat's pointer shows, or `None` when a client
-    /// hid the pointer with a null-surface `set_cursor`. Set from chrome
-    /// hover feedback and clients' cursor-shape-v1 requests; a legacy
-    /// client committing its own cursor pixels gets our arrow instead. The
-    /// tty and winit backends both composite it over a hidden host cursor.
-    pub cursor_status: Option<CursorIcon>,
+    /// What the seat's pointer shows: a named shape (from chrome hover
+    /// feedback or a cursor-shape-v1 request), a client's own cursor
+    /// surface (`wl_pointer.set_cursor` with committed pixels — XWayland
+    /// forwards X11 cursors this way too), or hidden after a null-surface
+    /// `set_cursor`. The tty and winit backends both composite it over a
+    /// hidden host cursor.
+    pub cursor_status: CursorImageStatus,
     /// Lazily-uploaded named cursor images: master's hand-drawn sprites
     /// (see `comp::cursor`).
     pub cursors: cursor::CursorCache,
@@ -363,7 +364,7 @@ impl Comp {
             backend,
             output,
             clear,
-            cursor_status: Some(CursorIcon::Default),
+            cursor_status: CursorImageStatus::default_named(),
             cursors: cursor::CursorCache::new(),
             chrome,
             indexed,
@@ -869,6 +870,12 @@ impl Comp {
 
     /// Composite one frame and pace clients' frame callbacks.
     pub fn redraw(&mut self) {
+        // A client that dies mid-hover leaves its cursor surface behind;
+        // fall back to the arrow.
+        use smithay::utils::IsAlive;
+        if matches!(&self.cursor_status, CursorImageStatus::Surface(s) if !s.alive()) {
+            self.cursor_status = CursorImageStatus::default_named();
+        }
         // Scroll glide: step toward the target and re-place windows.
         if self.state.scroll_animating() {
             self.state.step_scroll();
@@ -959,7 +966,7 @@ impl Comp {
                         renderer,
                         scene.indexed,
                         pointer_loc,
-                        self.cursor_status,
+                        &self.cursor_status,
                         &mut self.cursors,
                     );
                     elements.extend(chrome::output_elements(renderer, &scene));
@@ -983,7 +990,7 @@ impl Comp {
                 t.render(
                     &scene,
                     pointer_loc,
-                    self.cursor_status,
+                    &self.cursor_status,
                     &mut self.cursors,
                     self.clear,
                     &mut self.quantize,
@@ -1016,6 +1023,16 @@ impl Comp {
             layer.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
                 Some(output.clone())
             });
+        }
+        // A client cursor surface animates through frame callbacks too.
+        if let CursorImageStatus::Surface(surface) = &self.cursor_status {
+            smithay::desktop::utils::send_frames_surface_tree(
+                surface,
+                &output,
+                elapsed,
+                Some(Duration::ZERO),
+                |_, _| Some(output.clone()),
+            );
         }
     }
 }

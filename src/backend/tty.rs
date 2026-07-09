@@ -23,7 +23,7 @@ use smithay::backend::renderer::Color32F;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session as _};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
-use smithay::input::pointer::CursorIcon;
+use smithay::input::pointer::CursorImageStatus;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
@@ -87,7 +87,7 @@ impl Tty {
         &mut self,
         scene: &chrome::Scene<'_>,
         pointer_loc: Point<f64, Logical>,
-        cursor_icon: Option<CursorIcon>,
+        cursor: &CursorImageStatus,
         cursors: &mut CursorCache,
         clear: Color32F,
         quantize: &mut crate::comp::quantize::Quantize,
@@ -102,7 +102,7 @@ impl Tty {
             &mut self.renderer,
             scene.indexed,
             pointer_loc,
-            cursor_icon,
+            cursor,
             cursors,
         );
         elements.extend(chrome::output_elements(&mut self.renderer, scene));

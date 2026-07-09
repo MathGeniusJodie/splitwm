@@ -161,9 +161,11 @@ fn command(comp: &mut Comp, line: &str) {
             println!("ok layout {}", tokens.join(" "));
         }
         None if line == "cursor" => {
-            let name = match comp.cursor_status {
-                None => "hidden",
-                Some(icon) => icon.name(),
+            use smithay::input::pointer::CursorImageStatus;
+            let name = match &comp.cursor_status {
+                CursorImageStatus::Hidden => "hidden",
+                CursorImageStatus::Named(icon) => icon.name(),
+                CursorImageStatus::Surface(_) => "surface",
             };
             println!("ok cursor {name}");
         }

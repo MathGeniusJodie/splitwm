@@ -341,7 +341,7 @@ impl Comp {
                 }
                 None => self.hover_cursor(pos),
             };
-            self.cursor_status = Some(icon);
+            self.cursor_status = smithay::input::pointer::CursorImageStatus::Named(icon);
         }
         let pointer = self.pointer.clone();
         pointer.motion(

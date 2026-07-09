@@ -2,7 +2,7 @@
 
 use smithay::backend::renderer::ImportDma as _;
 use smithay::desktop::{PopupKind, Window};
-use smithay::input::pointer::{CursorIcon, CursorImageStatus};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
@@ -333,16 +333,12 @@ impl SeatHandler for Comp {
         set_primary_focus(&self.dh, seat, client);
     }
     fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-        // The compositor owns the pointer image: a cursor-shape-v1 request
-        // names the shape, a null-surface set_cursor hides it, and a legacy
-        // client committing its own cursor pixels gets the arrow (its
-        // surface is never shown). Consumed at redraw by whichever backend
-        // presents the cursor.
-        self.cursor_status = match image {
-            CursorImageStatus::Surface(_) => Some(CursorIcon::Default),
-            CursorImageStatus::Named(icon) => Some(icon),
-            CursorImageStatus::Hidden => None,
-        };
+        // A cursor-shape-v1 request names a shape (drawn as splitwm's own
+        // sprite), a set_cursor with committed pixels shows the client's
+        // surface verbatim, and a null-surface set_cursor hides the
+        // pointer. Consumed at redraw by whichever backend presents the
+        // cursor.
+        self.cursor_status = image;
     }
 }
 delegate_seat!(Comp);
