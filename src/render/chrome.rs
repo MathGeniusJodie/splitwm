@@ -233,15 +233,23 @@ impl Renderer {
         }
         let clip_x = text_x.max(0) as isize;
         let clip_w = (right_limit - text_x) as usize;
-        // Embossed look: a copy of the text one pixel up in the split's dark
+        // Embossed look: a copy of the text offset one pixel vertically in an
         // accent shade, so the real text reads as if stamped into the bar.
-        if y > 0 {
+        // Text contrast follows the accent's luma: dark accents get light
+        // text with the dark shade above; light accents get dark text with
+        // the light shade below.
+        let (text_color, shadow_y, shadow_color) = if self.accent_is_light(v.accent_index) {
+            (self.fg_dark, y + 1, theme::lighter_index(v.accent_index))
+        } else {
+            (self.fg, y - 1, theme::darker_index(v.accent_index))
+        };
+        if shadow_y >= 0 {
             font.draw_text_clipped(
                 fb,
                 &title.title,
                 text_x as isize,
-                (y - 1) as isize,
-                theme::darker_index(v.accent_index),
+                shadow_y as isize,
+                shadow_color,
                 clip_x,
                 clip_w,
             );
@@ -251,7 +259,7 @@ impl Renderer {
             &title.title,
             text_x as isize,
             y as isize,
-            self.fg,
+            text_color,
             clip_x,
             clip_w,
         );

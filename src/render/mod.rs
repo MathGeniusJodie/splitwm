@@ -58,6 +58,9 @@ pub struct Renderer {
     palette: OklabPalette,
     /// Palette index used for foreground text/glyph strokes.
     fg: Index,
+    /// Closest-to-black counterpart of `fg`, for text over light accents
+    /// (see `Renderer::accent_is_light`).
+    fg_dark: Index,
     /// Screen-sized scaled wallpaper (quantized to the palette), tagged
     /// with the (path, w, h) it was loaded for; `wallpaper_base` copies it
     /// into the full-output wallpaper piece on load/resize.
@@ -159,9 +162,13 @@ impl Renderer {
             }
         };
         let fg = palette.inner().closest_to_white_index();
+        let fg_dark = palette
+            .inner()
+            .nearest_index(pixel_graphics::Rgb { r: 0, g: 0, b: 0 });
         Self {
             font,
             fg,
+            fg_dark,
             wallpaper: None,
             border: NineSlice {
                 sprite: crate::assets::winborder(),
@@ -250,6 +257,18 @@ impl Renderer {
             return;
         }
         font.draw_text_clipped(fb, s, x as isize, y as isize, color, 0, fb.width);
+    }
+
+    /// Whether the accent at `index` is light (Rec. 709 luma above 0.5):
+    /// light accents get dark title text, with the emboss shadow flipped to
+    /// the lighter shade below (see `draw_title`).
+    fn accent_is_light(&self, index: Index) -> bool {
+        let c = self.palette.inner().color(index);
+        let luma = 0.2126f32.mul_add(
+            f32::from(c.r),
+            0.7152f32.mul_add(f32::from(c.g), 0.0722 * f32::from(c.b)),
+        );
+        luma > 0.5 * 255.0
     }
 
     /// The na16 palette all art/indices resolve through, for callers running
