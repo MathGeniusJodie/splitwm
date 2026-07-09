@@ -141,13 +141,7 @@ impl Comp {
             self.fullscreen = None;
         }
         match self.managed.kind_of(win) {
-            Some(Kind::Tiled) => {
-                if let Some(m) = self.managed.remove(win) {
-                    self.space.unmap_elem(&m.window);
-                }
-                self.state.unpin_client(win);
-                self.arrange();
-            }
+            Some(Kind::Tiled) => self.unmanage_tiled(win),
             Some(Kind::Float(_)) => self.forget_float(win),
             Some(Kind::Dock(_)) => {
                 self.managed.remove(win);

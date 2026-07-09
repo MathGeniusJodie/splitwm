@@ -59,51 +59,55 @@ term() { key super+Return; sleep 1.2; }
 # A solid-colour terminal so window-content sampling has something to read.
 cterm() { echo "spawn alacritty -o colors.primary.background='\"$1\"'" >&3; wait_line "ok spawn"; sleep 1.2; }
 
-# 1: two terminals stacked as tabs in one split
+cmd() { echo "$1" >&3; wait_line "ok $1"; sleep 0.3; }
+
+# 1: each new terminal opens in its own split, right of the focused one;
+# the taskbar mirrors them left-to-right
 term; term
-shot 01_two_tabs
-
-# 2: split horizontally (Mod4+v) -> new empty split to the right
-key super+v
-shot 02_split_h
-# put a coloured terminal in the new split -> content-sampled accent
+shot 01_two_splits
 cterm "#006400"
-shot 03_term_in_split2
+shot 02_third_split_right
 
-# 3: split vertically (Mod4+h)
+# 2: split vertically (Mod4+h) -> empty placeholder below; the next
+# terminal fills it
 key super+h
 term
-shot 04_split_v
+shot 03_split_v_filled
 
-# 4: focus prev / next
+# 3: focus prev / next (brackets cycle focus too)
 key super+Left
-shot 05_focus_left
-key super+Right
-shot 06_focus_right
-
-# 5: cycle tabs in first split
-key super+Left
+shot 04_focus_left
 key super+bracketright
-shot 07_next_tab
+shot 05_focus_right
 
-# 6: grow / shrink
+# 4: move the focused split left (Mod4+Shift+[), then reorder by drag:
+# grab the leftmost split's titlebar, drop it on the left half of the
+# first taskbar tile
+key super+shift+bracketleft
+shot 06_moved_left
+cmd "press 90 33"
+cmd "motion 400 400"
+cmd "release 30 752"
+shot 07_dragged_first
+
+# 5: grow / shrink
 key super+l
 key super+l
 shot 08_grow
 key super+shift+l
 shot 09_shrink
 
-# 7: scroll the canvas (many splits)
-key super+v; term
-key super+v; term
-key super+v; term
+# 6: scroll the canvas (many splits)
+term; term; term
 shot 10_many_splits
 echo "scroll 2" >&3; wait_line "ok scroll 2"
 sleep 0.6 # let the glide settle
 shot 11_scrolled
 
-# 8: close a split (Mod4+q)
+# 7: close the focused split (Mod4+q): the window and its split go
+# together; neighbours reclaim the space once the client exits
 key super+q
+sleep 1.0
 shot 12_closed
 
 echo "=== splitwm.log tail ==="

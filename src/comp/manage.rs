@@ -6,10 +6,10 @@
 use smithay::desktop::Window;
 
 use super::Comp;
+use crate::layout::Win;
 use crate::render::{LeafView, TitleInfo};
 use crate::shell::{DockData, FloatData, Kind};
 use crate::theme;
-use crate::tree::Win;
 use crate::widgets::label_from_class;
 
 impl Comp {
@@ -31,11 +31,17 @@ impl Comp {
                 entry.icon_slot = slot;
             }
             self.spawn_icon_fetch(win, class);
-            self.state.pin_client(win);
+            // Into the focused split if it's an empty placeholder, else a
+            // fresh column right of the focused one, as the gap `+`
+            // button would (see `State::place_new_window`). Animate the
+            // new column sliding in and scroll it into view.
+            let wa = self.layout_area();
+            self.state.place_new_window(wa, win);
             if fullscreen {
                 self.fullscreen = Some(win);
             }
-            self.arrange();
+            self.animate = true;
+            self.commit_layout();
         }
     }
 
@@ -90,6 +96,21 @@ impl Comp {
         })
     }
 
+    /// A managed tiled window is gone — both protocol destroy paths
+    /// (Wayland and XWayland) land here. The dying window usually takes
+    /// its split with it (a badge-closed one leaves a placeholder, see
+    /// `unpin_client`); animate the layout settling — stacked neighbours
+    /// reclaiming the height, or the later columns sliding over a removed
+    /// one. arrange (via `commit_layout`) refocuses, so focus never rests
+    /// on a dead client.
+    pub fn unmanage_tiled(&mut self, win: Win) {
+        if let Some(m) = self.managed.remove(win) {
+            self.space.unmap_elem(&m.window);
+        }
+        self.animate = self.state.unpin_client(win);
+        self.commit_layout();
+    }
+
     /// Politely close a managed window, whichever backend it speaks.
     pub fn close_client(&self, win: Win) {
         if let Some(window) = self.managed.get(win) {
@@ -111,7 +132,7 @@ impl Comp {
         let wa = self.layout_area();
         // Center over the parent's frame when we know it, else the workarea.
         let around = parent
-            .and_then(|p| self.state.tree.find_leaf_for_client(p))
+            .and_then(|p| self.state.layout.find_leaf_for_client(p))
             .and_then(|l| self.prev_frame_rect.get(&l).copied())
             .unwrap_or(wa);
         let x = (around.x + (around.w - w) / 2).clamp(wa.x, (wa.x + wa.w - w).max(wa.x));
@@ -120,9 +141,9 @@ impl Comp {
         // The dialog inherits its transient parent's split accent so the
         // chrome visibly ties them together.
         let accent = parent
-            .and_then(|p| self.state.tree.find_leaf_for_client(p))
+            .and_then(|p| self.state.layout.find_leaf_for_client(p))
             .map_or(theme::FALLBACK_ACCENT_INDEX, |l| {
-                crate::widgets::leaf_color_index(&self.state.tree, l)
+                crate::widgets::leaf_color_index(&self.state.layout, l)
             });
 
         let data = FloatData {
@@ -144,7 +165,7 @@ impl Comp {
 
     /// Pin `window` as the borderless sidebar parked past the right end of
     /// the scrolling canvas, revealed by scrolling all the way right. It
-    /// never enters the split tree/taskbar — no chrome, no focus cycling —
+    /// never enters the layout/taskbar — no chrome, no focus cycling —
     /// and normal tiled columns never lay out under it. Its size is
     /// whatever it asked for at first commit, kept fixed for the session.
     pub fn manage_dock(&mut self, window: Window) {
@@ -169,11 +190,11 @@ impl Comp {
     /// tiling canvas, tucked `overlap` px under it, shifted by the current
     /// scroll like any other leaf. Full monitor height (it overlaps the
     /// taskbar strip in its column).
-    pub fn dock_geometry(&self, d: DockData) -> crate::tree::Rect {
+    pub fn dock_geometry(&self, d: DockData) -> crate::layout::Rect {
         let wa = self.layout_area();
         let size = self.output_size();
         let canvas_w = self.state.canvas_w(wa);
-        crate::tree::Rect {
+        crate::layout::Rect {
             x: wa.x + canvas_w - d.overlap() - self.state.scroll_x(),
             y: 0,
             w: d.w.max(1),
@@ -200,7 +221,7 @@ impl Comp {
             .filter(|&w| self.managed.float(w).is_some())
     }
 
-    /// The window holding the keyboard outside the split tree: a focused
+    /// The window holding the keyboard outside the layout: a focused
     /// float, or the dock after a click on it.
     pub fn keyboard_override(&self) -> Option<Win> {
         self.focused_float.filter(|&w| {
@@ -231,7 +252,7 @@ impl Comp {
         self.float_stack.retain(|&w| w != win);
         if self.focused_float == Some(win) {
             self.focused_float = None;
-            if let Some(leaf) = parent.and_then(|p| self.state.tree.find_leaf_for_client(p)) {
+            if let Some(leaf) = parent.and_then(|p| self.state.layout.find_leaf_for_client(p)) {
                 self.state.focus_leaf(leaf);
             }
         }

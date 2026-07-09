@@ -9,11 +9,11 @@
 use smithay::desktop::Window;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
+use crate::layout::{Rect, Win};
 use crate::theme;
-use crate::tree::{Rect, Win};
 
 /// A floating window's payload: a dialog/transient (xdg parent set) or a
-/// fixed-size client (min == max). Never in the split tree/taskbar: shown
+/// fixed-size client (min == max). Never in the layout/taskbar: shown
 /// at its requested size, centered over its parent's split (or the
 /// workarea), stacked above every tiled client, focused on map and click
 /// but not part of Mod4+Tab cycling.

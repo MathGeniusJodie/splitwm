@@ -183,12 +183,7 @@ impl IndexedProgram {
             commit,
             dst,
             tex_size: art.size,
-            inset: [
-                spec.l as f32,
-                spec.t as f32,
-                spec.r as f32,
-                spec.b as f32,
-            ],
+            inset: [spec.l as f32, spec.t as f32, spec.r as f32, spec.b as f32],
             edge: [spec.edge0 as f32, spec.edge1 as f32],
             swap_from: swap_from.map(f32::from),
             swap_to: swap_to.map(f32::from),
@@ -497,10 +492,7 @@ impl RenderElement<GlesRenderer> for NineSliceElement {
             &[
                 Uniform::new("palette", PALETTE_UNIT),
                 Uniform::new("dst_size", (dst.size.w as f32, dst.size.h as f32)),
-                Uniform::new(
-                    "tex_size",
-                    (self.tex_size.w as f32, self.tex_size.h as f32),
-                ),
+                Uniform::new("tex_size", (self.tex_size.w as f32, self.tex_size.h as f32)),
                 Uniform::new(
                     "inset",
                     (self.inset[0], self.inset[1], self.inset[2], self.inset[3]),

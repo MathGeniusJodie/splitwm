@@ -109,9 +109,6 @@ pub struct Comp {
     /// Taskbar quick-launch entries, resolved once at startup (icons and
     /// .desktop resolution arrive with M8).
     pub quick: Vec<crate::widgets::QuickSlot>,
-    /// Parent lookup for every node, rebuilt from one arena walk per
-    /// arrange, so per-event consumers skip `Tree::find_parent`'s scan.
-    pub parents: std::collections::HashMap<crate::tree::NodeId, (crate::tree::NodeId, usize)>,
     /// `SPLITWM_WALLPAPER`, kept so an output resize can rescale it.
     pub wallpaper_path: Option<String>,
 
@@ -132,7 +129,8 @@ pub struct Comp {
     pub anim: Option<chrome::LayoutAnim>,
     /// Every leaf's frame rect from the last arrange, on-screen or not —
     /// animation start rects and the empty-leaf-body hit region.
-    pub prev_frame_rect: std::collections::HashMap<crate::tree::NodeId, crate::widgets::FrameRect>,
+    pub prev_frame_rect:
+        std::collections::HashMap<crate::layout::NodeId, crate::widgets::FrameRect>,
     /// The rect the focus outline currently traces: the focused split's
     /// frame, or its interpolated frame mid-animation. `None` when no leaf
     /// holds focus. Tracked outside the underlay so a focus switch moves the
@@ -171,14 +169,14 @@ pub struct Comp {
     /// clients set app_id/parent/size hints after creating the role.
     pub pending: Vec<PendingWindow>,
     /// Float stacking, topmost first.
-    pub float_stack: Vec<crate::tree::Win>,
+    pub float_stack: Vec<crate::layout::Win>,
     /// Private invariant: reads go through `Comp::focused_float()`, which
     /// re-validates against the store, so a dangling record is never
     /// handed out.
-    focused_float: Option<crate::tree::Win>,
+    focused_float: Option<crate::layout::Win>,
     /// The fullscreen tiled client, covering the whole output above every
     /// tiled window (floats still render above it).
-    pub fullscreen: Option<crate::tree::Win>,
+    pub fullscreen: Option<crate::layout::Win>,
     /// Keycodes whose press we intercepted for a binding: their repeats are
     /// swallowed (a nested winit session auto-repeats; libinput doesn't)
     /// and their release must not leak to the client that never saw the
@@ -376,7 +374,6 @@ impl Comp {
             placed: Vec::new(),
             widgets: crate::widgets::Widgets::default(),
             quick,
-            parents: std::collections::HashMap::new(),
             wallpaper_path,
             drag: None,
             chrome_press: false,
@@ -540,11 +537,11 @@ impl Comp {
     /// (master's `la()`), further shrunk by layer-shell exclusive zones
     /// (panels, OSDs). Scale is 1 — this compositor lives in the same
     /// pixel world as its chrome art.
-    pub fn layout_area(&self) -> crate::tree::Rect {
+    pub fn layout_area(&self) -> crate::layout::Rect {
         let size = self.output_size();
         let z = self.layer_zone;
         let bottom = (z.loc.y + z.size.h).min(size.h - crate::theme::TASKBAR_H);
-        crate::tree::Rect {
+        crate::layout::Rect {
             x: z.loc.x,
             y: z.loc.y,
             w: z.size.w.max(1),
@@ -553,14 +550,14 @@ impl Comp {
     }
 
     /// Re-place every window from the layout state: configure sizes, map
-    /// what a shown leaf displays, unmap the stash / minimized / scrolled-
+    /// what a shown leaf displays, unmap the minimized / scrolled-
     /// out-of-view, then re-derive keyboard focus. The equivalent of
     /// master's `arrange` minus chrome and animation (M3/M5).
     pub fn arrange(&mut self) {
         let wa = self.layout_area();
-        // Canvas width / dock scroll room are State's own invariants; the
-        // compositor only supplies the inputs it alone knows.
-        self.state.update_canvas(wa, self.dock_extra());
+        // The strip width is derived from the columns; the dock scroll
+        // room is the one input the compositor alone knows.
+        self.state.set_dock_extra(self.dock_extra());
         let geos = self.state.compute(wa);
         let scroll_x = self.state.scroll_x();
         let focused = self.state.focused_leaf_valid();
@@ -572,16 +569,16 @@ impl Comp {
         // hit rect when it returns.
         self.placed.clear();
         let mut frame_rects: std::collections::HashMap<
-            crate::tree::NodeId,
+            crate::layout::NodeId,
             crate::widgets::FrameRect,
         > = std::collections::HashMap::new();
-        let mut shown: Vec<crate::tree::Win> = Vec::new();
-        let leaves = self.state.tree.collect_leaves();
+        let mut shown: Vec<crate::layout::Win> = Vec::new();
+        let leaves = self.state.layout.collect_leaves();
         for &leaf in &leaves {
             let Some(geo) = geos.get(&leaf).copied() else {
                 continue;
             };
-            let frame = crate::tree::Rect {
+            let frame = crate::layout::Rect {
                 x: geo.x - scroll_x,
                 y: geo.y,
                 w: geo.w.max(1),
@@ -591,7 +588,7 @@ impl Comp {
             if frame.x + frame.w <= wa.x || frame.x >= wa.x + wa.w {
                 continue;
             }
-            let leaf_data = self.state.tree.leaf(leaf);
+            let leaf_data = self.state.layout.leaf(leaf);
             let minimized = leaf_data.is_some_and(|l| l.minimized);
             let client = leaf_data.and_then(|l| l.client);
             self.placed.push(crate::widgets::Placement {
@@ -653,7 +650,7 @@ impl Comp {
             .collect();
         for window in &to_hide {
             self.space.unmap_elem(window);
-            // A stashed X11 window is really unmapped (its WM_STATE
+            // A hidden X11 window is really unmapped (its WM_STATE
             // bookkeeping lives inside smithay).
             if let Some(x11) = window.x11_surface() {
                 let _ = x11.set_mapped(false);
@@ -661,33 +658,49 @@ impl Comp {
         }
 
         // Hit regions and taskbar tiles for this layout, as one unit.
-        self.parents = self.state.tree.parent_map();
         self.widgets.clear();
-        crate::widgets::compute_leaf_widgets(&mut self.widgets, &self.state.tree, &self.placed);
+        crate::widgets::compute_leaf_widgets(&mut self.widgets, &self.state.layout, &self.placed);
         crate::widgets::compute_boundary_widgets(&mut self.widgets, &self.state, wa);
         // The taskbar strip spans the full output, not the (possibly
         // zone-shrunk) layout area.
         let size = self.output_size();
-        let full = crate::tree::Rect {
+        let full = crate::layout::Rect {
             x: 0,
             y: 0,
             w: size.w,
             h: size.h,
         };
-        let app_ids: Vec<(crate::tree::Win, String)> = self
+        let app_ids: Vec<(crate::layout::Win, String)> = self
             .managed
             .tiled_iter()
             .map(|(w, window)| (w, crate::shell::toplevel_app_id(window)))
             .collect();
-        let bar_order: Vec<crate::tree::Win> = self.managed.tiled_iter().map(|(w, _)| w).collect();
+        // Tiles mirror the splits: the bar reads left-to-right in the same
+        // depth-first order the canvas lays the leaves out in. Every tiled
+        // window occupies a leaf (`State::place_new_window`), so walking the
+        // leaves loses nobody.
+        let bar_order: Vec<(crate::layout::Win, crate::layout::NodeId)> = leaves
+            .iter()
+            .filter_map(|&l| {
+                self.state
+                    .layout
+                    .leaf(l)
+                    .and_then(|lf| lf.client)
+                    .map(|c| (c, l))
+            })
+            .collect();
+        debug_assert_eq!(
+            bar_order.len(),
+            self.managed.tiled_iter().count(),
+            "a tiled window is missing from the split tree"
+        );
         crate::widgets::compute_taskbar(
             &mut self.widgets,
-            &self.state.tree,
+            &self.state.layout,
             &app_ids,
             &self.quick,
             &bar_order,
             full,
-            &leaves,
         );
 
         // Layout-changing actions animate: capture start rects and let the
@@ -828,7 +841,7 @@ impl Comp {
         // (scroll, idle leaves, wallpaper, taskbar) hit the cache.
         self.update_chrome_pieces(&leaf_rects);
         // Float frames whose content changed since last frame.
-        let dirty_frames: Vec<crate::tree::Win> = self
+        let dirty_frames: Vec<crate::layout::Win> = self
             .managed
             .float_iter()
             .filter(|(_, _, f)| f.frame.is_stale())

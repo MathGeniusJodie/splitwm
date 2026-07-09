@@ -8,19 +8,36 @@ use smithay::input::pointer::CursorIcon;
 use smithay::utils::{Logical, Point};
 
 use super::Comp;
-use crate::state::{Activation, InsertAt};
+use crate::layout::{Boundary, Dir, GapAt, NodeId, Win};
+use crate::state::{Activation, Insert};
 use crate::theme;
-use crate::tree::{Boundary, Dir, NodeId, Win};
 use crate::widgets::{leaf_meta, BtnKind, FrameRect};
 
 /// An in-progress drag, keyed off button-1 press on a handle/edge/float
-/// frame.
+/// frame, a titlebar, or a taskbar tile.
 #[derive(Clone, Copy)]
 pub enum ActiveDrag {
-    Split(SplitDrag),
+    Gap(GapDrag),
     Edge(EdgeDrag),
     Float(FloatDrag),
+    Move(MoveDrag),
 }
+
+/// Relocating a split, grabbed by its titlebar or its taskbar tile. Armed
+/// on press but inert until the pointer travels `MOVE_DRAG_THRESHOLD` from
+/// `press` — a plain click must stay a click. The drop lands on release
+/// (`Comp::end_drag`): onto the left/right half of another split's frame or
+/// taskbar tile, placing the dragged split before/after it.
+#[derive(Clone, Copy)]
+pub struct MoveDrag {
+    pub leaf: NodeId,
+    pub press: (i32, i32),
+    pub active: bool,
+}
+
+/// Pointer travel (in px, Chebyshev) before a titlebar/tile press becomes a
+/// split-move drag rather than a click.
+const MOVE_DRAG_THRESHOLD: i32 = 8;
 
 /// Moving a float by its chrome frame: the pointer's offset into the
 /// client rect is pinned for the whole gesture.
@@ -31,13 +48,12 @@ pub struct FloatDrag {
     pub dy: i32,
 }
 
-/// Dragging the boundary between two children of `parent`: fraction =
-/// (pointer - start) / combined extent of the two children.
+/// Dragging a gap between two columns or two stacked rows. A column gap
+/// sets the left column's width outright; a row gap re-splits the pair,
+/// fraction = (pointer - start) / combined extent of the two rows.
 #[derive(Clone, Copy)]
-pub struct SplitDrag {
-    pub parent: NodeId,
-    pub idx: usize,
-    pub vertical: bool,
+pub struct GapDrag {
+    pub at: GapAt,
     pub start: i32,
     pub combined: i32,
     pub gap: i32,
@@ -55,10 +71,10 @@ pub struct EdgeDrag {
 enum Hit {
     Btn(NodeId, BtnKind),
     TaskbarClose(Win),
-    TaskbarTile(Win),
+    TaskbarTile(Win, NodeId),
     QuickLaunch(usize),
     Title(NodeId),
-    Plus(InsertAt),
+    Plus(Insert),
     Handle(Boundary),
     Edge(bool),
     LeafBody(NodeId),
@@ -67,6 +83,13 @@ enum Hit {
 
 const fn rect_contains(r: FrameRect, x: i32, y: i32) -> bool {
     x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
+}
+
+/// Where a split-move drop resolved to: a new column beside `dst`'s, or a
+/// row of `dst`'s stack (`bool` is before/above).
+enum MoveDrop {
+    Column(NodeId, bool),
+    Stack(NodeId, bool),
 }
 
 impl Comp {
@@ -108,19 +131,37 @@ impl Comp {
             }
             _ if secondary => {}
             Hit::Btn(leaf, kind) => self.click_split_button(leaf, kind, false),
-            Hit::TaskbarClose(win) => self.close_client(win),
-            Hit::TaskbarTile(win) => self.bring_into_layout(win, true),
+            // The tile badge closes only the window: its split stays behind
+            // as an empty placeholder (the titlebar close takes both).
+            Hit::TaskbarClose(win) => {
+                self.state.retain_split_on_close(win);
+                self.close_client(win);
+            }
+            // Press = click (focus + scroll the split into view); further
+            // travel turns it into a split-move drag, dropped on release.
+            Hit::TaskbarTile(win, leaf) => {
+                self.bring_into_layout(win, true);
+                // Armed after `bring_into_layout`: its `commit_layout`
+                // clears `self.drag`.
+                self.arm_move_drag(leaf, mx, my);
+            }
             Hit::QuickLaunch(i) => {
                 if let Some(cmd) = self.quick.get(i).map(|q| q.cmd.clone()) {
                     self.spawn(&cmd);
                 }
             }
-            Hit::Title(leaf) | Hit::LeafBody(leaf) => {
+            Hit::Title(leaf) => {
+                self.state.focus_leaf(leaf);
+                self.arrange();
+                self.arm_move_drag(leaf, mx, my);
+            }
+            Hit::LeafBody(leaf) => {
                 self.state.focus_leaf(leaf);
                 self.arrange();
             }
             Hit::Plus(at) => {
-                self.state.insert_at_root(at);
+                let wa = self.layout_area();
+                self.state.insert_at(wa, at);
                 self.animate = true;
                 self.commit_layout();
             }
@@ -132,10 +173,8 @@ impl Comp {
                     // fresh per motion, and a glide underneath would drift
                     // the anchor math out from under the pointer.
                     self.state.land_scroll();
-                    self.drag = Some(ActiveDrag::Split(SplitDrag {
-                        parent: b.parent,
-                        idx: b.idx,
-                        vertical: b.dir == Dir::V,
+                    self.drag = Some(ActiveDrag::Gap(GapDrag {
+                        at: b.at,
                         start: b.start,
                         combined: b.first + b.second,
                         gap: theme::GAP,
@@ -185,28 +224,109 @@ impl Comp {
                 self.arrange();
                 true
             }
-            Some(ActiveDrag::Split(d)) => {
+            Some(ActiveDrag::Gap(d)) => {
                 if d.combined <= 0 {
                     return true;
                 }
                 // Only x scrolls; a row-boundary drag reads y directly.
-                let canvas_pos = if d.vertical {
-                    pos.y as i32
-                } else {
-                    pos.x as i32 + self.state.scroll_x()
+                let canvas_pos = match d.at.dir() {
+                    Dir::V => pos.y as i32,
+                    Dir::H => pos.x as i32 + self.state.scroll_x(),
                 };
                 let new_first = canvas_pos - d.start - d.gap / 2;
-                let frac = f64::from(new_first) / f64::from(d.combined);
-                self.state.resize_boundary(d.parent, d.idx, frac);
+                self.state.resize_gap(d.at, new_first, d.combined);
                 self.arrange();
                 true
+            }
+            Some(ActiveDrag::Move(mut md)) => {
+                let (mx, my) = (pos.x as i32, pos.y as i32);
+                if !md.active
+                    && (mx - md.press.0).abs().max((my - md.press.1).abs()) >= MOVE_DRAG_THRESHOLD
+                {
+                    md.active = true;
+                    self.drag = Some(ActiveDrag::Move(md));
+                }
+                md.active
             }
             None => false,
         }
     }
 
-    pub fn end_drag(&mut self) {
-        self.drag = None;
+    /// Button release: an active split-move drag drops here. Every other
+    /// drag (and an un-armed move, i.e. a click) just ends.
+    pub fn end_drag(&mut self, pos: Point<f64, Logical>) {
+        let drag = self.drag.take();
+        let Some(ActiveDrag::Move(md)) = drag else {
+            return;
+        };
+        if !md.active || !self.state.layout.is_leaf(md.leaf) {
+            return;
+        }
+        let (mx, my) = (pos.x as i32, pos.y as i32);
+        let Some(drop) = self.move_drop_target(mx, my) else {
+            return;
+        };
+        let wa = self.layout_area();
+        let changed = match drop {
+            MoveDrop::Column(dst, before) => self.state.move_leaf_beside(wa, md.leaf, dst, before),
+            MoveDrop::Stack(dst, before) => self.state.move_leaf_into_stack(md.leaf, dst, before),
+        };
+        if changed {
+            self.animate = true;
+            self.commit_layout();
+        }
+    }
+
+    /// Where a split-move drop at (`mx`, `my`) lands, by what's under the
+    /// pointer: a *gap* adopts the gap's own orientation — a vertical gap
+    /// makes the dragged split a new column right there, a horizontal gap
+    /// slots it into that stack. A taskbar tile or a split frame places it
+    /// as a column before/after the target's (split down the middle: left
+    /// half before, right half after). Tiles are checked first (they
+    /// overlay the bar, and reversed like their hit-test); frames use the
+    /// same last-arrange rects `LeafBody` hits.
+    fn move_drop_target(&self, mx: i32, my: i32) -> Option<MoveDrop> {
+        if let Some(&(_, b)) = self
+            .widgets
+            .handle_regions
+            .iter()
+            .find(|(r, _)| rect_contains(*r, mx, my))
+        {
+            let anchor = |pos| self.state.layout.leaf_at(pos);
+            return match b.at {
+                GapAt::Col(idx) => {
+                    let dst = anchor(crate::layout::Pos { col: idx, row: 0 })?;
+                    Some(MoveDrop::Column(dst, false))
+                }
+                GapAt::Row { col, idx } => {
+                    let dst = anchor(crate::layout::Pos { col, row: idx })?;
+                    Some(MoveDrop::Stack(dst, false))
+                }
+            };
+        }
+        if let Some(t) = self
+            .widgets
+            .taskbar_regions
+            .iter()
+            .rev()
+            .find(|t| rect_contains(t.rect, mx, my))
+        {
+            return Some(MoveDrop::Column(t.leaf, mx < t.rect.x + t.rect.w / 2));
+        }
+        self.placed
+            .iter()
+            .find(|p| rect_contains(p.target, mx, my))
+            .map(|p| MoveDrop::Column(p.leaf, mx < p.target.x + p.target.w / 2))
+    }
+
+    /// Arm a split-move drag on a fresh titlebar/tile press (see
+    /// `MoveDrag`).
+    fn arm_move_drag(&mut self, leaf: NodeId, mx: i32, my: i32) {
+        self.drag = Some(ActiveDrag::Move(MoveDrag {
+            leaf,
+            press: (mx, my),
+            active: false,
+        }));
     }
 
     /// The topmost float whose chrome frame band (frame rect minus client
@@ -250,15 +370,15 @@ impl Comp {
         {
             return Hit::TaskbarClose(win);
         }
-        if let Some(win) = self
+        if let Some((win, leaf)) = self
             .widgets
             .taskbar_regions
             .iter()
             .rev()
             .find(|t| rect_contains(t.rect, mx, my))
-            .map(|t| t.win)
+            .map(|t| (t.win, t.leaf))
         {
-            return Hit::TaskbarTile(win);
+            return Hit::TaskbarTile(win, leaf);
         }
         if let Some(i) = self
             .widgets
@@ -310,7 +430,7 @@ impl Comp {
         if let Some(leaf) = self
             .prev_frame_rect
             .iter()
-            .find(|(l, r)| self.state.tree.is_leaf(**l) && rect_contains(**r, mx, my))
+            .find(|(l, r)| self.state.layout.is_leaf(**l) && rect_contains(**r, mx, my))
             .map(|(l, _)| *l)
         {
             return Hit::LeafBody(leaf);
@@ -337,16 +457,12 @@ impl Comp {
                 // button art (a minimized leaf's whole-frame region is
                 // always a live restore button).
                 if let Some(&frame) = self.prev_frame_rect.get(&leaf) {
-                    let meta = leaf_meta(
-                        &self.state.tree,
-                        self.parents.get(&leaf).copied(),
-                        leaf,
-                        frame,
-                    );
+                    let meta = leaf_meta(&self.state.layout, leaf, frame);
                     let disabled = !meta.minimized
                         && match kind {
-                            BtnKind::Close | BtnKind::Minimize => meta.parent_dir.is_none(),
-                            BtnKind::Split => !meta.can_split,
+                            BtnKind::Close => !meta.occupied && meta.sole,
+                            BtnKind::Minimize => meta.sole,
+                            BtnKind::Split => meta.split_dir.is_none(),
                         };
                     if disabled {
                         return CursorIcon::NotAllowed;
@@ -355,7 +471,7 @@ impl Comp {
                 CursorIcon::Pointer
             }
             Hit::TaskbarClose(_)
-            | Hit::TaskbarTile(_)
+            | Hit::TaskbarTile(..)
             | Hit::QuickLaunch(_)
             | Hit::Title(_)
             | Hit::Plus(_) => CursorIcon::Pointer,
@@ -364,7 +480,7 @@ impl Comp {
                 // advertise a resize that won't happen.
                 if !b.resizable {
                     CursorIcon::Default
-                } else if b.dir == Dir::V {
+                } else if b.at.dir() == Dir::V {
                     CursorIcon::NsResize
                 } else {
                     CursorIcon::EwResize
@@ -389,47 +505,38 @@ impl Comp {
                 w: wa.w,
                 h: wa.h,
             });
-        let meta = leaf_meta(
-            &self.state.tree,
-            self.parents.get(&leaf).copied(),
-            leaf,
-            frame,
-        );
+        let meta = leaf_meta(&self.state.layout, leaf, frame);
         match kind {
             BtnKind::Split => {
-                if !meta.can_split {
-                    return;
-                }
-                let base = if meta.wider { Dir::H } else { Dir::V };
+                // Right-click flips the advertised action where the
+                // flipped one is possible: a column insert always is, a
+                // stack insert needs the frame's height.
                 let dir = if secondary {
-                    match base {
-                        Dir::V => Dir::H,
-                        Dir::H => Dir::V,
+                    match meta.split_dir {
+                        Some(Dir::H) => theme::stack_fits(frame.h).then_some(Dir::V),
+                        Some(Dir::V) => Some(Dir::H),
+                        // A disabled button (advertised NotAllowed) stays
+                        // inert on right-click too.
+                        None => None,
                     }
                 } else {
-                    base
+                    meta.split_dir
                 };
                 self.state.focus_leaf(leaf);
-                let pre = self.prev_frame_rect.get(&leaf).copied();
-                self.animate = self.state.split_focused(dir);
-                // Carry the pre-split frame so content slides from its old
-                // spot.
-                if self.animate {
-                    if let Some(rect) = pre {
-                        self.prev_frame_rect
-                            .insert(self.state.focused_leaf_valid(), rect);
+                self.animate = match dir {
+                    Some(Dir::H) => {
+                        self.state.open_column_right(wa);
+                        true
                     }
-                }
+                    Some(Dir::V) => self.state.split_focused(),
+                    None => return,
+                };
             }
             BtnKind::Close => {
-                if meta.parent_dir.is_none() {
-                    return;
-                }
-                self.state.focus_leaf(leaf);
-                self.animate = self.state.close_focused();
+                return self.close_split(leaf);
             }
             BtnKind::Minimize => {
-                if meta.parent_dir.is_none() {
+                if meta.sole {
                     return;
                 }
                 self.animate = self.state.toggle_minimize(leaf);
@@ -438,16 +545,26 @@ impl Comp {
         self.commit_layout();
     }
 
-    /// Bring a managed tiled window into view and focus it: into its split
-    /// if it has one, otherwise into the focused split. `animate` requests
-    /// a transition, but only when rects actually moved.
+    /// Close the split at `leaf` — the titlebar close button's and
+    /// `Action::Close`'s shared semantics. Window and split live and die
+    /// together: an occupied split's close politely closes the window, and
+    /// the split collapses when it actually dies (`unpin_client` — so a
+    /// "do you want to save?" refusal keeps the split). An empty
+    /// placeholder is removed on the spot; the sole placeholder is the one
+    /// split that can't go.
+    pub fn close_split(&mut self, leaf: NodeId) {
+        match self.state.layout.leaf(leaf).and_then(|l| l.client) {
+            Some(win) => self.close_client(win),
+            None => self.animate = self.state.remove_empty_leaf(leaf),
+        }
+        self.commit_layout();
+    }
+
+    /// Focus a managed tiled window's split and scroll it into view (via
+    /// `commit_layout`'s `ensure_in_view`), un-minimizing it. `animate`
+    /// requests a transition, but only when rects actually moved.
     pub fn bring_into_layout(&mut self, win: Win, animate: bool) {
         let changed = match self.state.activate_client(win) {
-            Activation::NotFound => {
-                let leaf = self.state.focused_leaf_valid();
-                self.state.assign_to_leaf(win, leaf);
-                true
-            }
             Activation::Unminimized => true,
             Activation::Unchanged => false,
         };

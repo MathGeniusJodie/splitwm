@@ -211,7 +211,8 @@ impl Comp {
 
         let mut consumed = false;
         if state == ButtonState::Released {
-            self.end_drag();
+            // A split-move drag drops here (see `Comp::end_drag`).
+            self.end_drag(pos);
             // The release of a press we consumed must not leak to a
             // client that never saw the press.
             consumed = std::mem::take(&mut self.chrome_press);
@@ -325,15 +326,21 @@ impl Comp {
         if under.is_none() {
             use smithay::input::pointer::CursorIcon;
             let icon = match self.drag {
-                Some(crate::comp::pointer::ActiveDrag::Split(d)) => {
-                    if d.vertical {
-                        CursorIcon::NsResize
-                    } else {
-                        CursorIcon::EwResize
-                    }
-                }
+                Some(crate::comp::pointer::ActiveDrag::Gap(d)) => match d.at.dir() {
+                    crate::layout::Dir::V => CursorIcon::NsResize,
+                    crate::layout::Dir::H => CursorIcon::EwResize,
+                },
                 Some(crate::comp::pointer::ActiveDrag::Edge(_)) => CursorIcon::EwResize,
                 Some(crate::comp::pointer::ActiveDrag::Float(_)) => CursorIcon::Pointer,
+                // An armed-but-unmoved titlebar/tile press still reads as a
+                // click; only real travel shows the grab.
+                Some(crate::comp::pointer::ActiveDrag::Move(md)) => {
+                    if md.active {
+                        CursorIcon::Grabbing
+                    } else {
+                        self.hover_cursor(pos)
+                    }
+                }
                 None => self.hover_cursor(pos),
             };
             self.cursor_status = Some(icon);

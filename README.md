@@ -6,10 +6,21 @@ the Wayland port of splitwm — itself a standalone port of
 **splitwm** layout (originally Lua on AwesomeWM) — a
 terminal-multiplexer-style tiling layout where:
 
-- Splits are persistent containers arranged in an n-ary tree (split
-  horizontally or vertically).
-- Each split shows **one window**; everything else lives in a **bottom
-  taskbar** and can be cycled into a split (`Mod4+[` / `]`) or clicked in.
+- Splits are persistent containers in a **flat strip of columns**; a
+  column is one split or one vertical stack of splits — nothing nests
+  deeper. Columns own their width in pixels; the strip is exactly the
+  columns laid end to end.
+- Each split shows **one window**, and every window has a split: a new
+  window fills the focused split if it's an empty placeholder, else it
+  opens as a fresh column right of the focused one — never resizing any
+  other column — and a dying window takes its split with it (a whole
+  column just leaves the strip; a stacked row's neighbours reclaim its
+  height). The **bottom taskbar** mirrors the splits one icon per split,
+  in the same left-to-right order.
+- Splits reorder by **drag and drop**: grab a titlebar or a taskbar icon
+  and drop it. On either half of a split or icon it lands as a column —
+  left half before, right half after; on a vertical gap it becomes a
+  column right there; on a horizontal gap it slots into that stack.
 - The whole layout lives on a **horizontally-scrollable canvas** that can be
   wider than the screen (trackpad two-finger swipe, or Mod4+swipe over a
   window).
@@ -58,8 +69,8 @@ X11 and Wayland windows share one window abstraction and lifecycle.
 | `src/main.rs`    | logging, backend selection (nested → winit, bare VT → tty, `SPLITWM_HEADLESS` → headless) |
 | `src/backend/`   | backend enum + winit/tty/headless sessions; `Comp` reaches presentation only through the enum |
 | `src/theme.rs`   | palette/metrics/bindings/quick-launch table |
-| `src/tree.rs`    | pure split-tree math (ported verbatim from master + tests) |
-| `src/state.rs`   | per-tag layout state + all tree/taskbar mutations |
+| `src/layout.rs`  | pure column-strip layout math (flat columns/stacks + tests) |
+| `src/state.rs`   | layout state + all strip/taskbar mutations |
 | `src/render/`    | software chrome rendering: wallpaper, 9-slice borders, buttons, icons, taskbar |
 | `src/widgets.rs` | hit-region computation (handles, "+", titles, taskbar) |
 | `src/oklch.rs`   | OKLCH hue rotation for same-app icon disambiguation |
@@ -89,13 +100,12 @@ Mapping notes vs the X11 spec:
 |-----|--------|
 | `Mod4+Return`        | open terminal (`$TERMINAL`, default `alacritty`) |
 | `Mod4+Space`         | app launcher (`rofi -show combi`, native layer-shell) |
-| `Mod4+v`             | split into columns |
-| `Mod4+h`             | split into rows |
-| `Mod4+q`             | close current split (window goes to sibling/taskbar) |
+| `Mod4+h`             | stack an empty split below the focused one (it takes focus, so the next window fills it) |
+| `Mod4+q`             | close current split *and* its window (a placeholder is just removed) |
 | `Mod4+Tab` / `Right` | focus next split |
 | `Mod4+Shift+Tab` / `Left` | focus previous split |
-| `Mod4+]` / `[`       | cycle taskbar window into the focused split (fwd/back) |
-| `Mod4+Shift+]` / `[` | move window to next / previous split |
+| `Mod4+]` / `[`       | focus next / previous split |
+| `Mod4+Shift+]` / `[` | move the focused split right / left |
 | `Mod4+l` / `=`       | grow split |
 | `Mod4+Shift+l` / `Mod4+-` | shrink split |
 | `Mod4+c`             | cycle output colour depth: true colour / dithered RGB332 / dithered 24-colour palette |
@@ -103,13 +113,15 @@ Mapping notes vs the X11 spec:
 | `XF86Audio{Raise,Lower}Volume` / `Mute` | volume via `wpctl` (single-shot per press) |
 | `Ctrl+Alt+F1..F12`   | VT switch (tty backend; the X server's job on master) |
 | trackpad h-swipe     | scroll the canvas (over gaps; hold Mod4 over a window) |
-| drag a gap handle    | resize the two adjacent columns |
+| drag a column gap handle | resize the column left of it (the rest of the strip slides) |
+| drag a stack gap handle  | re-split the two rows' heights |
 | drag a canvas edge   | resize the outer column into its margin |
-| click a gap/edge `+` | insert an empty column there |
-| taskbar tile         | focus that window / bring it into the focused split |
-| taskbar tile corner `x` | close that window politely |
+| click a gap/edge `+` | insert an empty column there (in a stack gap: an empty row) |
+| taskbar tile         | focus that split and scroll it into view; drag to reorder |
+| taskbar tile corner `x` | close that window politely, leaving its split as an empty placeholder |
 | taskbar quick-launch icons | spawn that app (right of the pill separator) |
-| titlebar buttons     | minimize / split (right-click: other direction) / close split |
+| titlebar buttons     | minimize / ⊞ split (wide lone window: new column right; else stack below; right-click flips) / close window+split |
+| drag a titlebar      | move that split; drop on a frame/icon half or into a gap |
 
 There is no quit binding, faithful to master: `SIGTERM` (from another VT
 or a remote shell) is the only way out, on every backend.
@@ -137,7 +149,7 @@ cargo build --release                 # nested/headless backends
 cargo build --release --features tty  # + the real-seat DRM backend
 
 cargo test          # unit tests + tests/socket.rs: boots the real binary
-                    # headless and asserts manage/displacement/splits/
+                    # headless and asserts manage/placement/splits/drag/
                     # focus/layer-shell/cursor/close/SIGTERM as a real
                     # Wayland client over the socket. Nothing appears on
                     # the host desktop.
@@ -155,6 +167,28 @@ cargo run
 
 ## Deviations from master (approved)
 
+- **Windows and splits are 1:1** (2026-07-08, diverging from master's
+  stash model): there are no splitless windows — no stash, no taskbar
+  cycling, no displacement. Window death collapses its split. The
+  taskbar mirrors the splits in strip order; its icons and the titlebars
+  drag-and-drop to reorder splits. The titlebar close button closes
+  window *and* split; the taskbar badge closes only the window, leaving
+  a placeholder; the popup-restore (`Leaf::prev`) machinery is gone.
+  `Mod4+[`/`]` now cycle focus, `Mod4+Shift+[`/`]` move the focused
+  split.
+- **Flat column strip replaces the split tree** (2026-07-08): the layout
+  is a flat list of pixel-width columns, each one split or one vertical
+  stack — deeper nesting (master's arbitrary n-ary tree) is
+  unrepresentable. Opening, closing, and resizing a column never
+  resizes any other column; the strip absorbs the difference (only
+  stacked rows still trade height). A new window fills the focused
+  split only when it's an empty placeholder, else it opens a fresh
+  column right of the focused one at a third of the viewport — an
+  unfocused placeholder attracts nothing. `Mod4+v` (side-by-side split
+  of the focused window) is gone; `Mod4+h` stacks below and focuses the
+  new placeholder. The ⊞ titlebar button opens a column right of a
+  wide lone window and stacks below otherwise (right-click flips);
+  drops into gaps insert by the gap's orientation.
 - Default terminal **alacritty** (was xterm); `$TERMINAL` still wins.
 - The launcher runs as a **native layer-shell surface** (a
   wayland-capable rofi picks its wayland backend; an X11-only rofi still
@@ -197,11 +231,9 @@ cargo run
   mode changes on an unchanged connector are ignored; libinput devices
   run defaults except natural scrolling (no tap-to-click config);
   single GPU, single output by design (master had one X screen).
-- Harness: pointer injection stops at motion + left click (drags and
-  hover feel still ride manual nested runs); headless output size fixed
-  at 1280x800.
+- Harness: headless output size fixed at 1280x800.
 
 Intentionally not implemented: multi-monitor, multiple tags, a status
 bar/clock, and the Lua original's slanted tab bars, per-leaf tab stacks,
 window-content colour sampling, and XTEST "smush" — this port shows one
-window per split and keeps the rest in the taskbar.
+window per split, one split per window.

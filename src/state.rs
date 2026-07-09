@@ -1,24 +1,26 @@
-//! Layout state plus every mutation of the split tree / stash and the
-//! scroll bookkeeping — there is exactly one layout (no workspaces/tags).
+//! Layout state plus every mutation of the column strip and the scroll
+//! bookkeeping — there is exactly one layout (no workspaces/tags). Windows
+//! and splits are paired for life: a new window opens in (or as) its own
+//! split, and a dying window usually takes its split with it; only empty
+//! placeholder splits exist without a window, never the reverse.
 
+use crate::layout::{Boundary, ColWidth, GapAt, Layout, NodeId, Pos, Rect, Win};
 use crate::theme;
-use crate::tree::{Boundary, Dir, NodeId, Rect, Tree, Win};
 
-/// Where a "+" insert button adds a new root-level column.
+/// Where a "+" insert button (or a gap drop) adds a new empty split.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum InsertAt {
-    /// Before the root child at this index.
-    Index(usize),
-    /// After the last root child (the right-edge button).
-    End,
+pub enum Insert {
+    /// A new column before column `idx`.
+    Col(usize),
+    /// A new column after the last one (the right-edge button).
+    ColEnd,
+    /// A new row after row `idx` of column `col`'s stack.
+    Row { col: usize, idx: usize },
 }
 
 /// Outcome of `activate_client`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Activation {
-    /// `c` isn't tracked in any leaf (sitting in the stash);
-    /// the caller must place it itself.
-    NotFound,
     /// `c` occupied a minimized leaf that is now shown — rects changed.
     Unminimized,
     /// `c` already occupied a shown leaf — nothing a redraw would show moved.
@@ -26,7 +28,7 @@ pub enum Activation {
 }
 
 pub struct State {
-    pub tree: Tree,
+    pub layout: Layout,
     /// Private so every write outside `#[cfg(test)]` goes through
     /// `focus_leaf` (which accepts only live leaf ids) and every read
     /// through `focused_leaf_valid` (the focused leaf can still be
@@ -38,159 +40,139 @@ pub struct State {
     /// `scroll_target` one frame at a time via `step_scroll`, driven by the
     /// main event loop while they differ (`scroll_animating`). Private so
     /// every mutation goes through the clamping/landing/stepping methods
-    /// below — `update_canvas` re-clamps both whenever the scroll range
-    /// changes.
+    /// below.
     scroll_x: i32,
     scroll_target: i32,
-    /// Canvas width, derived by `update_canvas` (`None` until the first
-    /// call; read through `canvas_w()`, which falls back to the viewport
-    /// width).
-    canvas_w: Option<i32>,
-    /// Extra scrollable width past `canvas_w` reserved for the docked
+    /// Extra scrollable width past the strip reserved for the docked
     /// sidebar (see `Wm::manage_dock`), so scrolling all the way right
-    /// reveals it even though it sits outside the split tree and doesn't
+    /// reveals it even though it sits outside the strip and doesn't
     /// affect `compute`'s leaf geometry. Zero when nothing is docked.
-    /// Private so the only write is `update_canvas`, which re-clamps the
-    /// scroll offsets against the widened range in the same breath.
+    /// Private so the only writes (`set_dock_extra`, `clamp_scroll`)
+    /// re-clamp or deliberately preserve the scroll against the changed
+    /// range.
     dock_extra: i32,
-    /// Cumulative manual adjustment to `canvas_w` from dragging an
-    /// edge-of-canvas resize handle, layered on top of `update_canvas`'s
-    /// column-count-driven heuristic every recompute so a manual resize
-    /// isn't immediately overwritten by it. Private so the only write is
-    /// `resize_edge`, whose per-column `min_split_w` clamp keeps it sane.
-    canvas_w_extra: i32,
-    /// Windows not shown in any split; they appear un-highlighted in the
-    /// bottom taskbar and are what Mod4+[ / Mod4+] cycle through. Private so
-    /// every insert goes through `push_stash`, which owns the
-    /// no-duplicates invariant; read through `stash()`.
-    stash: Vec<Win>,
 }
 
 impl State {
     pub fn new() -> Self {
-        let tree = Tree::new();
-        let root = tree.root;
+        let layout = Layout::new();
+        let first = layout.first_leaf();
         Self {
-            tree,
-            focused_leaf: root,
+            layout,
+            focused_leaf: first,
             scroll_x: 0,
             scroll_target: 0,
-            canvas_w: None,
             dock_extra: 0,
-            canvas_w_extra: 0,
-            stash: Vec::new(),
         }
     }
 
     pub fn focused_leaf_valid(&self) -> NodeId {
-        if self.tree.is_leaf(self.focused_leaf) {
+        if self.layout.is_leaf(self.focused_leaf) {
             self.focused_leaf
         } else {
-            self.tree.first_leaf(self.tree.root)
+            self.layout.first_leaf()
         }
     }
 
     /// Point focus at `leaf`. Anything that isn't a live leaf is ignored:
     /// callers can hold ids captured before an intervening mutation, and
-    /// focus must never come to rest on a node `compute` doesn't lay out.
+    /// focus must never come to rest on a split `compute` doesn't lay out.
     pub fn focus_leaf(&mut self, leaf: NodeId) {
-        if self.tree.is_leaf(leaf) {
+        if self.layout.is_leaf(leaf) {
             self.focused_leaf = leaf;
         }
     }
 
+    /// The column holding the focused split.
+    fn focused_col(&self) -> usize {
+        self.layout
+            .locate(self.focused_leaf_valid())
+            .expect("focused_leaf_valid returns a live leaf")
+            .col
+    }
+
     // --- window placement helpers ---
 
-    /// Windows not currently shown in any split, in stash (queue) order.
-    pub fn stash(&self) -> &[Win] {
-        &self.stash
-    }
-
-    /// Drop a client into the stash (deduplicated).
-    fn push_stash(&mut self, c: Win) {
-        if !self.stash.contains(&c) {
-            self.stash.push(c);
+    /// Place a newly mapped window: into the focused split if that split
+    /// is an empty placeholder, else into a fresh column immediately right
+    /// of the focused one — the same insertion the gap `+` button
+    /// performs. An empty split that isn't focused attracts nothing; it
+    /// waits for a window placed *into* it deliberately. Every window
+    /// lives in exactly one split from map to destroy — there is no
+    /// off-layout stash.
+    pub fn place_new_window(&mut self, wa: Rect, c: Win) {
+        if self.layout.find_leaf_for_client(c).is_some() {
+            return;
         }
-    }
-
-    /// Pull `w` out of the stash; whether it was there.
-    fn take_from_stash(&mut self, w: Win) -> bool {
-        let len = self.stash.len();
-        self.stash.retain(|&x| x != w);
-        self.stash.len() < len
-    }
-
-    /// Detach `c` from wherever it lives (a split or the stash).
-    fn detach(&mut self, c: Win) {
-        if let Some(lid) = self.tree.find_leaf_for_client(c) {
-            if let Some(l) = self.tree.leaf_mut(lid) {
-                l.client = None;
+        let focused = self.focused_leaf_valid();
+        if self
+            .layout
+            .leaf(focused)
+            .is_some_and(|l| l.client.is_none())
+        {
+            if let Some(l) = self.layout.leaf_mut(focused) {
+                l.show(c);
             }
-        }
-        self.take_from_stash(c);
-    }
-
-    /// Place a new client into the focused leaf, bumping any current occupant
-    /// down to the stash.
-    pub fn pin_client(&mut self, c: Win) {
-        if self.tree.find_leaf_for_client(c).is_some() || self.stash.contains(&c) {
             return;
         }
-        self.assign_to_leaf(c, self.focused_leaf_valid());
-    }
-
-    /// Put `c` into leaf `dst`, displacing the existing occupant to the stash.
-    /// `c` is first detached from its previous home. The destination is
-    /// un-minimized by `Leaf::show`, which owns that invariant.
-    pub fn assign_to_leaf(&mut self, c: Win, dst: NodeId) {
-        if !self.tree.is_leaf(dst) {
-            return;
-        }
-        self.detach(c);
-        // `detach` just cleared `c` from wherever it lived (including `dst`),
-        // so whatever still occupies `dst` cannot be `c` itself.
-        let displaced = self.tree.leaf(dst).and_then(|l| l.client);
-        debug_assert_ne!(displaced, Some(c), "detach left {c:#x} in dst");
-        if let Some(prev) = displaced {
-            self.push_stash(prev);
-        }
-        if let Some(l) = self.tree.leaf_mut(dst) {
+        let col = self.focused_col();
+        let new = self
+            .layout
+            .insert_column(col + 1, ColWidth::Px(theme::default_col_w(wa.w)));
+        if let Some(l) = self.layout.leaf_mut(new) {
             l.show(c);
-            if displaced.is_some() {
-                l.prev = displaced;
-            }
         }
-        self.focus_leaf(dst);
+        self.focus_leaf(new);
     }
 
-    /// Remove a client entirely (window gone): clear it from its split/stash.
-    /// If the leaf it occupied remembers a displaced window (`Leaf::prev`)
-    /// that's still in the stash, that window is put back into the split —
-    /// closing a focus-stealing popup restores what it displaced.
-    pub fn unpin_client(&mut self, c: Win) {
-        let lid = self.tree.find_leaf_for_client(c);
-        self.detach(c);
-        if let Some(lid) = lid {
-            let prev = self.tree.leaf(lid).and_then(|l| l.prev);
-            if let Some(p) = prev {
-                if self.take_from_stash(p) {
-                    if let Some(l) = self.tree.leaf_mut(lid) {
-                        l.show(p);
-                    }
-                }
-            }
-            if let Some(l) = self.tree.leaf_mut(lid) {
-                l.prev = None;
+    /// The next time `c` is unpinned (its window destroyed), leave its
+    /// split behind as an empty placeholder instead of collapsing it — the
+    /// taskbar close badge's semantics. The mark lives on the leaf
+    /// (`Leaf::keep_on_close`), so it dies with the split it modifies.
+    pub fn retain_split_on_close(&mut self, c: Win) {
+        if let Some(lid) = self.layout.find_leaf_for_client(c) {
+            if let Some(l) = self.layout.leaf_mut(lid) {
+                l.keep_on_close = true;
             }
         }
-        // The destroyed window can't come back anywhere.
-        for leaf in self.tree.collect_leaves() {
-            if let Some(l) = self.tree.leaf_mut(leaf) {
-                if l.prev == Some(c) {
-                    l.prev = None;
-                }
-            }
+    }
+
+    /// A window is gone: clear it from its split and collapse that split —
+    /// windows and splits live and die together — unless the close was
+    /// marked placeholder-keeping (`retain_split_on_close`) or the split is
+    /// the strip's sole one (the layout always keeps one). Focus follows to
+    /// the nearest surviving neighbour only when the dying split held it.
+    /// Returns whether the layout changed (a split collapsed).
+    pub fn unpin_client(&mut self, c: Win) -> bool {
+        let Some(lid) = self.layout.find_leaf_for_client(c) else {
+            return false;
+        };
+        let mut keep = false;
+        if let Some(l) = self.layout.leaf_mut(lid) {
+            l.client = None;
+            keep = std::mem::take(&mut l.keep_on_close);
         }
+        if keep {
+            return false;
+        }
+        self.collapse_leaf(lid)
+    }
+
+    /// Collapse `leaf` out of the strip. A whole column vanishes without
+    /// its neighbours resizing (the strip just gets shorter); a row leaves
+    /// its stack to the surviving rows, which reclaim the height. Refused
+    /// for the strip's sole split. Focus follows to the nearest surviving
+    /// neighbour only when the collapsed leaf held it. Returns whether the
+    /// layout changed.
+    fn collapse_leaf(&mut self, leaf: NodeId) -> bool {
+        let had_focus = self.focused_leaf_valid() == leaf;
+        let Some(new_focus) = self.layout.remove(leaf) else {
+            return false;
+        };
+        if had_focus {
+            self.focus_leaf(new_focus);
+        }
+        true
     }
 
     /// Focus whatever split currently shows `c`, un-minimizing it —
@@ -198,13 +180,15 @@ impl State {
     /// a minimized leaf can't hold focus (see `focused_client` for why).
     /// Reports whether that changed anything a redraw would show, so callers
     /// can skip animating a transition that moves no rects (a plain refocus
-    /// of an already-visible window).
+    /// of an already-visible window). Every managed tiled window occupies a
+    /// leaf for its whole life, so there is no not-found case.
     pub fn activate_client(&mut self, c: Win) -> Activation {
-        let Some(lid) = self.tree.find_leaf_for_client(c) else {
-            return Activation::NotFound;
+        let Some(lid) = self.layout.find_leaf_for_client(c) else {
+            debug_assert!(false, "activate_client: {c:#x} occupies no leaf");
+            return Activation::Unchanged;
         };
-        let was_minimized = self.tree.leaf(lid).is_some_and(|l| l.minimized);
-        if let Some(l) = self.tree.leaf_mut(lid) {
+        let was_minimized = self.layout.leaf(lid).is_some_and(|l| l.minimized);
+        if let Some(l) = self.layout.leaf_mut(lid) {
             l.minimized = false;
         }
         self.focus_leaf(lid);
@@ -217,48 +201,19 @@ impl State {
 
     /// Currently *shown* client of the focused leaf. A minimized leaf shows
     /// nothing — its window is unmapped, and handing it out as a focus
-    /// target would mean `SetInputFocus` on an unviewable window (a
-    /// `BadMatch`) and a `_NET_ACTIVE_WINDOW` naming an invisible one.
+    /// target would mean focusing an unviewable window.
     pub fn focused_client(&self) -> Option<Win> {
-        let l = self.tree.leaf(self.focused_leaf_valid())?;
+        let l = self.layout.leaf(self.focused_leaf_valid())?;
         if l.minimized {
             return None;
         }
         l.client
     }
 
-    /// Swap the focused split's window with the next/prev stash entry,
-    /// cycling which off-screen window is shown.
-    pub fn cycle_stash(&mut self, forward: bool) -> Option<Win> {
-        if self.stash.is_empty() {
-            return None;
-        }
-        let lid = self.focused_leaf_valid();
-        let displaced = self.tree.leaf(lid).and_then(|l| l.client);
-        let next = if forward {
-            self.stash.remove(0)
-        } else {
-            self.stash.pop()?
-        };
-        self.assign_to_leaf(next, lid);
-        // `assign_to_leaf` pushes the displaced occupant to the *back* —
-        // exactly where backward cycling pops from, which would make prev
-        // flip-flop between two windows instead of walking the list in
-        // reverse. Move it to the front so forward and backward are true
-        // inverse rotations of the same queue.
-        if !forward {
-            if let Some(d) = displaced {
-                self.take_from_stash(d);
-                self.stash.insert(0, d);
-            }
-        }
-        Some(next)
-    }
-
     // --- focus / move between splits ---
 
     fn adjacent_leaf(&self, from: NodeId, next: bool) -> Option<NodeId> {
-        let leaves = self.tree.collect_leaves();
+        let leaves = self.layout.collect_leaves();
         if leaves.len() < 2 {
             return None;
         }
@@ -281,26 +236,82 @@ impl State {
         }
     }
 
-    /// Move the focused window to the adjacent split (displacing its occupant
-    /// to the stash). Returns the moved client.
-    pub fn move_window_to_direction(&mut self, next: bool) -> Option<Win> {
+    /// Move the focused split past its neighbour in strip order (the whole
+    /// split relocates, window and all), wrapping around the ends like
+    /// `focus_direction` does. Within a stack this reorders the rows;
+    /// across a column edge the split leaves as its own column beside the
+    /// neighbour's. Returns whether the strip changed.
+    pub fn move_focused_split(&mut self, wa: Rect, next: bool) -> bool {
+        let leaves = self.layout.collect_leaves();
+        if leaves.len() < 2 {
+            return false;
+        }
         let src = self.focused_leaf_valid();
-        let dst = self.adjacent_leaf(src, next)?;
-        let c = self.tree.leaf(src)?.client?;
-        self.assign_to_leaf(c, dst);
-        Some(c)
+        let Some(cur) = leaves.iter().position(|&l| l == src) else {
+            return false;
+        };
+        let n = leaves.len();
+        // Stepping past an end wraps to the far end, which flips which side
+        // of the destination the split lands on.
+        let (dst, before) = if next {
+            if cur + 1 < n {
+                (leaves[cur + 1], false)
+            } else {
+                (leaves[0], true)
+            }
+        } else if cur > 0 {
+            (leaves[cur - 1], true)
+        } else {
+            (leaves[n - 1], false)
+        };
+        let same_col = match (self.layout.locate(src), self.layout.locate(dst)) {
+            (Some(s), Some(d)) => s.col == d.col,
+            _ => return false,
+        };
+        let changed = if same_col {
+            self.layout.move_into_stack(src, dst, before)
+        } else {
+            self.move_leaf_beside(wa, src, dst, before)
+        };
+        if changed {
+            self.focus_leaf(src);
+        }
+        changed
+    }
+
+    /// Relocate split `src` into its own column beside `dst`'s (`before` =
+    /// left), keeping `src` focused so the reorder visibly follows the
+    /// gesture that asked for it. Returns whether the strip changed.
+    pub fn move_leaf_beside(&mut self, wa: Rect, src: NodeId, dst: NodeId, before: bool) -> bool {
+        let default = ColWidth::Px(theme::default_col_w(wa.w));
+        if !self.layout.move_beside_column(src, dst, before, default) {
+            return false;
+        }
+        self.focus_leaf(src);
+        true
+    }
+
+    /// Relocate split `src` into `dst`'s stack, above (`before`) or below
+    /// its row — the horizontal-gap drop. Keeps `src` focused. Returns
+    /// whether the strip changed.
+    pub fn move_leaf_into_stack(&mut self, src: NodeId, dst: NodeId, before: bool) -> bool {
+        if !self.layout.move_into_stack(src, dst, before) {
+            return false;
+        }
+        self.focus_leaf(src);
+        true
     }
 
     /// Toggle a leaf's minimized flag (the layout collapses it to min size).
-    /// Refused for the root leaf: it has no siblings to yield space to, and
-    /// its whole-frame restore button is disabled (`parent_dir.is_none()`),
-    /// so a minimized root would be a full-screen strip with no way back.
-    /// Returns whether the flag changed.
+    /// Refused for the strip's sole split: it has no siblings to yield space
+    /// to, and its whole-frame restore button is disabled (`LeafMeta::sole`),
+    /// so a minimized sole split would be a full-screen strip with no way
+    /// back. Returns whether the flag changed.
     pub fn toggle_minimize(&mut self, leaf: NodeId) -> bool {
-        if leaf == self.tree.root {
+        if self.layout.sole_split() {
             return false;
         }
-        match self.tree.leaf_mut(leaf) {
+        match self.layout.leaf_mut(leaf) {
             Some(l) => {
                 l.minimized = !l.minimized;
                 true
@@ -309,171 +320,228 @@ impl State {
         }
     }
 
-    // --- splitting ---
+    // --- splitting / inserting ---
 
-    /// Split the focused leaf; the existing window stays in the first child
-    /// (now focused) and the second starts empty. Refused for a minimized
-    /// leaf: a minimized child cloned from it would be a split state the
-    /// rest of the system (titlebar Split button, keyboard split gate)
-    /// treats as impossible. Returns whether the split happened, so callers
-    /// that queue an animation for the action can cancel it on refusal.
-    pub fn split_focused(&mut self, dir: Dir) -> bool {
+    /// Stack a new empty split below the focused one; the existing window
+    /// keeps the major share of the row, and the new placeholder takes the
+    /// focus — like every other insert, so the next window opened lands in
+    /// the split the user just made room in. Refused for a minimized leaf:
+    /// a minimized child cloned from it would be a split state the rest of
+    /// the system treats as impossible. Returns whether the split
+    /// happened, so callers that queue an animation for the action can
+    /// cancel it on refusal.
+    pub fn split_focused(&mut self) -> bool {
         let leaf = self.focused_leaf_valid();
-        if self.tree.leaf(leaf).is_none_or(|l| l.minimized) {
+        if self.layout.leaf(leaf).is_none_or(|l| l.minimized) {
             return false;
         }
-        match self.tree.split_leaf(leaf, dir, theme::SPLIT_RATIO) {
-            Some(child_a) => {
-                self.focus_leaf(child_a);
+        match self.layout.split_below(leaf, theme::SPLIT_RATIO) {
+            Some(new) => {
+                self.focus_leaf(new);
                 true
             }
             None => false,
         }
     }
 
-    /// Relocate `leaf`'s window: into the adjacent sibling's first leaf if it
-    /// is empty, otherwise onto the stash. `idx` is `leaf`'s index among
-    /// `parent`'s children.
-    fn relocate_closed_window(&mut self, parent: NodeId, idx: usize, leaf: NodeId) {
-        let client = self.tree.leaf(leaf).and_then(|l| l.client);
-        let dest_child = {
-            let Some(b) = self.tree.branch(parent) else {
-                return;
-            };
-            // A branch always has a sibling to fall back to (`Branch` holds
-            // at least two children by construction).
-            let dest_idx = if idx > 0 { idx - 1 } else { 1 };
-            self.tree.first_leaf(b.children()[dest_idx].node)
+    /// Insert a new empty split at `at` — the "+" buttons' semantics. A
+    /// column insert gets the default width; a row insert joins the stack
+    /// at the average share. The new split becomes focused.
+    pub fn insert_at(&mut self, wa: Rect, at: Insert) -> NodeId {
+        let new = match at {
+            Insert::Col(idx) => self
+                .layout
+                .insert_column(idx, ColWidth::Px(theme::default_col_w(wa.w))),
+            Insert::ColEnd => self.layout.insert_column(
+                self.layout.ncols(),
+                ColWidth::Px(theme::default_col_w(wa.w)),
+            ),
+            Insert::Row { col, idx } => match self.layout.insert_row(col, idx + 1) {
+                Some(id) => id,
+                None => return self.focused_leaf_valid(),
+            },
         };
-        if let Some(c) = client {
-            let dest_free = self
-                .tree
-                .leaf(dest_child)
-                .is_some_and(|l| l.client.is_none());
-            if dest_free {
-                // Carry the closed leaf's displaced-window memory
-                // (`Leaf::prev`) along with its window, so popup-restore
-                // still works after the split it happened in is closed.
-                let prev = self.tree.leaf(leaf).and_then(|l| l.prev);
-                if let Some(d) = self.tree.leaf_mut(dest_child) {
-                    d.show(c);
-                    if d.prev.is_none() {
-                        d.prev = prev;
-                    }
-                }
-            } else {
-                self.push_stash(c);
-            }
-        }
+        self.focus_leaf(new);
+        new
     }
 
-    /// Close the focused leaf. Its window moves into the adjacent sibling if
-    /// that split is empty, otherwise down to the stash. Focus moves to the
-    /// nearest surviving neighbour — the closed leaf *was* the focused one,
-    /// and node ids are never reused, so it can't still be found anywhere in
-    /// the tree after removal.
-    pub fn close_focused(&mut self) -> bool {
-        let leaf = self.focused_leaf_valid();
-        let Some((parent, idx)) = self.tree.find_parent(leaf) else {
-            return false; // root leaf: nothing to close
-        };
-        self.relocate_closed_window(parent, idx, leaf);
-        // `(parent, idx)` came from `find_parent`, so the removal always
-        // resolves — every arena node is attached (`Tree`'s mutation API
-        // never detaches one), leaving no orphan case to refuse.
-        let Some(new_focus) = self.tree.remove_leaf(parent, idx) else {
+    /// Open a fresh empty column immediately right of the focused one —
+    /// the ⊞ button's wide-window action. The new split becomes focused.
+    pub fn open_column_right(&mut self, wa: Rect) -> NodeId {
+        let col = self.focused_col();
+        self.insert_at(wa, Insert::Col(col + 1))
+    }
+
+    /// Remove `leaf` if it is an empty placeholder. An occupied split is
+    /// never removed directly — it collapses when its window dies
+    /// (`unpin_client`), so a window can't be left splitless. Refused for
+    /// the strip's sole split. Focus moves to the nearest surviving
+    /// neighbour when the removed leaf held it.
+    pub fn remove_empty_leaf(&mut self, leaf: NodeId) -> bool {
+        if self.layout.leaf(leaf).is_none_or(|l| l.client.is_some()) {
             return false;
-        };
-        self.focus_leaf(new_focus);
-        true
+        }
+        self.collapse_leaf(leaf)
     }
 
     // --- resize ---
 
-    pub fn resize_focused(&mut self, delta: f64) -> bool {
+    /// Grow or shrink the focused split by one keyboard step. A stacked
+    /// split trades height with its row neighbour (their sum is exactly
+    /// conserved); a lone-in-column split just changes its column's width —
+    /// the strip absorbs the difference and no sibling moves. Returns
+    /// whether anything changed.
+    pub fn resize_focused(&mut self, wa: Rect, grow: bool) -> bool {
         let leaf = self.focused_leaf_valid();
-        let Some((parent, idx)) = self.tree.find_parent(leaf) else {
+        let Some(pos) = self.layout.locate(leaf) else {
             return false;
         };
-        if let Some(b) = self.tree.branch_mut(parent) {
-            // `Branch` holds at least two children by construction, so a
-            // sibling to trade width with always exists.
-            let n = b.children().len();
-            let other = if idx + 1 < n { idx + 1 } else { idx - 1 };
-            let min_r = theme::MIN_SPLIT_FRAC;
-            let cs = b.children_mut();
-            let cur = cs[idx].ratio;
-            let cur_other = cs[other].ratio;
-            // Cap the transfer at what each side can actually give, so the
-            // pair's sum is exactly conserved — clamping both ends
-            // independently would let the total ratio mass drift upward once
-            // the neighbour bottoms out, silently shrinking every *other*
-            // sibling via renormalisation.
-            let (lo, hi) = ((min_r - cur).min(0.0), (cur_other - min_r).max(0.0));
-            let delta = delta.clamp(lo, hi);
-            if delta == 0.0 {
-                return false;
-            }
-            cs[idx].ratio = cur + delta;
-            cs[other].ratio = cur_other - delta;
-            true
-        } else {
-            false
+        if self.layout.leaf(leaf).is_some_and(|l| l.minimized) {
+            return false;
         }
+        if self.layout.col_len(pos.col) > 1 {
+            let delta = if grow {
+                theme::RESIZE_STEP
+            } else {
+                -theme::RESIZE_STEP
+            };
+            let other = if pos.row + 1 < self.layout.col_len(pos.col) {
+                Pos {
+                    row: pos.row + 1,
+                    ..pos
+                }
+            } else {
+                Pos {
+                    row: pos.row - 1,
+                    ..pos
+                }
+            };
+            return self.transfer_row_frac(pos, other, delta);
+        }
+        let widths = self.layout.widths(wa.w, theme::GAP);
+        let step = (wa.w / 20).max(1);
+        let target = widths[pos.col] + if grow { step } else { -step };
+        let new_w = target.max(theme::min_split_w());
+        if new_w == widths[pos.col] {
+            return false;
+        }
+        self.layout.set_col_width(pos.col, new_w);
+        true
+    }
+
+    /// Move `delta` of the column's height share from `other` to `pos`,
+    /// capped at what each side can actually give so the pair's sum is
+    /// exactly conserved — clamping both ends independently would let the
+    /// total drift, silently resizing every other row.
+    fn transfer_row_frac(&mut self, pos: Pos, other: Pos, delta: f64) -> bool {
+        let (Some(cur), Some(cur_other)) = (self.layout.row_frac(pos), self.layout.row_frac(other))
+        else {
+            return false;
+        };
+        let min_r = theme::MIN_SPLIT_FRAC;
+        let (lo, hi) = ((min_r - cur).min(0.0), (cur_other - min_r).max(0.0));
+        let delta = delta.clamp(lo, hi);
+        if delta == 0.0 {
+            return false;
+        }
+        self.layout.set_row_frac(pos, cur + delta);
+        self.layout.set_row_frac(other, cur_other - delta);
+        true
+    }
+
+    /// Apply a gap drag. A column gap sets the left column's width to the
+    /// dragged size (later columns slide; nothing resizes); a row gap sets
+    /// the split so the upper row occupies fraction `frac` of the two
+    /// rows' combined height (their sum is preserved).
+    pub fn resize_gap(&mut self, at: GapAt, first_px: i32, combined_px: i32) {
+        match at {
+            GapAt::Col(idx) => {
+                self.layout
+                    .set_col_width(idx, first_px.max(theme::min_split_w()));
+            }
+            GapAt::Row { col, idx } => {
+                if combined_px <= 0 {
+                    return;
+                }
+                let frac = (f64::from(first_px) / f64::from(combined_px))
+                    .clamp(theme::MIN_SPLIT_FRAC, 1.0 - theme::MIN_SPLIT_FRAC);
+                let (a, b) = (Pos { col, row: idx }, Pos { col, row: idx + 1 });
+                let (Some(fa), Some(fb)) = (self.layout.row_frac(a), self.layout.row_frac(b))
+                else {
+                    return;
+                };
+                let combined = fa + fb;
+                self.layout.set_row_frac(a, combined * frac);
+                self.layout.set_row_frac(b, combined * (1.0 - frac));
+            }
+        }
+    }
+
+    /// Resize the leftmost or rightmost column to `target_w` pixels: the
+    /// column absorbs the whole delta and the strip grows/shrinks with it;
+    /// no sibling moves. Refused when that column is pinned (minimized) —
+    /// its visible width is the gap, not a real width, so the drag is
+    /// meaningless. Returns the applied delta.
+    ///
+    /// For the left edge specifically, the column's *start* is what's
+    /// meant to track the mouse (growing toward the screen edge), but the
+    /// strip is laid out left-to-right from a fixed origin — so growing
+    /// column 0 shifts every later column's canvas-space x right by the
+    /// delta. The caller (`Wm::on_motion`) nudges `scroll_x`/`scroll_target`
+    /// by the same delta so those columns stay put on screen and only the
+    /// dragged edge visibly moves.
+    pub fn resize_edge(&mut self, wa: Rect, left: bool, target_w: i32) -> i32 {
+        let widths = self.layout.widths(wa.w, theme::GAP);
+        let idx = if left { 0 } else { widths.len() - 1 };
+        if self.layout.col_pinned(idx) {
+            return 0;
+        }
+        let old_w = widths[idx];
+        let new_w = target_w.max(theme::min_split_w());
+        let delta = new_w - old_w;
+        if delta == 0 {
+            return 0;
+        }
+        self.layout.set_col_width(idx, new_w);
+        delta
     }
 
     // --- canvas ---
 
-    /// The scrollable canvas width. Before the first `update_canvas` this
-    /// falls back to the viewport width, so pure-`State` callers (tests,
-    /// pre-first-arrange paths) see sane geometry.
+    /// The scrollable strip's width: the columns end to end plus margins,
+    /// exactly (`Layout::strip_w`). Narrower than the viewport is
+    /// meaningful — the leftover is wallpaper margin.
     pub fn canvas_w(&self, wa: Rect) -> i32 {
-        self.canvas_w.unwrap_or(wa.w)
+        self.layout.strip_w(wa.w, theme::GAP)
     }
 
-    /// Recompute the canvas width for the current tree and viewport; called
-    /// once per arrange. Width demand is measured in *columns*
-    /// (`Tree::h_units`), not leaves — a vertical stack of any depth still
-    /// occupies one column, so it must not open up phantom scroll space.
-    /// Each column gets a comfortable minimum so splits don't get crushed.
-    /// A manual edge-of-canvas resize layers on via `canvas_w_extra` and may
-    /// legitimately take the canvas narrower than the viewport (leaving
-    /// margin on the far side); `resize_edge`'s per-column `min_split_w`
-    /// clamp is what keeps that sane. `dock_extra` is the extra scroll room
-    /// the docked sidebar needs (zero when nothing is docked).
-    ///
-    /// Scroll positions are deliberately *not* re-clamped here: an
-    /// edge-of-canvas drag parks them outside `[0, max_scroll]` to hold a
-    /// wallpaper margin at the dragged edge (see `shift_scroll`), and this
-    /// runs on every arrange, so clamping here would yank that margin shut
-    /// on the next hover repaint. Mutations that change the scroll range
-    /// out from under the user (structural layout changes, viewport
-    /// resizes, dock removal) call `clamp_scroll` explicitly instead.
-    pub fn update_canvas(&mut self, wa: Rect, dock_extra: i32) {
-        let gap = theme::GAP;
-        let columns = self.tree.h_units().max(1);
-        let min_col_w = (theme::min_split_w() + 2 * gap).max(wa.w / 3);
-        let needed = columns.saturating_mul(min_col_w);
-        self.canvas_w = Some(needed.max(wa.w) + self.canvas_w_extra);
+    /// Record the extra scroll room the docked sidebar needs (zero when
+    /// nothing is docked); called once per arrange. Scroll positions are
+    /// deliberately *not* re-clamped here: an edge drag parks them outside
+    /// `[0, max_scroll]` to hold a wallpaper margin at the dragged edge
+    /// (see `shift_scroll`), and this runs on every arrange, so clamping
+    /// here would yank that margin shut on the next hover repaint.
+    /// Mutations that change the scroll range out from under the user
+    /// (structural layout changes, viewport resizes, dock removal) call
+    /// `clamp_scroll` explicitly instead.
+    pub fn set_dock_extra(&mut self, dock_extra: i32) {
         self.dock_extra = dock_extra;
     }
 
-    /// Pull both scroll positions back into `[0, max_scroll]`, recomputing
-    /// the canvas first so the range reflects the tree as it is *now* (the
-    /// caller typically just mutated it; clamping against the stale width
-    /// would be a no-op). This is the companion to `update_canvas` not
-    /// clamping: structural layout changes, viewport resizes and dock
-    /// removal shrink the scroll range and must not strand the viewport
-    /// past the content, while edge-drag margins (scroll out of range on
-    /// purpose) survive everything that doesn't call this.
+    /// Pull both scroll positions back into `[0, max_scroll]`. This is the
+    /// companion to `set_dock_extra` not clamping: structural layout
+    /// changes, viewport resizes and dock removal shrink the scroll range
+    /// and must not strand the viewport past the content, while edge-drag
+    /// margins (scroll out of range on purpose) survive everything that
+    /// doesn't call this.
     pub fn clamp_scroll(&mut self, wa: Rect, dock_extra: i32) {
-        self.update_canvas(wa, dock_extra);
+        self.dock_extra = dock_extra;
         let max_scroll = self.max_scroll(wa);
         self.scroll_target = self.scroll_target.clamp(0, max_scroll);
         self.scroll_x = self.scroll_x.clamp(0, max_scroll);
     }
 
-    /// The dock scroll room last supplied to `update_canvas`.
+    /// The dock scroll room last supplied to `set_dock_extra`.
     pub fn dock_extra(&self) -> i32 {
         self.dock_extra
     }
@@ -526,10 +594,10 @@ impl State {
 
     /// Shift both offsets by `delta` without clamping — used by the
     /// left-edge resize drag to keep on-screen columns stationary while the
-    /// canvas width changes underneath (`Tree::compute` lays out from a
-    /// fixed origin, so resizing column 0 moves every other column in
-    /// canvas space). A left-edge shrink legitimately takes the scroll
-    /// negative; see `max_scroll` for what out-of-range scroll means.
+    /// strip width changes underneath (the strip lays out from a fixed
+    /// origin, so resizing column 0 moves every other column in canvas
+    /// space). A left-edge shrink legitimately takes the scroll negative;
+    /// see `max_scroll` for what out-of-range scroll means.
     pub fn shift_scroll(&mut self, delta: i32) {
         self.scroll_x += delta;
         self.scroll_target += delta;
@@ -537,9 +605,9 @@ impl State {
 
     /// Upper end of the *scrollable* range. The current scroll can sit
     /// outside `[0, max_scroll]`, and that state is meaningful: negative
-    /// scroll is a wallpaper margin left of the canvas (left-edge shrink,
+    /// scroll is a wallpaper margin left of the strip (left-edge shrink,
     /// via `shift_scroll`), scroll past `max_scroll` is margin right of it
-    /// (a right-edge shrink narrows the canvas under an unmoved scroll).
+    /// (a right-edge shrink narrows the strip under an unmoved scroll).
     /// Such a margin holds until a scroll gesture (`scroll_to` clamps) or
     /// a range-shrinking mutation (`clamp_scroll`) repositions the
     /// viewport.
@@ -556,173 +624,32 @@ impl State {
         self.scroll_to(wa, t);
     }
 
-    /// The viewport rect widened to the scrollable canvas — the area every
-    /// layout query is answered against.
-    fn canvas_rect(&self, wa: Rect) -> Rect {
-        Rect {
-            w: self.canvas_w(wa),
-            ..wa
-        }
-    }
-
     /// Geometry of every leaf in canvas coordinates.
     pub fn compute(&self, wa: Rect) -> std::collections::HashMap<NodeId, Rect> {
-        self.tree.compute(self.canvas_rect(wa), theme::GAP)
+        self.layout.compute(wa, theme::GAP)
     }
 
     /// Gaps between adjacent splits, for drag handles / insert buttons.
     pub fn boundaries(&self, wa: Rect) -> Vec<Boundary> {
-        self.tree.boundaries(self.canvas_rect(wa), theme::GAP)
+        self.layout.boundaries(wa, theme::GAP)
     }
 
     /// Canvas-space x-span `(start_x, width)` of the leftmost/rightmost
-    /// root-level column — used to seed and drive an edge-of-canvas resize
-    /// drag (see `resize_edge`). A single leaf, or a root that's itself a
-    /// vertical branch, count as one column spanning the whole row, so
-    /// `left`/`right` both describe the same span in that case (see
-    /// `Tree::root_h_sizes`). `None` only if the tree is somehow empty.
+    /// column — used to seed and drive an edge-of-strip resize drag (see
+    /// `resize_edge`). With a single column, `left`/`right` both describe
+    /// the same span.
     pub fn edge_span(&self, wa: Rect, left: bool) -> Option<(i32, i32)> {
         let gap = theme::GAP;
-        let canvas_w = self.canvas_w(wa);
-        let sizes = self.tree.root_h_sizes(canvas_w - 2 * gap, gap)?;
+        let widths = self.layout.widths(wa.w, gap);
         let start_x = wa.x + gap;
         if left {
-            Some((start_x, sizes[0]))
+            Some((start_x, widths[0]))
         } else {
-            let n = sizes.len();
-            let before: i32 = sizes[..n - 1].iter().sum();
+            let n = widths.len();
+            let before: i32 = widths[..n - 1].iter().sum();
             let gaps_before = gap * i32::try_from(n - 1).unwrap_or(0);
-            Some((start_x + before + gaps_before, sizes[n - 1]))
+            Some((start_x + before + gaps_before, widths[n - 1]))
         }
-    }
-
-    /// Multi-column case of `resize_edge`: rewrite `root`'s ratios so that
-    /// column `idx` becomes `new_w` pixels wide, every other *normal*
-    /// (non-minimized) column keeps its relative share, and minimized
-    /// columns' ratios are left untouched. Returns `false` if the rewrite
-    /// isn't possible (e.g. every other column is minimized).
-    fn redistribute_column_widths(
-        &mut self,
-        root: NodeId,
-        idx: usize,
-        new_w: i32,
-        mut widths: Vec<i32>,
-        minimized: &[bool],
-    ) -> bool {
-        widths[idx] = new_w;
-        let total: i32 = widths
-            .iter()
-            .zip(minimized)
-            .filter_map(|(&w, &m)| (!m).then_some(w))
-            .sum();
-        if total <= 0 {
-            return false;
-        }
-        if let Some(b) = self.tree.branch_mut(root) {
-            if b.dir == Dir::H {
-                // Only normal children's ratios matter to the layout
-                // (`child_sizes` normalises over them alone), so rewriting
-                // just those reproduces the pixel widths exactly.
-                for ((c, &w), &m) in b
-                    .children_mut()
-                    .iter_mut()
-                    .zip(widths.iter())
-                    .zip(minimized)
-                {
-                    if !m {
-                        c.ratio = f64::from(w) / f64::from(total);
-                    }
-                }
-            }
-        }
-        true
-    }
-
-    /// Resize the leftmost or rightmost root-level column to `target_w`
-    /// pixels: the column absorbs the whole delta, every sibling keeps its
-    /// exact current pixel width, and `canvas_w` grows/shrinks by that same
-    /// delta (via `canvas_w_extra`, layered on top of `update_canvas`'s
-    /// heuristic each frame) — the canvas itself tracks the resize, the
-    /// same way it grows when a new column is inserted. `theme::GAP` (the
-    /// margin) never changes. A single leaf (or a vertical-branch root) has
-    /// no sibling ratios to redistribute — it's the whole row already, so
-    /// only `canvas_w_extra` moves.
-    ///
-    /// For the left edge specifically, the column's *start* is what's
-    /// meant to track the mouse (growing toward the screen edge), but
-    /// `Tree::compute` always lays children out left-to-right from a fixed
-    /// origin — so growing column 0 there necessarily shifts every later
-    /// column's canvas-space x right by `delta`. The caller (`Wm::on_motion`)
-    /// nudges `scroll_x`/`scroll_target` by the same `delta` so those
-    /// columns stay put on screen and only the dragged edge visibly moves.
-    pub fn resize_edge(&mut self, wa: Rect, left: bool, target_w: i32) -> i32 {
-        let root = self.tree.root;
-        let gap = theme::GAP;
-        let canvas_w = self.canvas_w(wa);
-        let Some(widths) = self.tree.root_h_sizes(canvas_w - 2 * gap, gap) else {
-            return 0;
-        };
-        let idx = if left { 0 } else { widths.len() - 1 };
-        let old_w = widths[idx];
-        let new_w = target_w.max(theme::min_split_w());
-        let delta = new_w - old_w;
-        if delta == 0 {
-            return 0;
-        }
-        if widths.len() > 1 {
-            // A multi-column root is necessarily an H-branch (`root_h_sizes`
-            // returns a single full-width span for a lone leaf or V-branch
-            // root), so per-column minimized flags index `widths` one-to-one.
-            // A minimized column's pixel width is pinned to `gap` regardless
-            // of ratio (see `child_sizes`), so its stored ratio must survive
-            // the rewrite in `redistribute_column_widths` untouched —
-            // deriving a ratio from the pinned width would crush the share
-            // it restores to.
-            let minimized: Vec<bool> = match self.tree.branch(root) {
-                Some(b) if b.dir == Dir::H => b
-                    .children()
-                    .iter()
-                    .map(|c| self.tree.leaf(c.node).is_some_and(|l| l.minimized))
-                    .collect(),
-                _ => return 0,
-            };
-            if minimized[idx] {
-                // The end column itself being minimized makes the whole drag
-                // meaningless (old_w is the pinned gap, not a real width).
-                return 0;
-            }
-            if !self.redistribute_column_widths(root, idx, new_w, widths, &minimized) {
-                return 0;
-            }
-        }
-        self.canvas_w_extra += delta;
-        delta
-    }
-
-    /// Set the split ratio at a boundary so the left child occupies fraction
-    /// `frac` of the two neighbours' combined width (their sum is preserved).
-    pub fn resize_boundary(&mut self, parent: NodeId, idx: usize, frac: f64) {
-        if let Some(b) = self.tree.branch_mut(parent) {
-            let cs = b.children_mut();
-            if idx + 1 < cs.len() {
-                let combined = cs[idx].ratio + cs[idx + 1].ratio;
-                let f = frac.clamp(theme::MIN_SPLIT_FRAC, 1.0 - theme::MIN_SPLIT_FRAC);
-                cs[idx].ratio = combined * f;
-                cs[idx + 1].ratio = combined * (1.0 - f);
-            }
-        }
-    }
-
-    /// Insert a new empty leaf column at root-children index `at`, making the
-    /// root an H-branch if it isn't one. The new leaf becomes focused.
-    pub fn insert_at_root(&mut self, at: InsertAt) -> NodeId {
-        let idx = match at {
-            InsertAt::Index(i) => Some(i),
-            InsertAt::End => None,
-        };
-        let new = self.tree.insert_leaf_at_root(idx, theme::SPLIT_RATIO);
-        self.focus_leaf(new);
-        new
     }
 
     /// Scroll so the focused split sits inside the viewport (one gap margin).
@@ -756,764 +683,502 @@ mod tests {
         w: 1280,
         h: 800,
     };
+    const GAP: i32 = crate::theme::GAP;
 
-    /// The root branch's per-child ratios; panics when the root is a leaf.
-    fn root_ratios(s: &State) -> Vec<f64> {
-        s.tree
-            .branch(s.tree.root)
-            .expect("root not a branch")
-            .children()
-            .iter()
-            .map(|c| c.ratio)
+    fn leaf_clients(s: &State) -> Vec<Option<Win>> {
+        s.layout
+            .collect_leaves()
+            .into_iter()
+            .map(|l| s.layout.leaf(l).unwrap().client)
             .collect()
     }
 
+    /// A new window fills the focused split when (and only when) that
+    /// split is an empty placeholder.
     #[test]
-    fn insert_at_root_grows_columns() {
+    fn place_fills_focused_empty_placeholder() {
         let mut s = State::new();
-        s.split_focused(Dir::H); // root H-branch, 2 columns
-        assert_eq!(s.tree.collect_leaves().len(), 2);
-        s.insert_at_root(InsertAt::Index(1)); // insert between
-        assert_eq!(s.tree.collect_leaves().len(), 3);
-        // The inserted leaf is focused and empty.
-        assert!(s.focused_client().is_none());
-        // Ratios renormalise to sum 1.
-        let sum: f64 = root_ratios(&s).iter().sum();
-        assert!((sum - 1.0).abs() < 1e-9, "ratios sum {sum}");
+        s.place_new_window(WA, 1);
+        assert_eq!(s.focused_client(), Some(1));
+        assert_eq!(s.layout.collect_leaves().len(), 1, "no new column opened");
     }
 
+    /// An empty split that is *not* focused attracts nothing: the new
+    /// window opens its own column even though a placeholder exists.
     #[test]
-    fn insert_at_root_wraps_single_leaf() {
+    fn place_ignores_unfocused_placeholders() {
         let mut s = State::new();
-        s.insert_at_root(InsertAt::Index(0)); // root is a lone leaf -> wrap into H-branch
-        assert_eq!(s.tree.collect_leaves().len(), 2);
-        assert!(s.tree.branch(s.tree.root).is_some_and(|b| b.dir == Dir::H));
+        s.place_new_window(WA, 1);
+        s.insert_at(WA, Insert::Col(0)); // placeholder column, focused
+        let placeholder = s.focused_leaf_valid();
+        s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
+        s.place_new_window(WA, 2);
+        assert_eq!(s.layout.leaf(placeholder).unwrap().client, None);
+        assert_eq!(s.focused_client(), Some(2));
+        assert_eq!(leaf_clients(&s), vec![None, Some(1), Some(2)]);
     }
 
-    /// Wrapping a lone leaf must keep the *existing* content on the larger
-    /// `SPLIT_RATIO` share regardless of which side the new column lands:
-    /// swapping the children without also swapping the ratios would hand
-    /// the empty column the bigger share on a left-edge insert.
+    /// With the focused split occupied, a new window opens in a fresh
+    /// column immediately right of the focused one, and gets the focus.
     #[test]
-    fn insert_at_root_keeps_existing_content_share_on_both_sides() {
-        for (at, existing_idx) in [(InsertAt::Index(0), 1usize), (InsertAt::End, 0usize)] {
-            let mut s = State::new();
-            let existing = s.tree.first_leaf(s.tree.root);
-            s.insert_at_root(at);
-            let children = s
-                .tree
-                .branch(s.tree.root)
-                .expect("root not a branch")
-                .children()
-                .to_vec();
-            assert_eq!(children[existing_idx].node, existing, "at={at:?}");
-            assert!(
-                (children[existing_idx].ratio - theme::SPLIT_RATIO).abs() < 1e-9,
-                "at={at:?}: existing content got ratio {}",
-                children[existing_idx].ratio
-            );
+    fn place_opens_a_column_right_of_the_focused_one() {
+        let mut s = State::new();
+        for w in [1, 2, 3] {
+            s.place_new_window(WA, w);
         }
+        assert_eq!(leaf_clients(&s), vec![Some(1), Some(2), Some(3)]);
+        assert_eq!(s.focused_client(), Some(3));
+
+        // Opening from the middle lands between, not at the end.
+        s.focus_leaf(s.layout.find_leaf_for_client(2).unwrap());
+        s.place_new_window(WA, 4);
+        assert_eq!(leaf_clients(&s), vec![Some(1), Some(2), Some(4), Some(3)]);
     }
 
+    /// Stacking focuses the fresh placeholder, so the next window lands in
+    /// the room just made; an *occupied* stacked split sends a new window
+    /// to a fresh column beside its whole stack, not into the stack.
     #[test]
-    fn resize_boundary_preserves_neighbour_sum() {
+    fn place_from_a_stacked_split_opens_a_column() {
         let mut s = State::new();
-        s.split_focused(Dir::H);
-        let root = s.tree.root;
-        let before: f64 = root_ratios(&s).iter().sum();
-        s.resize_boundary(root, 0, 0.25);
-        let ratios = root_ratios(&s);
-        assert!((ratios[0] + ratios[1] - before).abs() < 1e-9);
-        assert!((ratios[0] / (ratios[0] + ratios[1]) - 0.25).abs() < 1e-9);
-    }
-
-    #[test]
-    fn boundaries_match_column_count() {
-        let mut s = State::new();
-        s.split_focused(Dir::H);
-        s.update_canvas(WA, 0);
-        // One gap between two columns.
-        assert_eq!(s.boundaries(WA).len(), 1);
-        s.insert_at_root(InsertAt::Index(1));
-        s.update_canvas(WA, 0);
-        assert_eq!(s.boundaries(WA).len(), 2);
-    }
-
-    #[test]
-    fn splits_get_unique_colors_up_to_palette_size() {
-        let mut s = State::new();
-        for _ in 0..7 {
-            s.split_focused(Dir::H);
-        }
-        let leaves = s.tree.collect_leaves();
-        assert_eq!(leaves.len(), 8);
-        let colors: Vec<_> = leaves
-            .iter()
-            .map(|&l| s.tree.leaf(l).unwrap().color)
-            .collect();
-        let unique: std::collections::HashSet<_> = colors.iter().collect();
+        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 2);
+        s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
+        s.split_focused(); // column 0 becomes a stack; its placeholder focused
+        s.place_new_window(WA, 3);
         assert_eq!(
-            unique.len(),
-            8,
-            "expected all 8 leaves to have distinct colors"
+            s.layout.locate(s.layout.find_leaf_for_client(3).unwrap()),
+            Some(Pos { col: 0, row: 1 }),
+            "fills the placeholder the split just opened"
         );
-
-        // A 9th split must reuse a color (only 8 available) but shouldn't panic.
-        s.split_focused(Dir::H);
-        assert_eq!(s.tree.collect_leaves().len(), 9);
+        s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
+        s.place_new_window(WA, 4);
+        assert_eq!(s.layout.ncols(), 3, "new column, no stack growth");
+        assert_eq!(
+            s.layout.locate(s.layout.find_leaf_for_client(4).unwrap()),
+            Some(Pos { col: 1, row: 0 }),
+            "right of window 1's stack, before window 2"
+        );
+        assert_eq!(s.focused_client(), Some(4));
     }
 
+    /// Opening and closing a column never resizes the other columns; the
+    /// strip absorbs the difference.
     #[test]
-    fn closing_and_resplitting_still_avoids_collisions() {
+    fn open_close_never_resizes_neighbours() {
         let mut s = State::new();
-        for _ in 0..3 {
-            s.split_focused(Dir::H);
+        for w in [1, 2, 3] {
+            s.place_new_window(WA, w);
         }
-        // Close one, then split again — the freed color should be reusable
-        // without colliding with the remaining leaves.
-        s.close_focused();
-        s.split_focused(Dir::H);
-        let leaves = s.tree.collect_leaves();
-        let colors: Vec<_> = leaves
-            .iter()
-            .map(|&l| s.tree.leaf(l).unwrap().color)
-            .collect();
-        let unique: std::collections::HashSet<_> = colors.iter().collect();
-        assert_eq!(unique.len(), colors.len());
-    }
-
-    /// `dock_extra` must open up exactly enough extra scroll room to slide
-    /// the docked sidebar fully into view, mirroring `Wm::place_dock`'s
-    /// `x = wa.x + canvas_w - overlap - scroll_x` formula (overlap =
-    /// `DOCK_OVERLAP` clamped to the dock's width, see `Dock::overlap`),
-    /// even when there's only one column and the canvas alone has no scroll
-    /// room of its own.
-    #[test]
-    fn dock_extra_reveals_sidebar_at_max_scroll() {
-        let mut s = State::new();
-        let docked_w = 300;
-        let overlap = theme::DOCK_OVERLAP.min(docked_w);
-        // Single leaf: canvas == viewport, no scroll room of its own.
-        s.update_canvas(WA, docked_w - overlap);
-
-        assert_eq!(s.max_scroll(WA), docked_w - overlap);
-
-        let canvas_w = s.canvas_w(WA);
-        let dock_x_at = |scroll_x: i32| WA.x + canvas_w - overlap - scroll_x;
-
-        // Before scrolling, only the tucked-under overlap strip reaches
-        // on-screen (it sits below the canvas in stacking).
-        assert_eq!(dock_x_at(0), WA.x + WA.w - overlap);
-
-        // Scrolling to the clamped max brings it flush to the right edge.
-        s.scroll_to(WA, i32::MAX);
-        assert_eq!(s.scroll_target, docked_w - overlap);
-        assert_eq!(dock_x_at(s.scroll_target), WA.x + WA.w - docked_w);
-    }
-
-    /// A single leaf has no sibling to trade width with, but it should
-    /// still be resizable — both edges describe the same full-width span,
-    /// and shrinking it should work exactly like a two-column edge resize
-    /// minus the ratio bookkeeping (see `resize_edge_shrinks_lone_leaf`).
-    #[test]
-    fn edge_span_is_full_width_for_single_leaf() {
-        let s = State::new();
-        let canvas_w = s.canvas_w(WA);
-        let want = (WA.x + crate::theme::GAP, canvas_w - 2 * crate::theme::GAP);
-        assert_eq!(s.edge_span(WA, true), Some(want));
-        assert_eq!(s.edge_span(WA, false), Some(want));
-    }
-
-    /// Shrinking the lone leaf from the right edge should narrow it by
-    /// exactly the requested delta and shrink `canvas_w` by the same
-    /// amount, with no ratios to touch (there's no `Node::Branch` at all).
-    #[test]
-    fn resize_edge_shrinks_lone_leaf() {
-        let mut s = State::new();
-        s.update_canvas(WA, 0);
-        let (_, w_before) = s.edge_span(WA, false).unwrap();
-
-        let shrink_by = 50;
-        let applied = s.resize_edge(WA, false, w_before - shrink_by);
-        assert_eq!(applied, -shrink_by);
-        assert_eq!(s.canvas_w_extra, -shrink_by);
-
-        s.update_canvas(WA, 0);
-        let (_, w_after) = s.edge_span(WA, false).unwrap();
-        assert_eq!(w_after, w_before - shrink_by);
-    }
-
-    /// Growing the left column via `resize_edge` should widen it by exactly
-    /// the requested delta, leave the other column's pixel width untouched,
-    /// grow `canvas_w` by that same delta (so the scrollable canvas tracks
-    /// the resize, the way it does for every other canvas-widening
-    /// operation), and report the applied delta so the caller can
-    /// compensate scroll.
-    #[test]
-    fn resize_edge_grows_left_column_and_canvas() {
-        let mut s = State::new();
-        s.split_focused(Dir::H);
-        s.update_canvas(WA, 0);
-        let canvas_w_before = s.canvas_w(WA);
-
+        let l2 = s.layout.find_leaf_for_client(2).unwrap();
         let before = s.compute(WA);
-        let leaves = s.tree.collect_leaves();
-        let (left_id, right_id) = (leaves[0], leaves[1]);
-        let left_w_before = before[&left_id].w;
-        let right_w_before = before[&right_id].w;
-
-        let (start_x, w) = s.edge_span(WA, true).expect("two columns");
-        assert_eq!(w, left_w_before);
-        assert_eq!(start_x, WA.x + crate::theme::GAP);
-
-        let grow_by = 40;
-        let applied = s.resize_edge(WA, true, left_w_before + grow_by);
-        assert_eq!(applied, grow_by);
-        assert_eq!(s.canvas_w_extra, grow_by);
-
-        // `resize_edge` records the delta in `canvas_w_extra`; the next
-        // `update_canvas` (run once per arrange) layers it onto the width.
-        s.update_canvas(WA, 0);
-        assert_eq!(s.canvas_w(WA), canvas_w_before + grow_by);
+        let strip = s.canvas_w(WA);
+        assert!(s.unpin_client(2), "a column was removed");
         let after = s.compute(WA);
-        assert_eq!(after[&left_id].w, left_w_before + grow_by);
-        assert_eq!(after[&right_id].w, right_w_before);
-    }
-
-    /// Backward stash cycling must walk the whole list in reverse, not
-    /// flip-flop between the shown window and the last stash entry:
-    /// `assign_to_leaf` pushes the displaced window to the back, which is
-    /// exactly where the next backward pop looks, so the displaced window
-    /// must be moved to the front.
-    #[test]
-    fn cycle_stash_prev_visits_every_window() {
-        let mut s = State::new();
-        for w in [10, 1, 2, 3] {
-            s.pin_client(w);
+        for w in [1, 3] {
+            let l = s.layout.find_leaf_for_client(w).unwrap();
+            assert_eq!(before[&l].w, after[&l].w, "window {w} kept its width");
         }
-        // Leaf shows 3; stash is [10, 1, 2].
-        assert_eq!(s.focused_client(), Some(3));
-
-        let shown: Vec<_> = (0..4).map(|_| s.cycle_stash(false).unwrap()).collect();
-        assert_eq!(shown, vec![2, 1, 10, 3], "prev must rotate, not toggle");
+        assert_eq!(s.canvas_w(WA), strip - before[&l2].w - GAP);
     }
 
-    /// One step forward then one step back must restore both the shown
-    /// window and the stash order.
+    /// Closing a split stacked inside a column still merges: the stack
+    /// neighbour reclaims the height and the strip is untouched.
     #[test]
-    fn cycle_stash_prev_inverts_next() {
+    fn unpin_in_a_stack_still_merges() {
         let mut s = State::new();
-        for w in [10, 1, 2, 3] {
-            s.pin_client(w);
-        }
-        let before = s.stash.clone();
-        s.cycle_stash(true);
-        s.cycle_stash(false);
-        assert_eq!(s.focused_client(), Some(3));
-        assert_eq!(s.stash, before);
+        s.place_new_window(WA, 1);
+        s.split_focused();
+        s.focus_leaf(s.layout.collect_leaves()[1]);
+        s.place_new_window(WA, 2); // fills the focused empty bottom row
+        let strip = s.canvas_w(WA);
+        let full = {
+            let g = s.compute(WA);
+            let l1 = s.layout.find_leaf_for_client(1).unwrap();
+            let l2 = s.layout.find_leaf_for_client(2).unwrap();
+            g[&l1].h + g[&l2].h + GAP
+        };
+        assert!(s.unpin_client(2), "the stack collapsed");
+        let l1 = s.layout.find_leaf_for_client(1).unwrap();
+        assert_eq!(s.compute(WA)[&l1].h, full, "height reclaimed");
+        assert_eq!(s.canvas_w(WA), strip, "no column left the strip");
     }
 
-    /// A popup that displaces the working window and is then destroyed must
-    /// give the split back to the displaced window (pulled from the stash).
+    /// A destroyed window takes its split with it; focus moves to the
+    /// surviving neighbour only when the dying split held it.
     #[test]
-    fn closing_popup_restores_displaced_window() {
+    fn unpin_collapses_the_split() {
         let mut s = State::new();
-        s.pin_client(1); // working window
-        s.pin_client(99); // popup steals the split; 1 -> stash
-        assert_eq!(s.focused_client(), Some(99));
-        assert!(s.stash.contains(&1));
-
-        s.unpin_client(99); // popup window destroyed
-        assert_eq!(s.focused_client(), Some(1), "displaced window comes back");
-        assert!(!s.stash.contains(&1));
-    }
-
-    /// If the displaced window has since left the stash (shown elsewhere or
-    /// itself closed), the split just stays empty — no stale restore.
-    #[test]
-    fn no_restore_when_displaced_window_is_gone() {
-        let mut s = State::new();
-        s.pin_client(1);
-        s.pin_client(99);
-        s.unpin_client(1); // the remembered window itself is destroyed
-        s.unpin_client(99);
-        assert_eq!(s.focused_client(), None);
-        assert!(s.stash.is_empty());
-    }
-
-    /// Restoration is single-shot: after a restore the leaf holds no further
-    /// history, so closing the restored window doesn't resurrect anything.
-    #[test]
-    fn restore_is_single_shot() {
-        let mut s = State::new();
-        s.pin_client(1);
-        s.pin_client(2); // prev = 1
-        s.pin_client(3); // prev = 2, stash [1, 2]
-        s.unpin_client(3); // restores 2
-        assert_eq!(s.focused_client(), Some(2));
-        s.unpin_client(2); // prev was consumed; 1 stays in the stash
-        assert_eq!(s.focused_client(), None);
-        assert_eq!(s.stash, vec![1]);
-    }
-
-    /// Activating a client whose leaf is minimized must restore the leaf:
-    /// its window is unmapped while minimized, so focusing without
-    /// restoring would target an unviewable window (`SetInputFocus` on one
-    /// is a `BadMatch`). Assignment into a minimized leaf restores it too.
-    #[test]
-    fn activation_unminimizes_the_leaf() {
-        let mut s = State::new();
-        s.pin_client(1);
-        s.split_focused(Dir::H);
-        let leaf = s.tree.find_leaf_for_client(1).unwrap();
-        s.toggle_minimize(leaf);
-        assert_eq!(s.activate_client(1), Activation::Unminimized);
-        assert!(!s.tree.leaf(leaf).unwrap().minimized);
-
-        s.toggle_minimize(leaf);
-        s.assign_to_leaf(2, leaf);
-        assert!(!s.tree.leaf(leaf).unwrap().minimized);
-    }
-
-    /// `activate_client`'s report distinguishes a real layout change (a
-    /// minimized leaf reappearing) from a no-op refocus of a window that's
-    /// already shown, and from a window not tracked in the tree at all —
-    /// callers use this to skip animating a transition that moves no rects.
-    #[test]
-    fn activation_reports_whether_anything_changed() {
-        let mut s = State::new();
-        s.pin_client(1);
-        assert_eq!(s.activate_client(1), Activation::Unchanged);
-        assert_eq!(s.activate_client(99), Activation::NotFound);
-    }
-
-    /// Restoring the displaced window into a leaf that was minimized in the
-    /// meantime must clear the minimized flag: a leaf showing a window is
-    /// never minimized (its window would otherwise stay unmapped forever).
-    #[test]
-    fn popup_restore_unminimizes_the_leaf() {
-        let mut s = State::new();
-        s.pin_client(1);
-        s.split_focused(Dir::H);
-        s.pin_client(99); // displaces 1 -> stash, prev = 1
-        let leaf = s.tree.find_leaf_for_client(99).unwrap();
-        s.toggle_minimize(leaf);
-        s.unpin_client(99); // popup dies while its leaf is minimized
-        assert_eq!(s.tree.leaf(leaf).unwrap().client, Some(1));
-        assert!(!s.tree.leaf(leaf).unwrap().minimized);
-    }
-
-    /// Closing a window whose empty adjacent sibling is a minimized leaf
-    /// relocates the window into it *and* restores it — the same "a leaf
-    /// showing a window is never minimized" invariant as assignment and
-    /// activation; the relocated window would otherwise be unmapped and in
-    /// no stash, visible nowhere.
-    #[test]
-    fn close_into_minimized_sibling_unminimizes() {
-        let mut s = State::new();
-        s.pin_client(1);
-        s.split_focused(Dir::H);
-        let win_leaf = s.tree.find_leaf_for_client(1).unwrap();
-        let sibling = s
-            .tree
-            .collect_leaves()
-            .into_iter()
-            .find(|&l| l != win_leaf)
-            .unwrap();
-        s.toggle_minimize(sibling);
-        s.focused_leaf = win_leaf;
-        assert!(s.close_focused());
-        let dst = s.tree.find_leaf_for_client(1).unwrap();
-        assert!(!s.tree.leaf(dst).unwrap().minimized);
-        assert_eq!(s.focused_client(), Some(1));
-        assert!(s.stash.is_empty());
-    }
-
-    /// Closing when the adjacent sibling already shows a window pushes the
-    /// closed leaf's window to the stash instead of displacing the
-    /// sibling's occupant.
-    #[test]
-    fn close_with_occupied_sibling_pushes_to_stash() {
-        let mut s = State::new();
-        s.pin_client(1);
-        s.split_focused(Dir::H);
-        let a = s.tree.find_leaf_for_client(1).unwrap();
-        let b = s
-            .tree
-            .collect_leaves()
-            .into_iter()
-            .find(|&l| l != a)
-            .unwrap();
-        s.focused_leaf = b;
-        s.pin_client(2);
-        s.focused_leaf = a;
-        assert!(s.close_focused());
-        assert_eq!(s.stash, vec![1]);
-        assert_eq!(s.focused_client(), Some(2));
-    }
-
-    /// A minimized sibling promoted to root by a binary collapse must be
-    /// restored: the root leaf is never minimized — its whole-frame restore
-    /// button is disabled, so the promotion would otherwise leave a
-    /// full-screen restore strip with no way back and its window unmapped.
-    #[test]
-    fn collapse_unminimizes_a_leaf_promoted_to_root() {
-        let mut s = State::new();
-        s.pin_client(1);
-        s.split_focused(Dir::H); // H[A(win 1), B]
-        let leaves = s.tree.collect_leaves();
-        let (a, b) = (leaves[0], leaves[1]);
-        s.assign_to_leaf(1, b); // A empty, B holds the window
-        s.toggle_minimize(b);
-        s.focus_leaf(a);
-        assert!(s.close_focused()); // nothing to relocate out of A
-        assert_eq!(s.tree.root, b, "sibling takes the root");
-        assert!(
-            !s.tree.leaf(b).unwrap().minimized,
-            "promotion must restore the leaf"
-        );
+        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 2);
+        assert!(s.unpin_client(2), "collapse is a layout change");
+        assert_eq!(s.layout.collect_leaves().len(), 1);
         assert_eq!(s.focused_client(), Some(1));
     }
 
-    /// The root leaf can't be minimized: nothing exists to restore it.
     #[test]
-    fn toggle_minimize_refuses_the_root_leaf() {
+    fn unpin_keeps_focus_when_it_was_elsewhere() {
         let mut s = State::new();
-        let root = s.tree.root;
-        assert!(!s.toggle_minimize(root));
-        assert!(!s.tree.leaf(root).unwrap().minimized);
+        for w in [1, 2, 3] {
+            s.place_new_window(WA, w);
+        }
+        s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
+        s.unpin_client(2);
+        assert_eq!(s.focused_client(), Some(1));
     }
 
-    /// A minimized leaf must never be split: `child_a` would inherit
-    /// `minimized: true`, a split-then-minimized state the titlebar Split
-    /// button and keyboard split gate both treat as impossible to produce.
-    /// `State::split_focused` is the single place that refuses this, so the
-    /// tree is unchanged and nothing ends up both minimized and freshly split.
+    /// The last split survives its window: the layout always keeps one leaf.
+    #[test]
+    fn unpin_of_the_last_window_leaves_the_root_placeholder() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1);
+        assert!(!s.unpin_client(1), "no rect moved");
+        assert_eq!(s.layout.collect_leaves().len(), 1);
+        assert_eq!(s.focused_client(), None);
+    }
+
+    /// A placeholder-keeping close (`retain_split_on_close`, the taskbar
+    /// badge) leaves the split empty instead of collapsing it, exactly
+    /// once — and a later plain destroy in the same split collapses again.
+    #[test]
+    fn retained_close_leaves_a_placeholder_once() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 2);
+        s.retain_split_on_close(2);
+        assert!(!s.unpin_client(2));
+        assert_eq!(s.layout.collect_leaves().len(), 2, "placeholder kept");
+        let placeholder = s.layout.collect_leaves()[1];
+        s.focus_leaf(placeholder);
+        s.place_new_window(WA, 3);
+        assert_eq!(s.layout.leaf(placeholder).unwrap().client, Some(3));
+        assert!(s.unpin_client(3), "the mark was consumed: collapse again");
+        assert_eq!(s.layout.collect_leaves().len(), 1);
+    }
+
+    #[test]
+    fn remove_empty_leaf_refuses_occupied_and_sole() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1);
+        let occupied = s.focused_leaf_valid();
+        assert!(!s.remove_empty_leaf(occupied), "occupied split");
+        s.unpin_client(1);
+        let sole = s.focused_leaf_valid();
+        assert!(!s.remove_empty_leaf(sole), "sole placeholder");
+        let extra = s.insert_at(WA, Insert::ColEnd);
+        assert!(s.remove_empty_leaf(extra));
+    }
+
+    #[test]
+    fn remove_empty_leaf_moves_focus_to_neighbour() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1);
+        s.insert_at(WA, Insert::ColEnd);
+        assert!(s.remove_empty_leaf(s.focused_leaf_valid()));
+        assert_eq!(s.focused_client(), Some(1));
+    }
+
+    /// Focus cycling walks the strip order and wraps at the ends.
+    #[test]
+    fn focus_direction_cycles_and_wraps() {
+        let mut s = State::new();
+        for w in [1, 2, 3] {
+            s.place_new_window(WA, w);
+        }
+        assert!(s.focus_direction(true));
+        assert_eq!(s.focused_client(), Some(1), "wrapped past the end");
+        assert!(s.focus_direction(false));
+        assert_eq!(s.focused_client(), Some(3));
+    }
+
+    /// Mod4+Shift+brackets swap the focused split with its strip-order
+    /// neighbour; wrapping moves it to the far end.
+    #[test]
+    fn move_focused_split_swaps_with_neighbour() {
+        let mut s = State::new();
+        for w in [1, 2, 3] {
+            s.place_new_window(WA, w);
+        }
+        s.focus_leaf(s.layout.find_leaf_for_client(2).unwrap());
+        assert!(s.move_focused_split(WA, true));
+        assert_eq!(leaf_clients(&s), vec![Some(1), Some(3), Some(2)]);
+        assert_eq!(s.focused_client(), Some(2), "focus follows the move");
+        assert!(s.move_focused_split(WA, true), "wraps to the front");
+        assert_eq!(leaf_clients(&s), vec![Some(2), Some(1), Some(3)]);
+    }
+
+    /// Moving within a stack reorders the rows instead of leaving the
+    /// column.
+    #[test]
+    fn move_focused_split_reorders_within_a_stack() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1);
+        s.split_focused();
+        s.focus_leaf(s.layout.collect_leaves()[1]);
+        s.place_new_window(WA, 2);
+        s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
+        assert!(s.move_focused_split(WA, true));
+        assert_eq!(s.layout.ncols(), 1, "stayed one column");
+        assert_eq!(leaf_clients(&s), vec![Some(2), Some(1)]);
+    }
+
+    #[test]
+    fn toggle_minimize_refuses_the_sole_split() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1);
+        assert!(!s.toggle_minimize(s.focused_leaf_valid()));
+        s.place_new_window(WA, 2);
+        assert!(s.toggle_minimize(s.focused_leaf_valid()));
+    }
+
     #[test]
     fn split_focused_refuses_a_minimized_leaf() {
         let mut s = State::new();
-        s.split_focused(Dir::H); // two leaves, one non-root and minimizable
-        let leaves = s.tree.collect_leaves();
-        let target = leaves[1];
-        s.toggle_minimize(target);
-        s.focused_leaf = target;
-        let leaf_count_before = s.tree.collect_leaves().len();
-        assert!(!s.split_focused(Dir::V));
-        let leaves_after = s.tree.collect_leaves();
-        assert_eq!(leaves_after.len(), leaf_count_before);
-        assert!(s.tree.leaf(target).unwrap().minimized);
+        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 2);
+        s.toggle_minimize(s.focused_leaf_valid());
+        assert!(!s.split_focused());
+        assert_eq!(s.layout.collect_leaves().len(), 2);
     }
 
-    /// Repeated growing must stop once the neighbour bottoms out at
-    /// `MIN_SPLIT_FRAC`, conserving the pair's ratio sum exactly — clamping
-    /// both sides independently would let total ratio mass drift upward,
-    /// silently shrinking every other sibling via renormalisation.
+    /// A minimized leaf's window is hidden, so it can't be the focused
+    /// client; activation un-minimizes and refocuses it.
     #[test]
-    fn resize_focused_conserves_ratio_sum() {
+    fn activate_unminimizes_and_focuses() {
         let mut s = State::new();
-        s.split_focused(Dir::H);
-        s.insert_at_root(InsertAt::Index(2)); // three columns
-        s.focused_leaf = s.tree.collect_leaves()[0];
-        let sum_before: f64 = root_ratios(&s).iter().sum();
-        for _ in 0..100 {
-            s.resize_focused(theme::RESIZE_STEP);
-        }
-        let ratios = root_ratios(&s);
-        let sum_after: f64 = ratios.iter().sum();
-        assert!((sum_after - sum_before).abs() < 1e-9, "sum drifted");
-        assert!(ratios.iter().all(|&r| r >= theme::MIN_SPLIT_FRAC - 1e-9));
-        // Once the neighbour is at its floor, further growth is refused.
-        assert!(!s.resize_focused(theme::RESIZE_STEP));
-    }
-
-    /// Collapsing a binary branch must dissolve a same-direction sibling
-    /// branch into the grandparent (`Tree::flatten_same_dir`): nested
-    /// same-dir branches demote their gaps from root-level boundaries,
-    /// losing the "+" insert buttons between visually root-level columns.
-    #[test]
-    fn collapse_flattens_same_dir_branches() {
-        let mut s = State::new();
-        s.split_focused(Dir::H); // root H[a, b]
-        s.split_focused(Dir::V); // a -> V[a1, a2]
-        s.split_focused(Dir::H); // a1 -> H[x1, x2]
-        let leaves = s.tree.collect_leaves(); // x1, x2, a2, b
-        assert_eq!(leaves.len(), 4);
-        s.focused_leaf = leaves[2]; // a2
-        assert!(s.close_focused());
-        // The V-branch collapses; H[x1, x2] splices into the root H-branch
-        // and must flatten into it: one H-branch, three leaf children.
-        {
-            let b = s.tree.branch(s.tree.root).expect("root not a branch");
-            assert_eq!(b.dir, Dir::H, "root not an H-branch");
-            assert_eq!(b.children().len(), 3, "nested same-dir branch survived");
-            let ratio_sum: f64 = b.children().iter().map(|c| c.ratio).sum();
-            assert!((ratio_sum - 1.0).abs() < 1e-9);
-            for c in b.children() {
-                assert!(s.tree.is_leaf(c.node));
-            }
-        }
-        // Focus landed on a surviving leaf, and every root-level gap is
-        // insert-eligible again.
-        assert!(s.tree.is_leaf(s.focused_leaf));
-        s.update_canvas(WA, 0);
-        assert!(s.boundaries(WA).iter().all(|b| b.root));
-    }
-
-    /// Closing a split whose window moves into an empty sibling must carry
-    /// the displaced-window memory (`Leaf::prev`) with it, so popup-restore
-    /// survives the collapse.
-    #[test]
-    fn close_focused_carries_prev_to_sibling() {
-        let mut s = State::new();
-        s.pin_client(1);
-        s.split_focused(Dir::H); // window 1 stays in the focused child
-        s.pin_client(2); // displaces 1 -> stash, prev = 1
-        assert!(s.close_focused()); // 2 moves into the empty sibling
+        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 2);
+        let l2 = s.layout.find_leaf_for_client(2).unwrap();
+        s.toggle_minimize(l2);
+        assert_eq!(s.focused_client(), None, "minimized leaf shows nothing");
+        assert_eq!(s.activate_client(2), Activation::Unminimized);
         assert_eq!(s.focused_client(), Some(2));
-        s.unpin_client(2); // popup dies: 1 must come back
-        assert_eq!(
-            s.focused_client(),
-            Some(1),
-            "prev restore survives collapse"
-        );
+        assert_eq!(s.activate_client(2), Activation::Unchanged);
     }
 
-    /// Closing a middle column moves focus to a surviving neighbour.
+    /// Growing a lone column widens only that column; the strip follows.
     #[test]
-    fn close_focused_moves_focus_to_neighbour() {
+    fn resize_focused_lone_column_moves_only_the_strip() {
         let mut s = State::new();
-        s.split_focused(Dir::H); // two columns, focus left
-        s.insert_at_root(InsertAt::Index(1)); // middle column, focused
-        assert_eq!(s.tree.collect_leaves().len(), 3);
-        assert!(s.close_focused());
-        let leaves = s.tree.collect_leaves();
-        assert_eq!(leaves.len(), 2);
-        assert!(leaves.contains(&s.focused_leaf_valid()));
-    }
-
-    /// Canvas width demand is measured in columns: vertical stacking must
-    /// not increase `h_units`, horizontal splitting must.
-    #[test]
-    fn h_units_counts_columns_not_leaves() {
-        let mut s = State::new();
-        assert_eq!(s.tree.h_units(), 1);
-        for _ in 0..3 {
-            s.split_focused(Dir::V);
+        for w in [1, 2] {
+            s.place_new_window(WA, w);
         }
-        assert_eq!(s.tree.collect_leaves().len(), 4);
-        assert_eq!(s.tree.h_units(), 1, "a vertical stack is one column");
-        s.split_focused(Dir::H);
-        assert_eq!(s.tree.h_units(), 2);
+        let l1 = s.layout.find_leaf_for_client(1).unwrap();
+        let before = s.compute(WA);
+        let strip = s.canvas_w(WA);
+        assert!(s.resize_focused(WA, true));
+        let after = s.compute(WA);
+        assert_eq!(before[&l1].w, after[&l1].w, "neighbour untouched");
+        let l2 = s.layout.find_leaf_for_client(2).unwrap();
+        let grown = after[&l2].w - before[&l2].w;
+        assert!(grown > 0);
+        assert_eq!(s.canvas_w(WA), strip + grown);
     }
 
-    /// `parent_map` must agree with `find_parent` for every node.
+    /// Growing a stacked split trades height with its row neighbour; the
+    /// pair's sum is conserved.
     #[test]
-    fn parent_map_matches_find_parent() {
+    fn resize_focused_stacked_conserves_the_pair() {
         let mut s = State::new();
-        s.split_focused(Dir::H);
-        s.split_focused(Dir::V);
-        s.insert_at_root(InsertAt::Index(0));
-        let map = s.tree.parent_map();
-        for leaf in s.tree.collect_leaves() {
-            assert_eq!(map.get(&leaf).copied(), s.tree.find_parent(leaf));
+        s.place_new_window(WA, 1);
+        s.split_focused();
+        let rows = s.layout.collect_leaves();
+        s.focus_leaf(rows[0]);
+        let before = s.compute(WA);
+        let pair = before[&rows[0]].h + before[&rows[1]].h;
+        assert!(s.resize_focused(WA, true));
+        let after = s.compute(WA);
+        assert!(after[&rows[0]].h > before[&rows[0]].h);
+        assert_eq!(after[&rows[0]].h + after[&rows[1]].h, pair);
+    }
+
+    /// A row-gap drag preserves the two rows' combined height.
+    #[test]
+    fn resize_gap_preserves_row_sum() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1);
+        s.split_focused();
+        let rows = s.layout.collect_leaves();
+        let before = s.compute(WA);
+        let pair = before[&rows[0]].h + before[&rows[1]].h;
+        s.resize_gap(GapAt::Row { col: 0, idx: 0 }, pair / 4, pair);
+        let after = s.compute(WA);
+        assert_eq!(after[&rows[0]].h + after[&rows[1]].h, pair);
+        assert!(after[&rows[0]].h < before[&rows[0]].h);
+    }
+
+    /// A column-gap drag sets the left column's width; the right neighbour
+    /// keeps its width and slides.
+    #[test]
+    fn resize_gap_col_moves_only_the_left_column() {
+        let mut s = State::new();
+        for w in [1, 2] {
+            s.place_new_window(WA, w);
         }
+        let l1 = s.layout.find_leaf_for_client(1).unwrap();
+        let l2 = s.layout.find_leaf_for_client(2).unwrap();
+        let before = s.compute(WA);
+        s.resize_gap(GapAt::Col(0), before[&l1].w + 100, 0);
+        let after = s.compute(WA);
+        assert_eq!(after[&l1].w, before[&l1].w + 100);
+        assert_eq!(after[&l2].w, before[&l2].w);
+        assert_eq!(after[&l2].x, before[&l2].x + 100, "right column slides");
     }
 
-    /// An edge resize must not rewrite a minimized column's ratio from its
-    /// pinned pixel width, or un-minimizing after an edge drag would restore
-    /// the column as a sliver of its former share; dragging an end column
-    /// that is itself minimized is refused outright.
     #[test]
-    fn resize_edge_leaves_minimized_ratio_alone() {
+    fn resize_edge_shrinks_lone_leaf() {
         let mut s = State::new();
-        s.split_focused(Dir::H);
-        s.insert_at_root(InsertAt::Index(2)); // three columns
-        s.update_canvas(WA, 0);
-        let leaves = s.tree.collect_leaves();
-        s.toggle_minimize(leaves[1]); // middle column pinned to `gap` px
-        let ratio_before = root_ratios(&s)[1];
-        let (_, w) = s.edge_span(WA, false).unwrap();
-        assert_eq!(s.resize_edge(WA, false, w - 40), -40);
-        let ratios = root_ratios(&s);
-        assert!(
-            (ratios[1] - ratio_before).abs() < 1e-9,
-            "minimized column's ratio was rewritten from its pinned width"
-        );
-        // Minimize the right end column: dragging that edge is refused.
-        s.toggle_minimize(leaves[1]);
-        s.toggle_minimize(leaves[2]);
+        s.place_new_window(WA, 1);
+        let target = WA.w / 2;
+        let delta = s.resize_edge(WA, false, target);
+        assert!(delta < 0);
+        let l1 = s.layout.find_leaf_for_client(1).unwrap();
+        assert_eq!(s.compute(WA)[&l1].w, target);
+        assert!(s.canvas_w(WA) < WA.w, "wallpaper margin appears");
+    }
+
+    #[test]
+    fn resize_edge_grows_left_column_and_strip() {
+        let mut s = State::new();
+        for w in [1, 2] {
+            s.place_new_window(WA, w);
+        }
+        let strip = s.canvas_w(WA);
+        let (_, w0) = s.edge_span(WA, true).unwrap();
+        let delta = s.resize_edge(WA, true, w0 + 150);
+        assert_eq!(delta, 150);
+        assert_eq!(s.canvas_w(WA), strip + 150);
+        let l2 = s.layout.find_leaf_for_client(2).unwrap();
+        let widths = s.layout.widths(WA.w, GAP);
+        assert_eq!(widths[0], w0 + 150);
+        assert_eq!(s.compute(WA)[&l2].w, widths[1], "right column untouched");
+    }
+
+    #[test]
+    fn resize_edge_leaves_minimized_column_alone() {
+        let mut s = State::new();
+        for w in [1, 2] {
+            s.place_new_window(WA, w);
+        }
+        s.toggle_minimize(s.focused_leaf_valid()); // rightmost pinned
         assert_eq!(s.resize_edge(WA, false, 500), 0);
     }
 
-    /// Same as above, mirrored for the right edge (shrinking instead).
+    /// The "+" buttons: a column insert focuses a fresh placeholder at the
+    /// gap; a row insert grows that stack.
     #[test]
-    fn resize_edge_shrinks_right_column_and_canvas() {
+    fn insert_at_places_and_focuses() {
         let mut s = State::new();
-        s.split_focused(Dir::H);
-        s.update_canvas(WA, 0);
-        let canvas_w_before = s.canvas_w(WA);
-
-        let before = s.compute(WA);
-        let leaves = s.tree.collect_leaves();
-        let (left_id, right_id) = (leaves[0], leaves[1]);
-        let left_w_before = before[&left_id].w;
-        let right_w_before = before[&right_id].w;
-
-        let shrink_by = 30;
-        let applied = s.resize_edge(WA, false, right_w_before - shrink_by);
-        assert_eq!(applied, -shrink_by);
-        assert_eq!(s.canvas_w_extra, -shrink_by);
-
-        s.update_canvas(WA, 0);
-        assert_eq!(s.canvas_w(WA), canvas_w_before - shrink_by);
-        let after = s.compute(WA);
-        assert_eq!(after[&right_id].w, right_w_before - shrink_by);
-        assert_eq!(after[&left_id].w, left_w_before);
+        for w in [1, 2] {
+            s.place_new_window(WA, w);
+        }
+        s.insert_at(WA, Insert::Col(1));
+        assert_eq!(leaf_clients(&s), vec![Some(1), None, Some(2)]);
+        assert_eq!(s.focused_client(), None);
+        s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
+        s.split_focused();
+        s.insert_at(WA, Insert::Row { col: 0, idx: 0 });
+        assert_eq!(s.layout.col_len(0), 3);
+        assert_eq!(
+            s.layout.locate(s.focused_leaf_valid()),
+            Some(Pos { col: 0, row: 1 })
+        );
     }
 
-    /// A left-edge shrink compensates with `shift_scroll`, taking the
-    /// scroll negative — the wallpaper margin left of the canvas. That
-    /// margin must survive `update_canvas` (run on every arrange, i.e.
-    /// every hover repaint) and close only at `clamp_scroll`.
+    /// The ⊞ button's wide-window action: a fresh focused column right of
+    /// the focused one, even from inside a stack.
     #[test]
-    fn left_edge_margin_survives_update_canvas() {
+    fn open_column_right_lands_beside_the_stack() {
         let mut s = State::new();
-        s.split_focused(Dir::H);
-        s.update_canvas(WA, 0);
-
-        let (_, w) = s.edge_span(WA, true).expect("two columns");
-        let shrink_by = 50;
-        let applied = s.resize_edge(WA, true, w - shrink_by);
-        assert_eq!(applied, -shrink_by);
-        s.shift_scroll(applied);
-
-        s.update_canvas(WA, 0);
-        assert_eq!(s.scroll_x(), -shrink_by);
-
-        s.clamp_scroll(WA, 0);
-        assert_eq!(s.scroll_x(), 0);
+        s.place_new_window(WA, 1);
+        s.place_new_window(WA, 2);
+        s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
+        s.split_focused();
+        let new = s.open_column_right(WA);
+        assert_eq!(s.layout.locate(new), Some(Pos { col: 1, row: 0 }));
+        assert_eq!(s.focused_leaf_valid(), new);
     }
 
-    /// A right-edge shrink narrows the canvas under an unmoved scroll;
-    /// when the canvas was scrolled to its end this leaves the scroll past
-    /// `max_scroll` — the on-screen margin at the dragged edge. Same
-    /// lifetime as the left margin: arranges keep it, `clamp_scroll` ends
-    /// it.
-    #[test]
-    fn right_edge_margin_survives_update_canvas() {
-        let mut s = State::new();
-        // Enough columns to out-span the viewport and open scroll room.
-        s.split_focused(Dir::H);
-        s.split_focused(Dir::H);
-        s.split_focused(Dir::H);
-        s.update_canvas(WA, 0);
-        let max_before = s.max_scroll(WA);
-        assert!(max_before > 0, "canvas should out-span the viewport");
-        s.scroll_to(WA, i32::MAX);
-        s.land_scroll();
-        assert_eq!(s.scroll_x(), max_before);
+    // --- scroll behavior ---
 
-        let (_, w) = s.edge_span(WA, false).expect("four columns");
-        let shrink_by = 60;
-        let applied = s.resize_edge(WA, false, w - shrink_by);
-        assert_eq!(applied, -shrink_by);
-
-        s.update_canvas(WA, 0);
-        assert_eq!(s.max_scroll(WA), max_before - shrink_by);
-        assert_eq!(s.scroll_x(), s.max_scroll(WA) + shrink_by);
-
-        s.clamp_scroll(WA, 0);
-        assert_eq!(s.scroll_x(), s.max_scroll(WA));
-    }
-
-    /// Repeated stepping must monotonically close the distance to the
-    /// target and report `true` (still animating) until it arrives.
     #[test]
     fn step_scroll_approaches_target() {
         let mut s = State::new();
-        s.split_focused(Dir::H);
-        s.split_focused(Dir::H);
-        s.split_focused(Dir::H);
-        s.update_canvas(WA, 0);
-        let max = s.max_scroll(WA);
-        assert!(max > 0, "canvas should out-span the viewport");
-        s.scroll_to(WA, max);
-        assert!(s.scroll_animating());
-
-        let mut prev = s.scroll_x();
-        let mut still_going = true;
-        for _ in 0..1000 {
-            still_going = s.step_scroll();
-            let cur = s.scroll_x();
-            assert!(cur >= prev, "scroll must move monotonically toward target");
-            prev = cur;
-            if !still_going {
-                break;
-            }
+        for w in [1, 2, 3, 4, 5] {
+            s.place_new_window(WA, w);
         }
-        assert!(!still_going, "glide must terminate");
-        assert_eq!(s.scroll_x(), max);
-        assert!(!s.scroll_animating());
+        s.scroll_to(WA, 200);
+        assert!(s.step_scroll());
+        assert!(s.scroll_x() > 0 && s.scroll_x() < 200);
     }
 
-    /// A target within `SCROLL_SNAP_PX` of the current offset lands in a
-    /// single step rather than crawling the last pixel forever.
     #[test]
     fn step_scroll_snaps_within_threshold() {
         let mut s = State::new();
-        s.split_focused(Dir::H);
-        s.split_focused(Dir::H);
-        s.split_focused(Dir::H);
-        s.update_canvas(WA, 0);
-        let max = s.max_scroll(WA);
-        assert!(max >= 1, "need scroll room for this test");
-        s.scroll_to(WA, max - 1);
-        s.land_scroll();
-        s.scroll_to(WA, max);
-        assert!(s.scroll_animating(), "not yet landed on the target");
-        let still_animating = s.step_scroll();
-        assert_eq!(s.scroll_x(), max, "1px remainder must snap in one step");
-        assert!(!still_animating);
+        for w in [1, 2, 3, 4, 5] {
+            s.place_new_window(WA, w);
+        }
+        s.scroll_to(WA, 1);
+        assert!(!s.step_scroll(), "snapped: glide over");
+        assert_eq!(s.scroll_x(), 1);
     }
 
-    /// Retargeting mid-glide (fresh scroll input) must re-aim smoothly
-    /// rather than restart or overshoot toward the abandoned target.
     #[test]
     fn step_scroll_moving_target_reaims() {
         let mut s = State::new();
-        for _ in 0..4 {
-            s.split_focused(Dir::H);
+        for w in [1, 2, 3, 4, 5] {
+            s.place_new_window(WA, w);
         }
-        s.update_canvas(WA, 0);
-        let max = s.max_scroll(WA);
-        assert!(max >= 40, "need scroll room for this test");
-        s.scroll_to(WA, max);
-        for _ in 0..3 {
-            s.step_scroll();
-        }
-        assert!(s.scroll_animating(), "should still be gliding");
-        // New input re-aims at a nearer target before the old one lands.
+        s.scroll_to(WA, 200);
+        s.step_scroll();
+        let mid = s.scroll_x();
         s.scroll_to(WA, 0);
-        assert_eq!(s.scroll_target, 0);
-        let before = s.scroll_x();
-        assert!(before > 0, "glide should have made progress toward max");
-        while s.step_scroll() {}
-        assert_eq!(s.scroll_x(), 0);
+        s.step_scroll();
+        assert!(s.scroll_x() < mid, "glide re-aims at the new target");
     }
 
-    /// Edge-drag scroll compensation (`shift_scroll`) stays an exact,
-    /// instant shift of both offsets together — it must never leave a drag
-    /// gliding underneath the pointer, so it's unaffected by the glide
-    /// machinery entirely.
     #[test]
     fn shift_scroll_stays_exact_not_a_glide() {
         let mut s = State::new();
-        // Fresh state: both offsets start at 0.
-        assert!(!s.scroll_animating());
-        s.shift_scroll(-30);
-        // Both offsets move together by exactly `delta`; no glide opens up.
-        assert_eq!(s.scroll_x(), -30);
-        assert_eq!(s.scroll_target, -30);
-        assert!(!s.scroll_animating());
+        s.shift_scroll(-40);
+        assert_eq!(s.scroll_x(), -40);
+        assert!(!s.scroll_animating(), "both offsets moved together");
+    }
+
+    /// `ensure_in_view` scrolls a focused off-viewport column into view.
+    #[test]
+    fn ensure_in_view_reaches_the_focused_column() {
+        let mut s = State::new();
+        for w in [1, 2, 3, 4, 5, 6] {
+            s.place_new_window(WA, w);
+        }
+        s.land_scroll();
+        s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
+        s.ensure_in_view(WA);
+        s.land_scroll();
+        let l1 = s.layout.find_leaf_for_client(1).unwrap();
+        let geo = s.compute(WA)[&l1];
+        assert!(geo.x - s.scroll_x() >= WA.x, "left edge visible");
+    }
+
+    /// clamp_scroll never strands the viewport past shrunken content, but
+    /// an in-range scroll survives it untouched.
+    #[test]
+    fn clamp_scroll_pulls_back_into_range() {
+        let mut s = State::new();
+        for w in [1, 2, 3, 4, 5] {
+            s.place_new_window(WA, w);
+        }
+        let max = s.max_scroll(WA);
+        assert!(max > 0);
+        s.scroll_to(WA, max);
+        s.land_scroll();
+        while s.layout.collect_leaves().len() > 1 {
+            let last = *s.layout.collect_leaves().last().unwrap();
+            let win = s.layout.leaf(last).unwrap().client.unwrap();
+            s.unpin_client(win);
+            s.clamp_scroll(WA, 0);
+        }
+        assert_eq!(s.scroll_x(), 0, "single column: nothing to scroll");
     }
 }

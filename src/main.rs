@@ -11,6 +11,8 @@ mod backend;
 mod comp;
 mod icon;
 mod launch;
+#[allow(dead_code)]
+mod layout;
 mod notify;
 mod oklch;
 #[allow(dead_code)]
@@ -20,8 +22,6 @@ mod shell;
 mod state;
 #[allow(dead_code)]
 mod theme;
-#[allow(dead_code)]
-mod tree;
 mod widgets;
 
 /// A `pixel-graphics` palette index, threaded through as the accent-colour

@@ -5,15 +5,14 @@
 //! only Wayland adaptation is that clients are represented by `(Win, class)`
 //! pairs instead of the X11 `Client` struct.
 
-use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::state::{InsertAt, State};
+use crate::layout::{Boundary, Dir, GapAt, Layout, NodeId, Rect, Win};
+use crate::state::{Insert, State};
 use crate::theme;
-use crate::tree::{Boundary, Dir, NodeId, Rect, Tree, Win};
 
-/// Screen-space rect; the same shape as canvas-space `tree::Rect`, aliased
-/// so signatures can still say which space they mean.
+/// Screen-space rect; the same shape as canvas-space `layout::Rect`,
+/// aliased so signatures can still say which space they mean.
 pub type FrameRect = Rect;
 
 /// One on-screen leaf's placement for an arrange: its screen-space frame
@@ -50,7 +49,7 @@ pub const fn plus_rect(vis_x: i32, y: i32) -> FrameRect {
 #[derive(Default)]
 pub struct Widgets {
     pub handle_regions: Vec<(FrameRect, Boundary)>,
-    pub plus_regions: Vec<(FrameRect, InsertAt)>,
+    pub plus_regions: Vec<(FrameRect, Insert)>,
     /// Quick-launch icons in the bottom taskbar (after the window tiles),
     /// paired with their quick-slot index; entries hidden by their
     /// `ShowWhen` rule get no region.
@@ -105,55 +104,76 @@ pub enum BtnKind {
     Close,
 }
 
-/// A bottom-bar tile with its window and accent/visibility resolved once at
-/// compute time, so per-frame compositing needs no tree walks.
+/// A bottom-bar tile with its window and accent resolved once at compute
+/// time, so per-frame compositing needs no tree walks. Tiles mirror the
+/// splits one-to-one, in the same left-to-right (depth-first) order.
 #[derive(Clone, Copy)]
 pub struct TaskTile {
     pub rect: FrameRect,
     /// The close ("x") badge in the tile's bottom-right corner; hit-tested
-    /// before `rect` so it wins the click.
+    /// before `rect` so it wins the click. Closes only the window, leaving
+    /// its split as an empty placeholder (unlike the titlebar close).
     pub close: FrameRect,
     pub win: Win,
+    /// The split showing this window — every taskbar'd window has one.
+    /// Both the accent below and drag-drop targeting resolve through it.
+    pub leaf: NodeId,
     pub accent: crate::Index,
-    /// Whether the window occupies a split (drives the accent highlight).
-    /// Deliberately not "on screen": a split scrolled out of the viewport
-    /// still counts.
-    pub in_split: bool,
 }
 
 /// Per-leaf metadata driving the split-control buttons' icons/enabled state.
 #[derive(Clone, Copy)]
 pub struct LeafMeta {
-    pub parent_dir: Option<Dir>,
-    pub wider: bool,
-    pub can_split: bool,
+    /// Whether the split shares its column with other rows: it minimizes
+    /// to a horizontal strip, and its ⊞ always stacks below.
+    pub stacked: bool,
+    /// The strip's one guaranteed split: it can't be closed (when empty)
+    /// or minimized.
+    pub sole: bool,
+    /// What the split's ⊞ button does. `None` disables the button (a
+    /// too-short lone split can neither stack nor claim a preference);
+    /// `Dir::H` opens a new column right of this one, `Dir::V` stacks an
+    /// empty split below. A stacked split always stacks; a lone one goes
+    /// by shape — wide opens a column, tall stacks. Right-click flips
+    /// where the flipped action is possible.
+    pub split_dir: Option<Dir>,
     pub minimized: bool,
+    /// Whether the leaf shows a window. Close always works on an occupied
+    /// split (it closes the window; the split follows on its death); only
+    /// an empty sole placeholder has nothing to close.
+    pub occupied: bool,
 }
 
-/// Parent direction / split-eligibility metadata used to choose each
+/// Position / split-eligibility metadata used to choose each
 /// split-control button's icon and enabled state.
-pub fn leaf_meta(
-    tree: &Tree,
-    parent: Option<(NodeId, usize)>,
-    leaf: NodeId,
-    frame: FrameRect,
-) -> LeafMeta {
-    let parent_dir = parent.and_then(|(p, _)| tree.branch(p).map(|b| b.dir));
-    let wider = frame.w >= frame.h;
-    let split_dir = if wider { Dir::H } else { Dir::V };
+pub fn leaf_meta(layout: &Layout, leaf: NodeId, frame: FrameRect) -> LeafMeta {
+    let stacked = layout.stacked(leaf);
+    let can_stack = theme::stack_fits(frame.h);
+    let split_dir = if stacked || frame.w < frame.h {
+        // A stacked split only ever stacks further; a tall lone one
+        // prefers stacking too. Opening a column needs no room, so it is
+        // never the *disabled* fallback — only a too-short stack target
+        // disables the button.
+        can_stack.then_some(Dir::V)
+    } else {
+        Some(Dir::H)
+    };
+    let leaf = layout.leaf(leaf);
     LeafMeta {
-        parent_dir,
-        wider,
-        can_split: theme::split_fits(split_dir, frame.w, frame.h),
-        minimized: tree.leaf(leaf).is_some_and(|l| l.minimized),
+        stacked,
+        sole: layout.sole_split(),
+        split_dir,
+        minimized: leaf.is_some_and(|l| l.minimized),
+        occupied: leaf.is_some_and(|l| l.client.is_some()),
     }
 }
 
 /// Each split's persistent accent palette index, stored on the leaf so it
 /// survives splits and closes; palette-swaps the bitmap window border and
 /// colours the bottom-bar highlight.
-pub fn leaf_color_index(tree: &Tree, leaf: NodeId) -> crate::Index {
-    tree.leaf(leaf)
+pub fn leaf_color_index(layout: &Layout, leaf: NodeId) -> crate::Index {
+    layout
+        .leaf(leaf)
         .map_or(theme::FALLBACK_ACCENT_INDEX, |l| l.color)
 }
 
@@ -163,19 +183,19 @@ pub fn label_from_class(class: &str) -> char {
     class.chars().next().map_or('?', |c| c.to_ascii_uppercase())
 }
 
-/// Lay out the bottom bar's tiles: one per managed window (in stable
-/// `bar_order`) across the full screen width. Each tile's accent colour and
-/// in-split flag are resolved here, once per arrange, so the per-frame
-/// compositor needs no tree walks. `clients` pairs each managed window with
-/// its class string (for the quick-launch `ShowWhen` rules).
+/// Lay out the bottom bar's tiles: one per shown window, in `bar_order` —
+/// the splits' own depth-first order, so the bar always reads left-to-right
+/// like the canvas — across the full screen width. Each tile's accent
+/// colour is resolved here, once per arrange, so the per-frame compositor
+/// needs no tree walks. `clients` pairs each managed window with its class
+/// string (for the quick-launch `ShowWhen` rules).
 pub fn compute_taskbar(
     widgets: &mut Widgets,
-    tree: &Tree,
+    layout: &Layout,
     clients: &[(Win, String)],
     quick: &[QuickSlot],
-    bar_order: &[Win],
+    bar_order: &[(Win, NodeId)],
     wa: Rect,
-    leaves: &[NodeId],
 ) {
     let gap = theme::TASKBAR_GAP;
     let isz = theme::TASKBAR_ICON;
@@ -223,23 +243,12 @@ pub fn compute_taskbar(
     } else {
         full_stride
     };
-    // One pass over the caller's already-collected leaves for every tile's
-    // leaf lookup, rather than a second `collect_leaves` tree walk here —
-    // `find_leaf_for_client` per tile would be O(tiles × tree) on a
-    // per-arrange path.
-    let mut client_leaf = HashMap::new();
-    for &l in leaves {
-        if let Some(c) = tree.leaf(l).and_then(|lf| lf.client) {
-            client_leaf.insert(c, l);
-        }
-    }
     let mut x = left;
     let mut tiles = Vec::with_capacity(bar_order.len());
-    for &win in bar_order {
+    for &(win, leaf) in bar_order {
         // Even at minimum stride a pathological window count can run
         // past the edge; pin the excess at the right rather than lose it.
         let tx = x.min(right - isz);
-        let leaf = client_leaf.get(&win).copied();
         tiles.push(TaskTile {
             rect: FrameRect {
                 x: tx,
@@ -257,8 +266,8 @@ pub fn compute_taskbar(
                 h: cbs,
             },
             win,
-            accent: leaf.map_or(theme::palette_color::CREAM, |l| leaf_color_index(tree, l)),
-            in_split: leaf.is_some(),
+            leaf,
+            accent: leaf_color_index(layout, leaf),
         });
         x += stride;
     }
@@ -291,11 +300,11 @@ pub fn compute_taskbar(
 }
 
 /// Per-leaf titlebar hit-rects and split-control buttons.
-pub fn compute_leaf_widgets(widgets: &mut Widgets, tree: &Tree, placed: &[Placement]) {
+pub fn compute_leaf_widgets(widgets: &mut Widgets, layout: &Layout, placed: &[Placement]) {
     let tb_h = theme::tb_h();
     let bw = theme::BORDER_LEFT;
     for p in placed {
-        let leaf = tree.leaf(p.leaf);
+        let leaf = layout.leaf(p.leaf);
         let has_client = leaf.is_some_and(|l| l.client.is_some());
         let minimized = leaf.is_some_and(|l| l.minimized);
         if has_client && !minimized {
@@ -365,45 +374,53 @@ fn compute_btn_regions(widgets: &mut Widgets, p: &Placement, minimized: bool) {
 }
 
 /// Gap resize handles, boundary "+" buttons, and edge insert buttons.
+/// Every gap gets a "+": a column gap inserts a new column there, a stack
+/// gap inserts a new row into that stack.
 pub fn compute_boundary_widgets(widgets: &mut Widgets, state: &State, wa: Rect) {
     let gap = theme::GAP;
     let hw = (gap - HANDLE_INSET).max(4);
     let scroll_x = state.scroll_x();
     let canvas_w = state.canvas_w(wa);
     for b in state.boundaries(wa) {
-        let rect = if b.dir == Dir::H {
-            // Vertical gap between columns: a full-height pill dragged
-            // along x (scrolls with the canvas).
-            let vis_x = b.pos - scroll_x;
-            if vis_x + hw / 2 <= wa.x || vis_x - hw / 2 >= wa.x + wa.w {
-                continue;
+        match b.at {
+            GapAt::Col(idx) => {
+                // Vertical gap between columns: a full-height pill dragged
+                // along x (scrolls with the canvas).
+                let vis_x = b.pos - scroll_x;
+                if vis_x + hw / 2 <= wa.x || vis_x - hw / 2 >= wa.x + wa.w {
+                    continue;
+                }
+                let rect = FrameRect {
+                    x: vis_x - hw / 2,
+                    y: b.cross,
+                    w: hw,
+                    h: b.cross_len.max(1),
+                };
+                widgets.handle_regions.push((rect, b));
+                let py = b.cross + (b.cross_len - PLUS_SZ) / 2;
+                widgets
+                    .plus_regions
+                    .push((plus_rect(vis_x, py), Insert::Col(idx + 1)));
             }
-            FrameRect {
-                x: vis_x - hw / 2,
-                y: b.cross,
-                w: hw,
-                h: b.cross_len.max(1),
+            GapAt::Row { col, idx } => {
+                // Horizontal gap between stacked rows: a full-width strip
+                // dragged along y.
+                let vis_x = b.cross - scroll_x;
+                if vis_x + b.cross_len <= wa.x || vis_x >= wa.x + wa.w {
+                    continue;
+                }
+                let rect = FrameRect {
+                    x: vis_x,
+                    y: b.pos - hw / 2,
+                    w: b.cross_len.max(1),
+                    h: hw,
+                };
+                widgets.handle_regions.push((rect, b));
+                widgets.plus_regions.push((
+                    plus_rect(vis_x + b.cross_len / 2, b.pos - PLUS_SZ / 2),
+                    Insert::Row { col, idx },
+                ));
             }
-        } else {
-            // Horizontal gap between stacked rows: a full-width strip
-            // dragged along y.
-            let vis_x = b.cross - scroll_x;
-            if vis_x + b.cross_len <= wa.x || vis_x >= wa.x + wa.w {
-                continue;
-            }
-            FrameRect {
-                x: vis_x,
-                y: b.pos - hw / 2,
-                w: b.cross_len.max(1),
-                h: hw,
-            }
-        };
-        widgets.handle_regions.push((rect, b));
-        if b.root && b.dir == Dir::H {
-            let py = b.cross + (b.cross_len - PLUS_SZ) / 2;
-            widgets
-                .plus_regions
-                .push((plus_rect(b.pos - scroll_x, py), InsertAt::Index(b.idx + 1)));
         }
     }
     compute_edge_plus_buttons(widgets, wa, scroll_x, canvas_w, gap);
@@ -457,8 +474,8 @@ fn compute_edge_plus_buttons(
     let span_h = (wa.h - 2 * gap).max(PLUS_SZ);
     let edge_cy = wa.y + gap + (span_h - PLUS_SZ) / 2;
     for (canvas_x, at) in [
-        (wa.x + gap / 2, InsertAt::Index(0)),
-        (wa.x + canvas_w - gap / 2, InsertAt::End),
+        (wa.x + gap / 2, Insert::Col(0)),
+        (wa.x + canvas_w - gap / 2, Insert::ColEnd),
     ] {
         let vis_x = canvas_x - scroll_x;
         if vis_x < wa.x || vis_x > wa.x + wa.w {
@@ -471,7 +488,6 @@ fn compute_edge_plus_buttons(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::Dir;
 
     const WA: Rect = Rect {
         x: 0,
@@ -481,7 +497,7 @@ mod tests {
     };
 
     fn placement(state: &State, wa: Rect) -> Vec<Placement> {
-        let leaves = state.tree.collect_leaves();
+        let leaves = state.layout.collect_leaves();
         let geos = state.compute(wa);
         let focused = state.focused_leaf_valid();
         leaves
@@ -496,7 +512,7 @@ mod tests {
                         w: geo.w.max(1),
                         h: geo.h.max(1),
                     },
-                    active_client: state.tree.leaf(leaf).and_then(|l| l.client),
+                    active_client: state.layout.leaf(leaf).and_then(|l| l.client),
                     focused: focused == leaf,
                 })
             })
@@ -520,39 +536,57 @@ mod tests {
         assert!(lefts.contains(&true) && lefts.contains(&false));
     }
 
-    /// Regardless of how many root-level columns exist, there are always
-    /// exactly two edge handles (left margin, right margin) — not one per
-    /// column.
+    /// Three narrow columns that all fit inside the viewport, so no
+    /// handle is culled as off-screen.
+    fn three_visible_columns() -> State {
+        let mut s = State::new();
+        s.insert_at(WA, Insert::ColEnd);
+        s.insert_at(WA, Insert::Col(1));
+        for col in 0..3 {
+            s.layout.set_col_width(col, 300);
+        }
+        s
+    }
+
+    /// Regardless of how many columns exist, there are always exactly two
+    /// edge handles (left margin, right margin) — not one per column.
     #[test]
     fn edge_handles_stay_at_exactly_two_with_more_columns() {
-        let mut s = State::new();
-        s.split_focused(Dir::H);
-        s.insert_at_root(InsertAt::Index(1));
+        let s = three_visible_columns();
         let mut widgets = Widgets::default();
         compute_boundary_widgets(&mut widgets, &s, WA);
         assert_eq!(widgets.edge_handle_regions.len(), 2);
     }
 
+    /// Every gap gets one handle and one "+" button — column gaps and
+    /// stack gaps alike.
     #[test]
-    fn one_boundary_handle_per_gap_between_columns() {
-        let mut s = State::new();
-        s.split_focused(Dir::H); // 2 columns -> 1 gap
-        s.insert_at_root(InsertAt::Index(1)); // 3 columns -> 2 gaps
+    fn one_handle_and_plus_per_gap() {
+        let mut s = three_visible_columns(); // 3 columns -> 2 gaps
+        s.split_focused(); // a stack -> 1 more gap
         let mut widgets = Widgets::default();
         compute_boundary_widgets(&mut widgets, &s, WA);
-        assert_eq!(widgets.handle_regions.len(), 2);
+        assert_eq!(widgets.handle_regions.len(), 3);
+        let row_plus = widgets
+            .plus_regions
+            .iter()
+            .filter(|(_, at)| matches!(at, Insert::Row { .. }))
+            .count();
+        // Two column gaps + two edge buttons + one stack gap.
+        assert_eq!((widgets.plus_regions.len(), row_plus), (5, 1));
     }
 
     #[test]
     fn taskbar_stride_never_overlaps_within_available_width() {
-        let tree = crate::tree::Tree::new();
+        let layout = Layout::new();
+        let leaf = layout.first_leaf();
         let clients: Vec<(Win, String)> = Vec::new();
         // A pathological number of windows: the stride must compress
         // (clamped at a floor of 10px) rather than run tiles off-screen or
         // silently drop any of them.
-        let bar_order: Vec<Win> = (0..200).collect();
+        let bar_order: Vec<(Win, NodeId)> = (0..200).map(|w| (w, leaf)).collect();
         let mut widgets = Widgets::default();
-        compute_taskbar(&mut widgets, &tree, &clients, &[], &bar_order, WA, &[]);
+        compute_taskbar(&mut widgets, &layout, &clients, &[], &bar_order, WA);
         assert_eq!(
             widgets.taskbar_regions.len(),
             200,
@@ -569,7 +603,7 @@ mod tests {
 
     #[test]
     fn quick_launch_hidden_when_its_class_is_running() {
-        let tree = crate::tree::Tree::new();
+        let layout = Layout::new();
         let clients: Vec<(Win, String)> = vec![(1 as Win, "Firefox".to_string())];
         let quick = [QuickSlot {
             cmd: "firefox".into(),
@@ -578,7 +612,7 @@ mod tests {
             show: theme::ShowWhen::UnlessRunning("firefox"),
         }];
         let mut widgets = Widgets::default();
-        compute_taskbar(&mut widgets, &tree, &clients, &quick, &[], WA, &[]);
+        compute_taskbar(&mut widgets, &layout, &clients, &quick, &[], WA);
         assert!(
             widgets.quick_regions.is_empty(),
             "quick-launch entry must hide once its class is already running"
@@ -587,7 +621,7 @@ mod tests {
 
     #[test]
     fn quick_launch_shown_when_its_class_is_not_running() {
-        let tree = crate::tree::Tree::new();
+        let layout = Layout::new();
         let clients: Vec<(Win, String)> = Vec::new();
         let quick = [QuickSlot {
             cmd: "firefox".into(),
@@ -596,19 +630,19 @@ mod tests {
             show: theme::ShowWhen::UnlessRunning("firefox"),
         }];
         let mut widgets = Widgets::default();
-        compute_taskbar(&mut widgets, &tree, &clients, &quick, &[], WA, &[]);
+        compute_taskbar(&mut widgets, &layout, &clients, &quick, &[], WA);
         assert_eq!(widgets.quick_regions.len(), 1);
     }
 
     #[test]
     fn minimized_leaf_gets_one_full_frame_restore_button() {
         let mut s = State::new();
-        s.split_focused(Dir::H); // a lone root leaf can't be minimized
-        let minimized_leaf = s.tree.first_leaf(s.tree.root);
+        s.insert_at(WA, Insert::ColEnd); // a sole split can't be minimized
+        let minimized_leaf = s.layout.first_leaf();
         assert!(s.toggle_minimize(minimized_leaf));
         let placed = placement(&s, WA);
         let mut widgets = Widgets::default();
-        compute_leaf_widgets(&mut widgets, &s.tree, &placed);
+        compute_leaf_widgets(&mut widgets, &s.layout, &placed);
         let target = placed
             .iter()
             .find(|p| p.leaf == minimized_leaf)

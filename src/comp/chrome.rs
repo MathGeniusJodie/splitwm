@@ -42,9 +42,9 @@ use std::rc::Rc;
 use super::indexed::{IndexedElement, IndexedProgram, IndexedTexture, NineSliceElement};
 use super::Comp;
 use crate::icon::Icon;
+use crate::layout::{Dir, NodeId};
 use crate::render::{BtnIcon, LeafView, Renderer, SliceSpec, TitleInfo};
 use crate::theme;
-use crate::tree::{Dir, NodeId};
 use crate::widgets::{leaf_meta, BtnKind, FrameRect, Placement};
 use crate::Index;
 use pixel_graphics::Framebuffer;
@@ -77,11 +77,11 @@ pub struct Scene<'a> {
     pub or_windows: &'a [crate::comp::xwayland::OrWindow],
     pub note_popups: &'a [super::notifications::NotePopup],
     pub note_rects: &'a [(u32, crate::widgets::FrameRect)],
-    pub float_stack: &'a [crate::tree::Win],
+    pub float_stack: &'a [crate::layout::Win],
     pub managed: &'a crate::shell::Managed,
     pub space: &'a smithay::desktop::Space<smithay::desktop::Window>,
     pub output: &'a smithay::output::Output,
-    pub dock_place: &'a Option<(smithay::desktop::Window, crate::tree::Rect)>,
+    pub dock_place: &'a Option<(smithay::desktop::Window, crate::layout::Rect)>,
     /// The dock layer surface's scrolled position (`Comp::layer_dock_place`);
     /// it renders there instead of where the `LayerMap` pinned it.
     pub layer_dock: &'a Option<(
@@ -466,9 +466,10 @@ impl ChromePieces {
                     id: piece.id.clone(),
                     commit: piece.commit,
                     accent: piece.accent,
-                    titlebar: piece.titlebar.as_ref().map(|(_, t)| {
-                        (Point::<i32, Logical>::from((rect.x, rect.y)), t)
-                    }),
+                    titlebar: piece
+                        .titlebar
+                        .as_ref()
+                        .map(|(_, t)| (Point::<i32, Logical>::from((rect.x, rect.y)), t)),
                 })
             })
             .collect()
@@ -478,7 +479,7 @@ impl ChromePieces {
     /// animation runs (the old buffer omitted the insert glyphs mid-slide).
     pub fn plus_elements(
         &self,
-        plus_regions: &[(FrameRect, crate::state::InsertAt)],
+        plus_regions: &[(FrameRect, crate::state::Insert)],
         animating: bool,
     ) -> Vec<(Point<i32, Logical>, &IndexedTexture)> {
         if animating {
@@ -507,7 +508,11 @@ impl ChromePieces {
 /// rect for a bordered leaf; the restore strip centred across the short
 /// axis at the sprite's native size when minimized (clamped into the rect —
 /// the CPU renderer clipped to a leaf-sized buffer, elements don't clip).
-fn frame_dst(rect: FrameRect, mode: FrameMode, sprite: Size<i32, smithay::utils::Buffer>) -> FrameRect {
+fn frame_dst(
+    rect: FrameRect,
+    mode: FrameMode,
+    sprite: Size<i32, smithay::utils::Buffer>,
+) -> FrameRect {
     match mode {
         FrameMode::Border => rect,
         FrameMode::MinV => {
@@ -650,7 +655,6 @@ struct TilePaint {
     icon: Option<Rc<Icon>>,
     label: char,
     accent: Index,
-    in_split: bool,
 }
 
 struct QuickPaint {
@@ -667,7 +671,7 @@ struct TaskbarKey {
     w: i32,
     h: i32,
     origin: (i32, i32),
-    tiles: Vec<(FrameRect, FrameRect, Option<u64>, char, Index, bool)>,
+    tiles: Vec<(FrameRect, FrameRect, Option<u64>, char, Index)>,
     sep: Option<FrameRect>,
     quick: Vec<(FrameRect, Option<u64>, char)>,
 }
@@ -688,7 +692,6 @@ impl TaskbarPaint {
                         t.icon.as_ref().map(|i| i.id()),
                         t.label,
                         t.accent,
-                        t.in_split,
                     )
                 })
                 .collect(),
@@ -807,7 +810,7 @@ fn render_taskbar(
             t.icon.as_deref(),
             t.label,
             t.accent,
-            t.in_split,
+            true,
         );
         let c = shift(t.close);
         crate::render::draw_close_badge(&mut fb, c.x, c.y, c.w);
@@ -919,7 +922,8 @@ impl Comp {
         if self.pieces.art.is_none() {
             let mut upload = |fb: &Framebuffer| {
                 let mut tex = None;
-                self.indexed.upload(self.backend.renderer(), &mut tex, fb, false);
+                self.indexed
+                    .upload(self.backend.renderer(), &mut tex, fb, false);
                 tex.expect("frame art uploaded")
             };
             let (border_fb, border_spec) = self.chrome.border_art();
@@ -986,8 +990,8 @@ impl Comp {
     /// buttons. The frame paints at `rect`'s size, so borders and titlebar
     /// re-render crisp as the frame scales during a layout transition.
     fn leaf_paint(&self, p: &Placement, rect: FrameRect) -> LeafPaint {
-        let minimized = self.state.tree.leaf(p.leaf).is_some_and(|l| l.minimized);
-        let accent = crate::widgets::leaf_color_index(&self.state.tree, p.leaf);
+        let minimized = self.state.layout.leaf(p.leaf).is_some_and(|l| l.minimized);
+        let accent = crate::widgets::leaf_color_index(&self.state.layout, p.leaf);
         let title = if minimized {
             None
         } else {
@@ -1025,36 +1029,31 @@ impl Comp {
         if minimized {
             return Vec::new();
         }
-        let meta = leaf_meta(
-            &self.state.tree,
-            self.parents.get(&leaf).copied(),
-            leaf,
-            rect,
-        );
+        let meta = leaf_meta(&self.state.layout, leaf, rect);
         crate::widgets::leaf_btn_rects(rect)
             .into_iter()
             .map(|(kind, r)| {
                 let (icon, disabled) = match kind {
-                    // A V-branch parent means this leaf collapses to a row
-                    // (short/wide) when minimized, so its button previews that
-                    // with the horizontal glyph.
+                    // A stacked split collapses to a row (short/wide) when
+                    // minimized, so its button previews that with the
+                    // horizontal glyph.
                     BtnKind::Minimize => (
-                        if meta.parent_dir == Some(Dir::V) {
+                        if meta.stacked {
                             BtnIcon::MinimizeH
                         } else {
                             BtnIcon::Minimize
                         },
-                        meta.parent_dir.is_none(),
+                        meta.sole,
                     ),
-                    BtnKind::Split => (
-                        if meta.wider {
-                            BtnIcon::VSplit
-                        } else {
-                            BtnIcon::HSplit
-                        },
-                        !meta.can_split,
-                    ),
-                    BtnKind::Close => (BtnIcon::Close, meta.parent_dir.is_none()),
+                    // The glyph previews the divider the click draws: a
+                    // vertical one for a new column, a horizontal one for
+                    // stacking below.
+                    BtnKind::Split => match meta.split_dir {
+                        Some(Dir::H) => (BtnIcon::VSplit, false),
+                        Some(Dir::V) => (BtnIcon::HSplit, false),
+                        None => (BtnIcon::HSplit, true),
+                    },
+                    BtnKind::Close => (BtnIcon::Close, !meta.occupied && meta.sole),
                 };
                 BtnPaint {
                     cx: r.x + r.w / 2 - rect.x,
@@ -1067,10 +1066,10 @@ impl Comp {
             .collect()
     }
 
-    /// The taskbar strip's draw data: one tile per managed window (accent
-    /// highlight when in a split, corner close badge), the separator, and the
-    /// visible quick-launch icons. The strip spans the full output width and
-    /// the bottom `theme::TASKBAR_H` pixels.
+    /// The taskbar strip's draw data: one tile per split's window, in split
+    /// order (accent highlight box, corner close badge), the separator, and
+    /// the visible quick-launch icons. The strip spans the full output width
+    /// and the bottom `theme::TASKBAR_H` pixels.
     fn taskbar_paint(&self, ow: i32, oh: i32) -> TaskbarPaint {
         let origin_y = (oh - theme::TASKBAR_H).max(0);
         let tiles = self
@@ -1085,7 +1084,6 @@ impl Comp {
                     crate::widgets::label_from_class(&crate::shell::toplevel_app_id(w))
                 }),
                 accent: t.accent,
-                in_split: t.in_split,
             })
             .collect();
         let quick = self

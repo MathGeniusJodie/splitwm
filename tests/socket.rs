@@ -508,65 +508,130 @@ fn socket_lifecycle() {
     );
     s.wait_until("keyboard enters w1", |app| app.focus_is(a));
 
-    // --- displacement: a second client takes the slot; the first is
-    // stashed to the taskbar and loses activation, not its connection ---
+    // --- open-right: a second client gets its own fresh column to the
+    // right of the first, at the default column width; the sitting tenant
+    // keeps its full width untouched (columns never resize each other —
+    // the strip grows and scrolls instead) ---
     let b = s.open_window();
-    s.wait_until("w2 activated at the same slot size", |app| {
-        app.wins[b].activated && app.wins[b].size == full
+    s.wait_until("w2 mapped in its own column and focused", |app| {
+        app.wins[b].activated && app.wins[b].size.0 > 0 && app.wins[b].size.0 < full.0
     });
-    s.wait_until("displaced w1 deactivated", |app| !app.wins[a].activated);
+    s.wait_until("w1 keeps its full width", |app| {
+        !app.wins[a].activated && app.wins[a].size == full
+    });
     s.wait_until("keyboard moves to w2", |app| app.focus_is(b));
-
-    // --- split: the occupant keeps the golden-ratio major share
-    // (SPLIT_RATIO 0.618), the new empty split gets the rest ---
-    s.wm.key("super+v");
-    s.wait_until("w2 reconfigured to the 0.618 share", |app| {
-        let w = app.wins[b].size.0;
-        w > 0 && w < full.0 * 7 / 10
-    });
-    let major_w = s.app.wins[b].size.0;
-
-    // --- taskbar cycle: focus the new empty split, cycle the stashed w1
-    // into it; w1 comes back activated at the split's minor share ---
-    s.wm.key("super+Right");
-    s.wait_until("empty split focused: both windows deactivated", |app| {
-        !app.wins[a].activated && !app.wins[b].activated
-    });
-    s.wm.key("super+bracketright");
-    s.wait_until("w1 restored into the split and focused", |app| {
-        app.wins[a].activated && app.focus_is(a)
-    });
-    let minor_w = s.app.wins[a].size.0;
+    let minor_w = s.app.wins[b].size.0;
+    // A third of the viewport (`theme::default_col_w`), within
+    // chrome-inset slack.
     assert!(
-        minor_w > 0 && minor_w < major_w,
-        "restored w1 should get the minor share: {minor_w} vs {major_w}"
+        minor_w > OUTPUT_W / 5 && minor_w < OUTPUT_W / 2,
+        "new column opens at the default width, got {minor_w}"
     );
-    // Shares in golden proportion, within chrome-inset slack.
-    let ratio = f64::from(major_w) / f64::from(major_w + minor_w);
-    assert!(
-        (ratio - 0.618).abs() < 0.03,
-        "split shares should sit at SPLIT_RATIO, got {ratio:.3}"
-    );
+
+    // --- bracket cycling is focus cycling (everything is visible) ---
+    s.wm.key("super+bracketleft");
+    s.wait_until("focus cycles back to w1", |app| {
+        app.wins[a].activated && !app.wins[b].activated && app.focus_is(a)
+    });
 
     // --- polite close: the chord asks the focused client, and only asks ---
     assert!(!s.app.wins[a].closed);
-    s.wm.key("super+shift+c");
+    s.wm.key("super+q");
     s.wait_until("w1 received xdg_toplevel.close", |app| app.wins[a].closed);
     assert!(
         !s.app.wins[b].closed,
         "only the focused window is asked to close"
     );
-    // Honour it. The emptied split keeps layout focus (as on master), so
-    // nothing holds the keyboard until a deliberate move points it at w2.
+    // Honour it. The window's death takes its column with it, but
+    // side-by-side splits don't merge: the survivor keeps its own width
+    // (the canvas shrinks instead), and focus lands on it by itself.
+    let survivor = s.app.wins[b].size;
     s.app.wins[a].toplevel.destroy();
     s.app.wins[a].surface.destroy();
-    s.wait_until("keyboard focus parks on the emptied split", |app| {
-        app.focused.is_none() && !app.wins[b].activated
-    });
-    s.wm.key("super+Left");
-    s.wait_until("focus moves back to w2", |app| {
+    s.wait_until("survivor keeps its width and takes the keyboard", |app| {
         app.wins[b].activated && app.focus_is(b)
     });
+    assert_eq!(
+        s.app.wins[b].size, survivor,
+        "closing a neighbouring column must not resize the survivor"
+    );
+}
+
+/// Drag-and-drop split reordering, observed through the `layout` query
+/// (depth-first leaf order — also the taskbar's tile order). Geometry
+/// mirrors `theme.rs`: GAP 20, TASKBAR_ICON 42, TASKBAR_GAP 10,
+/// TASKBAR_H 82, badge 17px overlapping the tile bottom by 4.
+#[test]
+fn drag_reorders_splits_and_badge_close_leaves_placeholder() {
+    const OUTPUT_H: i32 = 800;
+    // Tile k spans x [20 + 52k, 62 + 52k); the icon row's centre sits at
+    // pad 13 + half the 42px icon below the bar's top edge.
+    let tile_x = |k: i32| 20 + 52 * k;
+    let tile_cy = OUTPUT_H - 82 + 13 + 21;
+
+    let mut s = Session::boot();
+    let mut wins = Vec::new();
+    for i in 0..3 {
+        let w = s.open_window();
+        s.wait_until("window mapped and focused", |app| app.wins[w].activated);
+        wins.push(w);
+        assert_eq!(i, w);
+    }
+    // New windows open right of the focused split: creation order is
+    // layout order.
+    assert_eq!(s.wm.query("layout"), "test-0 test-1 test-2");
+
+    // Tile onto a tile's left half: test-2's tile dropped on the left
+    // half of test-0's puts its split leftmost.
+    s.wm.cmd(&format!("press {} {tile_cy}", tile_x(2) + 21));
+    s.wm.cmd(&format!("motion 100 {tile_cy}"));
+    s.wm.cmd(&format!("release {} {tile_cy}", tile_x(0) + 10));
+    assert_eq!(s.wm.query("layout"), "test-2 test-0 test-1");
+
+    // Titlebar onto a tile's right half: the leftmost split's titlebar
+    // (frame at x 20, y 20, 27px tall) dropped after test-1's tile.
+    s.wm.cmd("press 90 33");
+    s.wm.cmd("motion 400 400");
+    s.wm.cmd(&format!("release {} {tile_cy}", tile_x(2) + 35));
+    assert_eq!(s.wm.query("layout"), "test-0 test-1 test-2");
+
+    // Tile onto a split frame's right half: test-0's tile dropped near
+    // the right edge of the rightmost split lands after it.
+    s.wm.cmd(&format!("press {} {tile_cy}", tile_x(0) + 21));
+    s.wm.cmd("motion 600 400");
+    s.wm.cmd("release 1250 400");
+    assert_eq!(s.wm.query("layout"), "test-1 test-2 test-0");
+
+    // The tile badge closes only the window: its split stays behind as an
+    // empty placeholder, and the next new window fills it.
+    let badge = (tile_x(0) + 25 + 8, OUTPUT_H - 82 + 13 + 42 - 4 + 8);
+    s.wm.cmd(&format!("click {} {}", badge.0, badge.1));
+    s.wait_until("badge asks the window to close", |app| app.wins[1].closed);
+    s.app.wins[1].toplevel.destroy();
+    s.app.wins[1].surface.destroy();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while s.wm.query("layout") != "- test-2 test-0" {
+        // Keep the connection flushed so the destroy actually reaches the
+        // compositor (the layout query rides a separate channel).
+        s.queue.roundtrip(&mut s.app).expect("roundtrip");
+        assert!(
+            Instant::now() < deadline,
+            "badge close should leave a placeholder, got: {}",
+            s.wm.query("layout")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // An *unfocused* placeholder attracts nothing: the new window opens
+    // its own column beside the focused one instead.
+    let w3 = s.open_window();
+    s.wait_until("new window mapped", |app| app.wins[w3].activated);
+    assert_eq!(s.wm.query("layout"), "- test-2 test-0 test-3");
+    // Focused (one step of wrap-around cycling from the new rightmost
+    // window), the placeholder is exactly where the next window lands.
+    s.wm.key("super+bracketright");
+    let w4 = s.open_window();
+    s.wait_until("new window mapped", |app| app.wins[w4].activated);
+    assert_eq!(s.wm.query("layout"), "test-4 test-2 test-0 test-3");
 }
 
 #[test]

@@ -162,7 +162,7 @@ pub const TASKBAR_GAP: i32 = 10;
 pub const TASKBAR_CLOSE: i32 = 17;
 
 /// Default `WM_NAME` of the window parked entirely off-screen past the right
-/// edge (see `Wm::manage_dock`), outside the split tree, immune to canvas
+/// edge (see `Wm::manage_dock`), outside the column strip, immune to canvas
 /// scrolling, and reserving no layout space. cozyui sets this exact title
 /// and never sets `WM_CLASS`, so title is the only identity it exposes.
 /// Overridable at runtime with the `SPLITWM_DOCK_TITLE` environment variable.
@@ -185,9 +185,17 @@ pub const DOCK_OVERLAP: i32 = 310;
 
 pub const SPLIT_RATIO: f64 = 0.618;
 pub const RESIZE_STEP: f64 = 0.05;
-/// Smallest fraction of a branch a child can be resized down to, shared by
+/// Smallest fraction of a stack a row can be resized down to, shared by
 /// keyboard resizing and boundary drags so both stop at the same point.
 pub const MIN_SPLIT_FRAC: f64 = 0.05;
+
+/// Width a fresh column opens at (new windows, "+" buttons, splits pulled
+/// out of a stack by a drag): a comfortable third of the viewport, never
+/// below the chrome's minimum. The bootstrap column instead tracks the
+/// viewport (`ColWidth::Viewport`).
+pub fn default_col_w(viewport_w: i32) -> i32 {
+    (viewport_w / 3).max(min_split_w())
+}
 pub const SCROLL_STEP: i32 = 100;
 
 // Split-control button geometry: native pixel size of the close/minimize/
@@ -228,16 +236,13 @@ pub const fn tb_h() -> i32 {
     BORDER_TOP
 }
 
-/// Whether a `w`x`h` frame is big enough to split into a `dir` branch: it
-/// must fit two children of the direction's minimum size plus the gap
-/// between them. The single threshold behind both the titlebar Split
-/// button's enabled state (`Wm::leaf_meta`) and the keyboard split gate
-/// (`Wm::can_split_focused`), so the two can't drift apart.
-pub fn split_fits(dir: crate::tree::Dir, w: i32, h: i32) -> bool {
-    match dir {
-        crate::tree::Dir::H => w >= 2 * min_split_w() + GAP,
-        crate::tree::Dir::V => h >= 2 * tb_h() + GAP,
-    }
+/// Whether a frame of height `h` is tall enough to stack: it must fit
+/// two rows of the minimum row height plus the gap between them. The
+/// single threshold behind the titlebar ⊞ button's enabled state
+/// (`widgets::leaf_meta`) and the keyboard stack gate
+/// (`Comp::stack_below`), so the two can't drift apart.
+pub fn stack_fits(h: i32) -> bool {
+    h >= 2 * tb_h() + GAP
 }
 
 // Palette indices cycled through to give each split its own persistent
@@ -256,7 +261,7 @@ pub const LEAF_PALETTE: [Index; 8] = [
     palette_color::PEACH,
 ];
 
-/// Fallback accent for a leaf id that no longer resolves in the tree.
+/// Fallback accent for a leaf id that no longer resolves in the layout.
 pub const FALLBACK_ACCENT_INDEX: Index = palette_color::CRIMSON;
 
 /// A stable accent palette index for a leaf, picked from `LEAF_PALETTE` by id.
@@ -292,15 +297,17 @@ pub use xkeysym::key as ks;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
-    SplitH,
-    SplitV,
+    /// Stack a new empty split below the focused one (a column's rows are
+    /// the only nesting; a new *column* comes from the gap "+" buttons or
+    /// a new window).
+    StackBelow,
     Close,
     FocusNext,
     FocusPrev,
-    StashNext,
-    StashPrev,
-    MoveWindowNext,
-    MoveWindowPrev,
+    /// Relocate the focused split past its neighbour in leaf order — the
+    /// whole split moves, window and all (a window never changes splits).
+    MoveSplitNext,
+    MoveSplitPrev,
     Grow,
     Shrink,
     SpawnTerminal,
@@ -336,25 +343,26 @@ pub const VOLUME_DOWN_CMD: &str = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-";
 pub const VOLUME_MUTE_CMD: &str = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle";
 
 /// The key bindings the keyboard dispatcher intercepts before clients see
-/// anything: (modifier mask, keysym, action). Keys are named for the divider
-/// the user sees, actions for the branch direction: Mod4+V draws a Vertical
-/// divider, i.e. an H-branch (side-by-side children), and vice versa. There
-/// is deliberately no quit binding: the compositor ends its session only by
-/// being killed (SIGTERM), never by a stray chord.
+/// anything: (modifier mask, keysym, action). Mod4+H draws a Horizontal
+/// divider under the focused split (stacking it); there is no side-by-side
+/// split chord — new columns come from new windows and the gap "+"
+/// buttons. There is deliberately no quit binding: the compositor ends its
+/// session only by being killed (SIGTERM), never by a stray chord.
 pub const BINDINGS: &[(u16, u32, Action)] = &[
     (MOD4, ks::Return, Action::SpawnTerminal),
     (MOD4, ks::space, Action::SpawnLauncher),
-    (MOD4, ks::v, Action::SplitH),
-    (MOD4, ks::h, Action::SplitV),
+    (MOD4, ks::h, Action::StackBelow),
     (MOD4, ks::q, Action::Close),
     (MOD4, ks::Tab, Action::FocusNext),
     (MOD4 | SHIFT, ks::Tab, Action::FocusPrev),
     (MOD4, ks::Right, Action::FocusNext),
     (MOD4, ks::Left, Action::FocusPrev),
-    (MOD4, ks::bracketright, Action::StashNext),
-    (MOD4, ks::bracketleft, Action::StashPrev),
-    (MOD4 | SHIFT, ks::bracketright, Action::MoveWindowNext),
-    (MOD4 | SHIFT, ks::bracketleft, Action::MoveWindowPrev),
+    // Every window is visible in a split, so cycling "which window is
+    // shown" is just cycling focus; the brackets keep their muscle memory.
+    (MOD4, ks::bracketright, Action::FocusNext),
+    (MOD4, ks::bracketleft, Action::FocusPrev),
+    (MOD4 | SHIFT, ks::bracketright, Action::MoveSplitNext),
+    (MOD4 | SHIFT, ks::bracketleft, Action::MoveSplitPrev),
     (MOD4, ks::l, Action::Grow),
     (MOD4 | SHIFT, ks::l, Action::Shrink),
     (MOD4, ks::equal, Action::Grow),

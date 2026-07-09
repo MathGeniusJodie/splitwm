@@ -42,7 +42,7 @@ impl Renderer {
     pub fn draw_taskbar_item(
         &self,
         fb: &mut Framebuffer,
-        r: crate::tree::Rect,
+        r: crate::layout::Rect,
         icon: Option<&Icon>,
         label: char,
         accent: Index,
@@ -128,7 +128,7 @@ pub fn draw_plus(fb: &mut Framebuffer, cx: i32, cy: i32, sz: i32) {
 /// Draw the vertical pill separating the taskbar's window tiles from its
 /// quick-launch icons: a cream rounded bar, corners notched pixel-art style
 /// like the tiles around it.
-pub fn draw_taskbar_sep(fb: &mut Framebuffer, r: crate::tree::Rect) {
+pub fn draw_taskbar_sep(fb: &mut Framebuffer, r: crate::layout::Rect) {
     fill(fb, r.x + 1, r.y, r.w - 2, r.h, palette_color::CREAM);
     fill(fb, r.x, r.y + 2, r.w, r.h - 4, palette_color::CREAM);
 }

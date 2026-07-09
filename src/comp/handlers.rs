@@ -186,14 +186,7 @@ impl XdgShellHandler for Comp {
             self.fullscreen = None;
         }
         match self.managed.kind_of(win) {
-            Some(crate::shell::Kind::Tiled) => {
-                if let Some(m) = self.managed.remove(win) {
-                    self.space.unmap_elem(&m.window);
-                }
-                self.state.unpin_client(win);
-                // arrange refocuses, so focus never rests on a dead client.
-                self.arrange();
-            }
+            Some(crate::shell::Kind::Tiled) => self.unmanage_tiled(win),
             Some(crate::shell::Kind::Float(_)) => self.forget_float(win),
             Some(crate::shell::Kind::Dock(_)) => {
                 self.managed.remove(win);

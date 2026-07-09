@@ -5,7 +5,6 @@ use smithay::input::keyboard::ModifiersState;
 
 use super::Comp;
 use crate::theme::{self, Action};
-use crate::tree::Dir;
 
 /// splitwm-mask bit for Ctrl. Never appears in `theme::BINDINGS`, but it
 /// participates in the exact-match so `Mod4+Ctrl+X` doesn't trigger the
@@ -43,12 +42,12 @@ pub fn binding_action(mods: &ModifiersState, sym: u32) -> Option<Action> {
 impl Comp {
     pub fn do_action(&mut self, action: Action) {
         match action {
-            Action::SplitH => self.split(Dir::H),
-            Action::SplitV => self.split(Dir::V),
+            Action::StackBelow => self.stack_below(),
+            // The titlebar close button's semantics, on the focused split
+            // (see `Comp::close_split`).
             Action::Close => {
-                if self.state.close_focused() {
-                    self.arrange();
-                }
+                let leaf = self.state.focused_leaf_valid();
+                self.close_split(leaf);
             }
             Action::FocusNext | Action::FocusPrev => {
                 // Deliberate focus moves take the keyboard off any float.
@@ -61,34 +60,23 @@ impl Comp {
                 }
                 self.arrange();
             }
-            Action::StashNext | Action::StashPrev => {
+            Action::MoveSplitNext | Action::MoveSplitPrev => {
                 self.clear_focused_float();
+                let wa = self.layout_area();
                 if self
                     .state
-                    .cycle_stash(matches!(action, Action::StashNext))
-                    .is_some()
-                {
-                    self.arrange();
-                }
-            }
-            Action::MoveWindowNext | Action::MoveWindowPrev => {
-                self.clear_focused_float();
-                if self
-                    .state
-                    .move_window_to_direction(matches!(action, Action::MoveWindowNext))
-                    .is_some()
+                    .move_focused_split(wa, matches!(action, Action::MoveSplitNext))
                 {
                     self.scroll_focus_into_view();
                     self.arrange();
                 }
             }
-            Action::Grow => {
-                if self.state.resize_focused(theme::RESIZE_STEP) {
-                    self.arrange();
-                }
-            }
-            Action::Shrink => {
-                if self.state.resize_focused(-theme::RESIZE_STEP) {
+            Action::Grow | Action::Shrink => {
+                let wa = self.layout_area();
+                if self
+                    .state
+                    .resize_focused(wa, matches!(action, Action::Grow))
+                {
                     self.arrange();
                 }
             }
@@ -106,20 +94,17 @@ impl Comp {
         }
     }
 
-    /// Split the focused leaf if its frame is big enough for two children
-    /// of `dir` (the same gate as master's `can_split_focused`).
-    fn split(&mut self, dir: Dir) {
+    /// Stack an empty split below the focused one if its frame is tall
+    /// enough for two rows (the same gate as the ⊞ button's).
+    fn stack_below(&mut self) {
         let wa = self.layout_area();
         let leaf = self.state.focused_leaf_valid();
-        if self.state.tree.leaf(leaf).is_some_and(|l| l.minimized) {
-            return;
-        }
         let fits = self
             .state
             .compute(wa)
             .get(&leaf)
-            .is_some_and(|g| theme::split_fits(dir, g.w, g.h));
-        if fits && self.state.split_focused(dir) {
+            .is_some_and(|g| theme::stack_fits(g.h));
+        if fits && self.state.split_focused() {
             self.arrange();
         }
     }

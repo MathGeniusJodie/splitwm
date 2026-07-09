@@ -15,6 +15,8 @@
 //!   tracking as if the mouse moved there.
 //! - `click <x> <y>` — motion there, then a full left press+release
 //!   through the same dispatch as a real button.
+//! - `press <x> <y>` / `release <x> <y>` — the two halves of `click`
+//!   separately, so a driver can drag: press, motions, release.
 //! - `scroll <clicks>` — pan the canvas by wheel clicks (the Mod4+wheel
 //!   path), positive scrolls right.
 //! - `shot <path>` — write the next composited frame to `path`
@@ -25,6 +27,10 @@
 //!   class/app_id, or `unmanaged` (o-r window, layer surface). Lets a
 //!   driver observe focus on clients that aren't the test's own Wayland
 //!   connection (XWayland windows).
+//! - `layout` — report the splits in depth-first (left-to-right) order,
+//!   one token per leaf: its window's title, or `-` for an empty
+//!   placeholder. This is also the taskbar's tile order, so a driver can
+//!   verify reorders without pixel-reading the bar.
 
 use std::io::Read as _;
 
@@ -91,16 +97,20 @@ fn command(comp: &mut Comp, line: &str) {
             }
             None => println!("err motion {xy}: want <x> <y>"),
         },
-        Some(("click", xy)) => match parse_xy(xy) {
+        Some((cmd @ ("click" | "press" | "release"), xy)) => match parse_xy(xy) {
             Some(pos) => {
                 const BTN_LEFT: u32 = 0x110;
                 let time = comp.start.elapsed().as_millis() as u32;
                 comp.pointer_moved(pos, time);
-                comp.pointer_button(BTN_LEFT, ButtonState::Pressed, time);
-                comp.pointer_button(BTN_LEFT, ButtonState::Released, time);
-                println!("ok click {xy}");
+                if cmd != "release" {
+                    comp.pointer_button(BTN_LEFT, ButtonState::Pressed, time);
+                }
+                if cmd != "press" {
+                    comp.pointer_button(BTN_LEFT, ButtonState::Released, time);
+                }
+                println!("ok {cmd} {xy}");
             }
-            None => println!("err click {xy}: want <x> <y>"),
+            None => println!("err {cmd} {xy}: want <x> <y>"),
         },
         Some(("scroll", clicks)) => match clicks.parse::<f64>() {
             Ok(clicks) => {
@@ -129,6 +139,26 @@ fn command(comp: &mut Comp, line: &str) {
                 },
             };
             println!("ok focus {name}");
+        }
+        None if line == "layout" => {
+            let tokens: Vec<String> = comp
+                .state
+                .layout
+                .collect_leaves()
+                .into_iter()
+                .map(|l| {
+                    comp.state
+                        .layout
+                        .leaf(l)
+                        .and_then(|lf| lf.client)
+                        .and_then(|c| comp.managed.get(c))
+                        .map_or_else(
+                            || "-".to_string(),
+                            |w| crate::shell::toplevel_title(w).to_string(),
+                        )
+                })
+                .collect();
+            println!("ok layout {}", tokens.join(" "));
         }
         None if line == "cursor" => {
             let name = match comp.cursor_status {

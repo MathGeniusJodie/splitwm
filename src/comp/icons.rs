@@ -10,9 +10,9 @@ use std::rc::Rc;
 
 use super::Comp;
 use crate::icon::{self, Icon};
+use crate::layout::Win;
 use crate::shell::Kind;
 use crate::theme;
-use crate::tree::Win;
 
 /// An off-thread icon fetch's outcome, delivered over the icon channel.
 pub struct IconResult {
