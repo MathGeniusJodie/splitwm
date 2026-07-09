@@ -639,6 +639,21 @@ fn drag_reorders_splits_and_badge_close_leaves_placeholder() {
     s.wm.cmd(&format!("release {} {tile_cy}", tile_x(2) + 35));
     assert_eq!(s.wm.query("layout"), "test-0 test-1 test-2");
 
+    // Tile into the gap *between* two tiles: the strip re-slots by tile
+    // centres, so the 10px gap at [62+52k, 72+52k) inserts there too.
+    // test-2's tile dropped between test-0's and test-1's lands second.
+    s.wm.cmd(&format!("press {} {tile_cy}", tile_x(2) + 21));
+    s.wm.cmd(&format!("motion 100 {tile_cy}"));
+    s.wm.cmd(&format!("release {} {tile_cy}", tile_x(0) + 47));
+    assert_eq!(s.wm.query("layout"), "test-0 test-2 test-1");
+
+    // Tile past the last tile (the band before the quick-launch
+    // separator): lands after everything.
+    s.wm.cmd(&format!("press {} {tile_cy}", tile_x(1) + 21));
+    s.wm.cmd(&format!("motion 400 {tile_cy}"));
+    s.wm.cmd(&format!("release {} {tile_cy}", tile_x(2) + 46));
+    assert_eq!(s.wm.query("layout"), "test-0 test-1 test-2");
+
     // Tile onto a split frame's right half: test-0's tile dropped near
     // the right edge of the rightmost split lands after it.
     s.wm.cmd(&format!("press {} {tile_cy}", tile_x(0) + 21));

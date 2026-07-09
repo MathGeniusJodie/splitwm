@@ -334,11 +334,14 @@ impl Comp {
     /// Where a split-move drop at (`mx`, `my`) lands, by what's under the
     /// pointer: a *gap* adopts the gap's own orientation — a vertical gap
     /// makes the dragged split a new column right there, a horizontal gap
-    /// slots it into that stack. A taskbar tile or a split frame places it
-    /// as a column before/after the target's (split down the middle: left
-    /// half before, right half after). Tiles are checked first (they
-    /// overlay the bar, and reversed like their hit-test); frames use the
-    /// same last-arrange rects `LeafBody` hits.
+    /// slots it into that stack. Anywhere over the taskbar's tile strip
+    /// re-slots by tile centres — before the first tile whose centre lies
+    /// right of the pointer, after the last one otherwise — so the gaps
+    /// between tiles and the strip's ends take drops too, and a drop
+    /// inside a tile keeps the left-half-before / right-half-after rule.
+    /// A split frame places it as a column before/after the target's
+    /// (split down the middle), using the same last-arrange rects
+    /// `LeafBody` hits.
     fn move_drop_target(&self, mx: i32, my: i32) -> Option<MoveDrop> {
         if let Some(&(_, b)) = self
             .widgets
@@ -358,14 +361,17 @@ impl Comp {
                 }
             };
         }
-        if let Some(t) = self
-            .widgets
-            .taskbar_regions
-            .iter()
-            .rev()
-            .find(|t| rect_contains(t.rect, mx, my))
-        {
-            return Some(MoveDrop::Column(t.leaf, mx < t.rect.x + t.rect.w / 2));
+        if my >= self.output_size().h - theme::TASKBAR_H {
+            // The strip ends where the quick-launch separator starts; a
+            // drop over the quick icons means nothing.
+            let strip_end = self.widgets.taskbar_sep.map_or(i32::MAX, |s| s.x);
+            let tiles = &self.widgets.taskbar_regions;
+            let dst = tiles
+                .iter()
+                .find(|t| mx < t.rect.x + t.rect.w / 2)
+                .map(|t| MoveDrop::Column(t.leaf, true))
+                .or_else(|| tiles.last().map(|t| MoveDrop::Column(t.leaf, false)));
+            return dst.filter(|_| mx < strip_end);
         }
         self.placed
             .iter()
