@@ -181,7 +181,7 @@ pub fn dock_identity() -> String {
 /// same amount. The first `GAP` px only close the canvas's trailing margin;
 /// beyond that the last column's windows themselves cover the dock's edge.
 /// 0 restores the flush side-by-side layout.
-pub const DOCK_OVERLAP: i32 = 310;
+pub const DOCK_OVERLAP: i32 = 360;
 
 pub const SPLIT_RATIO: f64 = 0.618;
 pub const RESIZE_STEP: f64 = 0.05;
