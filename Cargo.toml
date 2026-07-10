@@ -39,8 +39,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
-# Real-session backend (DRM/GBM scanout, libinput, libseat session). Off by
-# default: linking needs the libseat system library (Arch package `seatd`).
+default = ["tty"]
+# Real-session backend (DRM/GBM scanout, libinput, libseat session). On by
+# default; linking needs the libseat system library (Arch package `seatd`).
+# Build with --no-default-features on machines without it.
 tty = [
     "smithay/backend_udev",
     "smithay/backend_gbm",

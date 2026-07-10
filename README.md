@@ -37,8 +37,8 @@ this compositor reproduces it unless a deviation is listed below.
 - **smithay 0.7** — compositor framework: protocol machinery, GLES
   renderer, XWayland. Three backends: **winit** (nested development runs
   inside an existing session), **tty** (real seat via
-  DRM/GBM/libinput/libseat, behind the `tty` cargo feature — linking needs
-  the system `libseat`), and **headless** (offscreen, for the test
+  DRM/GBM/libinput/libseat, the default-on `tty` cargo feature — linking
+  needs the system `libseat`), and **headless** (offscreen, for the test
   harness, `SPLITWM_HEADLESS=1`).
 - **pixel-graphics / pixel-fonts** (vendored) — palette-indexed software
   rasteriser and bitmap font behind all chrome; frames are drawn into CPU
@@ -145,8 +145,8 @@ or a remote shell) is the only way out, on every backend.
 ## Build & test
 
 ```sh
-cargo build --release                 # nested/headless backends
-cargo build --release --features tty  # + the real-seat DRM backend
+cargo build --release                        # all backends incl. real-seat DRM
+cargo build --release --no-default-features  # without tty (no libseat needed)
 
 cargo test          # unit tests + tests/socket.rs: boots the real binary
                     # headless and asserts manage/placement/splits/drag/
