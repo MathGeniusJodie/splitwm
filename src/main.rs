@@ -8,6 +8,7 @@
 #[allow(dead_code)]
 mod assets;
 mod backend;
+mod backlight;
 mod comp;
 mod icon;
 mod launch;

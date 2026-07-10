@@ -89,6 +89,8 @@ impl Comp {
             Action::VolumeUp => self.spawn(theme::VOLUME_UP_CMD),
             Action::VolumeDown => self.spawn(theme::VOLUME_DOWN_CMD),
             Action::VolumeMuteToggle => self.spawn(theme::VOLUME_MUTE_CMD),
+            Action::BrightnessUp => crate::backlight::step(theme::BRIGHTNESS_STEP_PERCENT),
+            Action::BrightnessDown => crate::backlight::step(-theme::BRIGHTNESS_STEP_PERCENT),
             // The redraw timer picks the mode change up on its next tick.
             Action::CycleColorMode => self.quantize.cycle(),
         }

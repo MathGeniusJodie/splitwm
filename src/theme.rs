@@ -319,6 +319,10 @@ pub enum Action {
     VolumeUp,
     VolumeDown,
     VolumeMuteToggle,
+    /// Step the screen backlight by `BRIGHTNESS_STEP_PERCENT` (see
+    /// `backlight::step`).
+    BrightnessUp,
+    BrightnessDown,
     /// Cycle the output colour depth: true colour -> dithered RGB332 ->
     /// dithered na16 (see `comp::quantize`).
     CycleColorMode,
@@ -341,6 +345,9 @@ pub const VOLUME_UP_CMD: &str = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%
 pub const VOLUME_DOWN_CMD: &str = "wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-";
 /// Command `Action::VolumeMuteToggle` spawns to toggle the default sink's mute.
 pub const VOLUME_MUTE_CMD: &str = "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle";
+/// How far one brightness key press moves the backlight, as a percentage
+/// of the device's maximum.
+pub const BRIGHTNESS_STEP_PERCENT: i32 = 5;
 
 /// The key bindings the keyboard dispatcher intercepts before clients see
 /// anything: (modifier mask, keysym, action). Mod4+H draws a Horizontal
@@ -374,6 +381,8 @@ pub const BINDINGS: &[(u16, u32, Action)] = &[
     (0, ks::XF86_AudioRaiseVolume, Action::VolumeUp),
     (0, ks::XF86_AudioLowerVolume, Action::VolumeDown),
     (0, ks::XF86_AudioMute, Action::VolumeMuteToggle),
+    (0, ks::XF86_MonBrightnessUp, Action::BrightnessUp),
+    (0, ks::XF86_MonBrightnessDown, Action::BrightnessDown),
 ];
 
 // --- taskbar quick-launch entries ---
