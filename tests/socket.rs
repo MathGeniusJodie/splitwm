@@ -19,7 +19,9 @@ use wayland_client::protocol::{
     wl_data_source, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle, WEnum};
-use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
+use wayland_protocols::xdg::shell::client::{
+    xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
 
 /// The headless backend's fixed output, and the taskbar strip under the
@@ -160,6 +162,11 @@ struct App {
     enter_serial: u32,
     /// zwlr_layer_surface configures seen (each acked on arrival).
     layer_configures: u32,
+    /// xdg_surface configures seen by the test popup (each acked on
+    /// arrival).
+    popup_configures: u32,
+    /// The test popup received xdg_popup.popup_done.
+    popup_done: bool,
     /// The current clipboard offer and the mime types seen per offer.
     selection: Option<wl_data_offer::WlDataOffer>,
     offer_mimes: HashMap<wayland_client::backend::ObjectId, Vec<String>>,
@@ -214,6 +221,39 @@ impl Dispatch<xdg_surface::XdgSurface, usize> for App {
             let w = &mut app.wins[win];
             (w.size.0, w.size.1, w.activated) = w.pending;
             w.configures += 1;
+        }
+    }
+}
+
+// The popup's xdg_surface is keyed by unit user data, the toplevels' by
+// their `wins` index.
+impl Dispatch<xdg_surface::XdgSurface, ()> for App {
+    fn event(
+        app: &mut App,
+        xdg: &xdg_surface::XdgSurface,
+        event: xdg_surface::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        if let xdg_surface::Event::Configure { serial } = event {
+            xdg.ack_configure(serial);
+            app.popup_configures += 1;
+        }
+    }
+}
+
+impl Dispatch<xdg_popup::XdgPopup, ()> for App {
+    fn event(
+        app: &mut App,
+        _: &xdg_popup::XdgPopup,
+        event: xdg_popup::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        if let xdg_popup::Event::PopupDone = event {
+            app.popup_done = true;
         }
     }
 }
@@ -361,6 +401,7 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for App {
     }
 }
 
+wayland_client::delegate_noop!(App: ignore xdg_positioner::XdgPositioner);
 wayland_client::delegate_noop!(App: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 wayland_client::delegate_noop!(App: ignore wl_compositor::WlCompositor);
 wayland_client::delegate_noop!(App: ignore wl_surface::WlSurface);
@@ -591,6 +632,51 @@ fn socket_lifecycle() {
         s.app.wins[b].size, survivor,
         "closing a neighbouring column must not resize the survivor"
     );
+}
+
+/// An xdg_popup with an explicit grab — a context menu. The grab must be
+/// honored (browsers self-dismiss their menus when it isn't): keyboard
+/// focus redirects into the popup while it lives, and a click outside
+/// dismisses it with popup_done, returning focus to the parent.
+#[test]
+fn popup_grab_redirects_keyboard_and_outside_click_dismisses() {
+    let mut s = Session::boot();
+    let a = s.open_window();
+    s.wait_until("keyboard enters the toplevel", |app| app.focus_is(a));
+
+    // The context-menu dance: positioner, get_popup, grab with a real
+    // input serial (the keyboard enter), then the mapping commit.
+    let surface = s.compositor.create_surface(&s.qh, ());
+    let xdg = s.wm_base.get_xdg_surface(&surface, &s.qh, ());
+    let positioner = s.wm_base.create_positioner(&s.qh, ());
+    positioner.set_size(120, 90);
+    positioner.set_anchor_rect(10, 10, 1, 1);
+    let popup = xdg.get_popup(Some(&s.app.wins[a].xdg), &positioner, &s.qh, ());
+    popup.grab(&s.seat, s.app.enter_serial);
+    surface.commit();
+    s.wait_until("popup configured", |app| app.popup_configures > 0);
+    let buffer = s
+        .pool
+        .create_buffer(0, 120, 90, 120 * 4, wl_shm::Format::Argb8888, &s.qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+
+    // The grab owns the keyboard: focus leaves the parent for the popup.
+    s.wait_until("keyboard redirects into the popup", |app| {
+        app.focused.as_ref() == Some(&surface.id())
+    });
+    assert!(!s.app.popup_done, "popup dismissed before any outside click");
+
+    // A click outside the client dismisses. Same-client surfaces don't
+    // count as outside (a press on the parent forwards, and the client
+    // closes its own menu), so aim at bare chrome: the canvas gap left of
+    // the first column.
+    s.wm.cmd("click 10 300");
+    s.wait_until("outside click sends popup_done", |app| app.popup_done);
+    s.wait_until("keyboard returns to the parent", |app| app.focus_is(a));
+
+    popup.destroy();
+    surface.destroy();
 }
 
 /// Drag-and-drop split reordering, observed through the `layout` query

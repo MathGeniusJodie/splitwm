@@ -1,8 +1,11 @@
 //! Delegate implementations wiring smithay's protocol machinery to `Comp`.
 
 use smithay::backend::renderer::ImportDma as _;
-use smithay::desktop::{PopupKind, Window};
-use smithay::input::pointer::CursorImageStatus;
+use smithay::desktop::{
+    find_popup_root_surface, PopupKeyboardGrab, PopupKind, PopupPointerGrab, PopupUngrabStrategy,
+    Window,
+};
+use smithay::input::pointer::{CursorImageStatus, Focus};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::reexports::wayland_server::protocol::wl_buffer::WlBuffer;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
@@ -249,9 +252,43 @@ impl XdgShellHandler for Comp {
         surface.send_repositioned(token);
     }
 
-    fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
-        // Popup grabs (keyboard redirect into menus) arrive with the real
-        // input model in M4.
+    fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+        // An explicit popup grab (context menus, dropdowns): input routes
+        // to the popup chain until it is dismissed, and a click outside
+        // dismisses it. Granting it matters beyond keyboard redirect —
+        // browsers watch their menus' grab state and flakily self-dismiss
+        // when the compositor neither grants the grab nor sends
+        // popup_done.
+        let seat: Seat<Comp> = Seat::from_resource(&seat).expect("seat resource has a Seat handle");
+        let kind = PopupKind::Xdg(surface);
+        let Ok(root) = find_popup_root_surface(&kind) else {
+            return;
+        };
+        let mut grab = match self.popups.grab_popup(root, kind, &seat, serial) {
+            Ok(grab) => grab,
+            Err(err) => {
+                tracing::warn!("popup grab refused: {err}");
+                return;
+            }
+        };
+        let keyboard = seat.get_keyboard().expect("seat has a keyboard");
+        let pointer = seat.get_pointer().expect("seat has a pointer");
+        // A grab held by anyone else (an ongoing chrome drag, another
+        // client's popup chain) wins: dismiss the popup instead of
+        // stealing the seat from under the holder.
+        if keyboard.is_grabbed()
+            && !(keyboard.has_grab(serial)
+                || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            || pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
+        {
+            grab.ungrab(PopupUngrabStrategy::All);
+            return;
+        }
+        keyboard.set_focus(self, grab.current_grab(), serial);
+        keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
     }
 }
 delegate_xdg_shell!(Comp);
