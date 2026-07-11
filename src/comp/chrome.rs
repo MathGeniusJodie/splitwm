@@ -549,7 +549,7 @@ impl ChromePieces {
     /// animation runs (the old buffer omitted the insert glyphs mid-slide).
     pub fn plus_elements(
         &self,
-        plus_regions: &[(FrameRect, crate::state::Insert)],
+        plus_regions: &[(FrameRect, crate::layout::Insert)],
         animating: bool,
     ) -> Vec<(Point<i32, Logical>, &IndexedTexture)> {
         if animating {

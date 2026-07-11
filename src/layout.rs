@@ -519,6 +519,20 @@ fn child_sizes(children: &[(bool, f64)], usable: i32, min_sz: i32) -> Vec<i32> {
     sizes
 }
 
+/// Where a "+" insert button adds a new empty split. Every margin and gap
+/// carries exactly one `Insert` (see `insert_slots`): the outer margins
+/// and inter-column gaps insert a column, a column's top/bottom margins
+/// and inter-row gaps insert a row into its stack.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Insert {
+    /// A new column at strip position `idx` (`0` = far left, `ncols()` =
+    /// far right).
+    Col(usize),
+    /// A new row at stack position `idx` of column `col` (`0` = top, the
+    /// row count = bottom).
+    Row { col: usize, idx: usize },
+}
+
 /// A gap between two adjacent columns, or two adjacent rows of one stack.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GapAt {
@@ -681,6 +695,29 @@ impl Layout {
                     });
                 }
                 y += sz + gap;
+            }
+        }
+        out
+    }
+
+    /// Every place a new split can be inserted, as the canvas-space centre
+    /// its "+" button sits on: one slot per column position — the outer
+    /// margins and every inter-column gap, centred in the strip's height —
+    /// and one slot per row position of every column — its top/bottom
+    /// margins and every inter-row gap, centred on the column's width.
+    pub fn insert_slots(&self, wa: Rect, gap: i32) -> Vec<(i32, i32, Insert)> {
+        let mut out = Vec::new();
+        let strip_cy = wa.y + wa.h / 2;
+        out.push((wa.x + gap / 2, strip_cy, Insert::Col(0)));
+        for (ci, r) in self.col_rects(wa, gap).into_iter().enumerate() {
+            out.push((r.x + r.w + gap / 2, strip_cy, Insert::Col(ci + 1)));
+            let cx = r.x + r.w / 2;
+            out.push((cx, r.y - gap / 2, Insert::Row { col: ci, idx: 0 }));
+            let mut y = r.y;
+            for (ri, sz) in self.row_sizes(ci, r.h, gap).iter().enumerate() {
+                y += sz + gap;
+                let idx = ri + 1;
+                out.push((cx, y - gap / 2, Insert::Row { col: ci, idx }));
             }
         }
         out
@@ -971,5 +1008,25 @@ mod tests {
             .filter(|b| matches!(b.at, GapAt::Row { .. }))
             .count();
         assert_eq!((cols, rows), (2, 1));
+    }
+
+    /// One slot per insert position: column slots at both margins and each
+    /// gap (`0..=ncols`), and per column a row slot at its top/bottom
+    /// margins and each stack gap (`0..=nrows`), each exactly once.
+    #[test]
+    fn insert_slots_cover_every_position_once() {
+        let mut l = Layout::new();
+        let ids = columns(&mut l, 3);
+        l.split_below(ids[1], 0.5).expect("splittable");
+        let mut inserts: Vec<Insert> =
+            l.insert_slots(WA, GAP).into_iter().map(|(_, _, at)| at).collect();
+        let mut expected: Vec<Insert> = (0..=3).map(Insert::Col).collect();
+        for (col, rows) in [(0, 1), (1, 2), (2, 1)] {
+            expected.extend((0..=rows).map(|idx| Insert::Row { col, idx }));
+        }
+        let key = |at: &Insert| format!("{at:?}");
+        inserts.sort_by_key(key);
+        expected.sort_by_key(key);
+        assert_eq!(inserts, expected);
     }
 }

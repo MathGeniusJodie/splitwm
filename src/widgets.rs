@@ -7,8 +7,8 @@
 
 use std::rc::Rc;
 
-use crate::layout::{Boundary, Dir, GapAt, Layout, NodeId, Rect, Win};
-use crate::state::{Insert, State};
+use crate::layout::{Boundary, Dir, GapAt, Insert, Layout, NodeId, Rect, Win};
+use crate::state::State;
 use crate::theme;
 
 /// Screen-space rect; the same shape as canvas-space `layout::Rect`,
@@ -31,11 +31,11 @@ pub const PLUS_SZ: i32 = theme::GAP - 4;
 /// How much narrower than the gap a boundary drag handle is drawn/hit.
 pub const HANDLE_INSET: i32 = 10;
 
-/// A `PLUS_SZ`-square hit/draw rect centred horizontally on `vis_x`.
-pub const fn plus_rect(vis_x: i32, y: i32) -> FrameRect {
+/// A `PLUS_SZ`-square hit/draw rect centred on (`cx`, `cy`).
+pub const fn plus_rect(cx: i32, cy: i32) -> FrameRect {
     FrameRect {
-        x: vis_x - PLUS_SZ / 2,
-        y,
+        x: cx - PLUS_SZ / 2,
+        y: cy - PLUS_SZ / 2,
         w: PLUS_SZ,
         h: PLUS_SZ,
     }
@@ -373,57 +373,54 @@ fn compute_btn_regions(widgets: &mut Widgets, p: &Placement, minimized: bool) {
     }
 }
 
-/// Gap resize handles, boundary "+" buttons, and edge insert buttons.
-/// Every gap gets a "+": a column gap inserts a new column there, a stack
-/// gap inserts a new row into that stack.
+/// Gap resize handles and "+" insert buttons. Every gap *and margin*
+/// carries a "+" through one shared path (`Layout::insert_slots`): the
+/// outer margins and column gaps insert a new column, a column's
+/// top/bottom margins and stack gaps insert a row into that stack.
 pub fn compute_boundary_widgets(widgets: &mut Widgets, state: &State, wa: Rect) {
     let gap = theme::GAP;
     let hw = (gap - HANDLE_INSET).max(4);
     let scroll_x = state.scroll_x();
-    let canvas_w = state.canvas_w(wa);
     for b in state.boundaries(wa) {
-        match b.at {
-            GapAt::Col(idx) => {
-                // Vertical gap between columns: a full-height pill dragged
-                // along x (scrolls with the canvas).
+        let rect = match b.at {
+            // Vertical gap between columns: a full-height pill dragged
+            // along x (scrolls with the canvas).
+            GapAt::Col(_) => {
                 let vis_x = b.pos - scroll_x;
                 if vis_x + hw / 2 <= wa.x || vis_x - hw / 2 >= wa.x + wa.w {
                     continue;
                 }
-                let rect = FrameRect {
+                FrameRect {
                     x: vis_x - hw / 2,
                     y: b.cross,
                     w: hw,
                     h: b.cross_len.max(1),
-                };
-                widgets.handle_regions.push((rect, b));
-                let py = b.cross + (b.cross_len - PLUS_SZ) / 2;
-                widgets
-                    .plus_regions
-                    .push((plus_rect(vis_x, py), Insert::Col(idx + 1)));
+                }
             }
-            GapAt::Row { col, idx } => {
-                // Horizontal gap between stacked rows: a full-width strip
-                // dragged along y.
+            // Horizontal gap between stacked rows: a full-width strip
+            // dragged along y.
+            GapAt::Row { .. } => {
                 let vis_x = b.cross - scroll_x;
                 if vis_x + b.cross_len <= wa.x || vis_x >= wa.x + wa.w {
                     continue;
                 }
-                let rect = FrameRect {
+                FrameRect {
                     x: vis_x,
                     y: b.pos - hw / 2,
                     w: b.cross_len.max(1),
                     h: hw,
-                };
-                widgets.handle_regions.push((rect, b));
-                widgets.plus_regions.push((
-                    plus_rect(vis_x + b.cross_len / 2, b.pos - PLUS_SZ / 2),
-                    Insert::Row { col, idx },
-                ));
+                }
             }
-        }
+        };
+        widgets.handle_regions.push((rect, b));
     }
-    compute_edge_plus_buttons(widgets, wa, scroll_x, canvas_w, gap);
+    for (cx, cy, at) in state.layout.insert_slots(wa, gap) {
+        let vis_x = cx - scroll_x;
+        if vis_x + PLUS_SZ / 2 <= wa.x || vis_x - PLUS_SZ / 2 >= wa.x + wa.w {
+            continue;
+        }
+        widgets.plus_regions.push((plus_rect(vis_x, cy), at));
+    }
     compute_edge_handle_widgets(widgets, state, wa);
 }
 
@@ -460,28 +457,6 @@ fn compute_edge_handle_widgets(widgets: &mut Widgets, state: &State, wa: Rect) {
             },
             left,
         ));
-    }
-}
-
-/// Edge "+" buttons at the far left / far right of the canvas.
-fn compute_edge_plus_buttons(
-    widgets: &mut Widgets,
-    wa: Rect,
-    scroll_x: i32,
-    canvas_w: i32,
-    gap: i32,
-) {
-    let span_h = (wa.h - 2 * gap).max(PLUS_SZ);
-    let edge_cy = wa.y + gap + (span_h - PLUS_SZ) / 2;
-    for (canvas_x, at) in [
-        (wa.x + gap / 2, Insert::Col(0)),
-        (wa.x + canvas_w - gap / 2, Insert::ColEnd),
-    ] {
-        let vis_x = canvas_x - scroll_x;
-        if vis_x < wa.x || vis_x > wa.x + wa.w {
-            continue;
-        }
-        widgets.plus_regions.push((plus_rect(vis_x, edge_cy), at));
     }
 }
 
@@ -540,7 +515,7 @@ mod tests {
     /// handle is culled as off-screen.
     fn three_visible_columns() -> State {
         let mut s = State::new();
-        s.insert_at(WA, Insert::ColEnd);
+        s.insert_at(WA, Insert::Col(1));
         s.insert_at(WA, Insert::Col(1));
         for col in 0..3 {
             s.layout.set_col_width(col, crate::layout::ColWidth::Px(300));
@@ -558,10 +533,10 @@ mod tests {
         assert_eq!(widgets.edge_handle_regions.len(), 2);
     }
 
-    /// Every gap gets one handle and one "+" button — column gaps and
-    /// stack gaps alike.
+    /// Every gap gets one drag handle, and every gap *and margin* gets a
+    /// "+" button — column and row positions alike.
     #[test]
-    fn one_handle_and_plus_per_gap() {
+    fn one_handle_per_gap_and_one_plus_per_insert_position() {
         let mut s = three_visible_columns(); // 3 columns -> 2 gaps
         s.split_focused(); // a stack -> 1 more gap
         let mut widgets = Widgets::default();
@@ -572,8 +547,9 @@ mod tests {
             .iter()
             .filter(|(_, at)| matches!(at, Insert::Row { .. }))
             .count();
-        // Two column gaps + two edge buttons + one stack gap.
-        assert_eq!((widgets.plus_regions.len(), row_plus), (5, 1));
+        // Column slots: 2 margins + 2 gaps. Row slots: top + bottom margin
+        // per column, plus the stacked column's one inter-row gap.
+        assert_eq!((widgets.plus_regions.len(), row_plus), (11, 7));
     }
 
     #[test]
@@ -651,7 +627,7 @@ mod tests {
     #[test]
     fn minimized_leaf_gets_one_full_frame_restore_button() {
         let mut s = State::new();
-        s.insert_at(WA, Insert::ColEnd); // a sole split can't be minimized
+        s.insert_at(WA, Insert::Col(1)); // a sole split can't be minimized
         let minimized_leaf = s.layout.first_leaf();
         assert!(s.toggle_minimize(minimized_leaf));
         let placed = placement(&s, WA);

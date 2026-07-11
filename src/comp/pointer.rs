@@ -8,8 +8,8 @@ use smithay::input::pointer::CursorIcon;
 use smithay::utils::{Logical, Point};
 
 use super::Comp;
-use crate::layout::{Boundary, Dir, GapAt, NodeId, Win};
-use crate::state::{Activation, Insert};
+use crate::layout::{Boundary, Dir, GapAt, Insert, NodeId, Win};
+use crate::state::Activation;
 use crate::theme;
 use crate::widgets::{leaf_meta, BtnKind, FrameRect};
 

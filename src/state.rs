@@ -4,19 +4,8 @@
 //! split, and a dying window usually takes its split with it; only empty
 //! placeholder splits exist without a window, never the reverse.
 
-use crate::layout::{Boundary, ColWidth, GapAt, Layout, NodeId, Pos, Rect, Win};
+use crate::layout::{Boundary, ColWidth, GapAt, Insert, Layout, NodeId, Pos, Rect, Win};
 use crate::theme;
-
-/// Where a "+" insert button (or a gap drop) adds a new empty split.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Insert {
-    /// A new column before column `idx`.
-    Col(usize),
-    /// A new column after the last one (the right-edge button).
-    ColEnd,
-    /// A new row after row `idx` of column `col`'s stack.
-    Row { col: usize, idx: usize },
-}
 
 /// Outcome of `activate_client`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -373,11 +362,7 @@ impl State {
             Insert::Col(idx) => self
                 .layout
                 .insert_column(idx, ColWidth::Px(theme::default_col_w(wa.w))),
-            Insert::ColEnd => self.layout.insert_column(
-                self.layout.ncols(),
-                ColWidth::Px(theme::default_col_w(wa.w)),
-            ),
-            Insert::Row { col, idx } => match self.layout.insert_row(col, idx + 1) {
+            Insert::Row { col, idx } => match self.layout.insert_row(col, idx) {
                 Some(id) => id,
                 None => return self.focused_leaf_valid(),
             },
@@ -961,7 +946,7 @@ mod tests {
         s.unpin_client(1);
         let sole = s.focused_leaf_valid();
         assert!(!s.remove_empty_leaf(sole), "sole placeholder");
-        let extra = s.insert_at(WA, Insert::ColEnd);
+        let extra = s.insert_at(WA, Insert::Col(s.layout.ncols()));
         assert!(s.remove_empty_leaf(extra));
     }
 
@@ -969,7 +954,7 @@ mod tests {
     fn remove_empty_leaf_moves_focus_to_neighbour() {
         let mut s = State::new();
         s.place_new_window(WA, 1, None);
-        s.insert_at(WA, Insert::ColEnd);
+        s.insert_at(WA, Insert::Col(s.layout.ncols()));
         assert!(s.remove_empty_leaf(s.focused_leaf_valid()));
         assert_eq!(s.focused_client(), Some(1));
     }
@@ -1173,7 +1158,7 @@ mod tests {
         assert_eq!(s.focused_client(), None);
         s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
         s.split_focused();
-        s.insert_at(WA, Insert::Row { col: 0, idx: 0 });
+        s.insert_at(WA, Insert::Row { col: 0, idx: 1 });
         assert_eq!(s.layout.col_len(0), 3);
         assert_eq!(
             s.layout.locate(s.focused_leaf_valid()),
