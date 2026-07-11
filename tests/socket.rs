@@ -165,6 +165,9 @@ struct App {
     /// xdg_surface configures seen by the test popup (each acked on
     /// arrival).
     popup_configures: u32,
+    /// The test popup's last configured geometry, relative to the parent's
+    /// window geometry.
+    popup_geometry: (i32, i32, i32, i32),
     /// The test popup received xdg_popup.popup_done.
     popup_done: bool,
     /// The current clipboard offer and the mime types seen per offer.
@@ -252,8 +255,15 @@ impl Dispatch<xdg_popup::XdgPopup, ()> for App {
         _: &Connection,
         _: &QueueHandle<App>,
     ) {
-        if let xdg_popup::Event::PopupDone = event {
-            app.popup_done = true;
+        match event {
+            xdg_popup::Event::PopupDone => app.popup_done = true,
+            xdg_popup::Event::Configure {
+                x,
+                y,
+                width,
+                height,
+            } => app.popup_geometry = (x, y, width, height),
+            _ => {}
         }
     }
 }
@@ -674,6 +684,75 @@ fn popup_grab_redirects_keyboard_and_outside_click_dismisses() {
     s.wm.cmd("click 10 300");
     s.wait_until("outside click sends popup_done", |app| app.popup_done);
     s.wait_until("keyboard returns to the parent", |app| app.focus_is(a));
+
+    popup.destroy();
+    surface.destroy();
+}
+
+/// A popup anchored at its parent's bottom-right corner with slide
+/// adjustment — a context menu opened next to the screen edge. Keeping it
+/// on screen is the compositor's job: the client only states preferences
+/// through xdg_positioner, so the configured geometry must come back slid
+/// inside the output, not at the requested spot. Geometry mirrors
+/// `theme.rs`: the sole column's client origin is GAP + the frame's
+/// left/top border insets, (20 + 6, 20 + 27).
+#[test]
+fn popup_slides_back_inside_the_output() {
+    const OUTPUT_H: i32 = 800;
+    const CLIENT_X: i32 = 26;
+    const CLIENT_Y: i32 = 47;
+    let mut s = Session::boot();
+    let a = s.open_window();
+    s.wait_until("toplevel sized and focused", |app| {
+        app.focus_is(a) && app.wins[a].size.0 > 0
+    });
+    let (w, h) = s.app.wins[a].size;
+
+    // Anchor a 200x150 popup to the client's bottom-right corner, growing
+    // further right and down — past the output on both axes.
+    let surface = s.compositor.create_surface(&s.qh, ());
+    let xdg = s.wm_base.get_xdg_surface(&surface, &s.qh, ());
+    let positioner = s.wm_base.create_positioner(&s.qh, ());
+    positioner.set_size(200, 150);
+    positioner.set_anchor_rect(w - 1, h - 1, 1, 1);
+    positioner.set_anchor(xdg_positioner::Anchor::BottomRight);
+    positioner.set_gravity(xdg_positioner::Gravity::BottomRight);
+    positioner.set_constraint_adjustment(
+        xdg_positioner::ConstraintAdjustment::SlideX
+            | xdg_positioner::ConstraintAdjustment::SlideY,
+    );
+    let popup = xdg.get_popup(Some(&s.app.wins[a].xdg), &positioner, &s.qh, ());
+    surface.commit();
+    s.wait_until("popup configured", |app| app.popup_configures > 0);
+
+    // Slid flush against the output's right and bottom edges (popups may
+    // overhang the taskbar; only the output bounds them).
+    assert_eq!(
+        s.app.popup_geometry,
+        (OUTPUT_W - 200 - CLIENT_X, OUTPUT_H - 150 - CLIENT_Y, 200, 150),
+        "popup geometry slid inside the output (naive spot was ({w}, {h}))"
+    );
+
+    // Map the popup with a solid green buffer: it overhangs the leaf rect
+    // (the right canvas gap and the taskbar strip), and unlike the toplevel
+    // buffer under it, it renders uncropped — its pixels must reach the
+    // screen out there.
+    let shm: wl_shm::WlShm = s.globals.bind(&s.qh, 1..=1, ()).expect("bind wl_shm");
+    let file = tempfile::tempfile().expect("shm backing file");
+    // Argb8888 little-endian: B, G, R, A.
+    let green: Vec<u8> = [0u8, 255, 0, 255].repeat(200 * 150);
+    (&file).write_all(&green).expect("fill shm with green");
+    let pool = shm.create_pool(file.as_fd(), 200 * 150 * 4, &s.qh, ());
+    let buffer = pool.create_buffer(0, 200, 150, 200 * 4, wl_shm::Format::Argb8888, &s.qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+    s.queue.roundtrip(&mut s.app).expect("roundtrip");
+    let (px, py) = (OUTPUT_W - 10, OUTPUT_H - 10);
+    assert_eq!(
+        s.pixel(px, py),
+        [0, 255, 0, 255],
+        "the popup's overflow past the leaf rect should show at ({px}, {py})"
+    );
 
     popup.destroy();
     surface.destroy();

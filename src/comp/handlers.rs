@@ -233,7 +233,9 @@ impl XdgShellHandler for Comp {
         self.arrange();
     }
 
-    fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        let geometry = self.unconstrained_popup_geometry(&surface, positioner);
+        surface.with_pending_state(|state| state.geometry = geometry);
         if let Err(err) = self.popups.track_popup(PopupKind::Xdg(surface)) {
             tracing::warn!("failed to track popup: {err}");
         }
@@ -245,8 +247,9 @@ impl XdgShellHandler for Comp {
         positioner: PositionerState,
         token: u32,
     ) {
+        let geometry = self.unconstrained_popup_geometry(&surface, positioner);
         surface.with_pending_state(|state| {
-            state.geometry = positioner.get_geometry();
+            state.geometry = geometry;
             state.positioner = positioner;
         });
         surface.send_repositioned(token);

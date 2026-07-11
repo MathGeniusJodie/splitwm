@@ -256,8 +256,16 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
     // settled layout). Each buffer anchors at its rect's origin, stretches
     // per-axis when the rect outgrows it, and crops to the rect — so a
     // mid-animation buffer at the wrong size never spills over the frame
-    // borders or leaves a wallpaper sliver.
+    // borders or leaves a wallpaper sliver. Popups draw in front of their
+    // window, uncropped and unscaled: menus legitimately overflow the leaf
+    // rect (`Comp::unconstrained_popup_geometry` keeps them inside the
+    // output instead), and as transient surfaces they skip the animation
+    // stretch.
     for t in scene.tiled {
+        use smithay::wayland::seat::WaylandFocus as _;
+        let Some(surface) = t.window.wl_surface() else {
+            continue;
+        };
         let geo = t.window.geometry();
         let origin = Point::<i32, Logical>::from((t.rect.x, t.rect.y));
         let scale = Scale {
@@ -268,20 +276,36 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
             origin.to_physical(1),
             Size::from((t.rect.w.max(1), t.rect.h.max(1))),
         );
-        elements.extend(
-            t.window
-                .render_elements::<WaylandSurfaceRenderElement<GlesRenderer>>(
+        for (popup, offset) in smithay::desktop::PopupManager::popups_for_surface(&surface) {
+            let loc = (origin + offset - popup.geometry().loc).to_physical(1);
+            elements.extend(
+                smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
                     renderer,
-                    (origin - geo.loc).to_physical(1),
-                    1.0.into(),
+                    popup.wl_surface(),
+                    loc,
                     1.0,
+                    1.0,
+                    Kind::Unspecified,
                 )
                 .into_iter()
-                .filter_map(|e| {
-                    let scaled = RescaleRenderElement::from_element(e, origin.to_physical(1), scale);
-                    CropRenderElement::from_element(scaled, 1.0, crop)
-                })
-                .map(OutputElement::Tiled),
+                .map(OutputElement::Float),
+            );
+        }
+        elements.extend(
+            smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
+                renderer,
+                &surface,
+                (origin - geo.loc).to_physical(1),
+                1.0,
+                1.0,
+                Kind::Unspecified,
+            )
+            .into_iter()
+            .filter_map(|e: WaylandSurfaceRenderElement<GlesRenderer>| {
+                let scaled = RescaleRenderElement::from_element(e, origin.to_physical(1), scale);
+                CropRenderElement::from_element(scaled, 1.0, crop)
+            })
+            .map(OutputElement::Tiled),
         );
     }
     if let Some((window, rect)) = scene.dock_place {

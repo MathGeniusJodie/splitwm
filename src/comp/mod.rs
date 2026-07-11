@@ -26,7 +26,7 @@ use smithay::backend::egl::EGLDevice;
 use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::{Color32F, ImportDma as _};
-use smithay::desktop::{PopupManager, Space, Window};
+use smithay::desktop::{PopupKind, PopupManager, Space, Window};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::{Seat, SeatState};
 use smithay::output::{Mode, Output};
@@ -494,11 +494,29 @@ impl Comp {
                 return Some(hit);
             }
         }
-        if let Some(t) = self.tiled_under(pos) {
+        // Tiled/fullscreen windows, frontmost first. Popups hit-test
+        // everywhere: they render uncropped, so a menu overflowing its leaf
+        // must take input where it is visible. The toplevel only hit-tests
+        // inside its settled client rect — the region it draws in
+        // (`Scene::tiled` crops its buffer to it), not its buffer extent: a
+        // client whose resize waits for an animation's end still holds an
+        // oversized buffer, which must not take input over chrome it
+        // visibly no longer covers.
+        let settled: Vec<_> = self.placed.iter().map(|p| (p.leaf, p.target)).collect();
+        for t in self.tiled_places(&settled) {
             let loc = Point::<i32, Logical>::from((t.rect.x, t.rect.y)) - t.window.geometry().loc;
+            let in_rect = pos.x >= f64::from(t.rect.x)
+                && pos.x < f64::from(t.rect.x + t.rect.w)
+                && pos.y >= f64::from(t.rect.y)
+                && pos.y < f64::from(t.rect.y + t.rect.h);
+            let surface_type = if in_rect {
+                smithay::desktop::WindowSurfaceType::ALL
+            } else {
+                smithay::desktop::WindowSurfaceType::POPUP
+            };
             if let Some(hit) = t
                 .window
-                .surface_under(pos - loc.to_f64(), smithay::desktop::WindowSurfaceType::ALL)
+                .surface_under(pos - loc.to_f64(), surface_type)
                 .map(|(s, p)| (s, p.to_f64() + loc.to_f64()))
             {
                 return Some(hit);
@@ -530,6 +548,67 @@ impl Comp {
                 && pos.y >= f64::from(t.rect.y)
                 && pos.y < f64::from(t.rect.y + t.rect.h)
         })
+    }
+
+    /// `positioner`'s geometry, constraint-adjusted (flip/slide/resize per
+    /// the client's `constraint_adjustment`) so the popup stays inside the
+    /// output. The client only states placement preferences through
+    /// `xdg_positioner`; keeping the popup on screen is the compositor's
+    /// job, so without this a menu opened near a screen edge runs off it.
+    pub fn unconstrained_popup_geometry(
+        &self,
+        popup: &smithay::wayland::shell::xdg::PopupSurface,
+        positioner: smithay::wayland::shell::xdg::PositionerState,
+    ) -> Rectangle<i32, Logical> {
+        let kind = PopupKind::Xdg(popup.clone());
+        let fallback = positioner.get_geometry();
+        let Ok(root) = smithay::desktop::find_popup_root_surface(&kind) else {
+            return fallback;
+        };
+        let Some(root_loc) = self.popup_root_loc(&root) else {
+            return fallback;
+        };
+        let size: Size<i32, Logical> = self.output_size().to_logical(1);
+        // The positioner works relative to the parent's geometry origin;
+        // express the output rect in that space.
+        let mut target = Rectangle::new((0, 0).into(), size);
+        target.loc -= root_loc + smithay::desktop::get_popup_toplevel_coords(&kind);
+        positioner.get_unconstrained_geometry(target)
+    }
+
+    /// The global position of `root`'s geometry origin — the space xdg
+    /// popup geometries are relative to. Mirrors `surface_under`'s legs:
+    /// settled tiled/fullscreen rects, float and dock positions, layer
+    /// surfaces at their map (or scrolled-dock) location.
+    fn popup_root_loc(
+        &self,
+        root: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+    ) -> Option<Point<i32, Logical>> {
+        use smithay::wayland::seat::WaylandFocus as _;
+        if let Some(win) = self.managed.win_for_surface(root) {
+            return match self.managed.kind_of(win)? {
+                crate::shell::Kind::Tiled => {
+                    let settled: Vec<_> = self.placed.iter().map(|p| (p.leaf, p.target)).collect();
+                    self.tiled_places(&settled)
+                        .into_iter()
+                        .find(|t| t.window.wl_surface().is_some_and(|s| *s == *root))
+                        .map(|t| Point::from((t.rect.x, t.rect.y)))
+                }
+                crate::shell::Kind::Float(f) => Some(Point::from((f.x, f.y))),
+                crate::shell::Kind::Dock(d) => {
+                    let rect = self.dock_geometry(*d);
+                    Some(Point::from((rect.x, rect.y)))
+                }
+            };
+        }
+        if let Some((surface, loc)) = self.layer_dock_place() {
+            if surface == *root {
+                return Some(loc);
+            }
+        }
+        let map = smithay::desktop::layer_map_for_output(&self.output);
+        let layer = map.layer_for_surface(root, smithay::desktop::WindowSurfaceType::TOPLEVEL)?;
+        map.layer_geometry(layer).map(|geo| geo.loc)
     }
 
     /// Current output size in pixels. The backend configures a mode before
