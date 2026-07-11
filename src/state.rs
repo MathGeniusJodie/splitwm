@@ -360,7 +360,7 @@ impl State {
     /// The placeholder becomes focused.
     pub fn split_column_right(&mut self, wa: Rect) -> NodeId {
         let col = self.focused_col();
-        let w = self.layout.widths(wa.w, theme::GAP)[col];
+        let w = self.layout.col_px(col, wa.w, theme::GAP);
         let minor =
             ((f64::from(w) * (1.0 - theme::SPLIT_RATIO)).round() as i32).max(theme::min_split_w());
         let major = (w - minor).max(theme::min_split_w());
@@ -416,11 +416,11 @@ impl State {
             };
             return self.transfer_row_frac(pos, other, delta);
         }
-        let widths = self.layout.widths(wa.w, theme::GAP);
+        let cur_w = self.layout.col_px(pos.col, wa.w, theme::GAP);
         let step = (wa.w / 20).max(1);
-        let target = widths[pos.col] + if grow { step } else { -step };
+        let target = cur_w + if grow { step } else { -step };
         let new_w = target.max(theme::min_split_w());
-        if new_w == widths[pos.col] {
+        if new_w == cur_w {
             return false;
         }
         self.layout.set_col_width(pos.col, ColWidth::Px(new_w));
@@ -491,7 +491,7 @@ impl State {
         if self.layout.col_pinned(col) {
             return 0;
         }
-        let old_w = self.layout.widths(wa.w, theme::GAP)[col];
+        let old_w = self.layout.col_px(col, wa.w, theme::GAP);
         let new_w = target_w.max(theme::min_split_w());
         let delta = new_w - old_w;
         if delta == 0 {
@@ -649,15 +649,17 @@ impl State {
     /// the same span.
     pub fn edge_span(&self, wa: Rect, left: bool) -> Option<(i32, i32)> {
         let gap = theme::GAP;
-        let widths = self.layout.widths(wa.w, gap);
         let start_x = wa.x + gap;
         if left {
-            Some((start_x, widths[0]))
+            Some((start_x, self.layout.col_px(0, wa.w, gap)))
         } else {
-            let n = widths.len();
-            let before: i32 = widths[..n - 1].iter().sum();
+            let n = self.layout.ncols();
+            let before: i32 = (0..n - 1).map(|i| self.layout.col_px(i, wa.w, gap)).sum();
             let gaps_before = gap * i32::try_from(n - 1).unwrap_or(0);
-            Some((start_x + before + gaps_before, widths[n - 1]))
+            Some((
+                start_x + before + gaps_before,
+                self.layout.col_px(n - 1, wa.w, gap),
+            ))
         }
     }
 

@@ -529,19 +529,18 @@ impl Comp {
         // client whose resize waits for an animation's end still holds an
         // oversized buffer, which must not take input over chrome it
         // visibly no longer covers.
-        for t in self.settled_tiled_places() {
-            let loc = Point::<i32, Logical>::from((t.rect.x, t.rect.y)) - t.window.geometry().loc;
-            let in_rect = pos.x >= f64::from(t.rect.x)
-                && pos.x < f64::from(t.rect.x + t.rect.w)
-                && pos.y >= f64::from(t.rect.y)
-                && pos.y < f64::from(t.rect.y + t.rect.h);
+        for (window, rect) in self.settled_tiled() {
+            let loc = Point::<i32, Logical>::from((rect.x, rect.y)) - window.geometry().loc;
+            let in_rect = pos.x >= f64::from(rect.x)
+                && pos.x < f64::from(rect.x + rect.w)
+                && pos.y >= f64::from(rect.y)
+                && pos.y < f64::from(rect.y + rect.h);
             let surface_type = if in_rect {
                 smithay::desktop::WindowSurfaceType::ALL
             } else {
                 smithay::desktop::WindowSurfaceType::POPUP
             };
-            if let Some(hit) = t
-                .window
+            if let Some(hit) = window
                 .surface_under(pos - loc.to_f64(), surface_type)
                 .map(|(s, p)| (s, p.to_f64() + loc.to_f64()))
             {
@@ -567,12 +566,17 @@ impl Comp {
     /// end still holds an oversized buffer, which must not take input over
     /// chrome it visibly no longer covers.
     pub fn tiled_under(&self, pos: Point<f64, Logical>) -> Option<scene::TiledPlace> {
-        self.settled_tiled_places().into_iter().find(|t| {
-            pos.x >= f64::from(t.rect.x)
-                && pos.x < f64::from(t.rect.x + t.rect.w)
-                && pos.y >= f64::from(t.rect.y)
-                && pos.y < f64::from(t.rect.y + t.rect.h)
-        })
+        self.settled_tiled()
+            .find(|(_, rect)| {
+                pos.x >= f64::from(rect.x)
+                    && pos.x < f64::from(rect.x + rect.w)
+                    && pos.y >= f64::from(rect.y)
+                    && pos.y < f64::from(rect.y + rect.h)
+            })
+            .map(|(window, rect)| scene::TiledPlace {
+                window: window.clone(),
+                rect,
+            })
     }
 
     /// `positioner`'s geometry, constraint-adjusted (flip/slide/resize per
@@ -613,10 +617,9 @@ impl Comp {
         if let Some(win) = self.managed.win_for_surface(root) {
             return match self.managed.kind_of(win)? {
                 crate::shell::Kind::Tiled => self
-                    .settled_tiled_places()
-                    .into_iter()
-                    .find(|t| t.window.wl_surface().is_some_and(|s| *s == *root))
-                    .map(|t| Point::from((t.rect.x, t.rect.y))),
+                    .settled_tiled()
+                    .find(|(w, _)| w.wl_surface().is_some_and(|s| *s == *root))
+                    .map(|(_, rect)| Point::from((rect.x, rect.y))),
                 crate::shell::Kind::Float(f) => Some(Point::from((f.x, f.y))),
                 crate::shell::Kind::Dock(d) => {
                     let rect = self.dock_geometry(*d);
@@ -682,8 +685,10 @@ impl Comp {
         let fullscreen = self.fullscreen();
         let mut deferred: Vec<(crate::layout::Win, (i32, i32, i32, i32))> = Vec::new();
         let mut shown: Vec<crate::layout::Win> = Vec::new();
-        let placed = self.view.placed.clone();
-        for p in placed {
+        // Taken (not cloned) around the loop: the body borrows `self`
+        // mutably but never touches `view.placed`.
+        let placed = std::mem::take(&mut self.view.placed);
+        for &p in &placed {
             let Some(c) = p.active_client else {
                 continue;
             };
@@ -715,6 +720,7 @@ impl Comp {
             self.space.map_element(window, (cx, cy), false);
             shown.push(c);
         }
+        self.view.placed = placed;
 
         // The fullscreen client covers the whole output above every tiled
         // client, regardless of where (or whether) its split is on screen.
@@ -916,14 +922,12 @@ impl Comp {
     }
 
     /// The focus outline's four solid strips (top, bottom, left, right) for
-    /// the current `focus_rect`, or empty when no leaf holds focus. Each
+    /// the current `focus_rect`, or `None` when no leaf holds focus. Each
     /// strip resizes its persistent buffer (bumping its damage on a size
     /// change) and draws at scale 1; the buffers' stable ids let the damage
     /// tracker track a strip across frames as the focused rect moves.
-    fn focus_outline_elements(&mut self) -> Vec<SolidColorRenderElement> {
-        let Some(r) = self.view.focus_rect else {
-            return Vec::new();
-        };
+    fn focus_outline_elements(&mut self) -> Option<[SolidColorRenderElement; 4]> {
+        let r = self.view.focus_rect?;
         const T: i32 = 2;
         // Traced on the frame's edges (top and bottom full width, sides
         // between them), matching the strips the underlay used to paint.
@@ -933,21 +937,18 @@ impl Comp {
             (r.x, r.y + T, T, r.h - 2 * T),
             (r.x + r.w - T, r.y + T, T, r.h - 2 * T),
         ];
-        self.view
-            .focus_outline
-            .iter_mut()
-            .zip(strips)
-            .map(|(buf, (x, y, w, h))| {
-                buf.resize((w.max(0), h.max(0)));
-                SolidColorRenderElement::from_buffer(
-                    buf,
-                    Point::<i32, Logical>::from((x, y)).to_physical(1),
-                    1.0,
-                    1.0,
-                    Kind::Unspecified,
-                )
-            })
-            .collect()
+        Some(std::array::from_fn(|i| {
+            let (x, y, w, h) = strips[i];
+            let buf = &mut self.view.focus_outline[i];
+            buf.resize((w.max(0), h.max(0)));
+            SolidColorRenderElement::from_buffer(
+                buf,
+                Point::<i32, Logical>::from((x, y)).to_physical(1),
+                1.0,
+                1.0,
+                Kind::Unspecified,
+            )
+        }))
     }
 
     /// Composite one frame and pace clients' frame callbacks.
@@ -1031,7 +1032,7 @@ impl Comp {
             frame_art: self.view.pieces.frame_art(),
             plus: &plus,
             taskbar,
-            focus_outline: &focus_outline,
+            focus_outline: focus_outline.as_ref().map_or(&[][..], <[_; 4]>::as_slice),
         };
         match &mut self.backend {
             crate::backend::Backend::Winit(w) => {

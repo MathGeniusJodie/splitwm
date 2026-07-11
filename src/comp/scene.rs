@@ -354,17 +354,47 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
 }
 
 impl Comp {
-    /// `tiled_places` at the *settled* rects (`view.placed` targets),
-    /// ignoring any in-flight animation — for the input paths, which must
-    /// see the layout the user is aiming at, not a mid-slide frame.
-    pub fn settled_tiled_places(&self) -> Vec<TiledPlace> {
-        let settled: Vec<_> = self
-            .view
-            .placed
-            .iter()
-            .map(|p| (p.leaf, p.target))
-            .collect();
-        self.tiled_places(&settled)
+    /// Every visible tiled window at the client rect inside its *settled*
+    /// leaf rect (`view.placed` targets, ignoring any in-flight animation),
+    /// fullscreen client first — `tiled_places`' logic as a borrowing
+    /// iterator for the input paths, which must see the layout the user is
+    /// aiming at and which run per pointer event, so they must not collect
+    /// or clone window handles.
+    pub fn settled_tiled(
+        &self,
+    ) -> impl Iterator<Item = (&smithay::desktop::Window, FrameRect)> {
+        let fullscreen = self.fullscreen();
+        let fs = fullscreen.and_then(|c| self.managed.get(c)).map(|window| {
+            let size = self.output_size();
+            (
+                window,
+                FrameRect {
+                    x: 0,
+                    y: 0,
+                    w: size.w,
+                    h: size.h,
+                },
+            )
+        });
+        fs.into_iter()
+            .chain(self.view.placed.iter().filter_map(move |p| {
+                let l = self.state.layout.leaf(p.leaf)?;
+                let c = l.client?;
+                if l.minimized || Some(c) == fullscreen {
+                    return None;
+                }
+                let window = self.managed.get(c)?;
+                let (cx, cy, cw, ch) = crate::shell::client_rect_in_frame(p.target, (1, 1));
+                Some((
+                    window,
+                    FrameRect {
+                        x: cx,
+                        y: cy,
+                        w: cw,
+                        h: ch,
+                    },
+                ))
+            }))
     }
 
     /// Every visible tiled window's draw placement for this frame: the

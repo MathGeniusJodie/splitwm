@@ -10,7 +10,6 @@ use crate::layout::Win;
 use crate::render::{LeafView, TitleInfo};
 use crate::shell::{DockData, FloatData, Kind};
 use crate::theme;
-use crate::widgets::label_from_class;
 
 impl Comp {
     /// First commit with a buffer (Wayland) or map request (X11): decide
@@ -315,7 +314,7 @@ impl Comp {
             return;
         };
         let title = crate::shell::toplevel_title(window);
-        let label = label_from_class(&crate::shell::toplevel_app_id(window));
+        let label = crate::shell::toplevel_label(window);
         let icon = self.managed.entry(win).and_then(|m| m.icon.clone());
         let rect = f.frame_rect();
         let view = LeafView {

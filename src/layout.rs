@@ -547,21 +547,31 @@ impl Layout {
         self.columns[col].rows.iter().all(|r| r.leaf.minimized)
     }
 
-    /// Each column's laid-out pixel width: `Viewport` resolves against the
+    /// Column `col`'s laid-out pixel width: `Viewport` resolves against the
     /// viewport (minus the outer margins), a pinned column to the gap.
+    /// The single-column form of `widths`, for callers that would otherwise
+    /// build the whole vector to index one entry.
+    pub fn col_px(&self, col: usize, viewport_w: i32, gap: i32) -> i32 {
+        if self.col_pinned(col) {
+            gap
+        } else {
+            match self.columns[col].width {
+                ColWidth::Viewport => (viewport_w - 2 * gap).max(gap),
+                ColWidth::Px(w) => w.max(gap),
+            }
+        }
+    }
+
+    /// Each column's laid-out pixel width, left to right (see `col_px`).
+    fn widths_iter(&self, viewport_w: i32, gap: i32) -> impl Iterator<Item = i32> + '_ {
+        (0..self.columns.len()).map(move |i| self.col_px(i, viewport_w, gap))
+    }
+
+    /// Each column's laid-out pixel width as a vector; every non-test
+    /// caller gets by with `col_px`/`widths_iter`.
+    #[cfg(test)]
     pub fn widths(&self, viewport_w: i32, gap: i32) -> Vec<i32> {
-        (0..self.columns.len())
-            .map(|i| {
-                if self.col_pinned(i) {
-                    gap
-                } else {
-                    match self.columns[i].width {
-                        ColWidth::Viewport => (viewport_w - 2 * gap).max(gap),
-                        ColWidth::Px(w) => w.max(gap),
-                    }
-                }
-            })
-            .collect()
+        self.widths_iter(viewport_w, gap).collect()
     }
 
     /// The scrollable strip's total width: the columns end to end, plus
@@ -569,17 +579,15 @@ impl Layout {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn strip_w(&self, viewport_w: i32, gap: i32) -> i32 {
         let n = self.columns.len() as i32;
-        2 * gap + self.widths(viewport_w, gap).iter().sum::<i32>() + gap * (n - 1)
+        2 * gap + self.widths_iter(viewport_w, gap).sum::<i32>() + gap * (n - 1)
     }
 
     /// Canvas-space rect of each column (before per-row subdivision).
     fn col_rects(&self, wa: Rect, gap: i32) -> Vec<Rect> {
-        let widths = self.widths(wa.w, gap);
         let mut x = wa.x + gap;
         let y = wa.y + gap;
         let h = (wa.h - 2 * gap).max(0);
-        widths
-            .into_iter()
+        self.widths_iter(wa.w, gap)
             .map(|w| {
                 let r = Rect { x, y, w, h };
                 x += w + gap;

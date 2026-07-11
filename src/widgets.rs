@@ -365,7 +365,7 @@ pub fn compute_leaf_widgets(widgets: &mut Widgets, layout: &Layout, placed: &[Pl
 /// hit-regions (`compute_btn_regions`) and the baked chrome
 /// (`Comp::leaf_buttons`, which re-derives them at each interpolated size
 /// mid-animation) read it, so a click always lands where a button drew.
-pub fn leaf_btn_rects(frame: FrameRect) -> Vec<(BtnKind, FrameRect)> {
+pub fn leaf_btn_rects(frame: FrameRect) -> impl Iterator<Item = (BtnKind, FrameRect)> {
     let bsz = theme::BTN_SIZE;
     let bsp = theme::BTN_SPACING;
     let bcy = frame.y + theme::tb_h() / 2 + theme::BTN_Y_OFFSET;
@@ -380,19 +380,22 @@ pub fn leaf_btn_rects(frame: FrameRect) -> Vec<(BtnKind, FrameRect)> {
             },
         )
     };
+    // At most three buttons, in a fixed array: this runs per leaf per frame
+    // (the baked-chrome fingerprint), so it must not allocate.
+    let mut btns = [None; 3];
     if frame.w >= theme::min_split_w() {
         let right = theme::btn_strip_right(frame.x, frame.w, theme::BORDER_LEFT);
-        [BtnKind::Close, BtnKind::Split, BtnKind::Minimize]
+        for (i, kind) in [BtnKind::Close, BtnKind::Split, BtnKind::Minimize]
             .into_iter()
             .enumerate()
-            .map(|(i, kind)| {
-                let bcx = right - bsz / 2 - i32::try_from(i).unwrap_or(0) * (bsz + bsp);
-                at(bcx, kind)
-            })
-            .collect()
+        {
+            let bcx = right - bsz / 2 - i32::try_from(i).unwrap_or(0) * (bsz + bsp);
+            btns[i] = Some(at(bcx, kind));
+        }
     } else {
-        vec![at(frame.x + frame.w / 2, BtnKind::Minimize)]
+        btns[0] = Some(at(frame.x + frame.w / 2, BtnKind::Minimize));
     }
+    btns.into_iter().flatten()
 }
 
 /// Split-control buttons on the right of a leaf's titlebar; a minimized

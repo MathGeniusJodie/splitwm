@@ -256,14 +256,41 @@ impl Managed {
     }
 }
 
+/// Memoized `Rc` of a toplevel's title, stored in the surface's user data:
+/// the chrome fingerprints re-read the title every frame, and without the
+/// cache each read would allocate a fresh `Rc<str>` just to compare equal.
+struct TitleCache(std::cell::RefCell<std::rc::Rc<str>>);
+
 /// The window's current title (xdg toplevel title / X11 `_NET_WM_NAME`),
-/// or empty when unset.
+/// or empty when unset. Repeated reads of an unchanged title return clones
+/// of one shared `Rc` (see `TitleCache`).
 pub fn toplevel_title(window: &Window) -> std::rc::Rc<str> {
     if let Some(x11) = window.x11_surface() {
         return x11.title().into();
     }
-    read_toplevel_data(window, |d| d.title.as_deref().map(std::rc::Rc::from))
-        .unwrap_or_else(|| "".into())
+    let Some(t) = window.toplevel() else {
+        return "".into();
+    };
+    smithay::wayland::compositor::with_states(t.wl_surface(), |states| {
+        let data = states
+            .data_map
+            .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+            .and_then(|d| d.lock().ok());
+        let title = data.as_ref().and_then(|d| d.title.as_deref()).unwrap_or("");
+        states
+            .data_map
+            .insert_if_missing(|| TitleCache(std::cell::RefCell::new("".into())));
+        let mut cached = states
+            .data_map
+            .get::<TitleCache>()
+            .expect("inserted above")
+            .0
+            .borrow_mut();
+        if &**cached != title {
+            *cached = title.into();
+        }
+        std::rc::Rc::clone(&cached)
+    })
 }
 
 /// The window's class identity (xdg app_id / X11 `WM_CLASS` class half),
@@ -273,6 +300,20 @@ pub fn toplevel_app_id(window: &Window) -> String {
         return x11.class();
     }
     read_toplevel_data(window, |d| d.app_id.clone()).unwrap_or_default()
+}
+
+/// The window's fallback glyph — its class identity's first character,
+/// uppercased, `?` when unset — without cloning the whole app_id the way
+/// `toplevel_app_id` + `label_from_class` would (the chrome fingerprints
+/// re-derive it every frame).
+pub fn toplevel_label(window: &Window) -> char {
+    if let Some(x11) = window.x11_surface() {
+        return crate::widgets::label_from_class(&x11.class());
+    }
+    read_toplevel_data(window, |d| {
+        d.app_id.as_deref().map(crate::widgets::label_from_class)
+    })
+    .unwrap_or('?')
 }
 
 /// Politely ask a window to close, whichever backend it speaks.

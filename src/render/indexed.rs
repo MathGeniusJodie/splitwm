@@ -111,6 +111,12 @@ impl IndexedProgram {
         }
     }
 
+    /// Staging capacity kept resident between uploads: comfortably above
+    /// every routinely re-uploaded piece (titlebar/taskbar strips are tens
+    /// of KiB even at 4K width), so only the full-output wallpaper — MBs,
+    /// re-uploaded only on load/resize — triggers the shrink below.
+    const STAGING_KEEP: usize = 512 * 1024;
+
     /// Upload `fb`'s indices into `target`, reusing the shared staging
     /// buffer. For the chrome buffers re-uploaded as the layout changes
     /// (underlay, float frames, notes), where a per-frame allocation would
@@ -123,6 +129,9 @@ impl IndexedProgram {
         opaque: bool,
     ) {
         upload_into(renderer, target, fb, opaque, &mut self.staging);
+        if self.staging.capacity() > Self::STAGING_KEEP {
+            self.staging.shrink_to(Self::STAGING_KEEP);
+        }
     }
 
     /// Upload `fb` with a throwaway staging buffer, for one-off uploads (the

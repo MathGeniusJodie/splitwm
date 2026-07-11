@@ -249,7 +249,9 @@ struct LeafPaint {
     accent: Index,
     minimized: bool,
     title: Option<TitlePaint>,
-    buttons: Vec<BtnPaint>,
+    /// The at-most-three baked buttons (`leaf_btn_rects`' fixed capacity),
+    /// inline so gathering a paint per leaf per frame never allocates.
+    buttons: [Option<BtnPaint>; 3],
 }
 
 /// A leaf titlebar's contents (drawn only when unminimized and occupied).
@@ -260,6 +262,7 @@ struct TitlePaint {
 }
 
 /// One baked split-control button, its centre relative to the leaf origin.
+#[derive(Clone, Copy, PartialEq)]
 struct BtnPaint {
     cx: i32,
     cy: i32,
@@ -272,12 +275,14 @@ struct BtnPaint {
 /// the strip must be re-rendered. Everything `draw_titlebar_strip` and the
 /// baked buttons consult appears here; the height is always `tb_h`. Icons
 /// compare by their process-unique id and titles by their string contents.
+/// Building one is allocation-free (the title `Rc` is a refcount bump), so
+/// deriving it per leaf per frame just to compare is cheap.
 #[derive(PartialEq)]
 struct TitlebarKey {
     w: i32,
     accent: Index,
     title: Option<(char, Option<u64>, Rc<str>)>,
-    buttons: Vec<(i32, i32, BtnIcon, bool, Index)>,
+    buttons: [Option<BtnPaint>; 3],
 }
 
 impl LeafPaint {
@@ -289,11 +294,7 @@ impl LeafPaint {
                 .title
                 .as_ref()
                 .map(|t| (t.label, t.icon.as_ref().map(|i| i.id()), t.title.clone())),
-            buttons: self
-                .buttons
-                .iter()
-                .map(|b| (b.cx, b.cy, b.icon, b.disabled, b.accent))
-                .collect(),
+            buttons: self.buttons,
         }
     }
 
@@ -352,7 +353,6 @@ struct QuickPaint {
 /// The taskbar's content fingerprint (mirrors `LeafKey`'s role): window
 /// set/order, per-tile accent/highlight/icon, the separator, and the visible
 /// quick-launch entries.
-#[derive(PartialEq)]
 struct TaskbarKey {
     w: i32,
     h: i32,
@@ -362,31 +362,45 @@ struct TaskbarKey {
     quick: Vec<(FrameRect, Option<u64>, char)>,
 }
 
+fn tile_key(t: &TilePaint) -> (FrameRect, FrameRect, Option<u64>, char, Index) {
+    (
+        t.rect,
+        t.close,
+        t.icon.as_ref().map(|i| i.id()),
+        t.label,
+        t.accent,
+    )
+}
+
+fn quick_key(q: &QuickPaint) -> (FrameRect, Option<u64>, char) {
+    (q.rect, q.icon.as_ref().map(|i| i.id()), q.label)
+}
+
+impl TaskbarKey {
+    /// Whether `p` would rebuild into exactly this key — the steady-state
+    /// per-frame check, comparing in place instead of building (and
+    /// allocating) a fresh key just to throw it away.
+    fn matches(&self, p: &TaskbarPaint) -> bool {
+        self.w == p.w
+            && self.h == p.h
+            && self.origin == p.origin
+            && self.sep == p.sep
+            && self.tiles.len() == p.tiles.len()
+            && self.quick.len() == p.quick.len()
+            && self.tiles.iter().zip(&p.tiles).all(|(k, t)| *k == tile_key(t))
+            && self.quick.iter().zip(&p.quick).all(|(k, q)| *k == quick_key(q))
+    }
+}
+
 impl TaskbarPaint {
     fn key(&self) -> TaskbarKey {
         TaskbarKey {
             w: self.w,
             h: self.h,
             origin: self.origin,
-            tiles: self
-                .tiles
-                .iter()
-                .map(|t| {
-                    (
-                        t.rect,
-                        t.close,
-                        t.icon.as_ref().map(|i| i.id()),
-                        t.label,
-                        t.accent,
-                    )
-                })
-                .collect(),
+            tiles: self.tiles.iter().map(tile_key).collect(),
             sep: self.sep,
-            quick: self
-                .quick
-                .iter()
-                .map(|q| (q.rect, q.icon.as_ref().map(|i| i.id()), q.label))
-                .collect(),
+            quick: self.quick.iter().map(quick_key).collect(),
         }
     }
 }
@@ -418,7 +432,7 @@ fn update_leaf(
         piece.mode = mode;
         piece.commit.increment();
     }
-    if paint.minimized || (paint.title.is_none() && paint.buttons.is_empty()) {
+    if paint.minimized || (paint.title.is_none() && paint.buttons.iter().all(Option::is_none)) {
         piece.titlebar = None;
         return;
     }
@@ -434,7 +448,7 @@ fn update_leaf(
         pixel_graphics::TRANSPARENT,
     );
     chrome.draw_titlebar_strip(&mut fb, &paint.view());
-    for b in &paint.buttons {
+    for b in paint.buttons.iter().flatten() {
         chrome.draw_button(&mut fb, b.cx, b.cy, b.icon, b.disabled, b.accent);
     }
     // Reuse the previous texture's GL storage when the size matches.
@@ -472,9 +486,8 @@ fn render_taskbar(
     piece: &mut TaskbarPiece,
     paint: &TaskbarPaint,
 ) {
-    let key = paint.key();
     piece.origin = paint.origin;
-    if piece.tex.is_some() && piece.key.as_ref() == Some(&key) {
+    if piece.tex.is_some() && piece.key.as_ref().is_some_and(|k| k.matches(paint)) {
         return;
     }
     let mut fb = Framebuffer::new(
@@ -515,7 +528,7 @@ fn render_taskbar(
         );
     }
     indexed.upload(renderer, &mut piece.tex, &fb, false);
-    piece.key = Some(key);
+    piece.key = Some(paint.key());
 }
 
 impl Comp {
@@ -551,13 +564,6 @@ impl Comp {
                     .find(|p| p.leaf == leaf)
                     .map(|p| (leaf, self.leaf_paint(p, rect)))
             })
-            .collect();
-        let plus_sizes: Vec<i32> = self
-            .view
-            .widgets
-            .plus_regions
-            .iter()
-            .map(|(r, _)| r.w.max(1))
             .collect();
         let taskbar_paint = self.taskbar_paint(ow, oh);
 
@@ -609,8 +615,11 @@ impl Comp {
             .leaves
             .retain(|l, _| leaf_paints.iter().any(|(p, _)| p == l));
 
-        // Plus buttons: one texture per distinct size.
-        for &sz in &plus_sizes {
+        // Plus buttons: one texture per distinct size. `widgets.plus_regions`
+        // and `pieces.plus` are disjoint `ChromeView` fields, so the regions
+        // are read in place rather than copied out first.
+        for i in 0..self.view.widgets.plus_regions.len() {
+            let sz = self.view.widgets.plus_regions[i].0.w.max(1);
             render_plus(
                 &mut self.view.indexed,
                 self.backend.renderer(),
@@ -618,7 +627,11 @@ impl Comp {
                 sz,
             );
         }
-        self.view.pieces.plus.retain(|s, _| plus_sizes.contains(s));
+        let plus_regions = &self.view.widgets.plus_regions;
+        self.view
+            .pieces
+            .plus
+            .retain(|s, _| plus_regions.iter().any(|(r, _)| r.w.max(1) == *s));
 
         // Taskbar strip.
         render_taskbar(
@@ -644,7 +657,7 @@ impl Comp {
             p.active_client
                 .and_then(|c| self.managed.get(c).map(|w| (c, w)))
                 .map(|(c, window)| TitlePaint {
-                    label: crate::widgets::label_from_class(&crate::shell::toplevel_app_id(window)),
+                    label: crate::shell::toplevel_label(window),
                     icon: self.icon_for(c),
                     title: crate::shell::toplevel_title(window),
                 })
@@ -671,14 +684,13 @@ impl Comp {
         rect: FrameRect,
         minimized: bool,
         accent: Index,
-    ) -> Vec<BtnPaint> {
+    ) -> [Option<BtnPaint>; 3] {
+        let mut out = [None; 3];
         if minimized {
-            return Vec::new();
+            return out;
         }
         let meta = leaf_meta(&self.state.layout, leaf, rect);
-        crate::widgets::leaf_btn_rects(rect)
-            .into_iter()
-            .map(|(kind, r)| {
+        let paints = crate::widgets::leaf_btn_rects(rect).map(|(kind, r)| {
                 let (icon, disabled) = match kind {
                     // A stacked split collapses to a row (short/wide) when
                     // minimized, so its button previews that with the
@@ -708,8 +720,11 @@ impl Comp {
                     disabled,
                     accent,
                 }
-            })
-            .collect()
+            });
+        for (slot, b) in out.iter_mut().zip(paints) {
+            *slot = Some(b);
+        }
+        out
     }
 
     /// The taskbar strip's draw data: one tile per split's window, in split
@@ -727,9 +742,10 @@ impl Comp {
                 rect: t.rect,
                 close: t.close,
                 icon: self.icon_for(t.win),
-                label: self.managed.get(t.win).map_or('?', |w| {
-                    crate::widgets::label_from_class(&crate::shell::toplevel_app_id(w))
-                }),
+                label: self
+                    .managed
+                    .get(t.win)
+                    .map_or('?', crate::shell::toplevel_label),
                 accent: t.accent,
             })
             .collect();
