@@ -68,7 +68,7 @@ const MIN_CAP_H: usize = 18;
 const MIN_CAP_W: usize = 18;
 
 /// How a static frame sprite slices over an arbitrary destination rect, for
-/// the GPU nine-slice shader (`comp::indexed::NineSliceElement`): the fixed
+/// the GPU nine-slice shader (`render::indexed::NineSliceElement`): the fixed
 /// margins plus the source column range the horizontal middle tiles from
 /// (narrower than the span between the corners when decoration is baked
 /// there — see `NineSlice::EDGE_SAMPLE_*`). The vertical middle always tiles

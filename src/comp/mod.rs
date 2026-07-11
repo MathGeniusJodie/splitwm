@@ -6,17 +6,18 @@
 //! focus. The split-tree layout replaces the naive Space placement in M4.
 
 pub mod actions;
-pub mod chrome;
+pub mod anim;
 pub mod cursor;
 pub mod debug;
 pub mod handlers;
 pub mod icons;
-pub mod indexed;
 pub mod input;
 pub mod layers;
 pub mod manage;
 pub mod notifications;
+pub mod pieces;
 pub mod pointer;
+pub mod scene;
 pub mod xwayland;
 
 use std::sync::Arc;
@@ -69,6 +70,121 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
+/// Everything describing what this arrange put on screen and how it draws:
+/// the software chrome renderer, the GPU piece caches, the placements and
+/// hit regions, and the layout animation. Owned as one unit so the render
+/// and hit-test paths borrow it independently of the rest of `Comp`.
+pub struct ChromeView {
+    // Software-rendered chrome (the ported pixel-art renderer) and its
+    // GPU-side buffer.
+    pub chrome: crate::render::Renderer,
+    /// The palette shader and its reused upload staging, shared by every
+    /// software-drawn chrome buffer on their way to the GPU.
+    pub indexed: crate::render::indexed::IndexedProgram,
+    /// The independently-textured ex-underlay pieces (wallpaper, per-leaf
+    /// frames, plus buttons, taskbar); each re-renders only when its own
+    /// content fingerprint changes, so scrolling and animation are pure
+    /// element placement (see `comp::pieces`).
+    pub pieces: pieces::ChromePieces,
+    /// On-screen leaves as of the last arrange (chrome + hit regions).
+    pub placed: Vec<crate::widgets::Placement>,
+    /// Every hit-testable widget rect for the current layout, rebuilt as
+    /// one unit each arrange.
+    pub widgets: crate::widgets::Widgets,
+    /// Taskbar quick-launch entries, resolved once at startup (icons and
+    /// .desktop resolution arrive with M8).
+    pub quick: Vec<crate::widgets::QuickSlot>,
+    /// `SPLITWM_WALLPAPER`, kept so an output resize can rescale it.
+    pub wallpaper_path: Option<String>,
+    /// Set by an action that wants its layout change animated; consumed by
+    /// the next `arrange`.
+    pub animate: bool,
+    /// In-flight layout transition (chrome-only interpolation).
+    pub anim: Option<anim::LayoutAnim>,
+    /// Every leaf's frame rect from the last arrange, on-screen or not —
+    /// animation start rects and the empty-leaf-body hit region.
+    pub prev_frame_rect:
+        std::collections::HashMap<crate::layout::NodeId, crate::widgets::FrameRect>,
+    /// The rect the focus outline currently traces: the focused split's
+    /// frame, or its interpolated frame mid-animation. `None` when no leaf
+    /// holds focus. Tracked outside the underlay so a focus switch moves the
+    /// outline without recompositing.
+    pub focus_rect: Option<crate::widgets::FrameRect>,
+    /// The four persistent solid-colour buffers (top, bottom, left, right)
+    /// the focus outline's GPU strips draw from; their stable ids let the
+    /// damage tracker follow each strip as the focused rect moves.
+    pub focus_outline: [SolidColorBuffer; 4],
+}
+
+/// In-flight input interaction state (see `comp::pointer`, `comp::input`).
+#[derive(Default)]
+pub struct Interaction {
+    pub drag: Option<pointer::ActiveDrag>,
+    /// A button press the chrome consumed: its release must be swallowed
+    /// too, so no client sees half a click.
+    pub chrome_press: bool,
+    /// Sub-pixel scroll remainder carried between axis events.
+    pub hscroll_frac: f64,
+    /// A three-finger touchpad swipe is in progress; its updates pan the
+    /// canvas.
+    pub swipe_pan: bool,
+    /// Keycodes whose press we intercepted for a binding: their repeats are
+    /// swallowed (a nested winit session auto-repeats; libinput doesn't)
+    /// and their release must not leak to the client that never saw the
+    /// press.
+    pub held_bound_keys: Vec<u32>,
+}
+
+/// Window bookkeeping beyond the `Managed` store: toplevels not yet
+/// classified, float stacking, and the two records only handed out
+/// re-validated.
+#[derive(Default)]
+pub struct WindowRoles {
+    /// Toplevels between role creation and their first buffer commit;
+    /// classified (tiled/float/dock) only once mapped, since Wayland
+    /// clients set app_id/parent/size hints after creating the role.
+    pub pending: Vec<PendingWindow>,
+    /// Float stacking, topmost first.
+    pub float_stack: Vec<crate::layout::Win>,
+    /// Private invariant: reads go through `Comp::focused_float()`, which
+    /// re-validates against the store, so a dangling record is never
+    /// handed out.
+    pub(super) focused_float: Option<crate::layout::Win>,
+    /// The fullscreen tiled client, covering the whole output above every
+    /// tiled window (floats still render above it). Private invariant:
+    /// reads go through `Comp::fullscreen()`, which re-validates against
+    /// the store, so a dangling record is never handed out.
+    pub(super) fullscreen: Option<crate::layout::Win>,
+}
+
+/// The published protocol globals. Most are only ever handed back to their
+/// smithay handler traits; the `dead_code` ones exist purely so dropping
+/// `Comp` (never in practice) is what unpublishes them.
+pub struct Globals {
+    pub compositor_state: CompositorState,
+    pub xdg_shell_state: XdgShellState,
+    /// Never read, but dropping it would unpublish the xdg-decoration
+    /// global (all chrome is ours; clients are told not to decorate).
+    #[allow(dead_code)]
+    pub xdg_decoration_state: XdgDecorationState,
+    pub shm_state: ShmState,
+    /// Never read, but dropping it would unpublish the xdg-output global.
+    #[allow(dead_code)]
+    pub output_manager_state: OutputManagerState,
+    pub seat_state: SeatState<Comp>,
+    pub data_device_state: DataDeviceState,
+    pub primary_selection_state: PrimarySelectionState,
+    pub layer_shell_state: WlrLayerShellState,
+    /// Never read, but dropping it would unpublish the cursor-shape-v1
+    /// global (how clients name pointer shapes for us to draw).
+    #[allow(dead_code)]
+    pub cursor_shape_state: CursorShapeManagerState,
+    pub dmabuf_state: DmabufState,
+    /// Never read, but it identifies the live dmabuf global for teardown.
+    #[allow(dead_code)]
+    pub dmabuf_global: DmabufGlobal,
+}
+
 pub struct Comp {
     // Presentation (winit window or DRM output; see crate::backend).
     pub backend: crate::backend::Backend,
@@ -86,56 +202,11 @@ pub struct Comp {
     /// (see `comp::cursor`).
     pub cursors: cursor::CursorCache,
 
-    // Software-rendered chrome (the ported pixel-art renderer) and its
-    // GPU-side buffer.
-    pub chrome: crate::render::Renderer,
-    /// The palette shader and its reused upload staging, shared by every
-    /// software-drawn chrome buffer on their way to the GPU.
-    pub indexed: indexed::IndexedProgram,
-    /// The independently-textured ex-underlay pieces (wallpaper, per-leaf
-    /// frames, plus buttons, taskbar); each re-renders only when its own
-    /// content fingerprint changes, so scrolling and animation are pure
-    /// element placement (see `comp::chrome`).
-    pub pieces: chrome::ChromePieces,
-    /// On-screen leaves as of the last arrange (chrome + hit regions).
-    pub placed: Vec<crate::widgets::Placement>,
-    /// Every hit-testable widget rect for the current layout, rebuilt as
-    /// one unit each arrange.
-    pub widgets: crate::widgets::Widgets,
-    /// Taskbar quick-launch entries, resolved once at startup (icons and
-    /// .desktop resolution arrive with M8).
-    pub quick: Vec<crate::widgets::QuickSlot>,
-    /// `SPLITWM_WALLPAPER`, kept so an output resize can rescale it.
-    pub wallpaper_path: Option<String>,
+    // What's on screen and how it draws.
+    pub view: ChromeView,
 
-    // Pointer interaction state (see comp::pointer).
-    pub drag: Option<pointer::ActiveDrag>,
-    /// A button press the chrome consumed: its release must be swallowed
-    /// too, so no client sees half a click.
-    pub chrome_press: bool,
-    /// Sub-pixel scroll remainder carried between axis events.
-    pub hscroll_frac: f64,
-    /// A three-finger touchpad swipe is in progress; its updates pan the
-    /// canvas.
-    pub swipe_pan: bool,
-    /// Set by an action that wants its layout change animated; consumed by
-    /// the next `arrange`.
-    pub animate: bool,
-    /// In-flight layout transition (chrome-only interpolation).
-    pub anim: Option<chrome::LayoutAnim>,
-    /// Every leaf's frame rect from the last arrange, on-screen or not —
-    /// animation start rects and the empty-leaf-body hit region.
-    pub prev_frame_rect:
-        std::collections::HashMap<crate::layout::NodeId, crate::widgets::FrameRect>,
-    /// The rect the focus outline currently traces: the focused split's
-    /// frame, or its interpolated frame mid-animation. `None` when no leaf
-    /// holds focus. Tracked outside the underlay so a focus switch moves the
-    /// outline without recompositing.
-    pub focus_rect: Option<crate::widgets::FrameRect>,
-    /// The four persistent solid-colour buffers (top, bottom, left, right)
-    /// the focus outline's GPU strips draw from; their stable ids let the
-    /// damage tracker follow each strip as the focused rect moves.
-    pub focus_outline: [SolidColorBuffer; 4],
+    // Pointer/keyboard interaction state.
+    pub interaction: Interaction,
 
     // Wayland plumbing.
     pub dh: DisplayHandle,
@@ -156,28 +227,11 @@ pub struct Comp {
     pub pointer: smithay::input::pointer::PointerHandle<Comp>,
     pub start: std::time::Instant,
 
-    // The layout core (pure, ported from master) and the Win <-> Window
-    // bridge it drives.
+    // The layout core (pure, ported from master), the Win <-> Window
+    // bridge it drives, and the window bookkeeping around the bridge.
     pub state: crate::state::State,
     pub managed: crate::shell::Managed,
-    /// Toplevels between role creation and their first buffer commit;
-    /// classified (tiled/float/dock) only once mapped, since Wayland
-    /// clients set app_id/parent/size hints after creating the role.
-    pub pending: Vec<PendingWindow>,
-    /// Float stacking, topmost first.
-    pub float_stack: Vec<crate::layout::Win>,
-    /// Private invariant: reads go through `Comp::focused_float()`, which
-    /// re-validates against the store, so a dangling record is never
-    /// handed out.
-    focused_float: Option<crate::layout::Win>,
-    /// The fullscreen tiled client, covering the whole output above every
-    /// tiled window (floats still render above it).
-    pub fullscreen: Option<crate::layout::Win>,
-    /// Keycodes whose press we intercepted for a binding: their repeats are
-    /// swallowed (a nested winit session auto-repeats; libinput doesn't)
-    /// and their release must not leak to the client that never saw the
-    /// press.
-    pub held_bound_keys: Vec<u32>,
+    pub windows: WindowRoles,
 
     /// Off-thread icon fetches report back over this channel (see
     /// `comp::icons`).
@@ -203,28 +257,7 @@ pub struct Comp {
     pub layer_zone: Rectangle<i32, Logical>,
 
     // Protocol globals.
-    pub compositor_state: CompositorState,
-    pub xdg_shell_state: XdgShellState,
-    /// Never read, but dropping it would unpublish the xdg-decoration
-    /// global (all chrome is ours; clients are told not to decorate).
-    #[allow(dead_code)]
-    pub xdg_decoration_state: XdgDecorationState,
-    pub shm_state: ShmState,
-    /// Never read, but dropping it would unpublish the xdg-output global.
-    #[allow(dead_code)]
-    pub output_manager_state: OutputManagerState,
-    pub seat_state: SeatState<Comp>,
-    pub data_device_state: DataDeviceState,
-    pub primary_selection_state: PrimarySelectionState,
-    pub layer_shell_state: WlrLayerShellState,
-    /// Never read, but dropping it would unpublish the cursor-shape-v1
-    /// global (how clients name pointer shapes for us to draw).
-    #[allow(dead_code)]
-    pub cursor_shape_state: CursorShapeManagerState,
-    pub dmabuf_state: DmabufState,
-    /// Never read, but it identifies the live dmabuf global for teardown.
-    #[allow(dead_code)]
-    pub dmabuf_global: DmabufGlobal,
+    pub globals: Globals,
 }
 
 impl Comp {
@@ -314,7 +347,7 @@ impl Comp {
             .expect("insert notification channel source");
         let note_dismiss_tx = crate::notify::spawn(note_tx);
 
-        let indexed = indexed::IndexedProgram::new(backend.renderer());
+        let indexed = crate::render::indexed::IndexedProgram::new(backend.renderer());
 
         let mut chrome = crate::render::Renderer::new();
         // The outline colour never changes; bake it into each strip buffer
@@ -361,22 +394,21 @@ impl Comp {
             clear,
             cursor_status: CursorImageStatus::default_named(),
             cursors: cursor::CursorCache::new(),
-            chrome,
-            indexed,
-            pieces: chrome::ChromePieces::default(),
-            focus_rect: None,
-            focus_outline,
-            placed: Vec::new(),
-            widgets: crate::widgets::Widgets::default(),
-            quick,
-            wallpaper_path,
-            drag: None,
-            chrome_press: false,
-            hscroll_frac: 0.0,
-            swipe_pan: false,
-            animate: false,
-            anim: None,
-            prev_frame_rect: std::collections::HashMap::new(),
+            view: ChromeView {
+                chrome,
+                indexed,
+                pieces: pieces::ChromePieces::default(),
+                placed: Vec::new(),
+                widgets: crate::widgets::Widgets::default(),
+                quick,
+                wallpaper_path,
+                animate: false,
+                anim: None,
+                prev_frame_rect: std::collections::HashMap::new(),
+                focus_rect: None,
+                focus_outline,
+            },
+            interaction: Interaction::default(),
             dh,
             handle,
             signal: event_loop.get_signal(),
@@ -389,11 +421,7 @@ impl Comp {
             start: std::time::Instant::now(),
             state: crate::state::State::new(),
             managed: crate::shell::Managed::default(),
-            pending: Vec::new(),
-            float_stack: Vec::new(),
-            focused_float: None,
-            fullscreen: None,
-            held_bound_keys: Vec::new(),
+            windows: WindowRoles::default(),
             icon_tx,
             note_popups: Vec::new(),
             note_dismiss_tx,
@@ -402,18 +430,20 @@ impl Comp {
             x11_query: None,
             xwayland_shell_state,
             layer_zone,
-            compositor_state,
-            xdg_shell_state,
-            xdg_decoration_state,
-            shm_state,
-            output_manager_state,
-            seat_state,
-            data_device_state,
-            primary_selection_state,
-            layer_shell_state,
-            cursor_shape_state,
-            dmabuf_state,
-            dmabuf_global,
+            globals: Globals {
+                compositor_state,
+                xdg_shell_state,
+                xdg_decoration_state,
+                shm_state,
+                output_manager_state,
+                seat_state,
+                data_device_state,
+                primary_selection_state,
+                layer_shell_state,
+                cursor_shape_state,
+                dmabuf_state,
+                dmabuf_global,
+            },
         }
     }
 
@@ -468,7 +498,7 @@ impl Comp {
         // override-redirect X11 windows, the Top layer, floats (top of
         // stack first), the tiled/fullscreen Space, the dock, the Bottom
         // layer at the bottom — the same front-to-back order
-        // chrome::output_elements renders. Background surfaces get no
+        // scene::output_elements renders. Background surfaces get no
         // pointer input: they render behind the opaque chrome underlay,
         // and what can't be seen must not swallow clicks meant for the
         // chrome.
@@ -482,7 +512,7 @@ impl Comp {
         if let Some(hit) = self.layer_surface_under(&[Layer::Top], pos) {
             return Some(hit);
         }
-        for &fw in &self.float_stack {
+        for &fw in &self.windows.float_stack {
             let Some((window, f)) = self.managed.float(fw) else {
                 continue;
             };
@@ -502,7 +532,12 @@ impl Comp {
         // client whose resize waits for an animation's end still holds an
         // oversized buffer, which must not take input over chrome it
         // visibly no longer covers.
-        let settled: Vec<_> = self.placed.iter().map(|p| (p.leaf, p.target)).collect();
+        let settled: Vec<_> = self
+            .view
+            .placed
+            .iter()
+            .map(|p| (p.leaf, p.target))
+            .collect();
         for t in self.tiled_places(&settled) {
             let loc = Point::<i32, Logical>::from((t.rect.x, t.rect.y)) - t.window.geometry().loc;
             let in_rect = pos.x >= f64::from(t.rect.x)
@@ -540,8 +575,13 @@ impl Comp {
     /// its buffer extent: a client whose resize waits for an animation's
     /// end still holds an oversized buffer, which must not take input over
     /// chrome it visibly no longer covers.
-    pub fn tiled_under(&self, pos: Point<f64, Logical>) -> Option<chrome::TiledPlace> {
-        let settled: Vec<_> = self.placed.iter().map(|p| (p.leaf, p.target)).collect();
+    pub fn tiled_under(&self, pos: Point<f64, Logical>) -> Option<scene::TiledPlace> {
+        let settled: Vec<_> = self
+            .view
+            .placed
+            .iter()
+            .map(|p| (p.leaf, p.target))
+            .collect();
         self.tiled_places(&settled).into_iter().find(|t| {
             pos.x >= f64::from(t.rect.x)
                 && pos.x < f64::from(t.rect.x + t.rect.w)
@@ -588,7 +628,12 @@ impl Comp {
         if let Some(win) = self.managed.win_for_surface(root) {
             return match self.managed.kind_of(win)? {
                 crate::shell::Kind::Tiled => {
-                    let settled: Vec<_> = self.placed.iter().map(|p| (p.leaf, p.target)).collect();
+                    let settled: Vec<_> = self
+                        .view
+                        .placed
+                        .iter()
+                        .map(|p| (p.leaf, p.target))
+                        .collect();
                     self.tiled_places(&settled)
                         .into_iter()
                         .find(|t| t.window.wl_surface().is_some_and(|s| *s == *root))
@@ -634,67 +679,47 @@ impl Comp {
         }
     }
 
-    /// Re-place every window from the layout state: configure sizes, map
-    /// what a shown leaf displays, unmap the minimized / scrolled-
-    /// out-of-view, then re-derive keyboard focus. The equivalent of
-    /// master's `arrange` minus chrome and animation (M3/M5).
+    /// Re-place every window from the layout state: compute this arrange's
+    /// placements (pure — `widgets::compute_placements`), push them at the
+    /// clients, rebuild the hit regions, arm or cancel the layout
+    /// animation, then re-derive keyboard focus. The equivalent of master's
+    /// `arrange` minus chrome and animation (M3/M5).
     pub fn arrange(&mut self) {
         let wa = self.layout_area();
         // The strip width is derived from the columns; the dock scroll
         // room is the one input the compositor alone knows.
         self.state.set_dock_extra(self.dock_extra());
-        let geos = self.state.compute(wa);
-        let scroll_x = self.state.scroll_x();
-        let focused = self.state.focused_leaf_valid();
+        let (placed, frame_rects) = crate::widgets::compute_placements(&self.state, wa);
+        self.view.placed = placed;
+        let deferred = self.apply_placements();
+        self.rebuild_widgets(wa);
+        self.arm_animation(deferred, frame_rects);
+        self.refocus();
+    }
 
-        // Every on-screen leaf gets a placement (chrome draws empty and
-        // minimized frames too); only occupied, unminimized ones map a
-        // window. frame_rects keeps every leaf's rect, on-screen or not,
-        // so a leaf scrolled out of view keeps a sane animation start /
-        // hit rect when it returns.
-        self.placed.clear();
+    /// Push the current placements at the clients: configure sizes, map
+    /// what a shown leaf displays (plus the fullscreen client over the
+    /// whole output), unmap the minimized / scrolled-out-of-view. Returns
+    /// the configures withheld from shrinking clients mid-animation.
+    fn apply_placements(&mut self) -> Vec<(crate::layout::Win, (i32, i32, i32, i32))> {
+        let fullscreen = self.fullscreen();
         let mut deferred: Vec<(crate::layout::Win, (i32, i32, i32, i32))> = Vec::new();
-        let mut frame_rects: std::collections::HashMap<
-            crate::layout::NodeId,
-            crate::widgets::FrameRect,
-        > = std::collections::HashMap::new();
         let mut shown: Vec<crate::layout::Win> = Vec::new();
-        let leaves = self.state.layout.collect_leaves();
-        for &leaf in &leaves {
-            let Some(geo) = geos.get(&leaf).copied() else {
+        let placed = self.view.placed.clone();
+        for p in placed {
+            let Some(c) = p.active_client else {
                 continue;
             };
-            let frame = crate::layout::Rect {
-                x: geo.x - scroll_x,
-                y: geo.y,
-                w: geo.w.max(1),
-                h: geo.h.max(1),
-            };
-            frame_rects.insert(leaf, frame);
-            if frame.x + frame.w <= wa.x || frame.x >= wa.x + wa.w {
-                continue;
-            }
-            let leaf_data = self.state.layout.leaf(leaf);
-            let minimized = leaf_data.is_some_and(|l| l.minimized);
-            let client = leaf_data.and_then(|l| l.client);
-            self.placed.push(crate::widgets::Placement {
-                leaf,
-                target: frame,
-                active_client: client,
-                focused: focused == leaf,
-            });
-            let Some(c) = client else {
-                continue;
-            };
+            let minimized = self.state.layout.leaf(p.leaf).is_some_and(|l| l.minimized);
             // The fullscreen client is configured below, over the whole
             // output; don't fight it with split geometry.
-            if minimized || Some(c) == self.fullscreen {
+            if minimized || Some(c) == fullscreen {
                 continue;
             }
             let Some(window) = self.managed.get(c).cloned() else {
                 continue;
             };
-            let (cx, cy, cw, ch) = crate::shell::client_rect_in_frame(frame, (1, 1));
+            let (cx, cy, cw, ch) = crate::shell::client_rect_in_frame(p.target, (1, 1));
             // An animating client that shrinks keeps its current size until
             // the slide settles (`finish_animation` sends this configure):
             // resizing it now would reflow its content narrow while its
@@ -702,42 +727,25 @@ impl Comp {
             // buffer is clipped by the still-small frame, and the new size
             // is ready as the frame arrives.
             let cur = window.geometry().size;
-            if self.animate && (cw < cur.w || ch < cur.h) {
+            if self.view.animate && (cw < cur.w || ch < cur.h) {
                 deferred.push((c, (cx, cy, cw, ch)));
-                // Only the resize waits; a hidden X11 window coming back
-                // must still map now.
-                if let Some(x11) = window.x11_surface() {
-                    let _ = x11.set_mapped(true);
-                }
-            } else if let Some(toplevel) = window.toplevel() {
-                toplevel.with_pending_state(|s| s.size = Some((cw, ch).into()));
-                toplevel.send_pending_configure();
-            } else if let Some(x11) = window.x11_surface() {
-                let _ = x11.configure(Rectangle::<i32, Logical>::new(
-                    (cx, cy).into(),
-                    (cw, ch).into(),
-                ));
-                let _ = x11.set_mapped(true);
+            } else {
+                crate::shell::configure_rect(&window, cx, cy, cw, ch);
             }
+            // Even when the resize waits, a hidden X11 window coming back
+            // must map now.
+            crate::shell::set_x11_mapped(&window, true);
             self.space.map_element(window, (cx, cy), false);
             shown.push(c);
         }
 
         // The fullscreen client covers the whole output above every tiled
         // client, regardless of where (or whether) its split is on screen.
-        if let Some(fs) = self.fullscreen {
+        if let Some(fs) = fullscreen {
             if let Some(window) = self.managed.get(fs).cloned() {
                 let size = self.output_size();
-                if let Some(toplevel) = window.toplevel() {
-                    toplevel.with_pending_state(|s| s.size = Some((size.w, size.h).into()));
-                    toplevel.send_pending_configure();
-                } else if let Some(x11) = window.x11_surface() {
-                    let _ = x11.configure(Rectangle::<i32, Logical>::new(
-                        (0, 0).into(),
-                        (size.w, size.h).into(),
-                    ));
-                    let _ = x11.set_mapped(true);
-                }
+                crate::shell::configure_rect(&window, 0, 0, size.w, size.h);
+                crate::shell::set_x11_mapped(&window, true);
                 self.space.map_element(window, (0, 0), true);
                 shown.push(fs);
             }
@@ -750,17 +758,21 @@ impl Comp {
             .collect();
         for window in &to_hide {
             self.space.unmap_elem(window);
-            // A hidden X11 window is really unmapped (its WM_STATE
-            // bookkeeping lives inside smithay).
-            if let Some(x11) = window.x11_surface() {
-                let _ = x11.set_mapped(false);
-            }
+            crate::shell::set_x11_mapped(window, false);
         }
+        deferred
+    }
 
-        // Hit regions and taskbar tiles for this layout, as one unit.
-        self.widgets.clear();
-        crate::widgets::compute_leaf_widgets(&mut self.widgets, &self.state.layout, &self.placed);
-        crate::widgets::compute_boundary_widgets(&mut self.widgets, &self.state, wa);
+    /// Rebuild every hit region and taskbar tile for the current arrange,
+    /// as one unit.
+    fn rebuild_widgets(&mut self, wa: crate::layout::Rect) {
+        self.view.widgets.clear();
+        crate::widgets::compute_leaf_widgets(
+            &mut self.view.widgets,
+            &self.state.layout,
+            &self.view.placed,
+        );
+        crate::widgets::compute_boundary_widgets(&mut self.view.widgets, &self.state, wa);
         // The taskbar strip spans the full output, not the (possibly
         // zone-shrunk) layout area.
         let size = self.output_size();
@@ -779,7 +791,10 @@ impl Comp {
         // depth-first order the canvas lays the leaves out in. Every tiled
         // window occupies a leaf (`State::place_new_window`), so walking the
         // leaves loses nobody.
-        let bar_order: Vec<(crate::layout::Win, crate::layout::NodeId)> = leaves
+        let bar_order: Vec<(crate::layout::Win, crate::layout::NodeId)> = self
+            .state
+            .layout
+            .collect_leaves()
             .iter()
             .filter_map(|&l| {
                 self.state
@@ -795,52 +810,64 @@ impl Comp {
             "a tiled window is missing from the split tree"
         );
         crate::widgets::compute_taskbar(
-            &mut self.widgets,
+            &mut self.view.widgets,
             &self.state.layout,
             &app_ids,
-            &self.quick,
+            &self.view.quick,
             &bar_order,
             full,
         );
+    }
 
-        // Layout-changing actions animate: capture start rects and let the
-        // redraw tick interpolate the chrome and the client windows riding
-        // it (`tiled_places`). Growing clients are already configured at
-        // their final rects above; shrinking ones get theirs when the
-        // animation settles (`deferred`). A non-animated arrange cancels any
-        // transition in flight (it describes a newer layout, and configured
-        // every window itself just above).
-        if std::mem::take(&mut self.animate) {
-            let placed_from = self
-                .placed
-                .iter()
-                .map(|p| {
-                    // A leaf with no previous rect just appeared: grow it
-                    // along the axis it split off — a row in a stack unfolds
-                    // vertically at full width, a new column horizontally at
-                    // full height.
-                    let from = self.prev_frame_rect.get(&p.leaf).copied().unwrap_or_else(|| {
-                        let stacked = self
-                            .state
-                            .layout
-                            .locate(p.leaf)
-                            .is_some_and(|pos| self.state.layout.col_len(pos.col) > 1);
-                        let (w, h) = if stacked {
-                            (p.target.w, 1)
-                        } else {
-                            (1, p.target.h)
-                        };
-                        crate::widgets::FrameRect {
-                            x: p.target.x,
-                            y: p.target.y,
-                            w,
-                            h,
-                        }
-                    });
-                    (from, *p)
-                })
-                .collect();
-            self.anim = Some(chrome::LayoutAnim {
+    /// Layout-changing actions animate: capture start rects and let the
+    /// redraw tick interpolate the chrome and the client windows riding
+    /// it (`tiled_places`). Growing clients are already configured at
+    /// their final rects by `apply_placements`; shrinking ones get theirs
+    /// when the animation settles (`deferred`). A non-animated arrange
+    /// cancels any transition in flight (it describes a newer layout, and
+    /// configured every window itself). Also rolls `frame_rects` into
+    /// `prev_frame_rect` as the next arrange's start rects.
+    fn arm_animation(
+        &mut self,
+        deferred: Vec<(crate::layout::Win, (i32, i32, i32, i32))>,
+        frame_rects: std::collections::HashMap<crate::layout::NodeId, crate::widgets::FrameRect>,
+    ) {
+        if std::mem::take(&mut self.view.animate) {
+            let placed_from =
+                self.view
+                    .placed
+                    .iter()
+                    .map(|p| {
+                        // A leaf with no previous rect just appeared: grow it
+                        // along the axis it split off — a row in a stack unfolds
+                        // vertically at full width, a new column horizontally at
+                        // full height.
+                        let from =
+                            self.view
+                                .prev_frame_rect
+                                .get(&p.leaf)
+                                .copied()
+                                .unwrap_or_else(|| {
+                                    let stacked =
+                                        self.state.layout.locate(p.leaf).is_some_and(|pos| {
+                                            self.state.layout.col_len(pos.col) > 1
+                                        });
+                                    let (w, h) = if stacked {
+                                        (p.target.w, 1)
+                                    } else {
+                                        (1, p.target.h)
+                                    };
+                                    crate::widgets::FrameRect {
+                                        x: p.target.x,
+                                        y: p.target.y,
+                                        w,
+                                        h,
+                                    }
+                                });
+                        (from, *p)
+                    })
+                    .collect();
+            self.view.anim = Some(anim::LayoutAnim {
                 start: std::time::Instant::now(),
                 placed: placed_from,
                 deferred,
@@ -850,10 +877,9 @@ impl Comp {
             // per-piece fingerprints (`update_chrome_pieces`) decide what
             // actually re-renders, so a rebuild that only re-aimed focus or
             // only scrolled positions repaints nothing.
-            self.anim = None;
+            self.view.anim = None;
         }
-        self.prev_frame_rect = frame_rects;
-        self.refocus();
+        self.view.prev_frame_rect = frame_rects;
     }
 
     /// Point keyboard focus (and xdg activated state) at the focused
@@ -898,8 +924,10 @@ impl Comp {
         self.output.set_preferred(mode);
         // Layer surfaces re-anchor to the new size; the zone follows.
         self.sync_layer_zone();
-        if let Some(path) = self.wallpaper_path.clone() {
-            self.chrome.set_wallpaper(&path, mode.size.w, mode.size.h);
+        if let Some(path) = self.view.wallpaper_path.clone() {
+            self.view
+                .chrome
+                .set_wallpaper(&path, mode.size.w, mode.size.h);
         }
         self.arrange();
         // The wallpaper piece rebuilds on the size change, and every leaf /
@@ -913,7 +941,7 @@ impl Comp {
     /// change) and draws at scale 1; the buffers' stable ids let the damage
     /// tracker track a strip across frames as the focused rect moves.
     fn focus_outline_elements(&mut self) -> Vec<SolidColorRenderElement> {
-        let Some(r) = self.focus_rect else {
+        let Some(r) = self.view.focus_rect else {
             return Vec::new();
         };
         const T: i32 = 2;
@@ -925,7 +953,8 @@ impl Comp {
             (r.x, r.y + T, T, r.h - 2 * T),
             (r.x + r.w - T, r.y + T, T, r.h - 2 * T),
         ];
-        self.focus_outline
+        self.view
+            .focus_outline
             .iter_mut()
             .zip(strips)
             .map(|(buf, (x, y, w, h))| {
@@ -995,30 +1024,31 @@ impl Comp {
 
         // The ex-underlay pieces as positioned elements, built from the
         // caches `update_chrome_pieces` just refreshed. These borrow only
-        // `self.pieces`, disjoint from the backend the scene renders through.
-        let leaf_chrome = self.pieces.leaf_elements(&leaf_rects);
+        // `self.view.pieces`, disjoint from the backend the scene renders through.
+        let leaf_chrome = self.view.pieces.leaf_elements(&leaf_rects);
         let plus = self
+            .view
             .pieces
-            .plus_elements(&self.widgets.plus_regions, self.anim.is_some());
-        let taskbar = self.pieces.taskbar_element();
-        let wallpaper = self.pieces.wallpaper_element();
+            .plus_elements(&self.view.widgets.plus_regions, self.view.anim.is_some());
+        let taskbar = self.view.pieces.taskbar_element();
+        let wallpaper = self.view.pieces.wallpaper_element();
 
         // Scene borrows and the backend borrow are disjoint `Comp` fields,
         // so the backend can consume the scene while borrowed mutably.
-        let scene = chrome::Scene {
+        let scene = scene::Scene {
             or_windows: &self.or_windows,
             note_popups: &self.note_popups,
             note_rects: &note_rects,
-            float_stack: &self.float_stack,
+            float_stack: &self.windows.float_stack,
             managed: &self.managed,
             tiled: &tiled,
             output: &self.output,
             dock_place: &dock_place,
             layer_dock: &layer_dock,
-            indexed: &self.indexed,
+            indexed: &self.view.indexed,
             wallpaper,
             leaf_chrome: &leaf_chrome,
-            frame_art: self.pieces.frame_art(),
+            frame_art: self.view.pieces.frame_art(),
             plus: &plus,
             taskbar,
             focus_outline: &focus_outline,
@@ -1042,7 +1072,7 @@ impl Comp {
                         &self.cursor_status,
                         &mut self.cursors,
                     );
-                    elements.extend(chrome::output_elements(renderer, &scene));
+                    elements.extend(scene::output_elements(renderer, &scene));
                     w.damage_tracker
                         .render_output(renderer, &mut fb, 0, &elements, self.clear)
                         .inspect_err(|err| tracing::error!("render: {err:?}"))

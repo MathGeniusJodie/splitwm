@@ -135,35 +135,17 @@ impl State {
         self.focus_leaf(new);
     }
 
-    /// The next time `c` is unpinned (its window destroyed), leave its
-    /// split behind as an empty placeholder instead of collapsing it — the
-    /// taskbar close badge's semantics. The mark lives on the leaf
-    /// (`Leaf::keep_on_close`), so it dies with the split it modifies.
-    pub fn retain_split_on_close(&mut self, c: Win) {
-        if let Some(lid) = self.layout.find_leaf_for_client(c) {
-            if let Some(l) = self.layout.leaf_mut(lid) {
-                l.keep_on_close = true;
-            }
-        }
-    }
-
     /// A window is gone: clear it from its split and collapse that split —
-    /// windows and splits live and die together — unless the close was
-    /// marked placeholder-keeping (`retain_split_on_close`) or the split is
-    /// the strip's sole one (the layout always keeps one). Focus follows to
+    /// windows and splits live and die together — unless the split is the
+    /// strip's sole one (the layout always keeps one). Focus follows to
     /// the nearest surviving neighbour only when the dying split held it.
     /// Returns whether the layout changed (a split collapsed).
     pub fn unpin_client(&mut self, c: Win) -> bool {
         let Some(lid) = self.layout.find_leaf_for_client(c) else {
             return false;
         };
-        let mut keep = false;
         if let Some(l) = self.layout.leaf_mut(lid) {
             l.client = None;
-            keep = std::mem::take(&mut l.keep_on_close);
-        }
-        if keep {
-            return false;
         }
         self.collapse_leaf(lid)
     }
@@ -916,25 +898,6 @@ mod tests {
         assert!(!s.unpin_client(1), "no rect moved");
         assert_eq!(s.layout.collect_leaves().len(), 1);
         assert_eq!(s.focused_client(), None);
-    }
-
-    /// A placeholder-keeping close (`retain_split_on_close`, the taskbar
-    /// badge) leaves the split empty instead of collapsing it, exactly
-    /// once — and a later plain destroy in the same split collapses again.
-    #[test]
-    fn retained_close_leaves_a_placeholder_once() {
-        let mut s = State::new();
-        s.place_new_window(WA, 1, None);
-        s.place_new_window(WA, 2, None);
-        s.retain_split_on_close(2);
-        assert!(!s.unpin_client(2));
-        assert_eq!(s.layout.collect_leaves().len(), 2, "placeholder kept");
-        let placeholder = s.layout.collect_leaves()[1];
-        s.focus_leaf(placeholder);
-        s.place_new_window(WA, 3, None);
-        assert_eq!(s.layout.leaf(placeholder).unwrap().client, Some(3));
-        assert!(s.unpin_client(3), "the mark was consumed: collapse again");
-        assert_eq!(s.layout.collect_leaves().len(), 1);
     }
 
     #[test]

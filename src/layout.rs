@@ -64,11 +64,6 @@ pub struct Leaf {
     /// placeholder awaiting the next new window; a window is never without
     /// a leaf (windows and splits live and die together).
     pub client: Option<Win>,
-    /// Leave this split behind as an empty placeholder when its window
-    /// dies (the taskbar close badge's semantics) instead of collapsing
-    /// it. One-shot: consumed by the death (`State::unpin_client`).
-    /// Meaningless while `client` is `None`.
-    pub keep_on_close: bool,
     pub minimized: bool,
     /// Persistent accent palette index for this split (kept across
     /// splits/closes), used to palette-swap the bitmap window border.
@@ -83,7 +78,6 @@ impl Leaf {
     /// here.
     pub fn show(&mut self, c: Win) {
         self.client = Some(c);
-        self.keep_on_close = false;
         self.minimized = false;
     }
 }

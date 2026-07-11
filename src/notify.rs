@@ -36,14 +36,33 @@ pub enum CloseReason {
     Undefined = 4,
 }
 
+/// Freedesktop urgency hint, decoded once at the door — a hint that isn't
+/// a known level (missing, unparsable, out of range) is `Normal`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Urgency {
+    Low,
+    Normal,
+    /// Never auto-expires (per spec) and renders with the alarm accent.
+    Critical,
+}
+
+impl Urgency {
+    fn from_hint(hints: &HashMap<String, Value<'_>>) -> Self {
+        match hints.get("urgency").and_then(|v| u8::try_from(v).ok()) {
+            Some(0) => Self::Low,
+            Some(2) => Self::Critical,
+            _ => Self::Normal,
+        }
+    }
+}
+
 /// One notification's payload, as the compositor renders it.
 #[derive(Clone)]
 pub struct Note {
     pub id: u32,
     pub summary: String,
     pub body: String,
-    /// 0 low / 1 normal / 2 critical (freedesktop urgency hint).
-    pub urgency: u8,
+    pub urgency: Urgency,
 }
 
 pub enum NoteMsg {
@@ -120,13 +139,10 @@ impl Notifications {
     ) -> u32 {
         let sender = header.sender().map(|s| s.to_string()).unwrap_or_default();
         let id = self.allocate_id(replaces_id, &sender);
-        let urgency = hints
-            .get("urgency")
-            .and_then(|v| u8::try_from(v).ok())
-            .unwrap_or(1);
+        let urgency = Urgency::from_hint(&hints);
         // 0 means never expire; so does critical urgency per spec.
         let expiry = match expire_timeout {
-            _ if urgency >= 2 => None,
+            _ if urgency == Urgency::Critical => None,
             0 => None,
             t if t > 0 => Some(Instant::now() + Duration::from_millis(t as u64)),
             _ => Some(Instant::now() + DEFAULT_TIMEOUT),
@@ -207,7 +223,7 @@ pub fn spawn(
                 id: 0,
                 summary: "notifications unavailable".into(),
                 body: err.to_string(),
-                urgency: 2,
+                urgency: Urgency::Critical,
             }));
         }
     });

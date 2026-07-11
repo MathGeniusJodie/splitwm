@@ -1,9 +1,13 @@
-//! Keyboard-binding dispatch: mapping intercepted chords to layout
-//! mutations, mirroring master's `wm/input/keyboard.rs` semantics.
+//! Keyboard-binding dispatch — mapping intercepted chords to layout
+//! mutations, mirroring master's `wm/input/keyboard.rs` semantics — plus
+//! the shared layout commands every input path (keyboard, titlebar
+//! buttons, taskbar, drags) funnels through.
 
 use smithay::input::keyboard::ModifiersState;
 
 use super::Comp;
+use crate::layout::{NodeId, Win};
+use crate::state::Activation;
 use crate::theme::{self, Action};
 
 /// splitwm-mask bit for Ctrl. Never appears in `theme::BINDINGS`, but it
@@ -132,5 +136,52 @@ impl Comp {
     /// Detached launch in its own transient scope (see `launch::spawn`).
     pub fn spawn(&self, cmd: &str) {
         crate::launch::spawn(cmd);
+    }
+
+    /// Close the split at `leaf` — the titlebar close button's and
+    /// `Action::Close`'s shared semantics. Window and split live and die
+    /// together: an occupied split's close politely closes the window, and
+    /// the split collapses when it actually dies (`unpin_client` — so a
+    /// "do you want to save?" refusal keeps the split). An empty
+    /// placeholder is removed on the spot; the sole placeholder is the one
+    /// split that can't go.
+    pub fn close_split(&mut self, leaf: NodeId) {
+        match self.state.layout.leaf(leaf).and_then(|l| l.client) {
+            Some(win) => self.close_client(win),
+            None => self.view.animate = self.state.remove_empty_leaf(leaf),
+        }
+        self.commit_layout();
+    }
+
+    /// Focus a managed tiled window's split and scroll it into view (via
+    /// `commit_layout`'s `ensure_in_view`), un-minimizing it. `animate`
+    /// requests a transition, but only when rects actually moved.
+    pub fn bring_into_layout(&mut self, win: Win, animate: bool) {
+        let changed = match self.state.activate_client(win) {
+            Activation::Unminimized => true,
+            Activation::Unchanged => false,
+        };
+        if animate {
+            self.view.animate = changed;
+        }
+        self.commit_layout();
+    }
+
+    /// Shared epilogue for every layout-mutating action: invalidate drags
+    /// whose tree snapshot went stale, keep the focused split in view
+    /// (gliding unless an animation is about to run), re-arrange.
+    pub fn commit_layout(&mut self) {
+        self.interaction.drag = None;
+        let wa = self.layout_area();
+        self.state.clamp_scroll(wa, 0);
+        self.state.ensure_in_view(wa);
+        // An animation's placements are computed from scroll_x at arrange
+        // time and held for the whole transition; a concurrent glide would
+        // make them stale every frame, so land it. Otherwise leave the
+        // target so step_scroll glides the viewport over.
+        if self.view.animate {
+            self.state.land_scroll();
+        }
+        self.arrange();
     }
 }

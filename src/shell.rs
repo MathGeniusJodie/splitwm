@@ -37,7 +37,7 @@ pub struct FloatData {
     /// below the client surface; re-uploaded only when its content
     /// (size/title) changes — a drag just moves the element. The border
     /// around it is not a texture at all: the shared border art sliced
-    /// over the frame rect by the GPU (see `comp::indexed`).
+    /// over the frame rect by the GPU (see `render::indexed`).
     pub frame: FrameTex,
     /// The border element's persistent identity for the damage tracker.
     /// Its commit never bumps: the accent is fixed and everything else
@@ -54,14 +54,14 @@ pub enum FrameTex {
     /// any — a float starts with none) was uploaded; repainted before the
     /// next composite, the old texture shown until then. The texture rides
     /// along so the repaint can reuse its GPU allocation.
-    Stale(Option<crate::comp::indexed::IndexedTexture>),
+    Stale(Option<crate::render::indexed::IndexedTexture>),
     /// The texture matches the strip's current content.
-    Fresh(crate::comp::indexed::IndexedTexture),
+    Fresh(crate::render::indexed::IndexedTexture),
 }
 
 impl FrameTex {
     /// Whatever texture there is to draw, fresh or stale.
-    pub fn texture(&self) -> Option<&crate::comp::indexed::IndexedTexture> {
+    pub fn texture(&self) -> Option<&crate::render::indexed::IndexedTexture> {
         match self {
             FrameTex::Stale(tex) => tex.as_ref(),
             FrameTex::Fresh(tex) => Some(tex),
@@ -80,7 +80,7 @@ impl FrameTex {
 
     /// Pull the texture out (leaving `Stale(None)`), for handing its
     /// allocation to an upload.
-    pub fn take(&mut self) -> Option<crate::comp::indexed::IndexedTexture> {
+    pub fn take(&mut self) -> Option<crate::render::indexed::IndexedTexture> {
         match std::mem::replace(self, FrameTex::Stale(None)) {
             FrameTex::Fresh(tex) | FrameTex::Stale(Some(tex)) => Some(tex),
             FrameTex::Stale(None) => None,
@@ -285,6 +285,33 @@ pub fn close_window(window: &Window) {
         if let Err(err) = x11.close() {
             tracing::warn!("x11 close: {err}");
         }
+    }
+}
+
+/// Send a window its rect, whichever backend it speaks: an xdg toplevel is
+/// configured with the size only (its position is the compositor's `Space`
+/// mapping), an X11 window with the full geometry.
+pub fn configure_rect(window: &Window, x: i32, y: i32, w: i32, h: i32) {
+    if let Some(toplevel) = window.toplevel() {
+        toplevel.with_pending_state(|s| s.size = Some((w, h).into()));
+        toplevel.send_pending_configure();
+    } else if let Some(x11) = window.x11_surface() {
+        let _ = x11.configure(
+            smithay::utils::Rectangle::<i32, smithay::utils::Logical>::new(
+                (x, y).into(),
+                (w, h).into(),
+            ),
+        );
+    }
+}
+
+/// Flip an X11 window's map state (its `WM_STATE` bookkeeping lives inside
+/// smithay, so hiding one must really unmap it). Wayland toplevels carry no
+/// such state — they show and hide purely by their `Space` mapping — so
+/// this is a no-op for them.
+pub fn set_x11_mapped(window: &Window, mapped: bool) {
+    if let Some(x11) = window.x11_surface() {
+        let _ = x11.set_mapped(mapped);
     }
 }
 

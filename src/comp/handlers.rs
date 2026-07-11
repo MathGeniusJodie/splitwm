@@ -45,7 +45,7 @@ use super::{ClientState, Comp};
 
 impl CompositorHandler for Comp {
     fn compositor_state(&mut self) -> &mut CompositorState {
-        &mut self.compositor_state
+        &mut self.globals.compositor_state
     }
 
     fn client_compositor_state<'a>(&self, client: &'a Client) -> &'a CompositorClientState {
@@ -70,7 +70,7 @@ impl CompositorHandler for Comp {
             let window = self
                 .managed
                 .windows()
-                .chain(self.pending.iter().map(|p| &p.window))
+                .chain(self.windows.pending.iter().map(|p| &p.window))
                 .find(|w| w.toplevel().is_some_and(|t| *t.wl_surface() == root))
                 .cloned();
             if let Some(window) = window {
@@ -87,12 +87,12 @@ impl CompositorHandler for Comp {
             })
             .unwrap_or(false);
         if has_buffer {
-            if let Some(idx) = self.pending.iter().position(|p| {
+            if let Some(idx) = self.windows.pending.iter().position(|p| {
                 p.window
                     .toplevel()
                     .is_some_and(|t| t.wl_surface() == surface)
             }) {
-                let pending = self.pending.remove(idx);
+                let pending = self.windows.pending.remove(idx);
                 self.classify_and_manage(pending.window, pending.fullscreen);
             } else if let Some(win) = self.managed.win_for_surface(surface) {
                 // A float resizing itself: track the new size and repaint
@@ -120,7 +120,8 @@ impl Comp {
     /// The pending record of the not-yet-mapped toplevel `surface`, for
     /// requests that arrive before the first commit.
     fn find_pending_mut(&mut self, surface: &ToplevelSurface) -> Option<&mut super::PendingWindow> {
-        self.pending
+        self.windows
+            .pending
             .iter_mut()
             .find(|p| p.window.toplevel().is_some_and(|t| *t == *surface))
     }
@@ -129,6 +130,7 @@ impl Comp {
     /// on the surface's first commit.
     fn ensure_initial_configure(&mut self, surface: &WlSurface) {
         if let Some(window) = self
+            .windows
             .pending
             .iter()
             .map(|p| &p.window)
@@ -166,28 +168,26 @@ impl Comp {
 
 impl XdgShellHandler for Comp {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
-        &mut self.xdg_shell_state
+        &mut self.globals.xdg_shell_state
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         // Wayland clients set app_id/parent/size hints after creating the
         // role; classification (tiled/float/dock) waits for the first
         // buffer commit (see `Comp::classify_and_manage`).
-        self.pending.push(super::PendingWindow {
+        self.windows.pending.push(super::PendingWindow {
             window: Window::new_wayland_window(surface),
             fullscreen: false,
         });
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
-        self.pending
+        self.windows
+            .pending
             .retain(|p| p.window.toplevel().is_none_or(|t| *t != surface));
         let Some(win) = self.managed.win_for_surface(surface.wl_surface()) else {
             return;
         };
-        if self.fullscreen == Some(win) {
-            self.fullscreen = None;
-        }
         match self.managed.kind_of(win) {
             Some(crate::shell::Kind::Tiled) => self.unmanage_tiled(win),
             Some(crate::shell::Kind::Float(_)) => self.forget_float(win),
@@ -211,7 +211,7 @@ impl XdgShellHandler for Comp {
             state.states.set(xdg_toplevel::State::Fullscreen);
         });
         if let Some(win) = self.managed.win_for_surface(surface.wl_surface()) {
-            self.fullscreen = Some(win);
+            self.windows.fullscreen = Some(win);
             self.arrange();
         } else if let Some(p) = self.find_pending_mut(&surface) {
             // Requested before the first commit (a startup-fullscreen
@@ -224,8 +224,8 @@ impl XdgShellHandler for Comp {
         surface.with_pending_state(|state| {
             state.states.unset(xdg_toplevel::State::Fullscreen);
         });
-        if self.fullscreen == self.managed.win_for_surface(surface.wl_surface()) {
-            self.fullscreen = None;
+        if self.windows.fullscreen == self.managed.win_for_surface(surface.wl_surface()) {
+            self.windows.fullscreen = None;
         }
         if let Some(p) = self.find_pending_mut(&surface) {
             p.fullscreen = false;
@@ -331,14 +331,14 @@ impl BufferHandler for Comp {
 
 impl ShmHandler for Comp {
     fn shm_state(&self) -> &ShmState {
-        &self.shm_state
+        &self.globals.shm_state
     }
 }
 delegate_shm!(Comp);
 
 impl DmabufHandler for Comp {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
-        &mut self.dmabuf_state
+        &mut self.globals.dmabuf_state
     }
 
     fn dmabuf_imported(
@@ -362,7 +362,7 @@ impl SeatHandler for Comp {
     type TouchFocus = WlSurface;
 
     fn seat_state(&mut self) -> &mut SeatState<Comp> {
-        &mut self.seat_state
+        &mut self.globals.seat_state
     }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
@@ -427,7 +427,7 @@ impl SelectionHandler for Comp {
 
 impl DataDeviceHandler for Comp {
     fn data_device_state(&self) -> &DataDeviceState {
-        &self.data_device_state
+        &self.globals.data_device_state
     }
 }
 impl ClientDndGrabHandler for Comp {}
@@ -436,7 +436,7 @@ delegate_data_device!(Comp);
 
 impl PrimarySelectionHandler for Comp {
     fn primary_selection_state(&self) -> &PrimarySelectionState {
-        &self.primary_selection_state
+        &self.globals.primary_selection_state
     }
 }
 delegate_primary_selection!(Comp);

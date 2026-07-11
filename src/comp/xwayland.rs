@@ -137,9 +137,6 @@ impl Comp {
         let Some(win) = win else {
             return;
         };
-        if self.fullscreen == Some(win) {
-            self.fullscreen = None;
-        }
         match self.managed.kind_of(win) {
             Some(Kind::Tiled) => self.unmanage_tiled(win),
             Some(Kind::Float(_)) => self.forget_float(win),

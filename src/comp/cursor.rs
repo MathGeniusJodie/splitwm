@@ -20,8 +20,8 @@ use smithay::input::pointer::{CursorIcon, CursorImageStatus, CursorImageSurfaceD
 use smithay::utils::{Logical, Point};
 use smithay::wayland::compositor::with_states;
 
-use super::chrome::OutputElement;
-use super::indexed::{IndexedProgram, IndexedTexture};
+use super::scene::OutputElement;
+use crate::render::indexed::{IndexedProgram, IndexedTexture};
 
 /// One uploaded cursor image and its hotspot.
 type CursorBuf = (IndexedTexture, Point<i32, Logical>);

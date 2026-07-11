@@ -47,9 +47,9 @@ impl Comp {
             let wa = self.layout_area();
             self.state.place_new_window(wa, win, want_w);
             if fullscreen {
-                self.fullscreen = Some(win);
+                self.windows.fullscreen = Some(win);
             }
-            self.animate = true;
+            self.view.animate = true;
             self.commit_layout();
         }
     }
@@ -116,7 +116,7 @@ impl Comp {
         if let Some(m) = self.managed.remove(win) {
             self.space.unmap_elem(&m.window);
         }
-        self.animate = self.state.unpin_client(win);
+        self.view.animate = self.state.unpin_client(win);
         self.commit_layout();
     }
 
@@ -142,7 +142,7 @@ impl Comp {
         // Center over the parent's frame when we know it, else the workarea.
         let around = parent
             .and_then(|p| self.state.layout.find_leaf_for_client(p))
-            .and_then(|l| self.prev_frame_rect.get(&l).copied())
+            .and_then(|l| self.view.prev_frame_rect.get(&l).copied())
             .unwrap_or(wa);
         let x = (around.x + (around.w - w) / 2).clamp(wa.x, (wa.x + wa.w - w).max(wa.x));
         let y = (around.y + (around.h - h) / 2).clamp(wa.y, (wa.y + wa.h - h).max(wa.y));
@@ -167,7 +167,7 @@ impl Comp {
         };
         let class = crate::shell::toplevel_app_id(&window);
         let win = self.managed.insert(window, Kind::Float(data));
-        self.float_stack.insert(0, win);
+        self.windows.float_stack.insert(0, win);
         self.spawn_icon_fetch(win, class);
         self.focus_float(win);
     }
@@ -217,23 +217,34 @@ impl Comp {
         if self.managed.float(win).is_none() {
             return;
         }
-        self.float_stack.retain(|&w| w != win);
-        self.float_stack.insert(0, win);
-        self.focused_float = Some(win);
+        self.windows.float_stack.retain(|&w| w != win);
+        self.windows.float_stack.insert(0, win);
+        self.windows.focused_float = Some(win);
         self.refocus();
     }
 
     /// Reads of the focused float re-validate against the store, so a
     /// dangling record is never handed out.
     pub fn focused_float(&self) -> Option<Win> {
-        self.focused_float
+        self.windows
+            .focused_float
             .filter(|&w| self.managed.float(w).is_some())
+    }
+
+    /// The fullscreen tiled client, if it is still managed. Like
+    /// `focused_float`, reads re-validate against the store rather than
+    /// relying on every destroy path clearing the record — a `Win` is
+    /// never reused, so a dead one can't alias a later window.
+    pub fn fullscreen(&self) -> Option<Win> {
+        self.windows
+            .fullscreen
+            .filter(|&w| self.managed.get(w).is_some())
     }
 
     /// The window holding the keyboard outside the layout: a focused
     /// float, or the dock after a click on it.
     pub fn keyboard_override(&self) -> Option<Win> {
-        self.focused_float.filter(|&w| {
+        self.windows.focused_float.filter(|&w| {
             matches!(
                 self.managed.kind_of(w),
                 Some(crate::shell::Kind::Float(_) | crate::shell::Kind::Dock(_))
@@ -243,12 +254,12 @@ impl Comp {
 
     /// Hand the keyboard to a non-tiled window (dock click).
     pub fn focus_override(&mut self, win: Win) {
-        self.focused_float = Some(win);
+        self.windows.focused_float = Some(win);
         self.refocus();
     }
 
     pub fn clear_focused_float(&mut self) {
-        self.focused_float = None;
+        self.windows.focused_float = None;
     }
 
     /// A float went away: drop its records and hand focus back to its
@@ -258,9 +269,9 @@ impl Comp {
             Kind::Float(f) => f.parent,
             _ => None,
         });
-        self.float_stack.retain(|&w| w != win);
-        if self.focused_float == Some(win) {
-            self.focused_float = None;
+        self.windows.float_stack.retain(|&w| w != win);
+        if self.windows.focused_float == Some(win) {
+            self.windows.focused_float = None;
             if let Some(leaf) = parent.and_then(|p| self.state.layout.find_leaf_for_client(p)) {
                 self.state.focus_leaf(leaf);
             }
@@ -305,10 +316,11 @@ impl Comp {
             theme::tb_h().max(1) as usize,
             pixel_graphics::TRANSPARENT,
         );
-        self.chrome.draw_titlebar_strip(&mut fb, &view);
+        self.view.chrome.draw_titlebar_strip(&mut fb, &view);
         if let Some((_, f)) = self.managed.float_mut(win) {
             let mut tex = f.frame.take();
-            self.indexed
+            self.view
+                .indexed
                 .upload(self.backend.renderer(), &mut tex, &fb, false);
             f.frame = match tex {
                 Some(tex) => crate::shell::FrameTex::Fresh(tex),

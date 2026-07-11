@@ -5,9 +5,9 @@
 
 use smithay::utils::{Logical, Point};
 
-use super::indexed::IndexedTexture;
 use super::Comp;
-use crate::notify::{CloseReason, NoteMsg};
+use crate::notify::{CloseReason, NoteMsg, Urgency};
+use crate::render::indexed::IndexedTexture;
 use crate::theme;
 use crate::widgets::FrameRect;
 
@@ -25,14 +25,17 @@ impl Comp {
     pub fn on_note_msg(&mut self, msg: NoteMsg) {
         match msg {
             NoteMsg::Show(note) => {
-                let fb = self
-                    .chrome
-                    .draw_note(&note.summary, &note.body, note.urgency >= 2);
+                let fb = self.view.chrome.draw_note(
+                    &note.summary,
+                    &note.body,
+                    note.urgency == Urgency::Critical,
+                );
                 let (w, h) = (fb.width as i32, fb.height as i32);
                 // The bubble has TRANSPARENT-indexed corners, so it is not
                 // opaque.
                 let mut tex = None;
-                self.indexed
+                self.view
+                    .indexed
                     .upload(self.backend.renderer(), &mut tex, &fb, false);
                 let popup = NotePopup {
                     id: note.id,

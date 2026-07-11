@@ -1,11 +1,12 @@
 //! Software rendering of the chrome pieces (wallpaper, leaf decorations,
 //! taskbar, insert buttons) as indexed-colour `pixel_graphics::Framebuffer`s.
 //! The index bytes upload straight to the GPU as `R8` textures and the
-//! palette lookup happens in a fragment shader (`comp::indexed`); this module
-//! only draws the indices. Each piece is drawn into its own small buffer at
-//! its own origin (leaf frames at (0,0) into a leaf-sized buffer, the taskbar
-//! into a strip-sized buffer, each "+" into a square) — see `comp::chrome`,
-//! which owns the per-piece texture caches and composites them by position.
+//! palette lookup happens in a fragment shader (`render::indexed`, the one
+//! GPU-side module here); the rest of this module only draws the indices.
+//! Each piece is drawn into its own small buffer at its own origin (leaf
+//! frames at (0,0) into a leaf-sized buffer, the taskbar into a strip-sized
+//! buffer, each "+" into a square) — see `comp::pieces`, which owns the
+//! per-piece texture caches and composites them by position.
 //! Each concern owns its own module: wallpaper loading/caching in
 //! `wallpaper`, a leaf's border/titlebar chrome in `chrome`, its
 //! split-control buttons in `buttons`, icon blitting/caching (shared by the
@@ -25,6 +26,7 @@
 mod buttons;
 mod chrome;
 mod icon_cache;
+pub mod indexed;
 mod notify_popup;
 mod taskbar;
 mod wallpaper;

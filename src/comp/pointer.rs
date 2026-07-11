@@ -1,15 +1,15 @@
 //! Pointer semantics on the chrome: the priority-ordered hit-test, click
-//! dispatch, gap/edge drags, canvas panning, and the shared layout-commit
-//! epilogue. Ported from master's `wm/input/pointer.rs` + `scroll.rs`;
-//! floats join in M6. Unlike X11, the surface under the pointer and the
-//! modifier state are already ours — no server round-trips, no caching.
+//! dispatch, gap/edge drags, and canvas panning. Ported from master's
+//! `wm/input/pointer.rs` + `scroll.rs`; floats join in M6. Unlike X11, the
+//! surface under the pointer and the modifier state are already ours — no
+//! server round-trips, no caching. The shared layout commands the clicks
+//! invoke live in `comp::actions`.
 
 use smithay::input::pointer::CursorIcon;
 use smithay::utils::{Logical, Point};
 
 use super::Comp;
 use crate::layout::{Boundary, Dir, GapAt, Insert, NodeId, Win};
-use crate::state::Activation;
 use crate::theme;
 use crate::widgets::{leaf_meta, BtnKind, FrameRect};
 
@@ -24,16 +24,17 @@ pub enum ActiveDrag {
     Move(MoveDrag),
 }
 
-/// Relocating a split, grabbed by its titlebar or its taskbar tile. Armed
-/// on press but inert until the pointer travels `MOVE_DRAG_THRESHOLD` from
-/// `press` — a plain click must stay a click. The drop lands on release
-/// (`Comp::end_drag`): onto the left/right half of another split's frame or
-/// taskbar tile, placing the dragged split before/after it.
+/// Relocating a split, grabbed by its titlebar or its taskbar tile. The
+/// drop lands on release (`Comp::end_drag`): onto the left/right half of
+/// another split's frame or taskbar tile, placing the dragged split
+/// before/after it.
 #[derive(Clone, Copy)]
-pub struct MoveDrag {
-    pub leaf: NodeId,
-    pub press: (i32, i32),
-    pub active: bool,
+pub enum MoveDrag {
+    /// Pressed but inert until the pointer travels `MOVE_DRAG_THRESHOLD`
+    /// from `press` — a plain click must stay a click.
+    Armed { leaf: NodeId, press: (i32, i32) },
+    /// Past the threshold: motion is consumed and release drops the split.
+    Active { leaf: NodeId },
 }
 
 /// Pointer travel (in px, Chebyshev) before a titlebar/tile press becomes a
@@ -115,7 +116,7 @@ impl Comp {
         // area never reaches here — the surface catches it): focus the
         // float and start moving it.
         if !secondary {
-            let hit = self.float_stack.iter().copied().find(|&fw| {
+            let hit = self.windows.float_stack.iter().copied().find(|&fw| {
                 self.managed
                     .float(fw)
                     .is_some_and(|(_, f)| rect_contains(f.frame_rect(), mx, my))
@@ -126,7 +127,7 @@ impl Comp {
                     .float(fw)
                     .map(|(_, f)| (mx - f.x, my - f.y))
                     .expect("found above");
-                self.drag = Some(ActiveDrag::Float(FloatDrag { win: fw, dx, dy }));
+                self.interaction.drag = Some(ActiveDrag::Float(FloatDrag { win: fw, dx, dy }));
                 self.focus_float(fw);
                 return true;
             }
@@ -134,7 +135,7 @@ impl Comp {
         // Hit regions describe the final layout, but an animation may still
         // be drawing chrome mid-slide; snap it so the click lands on what
         // the user sees.
-        if self.anim.is_some() {
+        if self.view.anim.is_some() {
             self.finish_animation();
         }
         match self.hit_test(mx, my) {
@@ -145,22 +146,17 @@ impl Comp {
             }
             _ if secondary => {}
             Hit::Btn(leaf, kind) => self.click_split_button(leaf, kind, false),
-            // The tile badge closes only the window: its split stays behind
-            // as an empty placeholder (the titlebar close takes both).
-            Hit::TaskbarClose(win) => {
-                self.state.retain_split_on_close(win);
-                self.close_client(win);
-            }
+            Hit::TaskbarClose(win) => self.close_client(win),
             // Press = click (focus + scroll the split into view); further
             // travel turns it into a split-move drag, dropped on release.
             Hit::TaskbarTile(win, leaf) => {
                 self.bring_into_layout(win, true);
                 // Armed after `bring_into_layout`: its `commit_layout`
-                // clears `self.drag`.
+                // clears `self.interaction.drag`.
                 self.arm_move_drag(leaf, mx, my);
             }
             Hit::QuickLaunch(i) => {
-                if let Some(cmd) = self.quick.get(i).map(|q| q.cmd.clone()) {
+                if let Some(cmd) = self.view.quick.get(i).map(|q| q.cmd.clone()) {
                     self.spawn(&cmd);
                 }
             }
@@ -176,7 +172,7 @@ impl Comp {
             Hit::Plus(at) => {
                 let wa = self.layout_area();
                 self.state.insert_at(wa, at);
-                self.animate = true;
+                self.view.animate = true;
                 self.commit_layout();
             }
             Hit::Handle(b) => {
@@ -187,7 +183,7 @@ impl Comp {
                     // fresh per motion, and a glide underneath would drift
                     // the anchor math out from under the pointer.
                     self.state.land_scroll();
-                    self.drag = Some(ActiveDrag::Gap(GapDrag {
+                    self.interaction.drag = Some(ActiveDrag::Gap(GapDrag {
                         at: b.at,
                         start: b.start,
                         combined: b.first + b.second,
@@ -201,7 +197,7 @@ impl Comp {
                 if let Some((start_x, w)) = self.state.edge_span(wa, left) {
                     let canvas_anchor = if left { start_x + w } else { start_x };
                     let anchor_x = canvas_anchor - self.state.scroll_x();
-                    self.drag = Some(ActiveDrag::Edge(EdgeDrag { left, anchor_x }));
+                    self.interaction.drag = Some(ActiveDrag::Edge(EdgeDrag { left, anchor_x }));
                 }
             }
             Hit::Border(leaf, left) => {
@@ -213,7 +209,7 @@ impl Comp {
                     // is the column's regardless of stacking.
                     let canvas_anchor = if left { geo.x + geo.w } else { geo.x };
                     let anchor_x = canvas_anchor - self.state.scroll_x();
-                    self.drag = Some(ActiveDrag::Border(BorderDrag {
+                    self.interaction.drag = Some(ActiveDrag::Border(BorderDrag {
                         leaf,
                         left,
                         anchor_x,
@@ -230,7 +226,7 @@ impl Comp {
     /// drag is consuming motion (the client under the pointer must not
     /// also see it).
     pub fn on_drag_motion(&mut self, pos: Point<f64, Logical>) -> bool {
-        match self.drag {
+        match self.interaction.drag {
             Some(ActiveDrag::Float(fd)) => {
                 self.move_float(fd.win, pos.x as i32 - fd.dx, pos.y as i32 - fd.dy);
                 true
@@ -292,28 +288,30 @@ impl Comp {
                 self.arrange();
                 true
             }
-            Some(ActiveDrag::Move(mut md)) => {
-                let (mx, my) = (pos.x as i32, pos.y as i32);
-                if !md.active
-                    && (mx - md.press.0).abs().max((my - md.press.1).abs()) >= MOVE_DRAG_THRESHOLD
-                {
-                    md.active = true;
-                    self.drag = Some(ActiveDrag::Move(md));
+            Some(ActiveDrag::Move(md)) => match md {
+                MoveDrag::Armed { leaf, press } => {
+                    let (mx, my) = (pos.x as i32, pos.y as i32);
+                    let travelled =
+                        (mx - press.0).abs().max((my - press.1).abs()) >= MOVE_DRAG_THRESHOLD;
+                    if travelled {
+                        self.interaction.drag = Some(ActiveDrag::Move(MoveDrag::Active { leaf }));
+                    }
+                    travelled
                 }
-                md.active
-            }
+                MoveDrag::Active { .. } => true,
+            },
             None => false,
         }
     }
 
     /// Button release: an active split-move drag drops here. Every other
-    /// drag (and an un-armed move, i.e. a click) just ends.
+    /// drag (and a still-armed move, i.e. a click) just ends.
     pub fn end_drag(&mut self, pos: Point<f64, Logical>) {
-        let drag = self.drag.take();
-        let Some(ActiveDrag::Move(md)) = drag else {
+        let drag = self.interaction.drag.take();
+        let Some(ActiveDrag::Move(MoveDrag::Active { leaf })) = drag else {
             return;
         };
-        if !md.active || !self.state.layout.is_leaf(md.leaf) {
+        if !self.state.layout.is_leaf(leaf) {
             return;
         }
         let (mx, my) = (pos.x as i32, pos.y as i32);
@@ -322,11 +320,11 @@ impl Comp {
         };
         let wa = self.layout_area();
         let changed = match drop {
-            MoveDrop::Column(dst, before) => self.state.move_leaf_beside(wa, md.leaf, dst, before),
-            MoveDrop::Stack(dst, before) => self.state.move_leaf_into_stack(md.leaf, dst, before),
+            MoveDrop::Column(dst, before) => self.state.move_leaf_beside(wa, leaf, dst, before),
+            MoveDrop::Stack(dst, before) => self.state.move_leaf_into_stack(leaf, dst, before),
         };
         if changed {
-            self.animate = true;
+            self.view.animate = true;
             self.commit_layout();
         }
     }
@@ -344,6 +342,7 @@ impl Comp {
     /// `LeafBody` hits.
     fn move_drop_target(&self, mx: i32, my: i32) -> Option<MoveDrop> {
         if let Some(&(_, b)) = self
+            .view
             .widgets
             .handle_regions
             .iter()
@@ -364,8 +363,8 @@ impl Comp {
         if my >= self.output_size().h - theme::TASKBAR_H {
             // The strip ends where the quick-launch separator starts; a
             // drop over the quick icons means nothing.
-            let strip_end = self.widgets.taskbar_sep.map_or(i32::MAX, |s| s.x);
-            let tiles = &self.widgets.taskbar_regions;
+            let strip_end = self.view.widgets.taskbar_sep.map_or(i32::MAX, |s| s.x);
+            let tiles = &self.view.widgets.taskbar_regions;
             let dst = tiles
                 .iter()
                 .find(|t| mx < t.rect.x + t.rect.w / 2)
@@ -373,7 +372,8 @@ impl Comp {
                 .or_else(|| tiles.last().map(|t| MoveDrop::Column(t.leaf, false)));
             return dst.filter(|_| mx < strip_end);
         }
-        self.placed
+        self.view
+            .placed
             .iter()
             .find(|p| rect_contains(p.target, mx, my))
             .map(|p| MoveDrop::Column(p.leaf, mx < p.target.x + p.target.w / 2))
@@ -382,10 +382,9 @@ impl Comp {
     /// Arm a split-move drag on a fresh titlebar/tile press (see
     /// `MoveDrag`).
     fn arm_move_drag(&mut self, leaf: NodeId, mx: i32, my: i32) {
-        self.drag = Some(ActiveDrag::Move(MoveDrag {
+        self.interaction.drag = Some(ActiveDrag::Move(MoveDrag::Armed {
             leaf,
             press: (mx, my),
-            active: false,
         }));
     }
 
@@ -395,7 +394,7 @@ impl Comp {
     /// press would otherwise fall through to the client underneath.
     pub fn float_frame_at(&self, pos: Point<f64, Logical>) -> Option<Win> {
         let (mx, my) = (pos.x as i32, pos.y as i32);
-        self.float_stack.iter().copied().find(|&fw| {
+        self.windows.float_stack.iter().copied().find(|&fw| {
             self.managed.float(fw).is_some_and(|(_, f)| {
                 rect_contains(f.frame_rect(), mx, my)
                     && !(mx >= f.x && mx < f.x + f.w && my >= f.y && my < f.y + f.h)
@@ -409,6 +408,7 @@ impl Comp {
     /// hover feedback can never drift apart (master's invariant).
     fn hit_test(&self, mx: i32, my: i32) -> Hit {
         if let Some((leaf, kind)) = self
+            .view
             .widgets
             .btn_regions
             .iter()
@@ -421,6 +421,7 @@ impl Comp {
         // top; reverse iteration matches draw order so the topmost tile
         // wins. The corner "x" badge outranks the tile bodies.
         if let Some(win) = self
+            .view
             .widgets
             .taskbar_regions
             .iter()
@@ -431,6 +432,7 @@ impl Comp {
             return Hit::TaskbarClose(win);
         }
         if let Some((win, leaf)) = self
+            .view
             .widgets
             .taskbar_regions
             .iter()
@@ -441,6 +443,7 @@ impl Comp {
             return Hit::TaskbarTile(win, leaf);
         }
         if let Some(i) = self
+            .view
             .widgets
             .quick_regions
             .iter()
@@ -450,6 +453,7 @@ impl Comp {
             return Hit::QuickLaunch(i);
         }
         if let Some(leaf) = self
+            .view
             .widgets
             .title_regions
             .iter()
@@ -462,6 +466,7 @@ impl Comp {
         // region — check the narrower "+" rects first so they aren't
         // shadowed by the handles.
         if let Some(at) = self
+            .view
             .widgets
             .plus_regions
             .iter()
@@ -471,6 +476,7 @@ impl Comp {
             return Hit::Plus(at);
         }
         if let Some(b) = self
+            .view
             .widgets
             .handle_regions
             .iter()
@@ -480,6 +486,7 @@ impl Comp {
             return Hit::Handle(b);
         }
         if let Some(&(_, left)) = self
+            .view
             .widgets
             .edge_handle_regions
             .iter()
@@ -488,6 +495,7 @@ impl Comp {
             return Hit::Edge(left);
         }
         if let Some((leaf, frame)) = self
+            .view
             .prev_frame_rect
             .iter()
             .find(|(l, r)| self.state.layout.is_leaf(**l) && rect_contains(**r, mx, my))
@@ -525,7 +533,7 @@ impl Comp {
                 // Mirror `leaf_buttons`' enabled/disabled choice for the
                 // button art (a minimized leaf's whole-frame region is
                 // always a live restore button).
-                if let Some(&frame) = self.prev_frame_rect.get(&leaf) {
+                if let Some(&frame) = self.view.prev_frame_rect.get(&leaf) {
                     let meta = leaf_meta(&self.state.layout, leaf, frame);
                     let disabled = !meta.minimized
                         && match kind {
@@ -574,6 +582,7 @@ impl Comp {
     pub fn click_split_button(&mut self, leaf: NodeId, kind: BtnKind, secondary: bool) {
         let wa = self.layout_area();
         let frame = self
+            .view
             .prev_frame_rect
             .get(&leaf)
             .copied()
@@ -601,7 +610,7 @@ impl Comp {
                     meta.split_dir
                 };
                 self.state.focus_leaf(leaf);
-                self.animate = match dir {
+                self.view.animate = match dir {
                     Some(Dir::H) => {
                         self.state.split_column_right(wa);
                         true
@@ -617,57 +626,10 @@ impl Comp {
                 if meta.sole {
                     return;
                 }
-                self.animate = self.state.toggle_minimize(leaf);
+                self.view.animate = self.state.toggle_minimize(leaf);
             }
         }
         self.commit_layout();
-    }
-
-    /// Close the split at `leaf` — the titlebar close button's and
-    /// `Action::Close`'s shared semantics. Window and split live and die
-    /// together: an occupied split's close politely closes the window, and
-    /// the split collapses when it actually dies (`unpin_client` — so a
-    /// "do you want to save?" refusal keeps the split). An empty
-    /// placeholder is removed on the spot; the sole placeholder is the one
-    /// split that can't go.
-    pub fn close_split(&mut self, leaf: NodeId) {
-        match self.state.layout.leaf(leaf).and_then(|l| l.client) {
-            Some(win) => self.close_client(win),
-            None => self.animate = self.state.remove_empty_leaf(leaf),
-        }
-        self.commit_layout();
-    }
-
-    /// Focus a managed tiled window's split and scroll it into view (via
-    /// `commit_layout`'s `ensure_in_view`), un-minimizing it. `animate`
-    /// requests a transition, but only when rects actually moved.
-    pub fn bring_into_layout(&mut self, win: Win, animate: bool) {
-        let changed = match self.state.activate_client(win) {
-            Activation::Unminimized => true,
-            Activation::Unchanged => false,
-        };
-        if animate {
-            self.animate = changed;
-        }
-        self.commit_layout();
-    }
-
-    /// Shared epilogue for every layout-mutating action: invalidate drags
-    /// whose tree snapshot went stale, keep the focused split in view
-    /// (gliding unless an animation is about to run), re-arrange.
-    pub fn commit_layout(&mut self) {
-        self.drag = None;
-        let wa = self.layout_area();
-        self.state.clamp_scroll(wa, 0);
-        self.state.ensure_in_view(wa);
-        // An animation's placements are computed from scroll_x at arrange
-        // time and held for the whole transition; a concurrent glide would
-        // make them stale every frame, so land it. Otherwise leave the
-        // target so step_scroll glides the viewport over.
-        if self.animate {
-            self.state.land_scroll();
-        }
-        self.arrange();
     }
 
     /// Accumulated horizontal scroll (in wheel-click units) pans the
@@ -676,9 +638,9 @@ impl Comp {
     /// truncating each independently would discard the whole gesture.
     pub fn apply_hscroll(&mut self, delta: f64) {
         let wa = self.layout_area();
-        let px_f = delta.mul_add(f64::from(theme::SCROLL_STEP), self.hscroll_frac);
+        let px_f = delta.mul_add(f64::from(theme::SCROLL_STEP), self.interaction.hscroll_frac);
         let px = px_f as i32;
-        self.hscroll_frac = px_f - f64::from(px);
+        self.interaction.hscroll_frac = px_f - f64::from(px);
         if px == 0 {
             return;
         }

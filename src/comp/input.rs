@@ -69,18 +69,21 @@ impl Comp {
                                     let Some(intercepted) = intercepted else {
                                         return FilterResult::Forward;
                                     };
-                                    if comp.held_bound_keys.contains(&raw) {
+                                    if comp.interaction.held_bound_keys.contains(&raw) {
                                         // Auto-repeat of a held chord.
                                         return FilterResult::Intercept(None);
                                     }
-                                    comp.held_bound_keys.push(raw);
+                                    comp.interaction.held_bound_keys.push(raw);
                                     FilterResult::Intercept(Some(intercepted))
                                 }
                                 KeyState::Released => {
-                                    if let Some(idx) =
-                                        comp.held_bound_keys.iter().position(|&k| k == raw)
+                                    if let Some(idx) = comp
+                                        .interaction
+                                        .held_bound_keys
+                                        .iter()
+                                        .position(|&k| k == raw)
                                     {
-                                        comp.held_bound_keys.swap_remove(idx);
+                                        comp.interaction.held_bound_keys.swap_remove(idx);
                                         FilterResult::Intercept(None)
                                     } else {
                                         FilterResult::Forward
@@ -182,16 +185,16 @@ impl Comp {
             // the canvas everywhere, no Mod4 needed. Other finger counts
             // stay swallowed.
             InputEvent::GestureSwipeBegin { event } => {
-                self.swipe_pan = event.fingers() == 3;
+                self.interaction.swipe_pan = event.fingers() == 3;
             }
             InputEvent::GestureSwipeUpdate { event } => {
-                if self.swipe_pan {
+                if self.interaction.swipe_pan {
                     // Same wheel-click conversion as continuous finger
                     // scroll: ~15 axis units per click.
                     self.apply_hscroll(-event.delta_x() / 15.0);
                 }
             }
-            InputEvent::GestureSwipeEnd { .. } => self.swipe_pan = false,
+            InputEvent::GestureSwipeEnd { .. } => self.interaction.swipe_pan = false,
             _ => {}
         }
     }
@@ -212,19 +215,19 @@ impl Comp {
             self.end_drag(pos);
             // The release of a press we consumed must not leak to a
             // client that never saw the press.
-            consumed = std::mem::take(&mut self.chrome_press);
+            consumed = std::mem::take(&mut self.interaction.chrome_press);
         } else if !pointer.is_grabbed() {
             // Any click on a notification bubble dismisses it,
             // before everything else (they render topmost).
             if self.dismiss_note_at(pos) {
-                self.chrome_press = true;
+                self.interaction.chrome_press = true;
                 consumed = true;
             } else
             // Float chrome frames overlap client surfaces beneath
             // them; they win the press outright.
             if button == BTN_LEFT && self.float_frame_at(pos).is_some() {
                 self.on_chrome_button(pos, false);
-                self.chrome_press = true;
+                self.interaction.chrome_press = true;
                 consumed = true;
             } else {
                 let under = self.surface_under(pos).map(|(s, _)| s);
@@ -257,7 +260,7 @@ impl Comp {
                     // where no surface is under the pointer at all.
                     None if !over_unmanaged && matches!(button, BTN_LEFT | BTN_RIGHT) => {
                         if self.on_chrome_button(pos, button == BTN_RIGHT) {
-                            self.chrome_press = true;
+                            self.interaction.chrome_press = true;
                             consumed = true;
                         }
                     }
@@ -322,7 +325,7 @@ impl Comp {
         // drag the gesture's own shape wherever the pointer strays.
         if under.is_none() {
             use smithay::input::pointer::CursorIcon;
-            let icon = match self.drag {
+            let icon = match self.interaction.drag {
                 Some(crate::comp::pointer::ActiveDrag::Gap(d)) => match d.at.dir() {
                     crate::layout::Dir::V => CursorIcon::NsResize,
                     crate::layout::Dir::H => CursorIcon::EwResize,
@@ -332,13 +335,12 @@ impl Comp {
                 Some(crate::comp::pointer::ActiveDrag::Float(_)) => CursorIcon::Pointer,
                 // An armed-but-unmoved titlebar/tile press still reads as a
                 // click; only real travel shows the grab.
-                Some(crate::comp::pointer::ActiveDrag::Move(md)) => {
-                    if md.active {
-                        CursorIcon::Grabbing
-                    } else {
-                        self.hover_cursor(pos)
-                    }
-                }
+                Some(crate::comp::pointer::ActiveDrag::Move(
+                    crate::comp::pointer::MoveDrag::Active { .. },
+                )) => CursorIcon::Grabbing,
+                Some(crate::comp::pointer::ActiveDrag::Move(
+                    crate::comp::pointer::MoveDrag::Armed { .. },
+                )) => self.hover_cursor(pos),
                 None => self.hover_cursor(pos),
             };
             self.cursor_status = smithay::input::pointer::CursorImageStatus::Named(icon);

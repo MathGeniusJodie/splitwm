@@ -26,6 +26,45 @@ pub struct Placement {
     pub focused: bool,
 }
 
+/// The pure placement pass of an arrange: every leaf's frame rect at the
+/// current scroll (on-screen or not — a leaf scrolled out of view keeps a
+/// sane animation start / hit rect for its return), and a `Placement` for
+/// each on-screen leaf. Every visible leaf gets a placement (chrome draws
+/// empty and minimized frames too); which ones actually map a window is the
+/// compositor's business (`Comp::apply_placements`).
+pub fn compute_placements(
+    state: &State,
+    wa: Rect,
+) -> (Vec<Placement>, std::collections::HashMap<NodeId, FrameRect>) {
+    let geos = state.compute(wa);
+    let scroll_x = state.scroll_x();
+    let focused = state.focused_leaf_valid();
+    let mut placed = Vec::new();
+    let mut frame_rects = std::collections::HashMap::new();
+    for leaf in state.layout.collect_leaves() {
+        let Some(geo) = geos.get(&leaf).copied() else {
+            continue;
+        };
+        let frame = FrameRect {
+            x: geo.x - scroll_x,
+            y: geo.y,
+            w: geo.w.max(1),
+            h: geo.h.max(1),
+        };
+        frame_rects.insert(leaf, frame);
+        if frame.x + frame.w <= wa.x || frame.x >= wa.x + wa.w {
+            continue;
+        }
+        placed.push(Placement {
+            leaf,
+            target: frame,
+            active_client: state.layout.leaf(leaf).and_then(|l| l.client),
+            focused: focused == leaf,
+        });
+    }
+    (placed, frame_rects)
+}
+
 /// Side of a "+" insert / drag square, sized to sit inside a gap.
 pub const PLUS_SZ: i32 = theme::GAP - 4;
 /// How much narrower than the gap a boundary drag handle is drawn/hit.
@@ -111,8 +150,7 @@ pub enum BtnKind {
 pub struct TaskTile {
     pub rect: FrameRect,
     /// The close ("x") badge in the tile's bottom-right corner; hit-tested
-    /// before `rect` so it wins the click. Closes only the window, leaving
-    /// its split as an empty placeholder (unlike the titlebar close).
+    /// before `rect` so it wins the click.
     pub close: FrameRect,
     pub win: Win,
     /// The split showing this window — every taskbar'd window has one.
@@ -518,7 +556,8 @@ mod tests {
         s.insert_at(WA, Insert::Col(1));
         s.insert_at(WA, Insert::Col(1));
         for col in 0..3 {
-            s.layout.set_col_width(col, crate::layout::ColWidth::Px(300));
+            s.layout
+                .set_col_width(col, crate::layout::ColWidth::Px(300));
         }
         s
     }

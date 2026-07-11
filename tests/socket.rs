@@ -763,7 +763,7 @@ fn popup_slides_back_inside_the_output() {
 /// mirrors `theme.rs`: GAP 20, TASKBAR_ICON 42, TASKBAR_GAP 10,
 /// TASKBAR_H 82, badge 17px overlapping the tile bottom by 4.
 #[test]
-fn drag_reorders_splits_and_badge_close_leaves_placeholder() {
+fn drag_reorders_splits_and_badge_closes() {
     const OUTPUT_H: i32 = 800;
     // Tile k spans x [20 + 52k, 62 + 52k); the icon row's centre sits at
     // pad 13 + half the 42px icon below the bar's top edge.
@@ -826,36 +826,25 @@ fn drag_reorders_splits_and_badge_close_leaves_placeholder() {
     s.wm.cmd("release 1250 400");
     assert_eq!(s.wm.query("layout"), "test-1 test-2 test-0");
 
-    // The tile badge closes only the window: its split stays behind as an
-    // empty placeholder, and the next new window fills it.
+    // The tile badge closes the window, and the split collapses with its
+    // window's death — the same semantics as the titlebar close.
     let badge = (tile_x(0) + 25 + 8, OUTPUT_H - 82 + 13 + 42 - 4 + 8);
     s.wm.cmd(&format!("click {} {}", badge.0, badge.1));
     s.wait_until("badge asks the window to close", |app| app.wins[1].closed);
     s.app.wins[1].toplevel.destroy();
     s.app.wins[1].surface.destroy();
     let deadline = Instant::now() + Duration::from_secs(10);
-    while s.wm.query("layout") != "- test-2 test-0" {
+    while s.wm.query("layout") != "test-2 test-0" {
         // Keep the connection flushed so the destroy actually reaches the
         // compositor (the layout query rides a separate channel).
         s.queue.roundtrip(&mut s.app).expect("roundtrip");
         assert!(
             Instant::now() < deadline,
-            "badge close should leave a placeholder, got: {}",
+            "badge close should collapse the split, got: {}",
             s.wm.query("layout")
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    // An *unfocused* placeholder attracts nothing: the new window opens
-    // its own column beside the focused one instead.
-    let w3 = s.open_window();
-    s.wait_until("new window mapped", |app| app.wins[w3].activated);
-    assert_eq!(s.wm.query("layout"), "- test-2 test-0 test-3");
-    // Focused (one step of wrap-around cycling from the new rightmost
-    // window), the placeholder is exactly where the next window lands.
-    s.wm.key("super+bracketright");
-    let w4 = s.open_window();
-    s.wait_until("new window mapped", |app| app.wins[w4].activated);
-    assert_eq!(s.wm.query("layout"), "test-4 test-2 test-0 test-3");
 }
 
 #[test]

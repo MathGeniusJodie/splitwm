@@ -33,8 +33,8 @@ use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{DeviceFd, Logical, Point, Transform};
 
-use crate::comp::chrome::{self, OutputElement};
 use crate::comp::cursor::{cursor_elements, CursorCache};
+use crate::comp::scene::{self, OutputElement};
 use crate::comp::Comp;
 
 type Allocator = GbmAllocator<DrmDeviceFd>;
@@ -85,7 +85,7 @@ impl Tty {
     /// nothing — the redraw timer polls until something is dirty again.
     pub fn render(
         &mut self,
-        scene: &chrome::Scene<'_>,
+        scene: &scene::Scene<'_>,
         pointer_loc: Point<f64, Logical>,
         cursor: &CursorImageStatus,
         cursors: &mut CursorCache,
@@ -104,7 +104,7 @@ impl Tty {
             cursor,
             cursors,
         );
-        elements.extend(chrome::output_elements(&mut self.renderer, scene));
+        elements.extend(scene::output_elements(&mut self.renderer, scene));
         match out.render_frame(&mut self.renderer, &elements, clear, FrameFlags::DEFAULT) {
             Ok(res) => {
                 if !res.is_empty {
@@ -302,7 +302,7 @@ pub fn run() {
                 // chord itself, at minimum) were lost with the devices;
                 // without this the next press of the same key would be
                 // swallowed as a "repeat" of a chord still thought held.
-                comp.held_bound_keys.clear();
+                comp.interaction.held_bound_keys.clear();
                 // Re-activating the DRM device can lose the GL textures, so
                 // drop every cached chrome piece for a full re-upload.
                 comp.invalidate_chrome();

@@ -118,7 +118,7 @@ Mapping notes vs the X11 spec:
 | drag a canvas edge   | resize the outer column into its margin |
 | click a gap/edge `+` | insert an empty column there (in a stack gap: an empty row) |
 | taskbar tile         | focus that split and scroll it into view; drag to reorder |
-| taskbar tile corner `x` | close that window politely, leaving its split as an empty placeholder |
+| taskbar tile corner `x` | close that window politely (its split collapses when it dies) |
 | taskbar quick-launch icons | spawn that app (right of the pill separator) |
 | titlebar buttons     | minimize / ⊞ split (wide lone window: new column right; else stack below; right-click flips) / close window+split |
 | drag a titlebar      | move that split; drop on a frame/icon half or into a gap |
@@ -171,9 +171,10 @@ cargo run
   stash model): there are no splitless windows — no stash, no taskbar
   cycling, no displacement. Window death collapses its split. The
   taskbar mirrors the splits in strip order; its icons and the titlebars
-  drag-and-drop to reorder splits. The titlebar close button closes
-  window *and* split; the taskbar badge closes only the window, leaving
-  a placeholder; the popup-restore (`Leaf::prev`) machinery is gone.
+  drag-and-drop to reorder splits. There is one close action (2026-07-11):
+  the titlebar close and the taskbar badge both close the window, and the
+  split collapses when it dies — the badge's leave-a-placeholder variant
+  and the popup-restore (`Leaf::prev`) machinery are gone.
   `Mod4+[`/`]` now cycle focus, `Mod4+Shift+[`/`]` move the focused
   split.
 - **Flat column strip replaces the split tree** (2026-07-08): the layout

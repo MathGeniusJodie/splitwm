@@ -20,7 +20,7 @@ use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{Buffer as BufferCoord, Rectangle, Size, Transform};
 
-use crate::comp::chrome;
+use crate::comp::scene;
 use crate::comp::Comp;
 
 /// Fixed output size: headless runs never resize, and the drive scripts'
@@ -40,8 +40,8 @@ pub struct Headless {
 
 impl Headless {
     /// Composite one frame, then serve any pending screenshot from it.
-    pub fn render(&mut self, scene: &chrome::Scene<'_>, clear: Color32F) {
-        let elements = chrome::output_elements(&mut self.renderer, scene);
+    pub fn render(&mut self, scene: &scene::Scene<'_>, clear: Color32F) {
+        let elements = scene::output_elements(&mut self.renderer, scene);
         let mut fb = match self.renderer.bind(&mut self.buffer) {
             Ok(fb) => fb,
             Err(err) => {

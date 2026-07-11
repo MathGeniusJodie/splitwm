@@ -50,7 +50,7 @@ fn dock_zone(layer: &LayerSurface) -> i32 {
 
 impl WlrLayerShellHandler for Comp {
     fn shell_state(&mut self) -> &mut WlrLayerShellState {
-        &mut self.layer_shell_state
+        &mut self.globals.layer_shell_state
     }
 
     fn new_layer_surface(

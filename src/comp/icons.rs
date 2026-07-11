@@ -59,7 +59,7 @@ impl Comp {
         let Some(icon) = r.icon else {
             return;
         };
-        let quant = Rc::new(icon::quantize(self.chrome.palette(), &icon));
+        let quant = Rc::new(icon::quantize(self.view.chrome.palette(), &icon));
         let class = match self.managed.get(r.win) {
             Some(window) => crate::shell::toplevel_app_id(window),
             None => return, // closed while the fetch ran
@@ -110,7 +110,7 @@ impl Comp {
                 continue;
             }
             let rotated = Rc::new(icon::rotate(
-                self.chrome.palette(),
+                self.view.chrome.palette(),
                 &icon,
                 theme::icon_hue_rotation(slot),
             ));
