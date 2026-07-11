@@ -105,12 +105,11 @@ impl Comp {
     }
 
     /// A managed tiled window is gone — both protocol destroy paths
-    /// (Wayland and XWayland) land here. The dying window usually takes
-    /// its split with it (a badge-closed one leaves a placeholder, see
-    /// `unpin_client`); animate the layout settling — stacked neighbours
-    /// reclaiming the height, or the later columns sliding over a removed
-    /// one. arrange (via `commit_layout`) refocuses, so focus never rests
-    /// on a dead client.
+    /// (Wayland and XWayland) land here. The dying window always takes its
+    /// split with it (`unpin_client`); animate the layout settling —
+    /// stacked neighbours reclaiming the height, or the later columns
+    /// sliding over a removed one. arrange (via `commit_layout`) refocuses,
+    /// so focus never rests on a dead client.
     pub fn unmanage_tiled(&mut self, win: Win) {
         if let Some(m) = self.managed.remove(win) {
             self.space.unmap_elem(&m.window);

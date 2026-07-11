@@ -51,16 +51,15 @@ this compositor reproduces it unless a deviation is listed below.
   config comes from the environment (`XKB_DEFAULT_LAYOUT` …).
 - **freedesktop-icons / freedesktop-desktop-entry** — taskbar icon lookup
   and `.desktop` resolution.
-- **xcursor** — theme lookup for named cursor shapes beyond the
-  hand-drawn sprites.
 
 ## Protocols
 
 wl_compositor, xdg-shell, wl_shm, linux-dmabuf (v4 feedback with a render
-node), wl_seat, wl_output/xdg-output, wl_data_device, xdg-decoration
-(ServerSide forced on every toplevel; clients that ignore it keep their
-CSD), **wlr-layer-shell**, **cursor-shape-v1**, and full **XWayland** —
-X11 and Wayland windows share one window abstraction and lifecycle.
+node), wl_seat, wl_output/xdg-output, wl_data_device, primary-selection,
+xdg-decoration (ServerSide forced on every toplevel; clients that ignore it
+keep their CSD), **wlr-layer-shell**, **cursor-shape-v1**, and full
+**XWayland** — X11 and Wayland windows share one window abstraction and
+lifecycle.
 
 ## Architecture
 
@@ -90,9 +89,11 @@ Mapping notes vs the X11 spec:
 - Redraws are vblank-driven (DRM) or 60 Hz timer-paced (winit/headless);
   animations key off `Instant` as before.
 - The pointer is composited from master's hand-drawn cursor sprites
-  (arrow, hand, disabled, text); other shapes clients request via
-  cursor-shape-v1 resolve through the xcursor theme. Nested (winit)
-  sessions map named shapes onto the host's hardware cursor instead.
+  (arrow, hand, disabled, text) on every backend, including nested (winit)
+  sessions: the host cursor is hidden and every named shape a client
+  requests via cursor-shape-v1 — or that chrome hover feedback picks — maps
+  onto one of the four sprites by intent (`comp::cursor::sprite_buf`), not
+  looked up in an xcursor theme.
 
 ## Keybindings (Mod4 = Super)
 
@@ -137,8 +138,6 @@ or a remote shell) is the only way out, on every backend.
 - `SPLITWM_HEADLESS=1` — offscreen backend for the harness;
   `SPLITWM_DEBUG_CHANNEL=1` — line protocol on stdin driving keys,
   pointer, spawns, screenshots, and cursor queries (see `comp/debug.rs`).
-- `XCURSOR_THEME` / `XCURSOR_SIZE` — theme for named cursor shapes the
-  sprites don't cover.
 - Taskbar quick-launch commands are configured per entry in
   `theme::QUICK` (each with its own env-var override).
 

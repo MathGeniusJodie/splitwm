@@ -16,7 +16,7 @@ use super::Renderer;
 pub struct TitleInfo {
     pub label: char,
     /// Icon to draw, already resolved by the caller — the hue-rotated
-    /// variant when same-app disambiguation applies (see `Wm::icon_for`).
+    /// variant when same-app disambiguation applies (see `Comp::icon_for`).
     pub icon: Option<Rc<Icon>>,
     /// `_NET_WM_NAME`/`WM_NAME`, drawn next to the icon/label when non-empty.
     pub title: Rc<str>,
@@ -69,8 +69,8 @@ const MIN_CAP_W: usize = 18;
 /// margins plus the source column range the horizontal middle tiles from
 /// (narrower than the span between the corners when decoration is baked
 /// there — see `NineSlice::EDGE_SAMPLE_*`). The vertical middle always tiles
-/// `t..height-b`. Mirrors what `NineSlice::draw`/`draw_minimized_axis` do on
-/// the CPU (still used for float frames).
+/// `t..height-b`. Every frame — leaf borders and float frames alike — slices
+/// through this same GPU path now; there is no CPU nine-slice draw left.
 pub struct SliceSpec {
     pub l: i32,
     pub t: i32,

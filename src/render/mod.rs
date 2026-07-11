@@ -115,9 +115,9 @@ fn fill(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, index: Index) {
 
 /// The accent remap shared by the border and its titlebar buttons: the
 /// titlebar/body fill (`LAVENDER`) becomes `index`, the outline (`PURPLE`)
-/// becomes its hand-picked darker counterpart (`theme::DARKER_INDEX`), and
-/// the highlight stroke (`CREAM`) becomes its hand-picked lighter
-/// counterpart (`theme::LIGHTER_INDEX`).
+/// becomes `index`'s hand-picked darker counterpart (`theme::darker_index`),
+/// and the highlight stroke (`CREAM`) becomes its hand-picked lighter
+/// counterpart (`theme::lighter_index`).
 /// The accent swap as index triples for the GPU nine-slice shader — the
 /// same three substitutions `accent_swap` bakes into a CPU `Swap`, spelled
 /// as data so the shader can apply them at draw time.

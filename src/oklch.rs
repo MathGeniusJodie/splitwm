@@ -4,8 +4,8 @@
 //!
 //! Also hosts the OKLCH hue rotation used on app icon bitmaps for same-app
 //! window disambiguation (`theme::icon_hue_rotation`,
-//! `Wm::refresh_icon_rotations`) — a real per-pixel hue shift of the icon's
-//! own colors, not a swatch/overlay.
+//! `Comp::refresh_icon_rotations`) — a real per-pixel hue shift of the
+//! icon's own colors, not a swatch/overlay.
 
 use pixel_graphics::{Palette, Rgb};
 

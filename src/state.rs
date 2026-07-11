@@ -33,7 +33,7 @@ pub struct State {
     scroll_x: i32,
     scroll_target: i32,
     /// Extra scrollable width past the strip reserved for the docked
-    /// sidebar (see `Wm::manage_dock`), so scrolling all the way right
+    /// sidebar (see `Comp::manage_dock`), so scrolling all the way right
     /// reveals it even though it sits outside the strip and doesn't
     /// affect `compute`'s leaf geometry. Zero when nothing is docked.
     /// Private so the only write (`set_dock_extra`) deliberately preserves
@@ -566,7 +566,7 @@ impl State {
     /// Per-frame fraction of the remaining distance closed by `step_scroll`,
     /// tuned for the event loop's 16ms frame cadence: snappy enough to keep
     /// pace with a trackpad swipe's moving target, while still reading as a
-    /// glide alongside the 280ms layout animation (`Wm::ANIM_DURATION`).
+    /// glide alongside the 280ms layout animation (`comp::anim::ANIM_DURATION`).
     const SCROLL_GLIDE_K: f64 = 0.25;
     /// Below this remaining distance, `step_scroll` snaps rather than
     /// asymptotically approaching forever.
@@ -589,7 +589,8 @@ impl State {
 
     /// Whether `scroll_x` has not yet caught up to `scroll_target` — the
     /// event loop keeps stepping frames (and stays non-blocking) while this
-    /// holds, exactly like it does for `Wm::anim`.
+    /// holds, exactly like it does for the layout animation
+    /// (`ChromeView::anim`).
     pub fn scroll_animating(&self) -> bool {
         self.scroll_x != self.scroll_target
     }

@@ -1,8 +1,8 @@
 //! Application-icon colour pipeline: snapping fetched icons onto the na16
 //! palette and the OKLCH hue-rotation used for same-app disambiguation.
-//! Both run once per icon fetch / assignment (see `Wm::fetch_icon` and
-//! `Wm::refresh_icon_rotations`), never per frame — the per-pixel OKLCH
-//! math is far too heavy for the blit path.
+//! Both run once per icon fetch / assignment (see `Comp::spawn_icon_fetch`
+//! and `Comp::refresh_icon_rotations`), never per frame — the per-pixel
+//! OKLCH math is far too heavy for the blit path.
 
 #![allow(clippy::cast_possible_truncation)]
 

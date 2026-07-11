@@ -162,9 +162,9 @@ pub const TASKBAR_GAP: i32 = 10;
 pub const TASKBAR_CLOSE: i32 = 17;
 
 /// Default `WM_NAME` of the window parked entirely off-screen past the right
-/// edge (see `Wm::manage_dock`), outside the column strip, immune to canvas
-/// scrolling, and reserving no layout space. cozyui sets this exact title
-/// and never sets `WM_CLASS`, so title is the only identity it exposes.
+/// edge (see `Comp::manage_dock`), outside the column strip, immune to
+/// canvas scrolling, and reserving no layout space. cozyui sets this exact
+/// title and never sets `WM_CLASS`, so title is the only identity it exposes.
 /// Overridable at runtime with the `SPLITWM_DOCK_TITLE` environment variable.
 pub const DOCK_TITLE: &str = "cozyui";
 
@@ -176,11 +176,12 @@ pub fn dock_identity() -> String {
 }
 
 /// How far the docked sidebar is tucked under the right end of the split
-/// canvas, in px: `Wm::place_dock` shifts the dock left by this much from
-/// the canvas edge, and the canvas (stacked above it) overlaps it by the
-/// same amount. The first `GAP` px only close the canvas's trailing margin;
-/// beyond that the last column's windows themselves cover the dock's edge.
-/// 0 restores the flush side-by-side layout.
+/// canvas, in px: `Comp::dock_geometry` shifts the dock left by this much
+/// (via `DockData::overlap`) from the canvas edge, and the canvas (stacked
+/// above it) overlaps it by the same amount. The first `GAP` px only close
+/// the canvas's trailing margin; beyond that the last column's windows
+/// themselves cover the dock's edge. 0 restores the flush side-by-side
+/// layout.
 pub const DOCK_OVERLAP: i32 = 360;
 
 pub const SPLIT_RATIO: f64 = 0.618;
@@ -280,15 +281,18 @@ pub const fn cycled_leaf_color(id: u32) -> Index {
 pub const ICON_HUE_STEPS: usize = 6;
 
 /// The `slot`th persistent icon hue-rotation (degrees), assigned once per
-/// window (see `Wm::assign_icon_slot`) and kept for the window's lifetime.
+/// window (see `Comp::assign_icon_slot`) and kept for the window's lifetime.
 pub const fn icon_hue_rotation(slot: usize) -> f32 {
     (slot % ICON_HUE_STEPS) as f32 * (360.0 / ICON_HUE_STEPS as f32)
 }
 
 // --- keyboard configuration ---
 //
-// Everything a user might retune lives here rather than in `wm`: the keysym
-// constants, the action set, and the binding table `Wm::grab_keys` installs.
+// Everything a user might retune lives here: the keysym constants, the
+// action set, and the `BINDINGS` table itself. There is no explicit grab
+// step (an X11 WM's `XGrabKey`) — every chord is intercepted by matching
+// `BINDINGS` inline in the keyboard filter closure (`comp::actions::binding_action`,
+// called from `Comp::process_input_event`) before a client ever sees the key.
 
 /// Keysyms used by `BINDINGS` (raw `u32` values from the `xkeysym` crate's
 /// generated tables — X11 keysym values are xkb keysym values, so the same
