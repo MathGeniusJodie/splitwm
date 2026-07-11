@@ -207,12 +207,10 @@ impl Managed {
     }
 
     /// The `Win` whose window's root surface is `surface`, any kind and
-    /// either backend (X11 surfaces resolve via their associated wl
-    /// surface).
+    /// either backend (`WaylandFocus::wl_surface` resolves an X11 window
+    /// through its associated wl surface).
     pub fn win_for_surface(&self, surface: &WlSurface) -> Option<Win> {
-        use smithay::desktop::WindowSurface;
         use smithay::wayland::seat::WaylandFocus as _;
-        let _ = WindowSurface::Wayland; // backend-agnostic via WaylandFocus
         self.entries.iter().find_map(|m| {
             m.window
                 .wl_surface()

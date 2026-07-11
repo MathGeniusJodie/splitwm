@@ -330,6 +330,10 @@ pub enum Action {
 pub const MOD4: u16 = 0x40; // Super/Logo
 pub const MOD1: u16 = 0x08; // Alt
 pub const SHIFT: u16 = 0x01;
+/// Never appears in `BINDINGS`, but it participates in the exact-match so
+/// `Mod4+Ctrl+X` doesn't trigger the `Mod4+X` binding (X grabs matched
+/// exactly; so does the dispatcher).
+pub const CTRL: u16 = 0x04;
 
 /// Command `Action::SpawnLauncher` spawns: rofi in combi mode (drun + run +
 /// window). A wayland-capable rofi picks its wayland backend and runs as a

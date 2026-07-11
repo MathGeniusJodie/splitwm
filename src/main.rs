@@ -2,26 +2,21 @@
 //!
 //! Runs nested (winit backend) when launched from an existing session, or
 //! on a bare VT (DRM/libinput/libseat, behind the `tty` cargo feature)
-//! when it is the session. The X11 splitwm on master is the behavioral
-//! spec; PORT.md tracks the port and its approved deviations.
+//! when it is the session. The retired X11 version lives on the `xorg`
+//! branch; behavioral deviations from it are listed in the README.
 
-#[allow(dead_code)]
 mod assets;
 mod backend;
 mod backlight;
 mod comp;
 mod icon;
 mod launch;
-#[allow(dead_code)]
 mod layout;
 mod notify;
 mod oklch;
-#[allow(dead_code)]
 mod render;
 mod shell;
-#[allow(dead_code)]
 mod state;
-#[allow(dead_code)]
 mod theme;
 mod widgets;
 

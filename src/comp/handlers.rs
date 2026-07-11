@@ -153,14 +153,12 @@ impl Comp {
             return;
         }
 
-        if let Some(popup) = self.popups.find_popup(surface) {
-            if let PopupKind::Xdg(ref xdg) = popup {
-                if !xdg.is_initial_configure_sent() {
-                    // A popup positioner is valid by construction, so the
-                    // only send_configure error (invalid positioner) can't
-                    // happen.
-                    xdg.send_configure().expect("initial popup configure");
-                }
+        if let Some(PopupKind::Xdg(ref xdg)) = self.popups.find_popup(surface) {
+            if !xdg.is_initial_configure_sent() {
+                // A popup positioner is valid by construction, so the
+                // only send_configure error (invalid positioner) can't
+                // happen.
+                xdg.send_configure().expect("initial popup configure");
             }
         }
     }
@@ -191,13 +189,7 @@ impl XdgShellHandler for Comp {
         match self.managed.kind_of(win) {
             Some(crate::shell::Kind::Tiled) => self.unmanage_tiled(win),
             Some(crate::shell::Kind::Float(_)) => self.forget_float(win),
-            Some(crate::shell::Kind::Dock(_)) => {
-                self.managed.remove(win);
-                // Re-clamp now that the scroll headroom it needed is gone.
-                let wa = self.layout_area();
-                self.state.clamp_scroll(wa, 0);
-                self.arrange();
-            }
+            Some(crate::shell::Kind::Dock(_)) => self.unmanage_dock(win),
             None => {}
         }
     }
@@ -279,12 +271,11 @@ impl XdgShellHandler for Comp {
         // A grab held by anyone else (an ongoing chrome drag, another
         // client's popup chain) wins: dismiss the popup instead of
         // stealing the seat from under the holder.
+        let chain_serial = grab.previous_serial().unwrap_or_else(|| grab.serial());
         if keyboard.is_grabbed()
-            && !(keyboard.has_grab(serial)
-                || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            && !(keyboard.has_grab(serial) || keyboard.has_grab(chain_serial))
             || pointer.is_grabbed()
-                && !(pointer.has_grab(serial)
-                    || pointer.has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
+                && !(pointer.has_grab(serial) || pointer.has_grab(chain_serial))
         {
             grab.ungrab(PopupUngrabStrategy::All);
             return;

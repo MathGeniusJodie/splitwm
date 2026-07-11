@@ -122,8 +122,7 @@ impl Widgets {
 /// One taskbar quick-launch entry: the command it spawns and its icon,
 /// resolved once at startup.
 pub struct QuickSlot {
-    /// Spawned when the icon is clicked (M5 wires the click).
-    #[allow(dead_code)]
+    /// Spawned when the icon is clicked.
     pub cmd: String,
     /// Decoded, palette-quantized icon; `None` falls back to the label glyph.
     pub icon: Option<Rc<crate::icon::Icon>>,

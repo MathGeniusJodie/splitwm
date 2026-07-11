@@ -1,9 +1,8 @@
 //! Compositor state: the Wayland display and its protocol globals, the
-//! window space, the seat, and the winit backend that presents it all.
-//!
-//! M1 shape: clients connect over a private socket, xdg toplevels map
-//! full-output into a `Space`, and input is forwarded to whatever holds
-//! focus. The split-tree layout replaces the naive Space placement in M4.
+//! window space, the seat, and the backend that presents it all. Clients
+//! connect over a private socket; the split layout (`crate::state`) places
+//! every tiled window, and `arrange`/`redraw` below push that placement at
+//! the clients and the screen.
 
 pub mod actions;
 pub mod anim;
@@ -91,8 +90,7 @@ pub struct ChromeView {
     /// Every hit-testable widget rect for the current layout, rebuilt as
     /// one unit each arrange.
     pub widgets: crate::widgets::Widgets,
-    /// Taskbar quick-launch entries, resolved once at startup (icons and
-    /// .desktop resolution arrive with M8).
+    /// Taskbar quick-launch entries, resolved once at startup.
     pub quick: Vec<crate::widgets::QuickSlot>,
     /// `SPLITWM_WALLPAPER`, kept so an output resize can rescale it.
     pub wallpaper_path: Option<String>,
@@ -103,7 +101,7 @@ pub struct ChromeView {
     pub anim: Option<anim::LayoutAnim>,
     /// Every leaf's frame rect from the last arrange, on-screen or not —
     /// animation start rects and the empty-leaf-body hit region.
-    pub prev_frame_rect:
+    pub frame_rects:
         std::collections::HashMap<crate::layout::NodeId, crate::widgets::FrameRect>,
     /// The rect the focus outline currently traces: the focused split's
     /// frame, or its interpolated frame mid-animation. `None` when no leaf
@@ -210,7 +208,6 @@ pub struct Comp {
 
     // Wayland plumbing.
     pub dh: DisplayHandle,
-    #[allow(dead_code)] // timers and deferred work hang off this from M4 on
     pub handle: LoopHandle<'static, Comp>,
     pub signal: LoopSignal,
     pub socket_name: std::ffi::OsString,
@@ -404,7 +401,7 @@ impl Comp {
                 wallpaper_path,
                 animate: false,
                 anim: None,
-                prev_frame_rect: std::collections::HashMap::new(),
+                frame_rects: std::collections::HashMap::new(),
                 focus_rect: None,
                 focus_outline,
             },
@@ -532,13 +529,7 @@ impl Comp {
         // client whose resize waits for an animation's end still holds an
         // oversized buffer, which must not take input over chrome it
         // visibly no longer covers.
-        let settled: Vec<_> = self
-            .view
-            .placed
-            .iter()
-            .map(|p| (p.leaf, p.target))
-            .collect();
-        for t in self.tiled_places(&settled) {
+        for t in self.settled_tiled_places() {
             let loc = Point::<i32, Logical>::from((t.rect.x, t.rect.y)) - t.window.geometry().loc;
             let in_rect = pos.x >= f64::from(t.rect.x)
                 && pos.x < f64::from(t.rect.x + t.rect.w)
@@ -576,13 +567,7 @@ impl Comp {
     /// end still holds an oversized buffer, which must not take input over
     /// chrome it visibly no longer covers.
     pub fn tiled_under(&self, pos: Point<f64, Logical>) -> Option<scene::TiledPlace> {
-        let settled: Vec<_> = self
-            .view
-            .placed
-            .iter()
-            .map(|p| (p.leaf, p.target))
-            .collect();
-        self.tiled_places(&settled).into_iter().find(|t| {
+        self.settled_tiled_places().into_iter().find(|t| {
             pos.x >= f64::from(t.rect.x)
                 && pos.x < f64::from(t.rect.x + t.rect.w)
                 && pos.y >= f64::from(t.rect.y)
@@ -627,18 +612,11 @@ impl Comp {
         use smithay::wayland::seat::WaylandFocus as _;
         if let Some(win) = self.managed.win_for_surface(root) {
             return match self.managed.kind_of(win)? {
-                crate::shell::Kind::Tiled => {
-                    let settled: Vec<_> = self
-                        .view
-                        .placed
-                        .iter()
-                        .map(|p| (p.leaf, p.target))
-                        .collect();
-                    self.tiled_places(&settled)
-                        .into_iter()
-                        .find(|t| t.window.wl_surface().is_some_and(|s| *s == *root))
-                        .map(|t| Point::from((t.rect.x, t.rect.y)))
-                }
+                crate::shell::Kind::Tiled => self
+                    .settled_tiled_places()
+                    .into_iter()
+                    .find(|t| t.window.wl_surface().is_some_and(|s| *s == *root))
+                    .map(|t| Point::from((t.rect.x, t.rect.y))),
                 crate::shell::Kind::Float(f) => Some(Point::from((f.x, f.y))),
                 crate::shell::Kind::Dock(d) => {
                     let rect = self.dock_geometry(*d);
@@ -682,8 +660,7 @@ impl Comp {
     /// Re-place every window from the layout state: compute this arrange's
     /// placements (pure — `widgets::compute_placements`), push them at the
     /// clients, rebuild the hit regions, arm or cancel the layout
-    /// animation, then re-derive keyboard focus. The equivalent of master's
-    /// `arrange` minus chrome and animation (M3/M5).
+    /// animation, then re-derive keyboard focus.
     pub fn arrange(&mut self) {
         let wa = self.layout_area();
         // The strip width is derived from the columns; the dock scroll
@@ -825,8 +802,8 @@ impl Comp {
     /// their final rects by `apply_placements`; shrinking ones get theirs
     /// when the animation settles (`deferred`). A non-animated arrange
     /// cancels any transition in flight (it describes a newer layout, and
-    /// configured every window itself). Also rolls `frame_rects` into
-    /// `prev_frame_rect` as the next arrange's start rects.
+    /// configured every window itself). Also stores this arrange's rects
+    /// in `view.frame_rects` as the next arrange's animation start rects.
     fn arm_animation(
         &mut self,
         deferred: Vec<(crate::layout::Win, (i32, i32, i32, i32))>,
@@ -844,7 +821,7 @@ impl Comp {
                         // full height.
                         let from =
                             self.view
-                                .prev_frame_rect
+                                .frame_rects
                                 .get(&p.leaf)
                                 .copied()
                                 .unwrap_or_else(|| {
@@ -879,7 +856,7 @@ impl Comp {
             // only scrolled positions repaints nothing.
             self.view.anim = None;
         }
-        self.view.prev_frame_rect = frame_rects;
+        self.view.frame_rects = frame_rects;
     }
 
     /// Point keyboard focus (and xdg activated state) at the focused
@@ -889,15 +866,15 @@ impl Comp {
         let focused = self
             .keyboard_override()
             .or_else(|| self.state.focused_client());
-        let updates: Vec<Window> = self
-            .managed
-            .windows()
-            .filter(|window| {
-                let win = self.managed.win_for_window(window);
-                window.set_activated(win.is_some() && win == focused)
-            })
-            .cloned()
-            .collect();
+        // Only windows whose activated state actually flipped get a
+        // configure (set_activated reports the change).
+        let mut updates: Vec<Window> = Vec::new();
+        for window in self.managed.windows() {
+            let win = self.managed.win_for_window(window);
+            if window.set_activated(win.is_some() && win == focused) {
+                updates.push(window.clone());
+            }
+        }
         for window in updates {
             if let Some(toplevel) = window.toplevel() {
                 toplevel.send_pending_configure();
@@ -924,6 +901,9 @@ impl Comp {
         self.output.set_preferred(mode);
         // Layer surfaces re-anchor to the new size; the zone follows.
         self.sync_layer_zone();
+        // A shrink also shrinks the scroll range; don't strand the
+        // viewport past the content.
+        self.reclamp_scroll();
         if let Some(path) = self.view.wallpaper_path.clone() {
             self.view
                 .chrome

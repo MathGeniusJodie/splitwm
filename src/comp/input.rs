@@ -1,6 +1,7 @@
-//! Forwarding winit input to the seat. M1 keeps this deliberately dumb:
-//! keys go to the keyboard focus, clicks focus-and-raise the window under
-//! the pointer. Bindings, drags, and scroll physics land in M4/M5.
+//! Forwarding backend input (winit or libinput) to the seat: keyboard
+//! chords are intercepted for `theme::BINDINGS` before clients see them,
+//! pointer buttons route through the chrome hit-test and click-to-focus,
+//! and horizontal scroll/three-finger swipes pan the canvas.
 
 use smithay::backend::input::{
     AbsolutePositionEvent as _, Axis, AxisSource, ButtonState, Event as _, GestureBeginEvent as _,

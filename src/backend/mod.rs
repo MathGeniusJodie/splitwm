@@ -64,14 +64,10 @@ impl Backend {
 /// The backend-independent tail of a session: XWayland, the launch probe,
 /// exporting the socket, and parking in the event loop until SIGTERM.
 fn run(mut event_loop: smithay::reexports::calloop::EventLoop<'static, Comp>, mut comp: Comp) {
-    // A nested session inherited the host's DISPLAY (the winit backend
-    // needed it; it's connected by now). Drop it so a child spawned before
-    // XWayland reports Ready can't open windows on the host's X server —
-    // X11-pinned children must reach our XWayland or nothing.
-    std::env::remove_var("DISPLAY");
-
-    // X11 clients (rofi, legacy apps) arrive via XWayland; DISPLAY is set
-    // once the server reports Ready.
+    // X11 clients (rofi, legacy apps) arrive via XWayland; spawned children
+    // get its DISPLAY injected once the server reports Ready (see
+    // `launch::spawn` — the process env itself is never mutated, other
+    // threads read it concurrently).
     comp.start_xwayland();
 
     // Harness drivers speak a line protocol over stdin (see comp::debug);
@@ -85,8 +81,8 @@ fn run(mut event_loop: smithay::reexports::calloop::EventLoop<'static, Comp>, mu
     crate::launch::have_systemd_run();
 
     // Children spawned by the compositor (terminal, launcher, quick-launch)
-    // inherit the session; nested test runs read it from stdout.
-    std::env::set_var("WAYLAND_DISPLAY", &comp.socket_name);
+    // get the session socket injected; nested test runs read it from stdout.
+    crate::launch::set_wayland_display(comp.socket_name.clone());
     println!("WAYLAND_DISPLAY={}", comp.socket_name.to_string_lossy());
 
     event_loop

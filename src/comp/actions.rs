@@ -10,18 +10,13 @@ use crate::layout::{NodeId, Win};
 use crate::state::Activation;
 use crate::theme::{self, Action};
 
-/// splitwm-mask bit for Ctrl. Never appears in `theme::BINDINGS`, but it
-/// participates in the exact-match so `Mod4+Ctrl+X` doesn't trigger the
-/// `Mod4+X` binding (X grabs matched exactly; so do we).
-const CTRL: u16 = 0x04;
-
 fn mask_of(mods: &ModifiersState) -> u16 {
     let mut mask = 0;
     if mods.shift {
         mask |= theme::SHIFT;
     }
     if mods.ctrl {
-        mask |= CTRL;
+        mask |= theme::CTRL;
     }
     if mods.alt {
         mask |= theme::MOD1;
@@ -115,9 +110,9 @@ impl Comp {
 
     /// Politely ask the focused window to close — a focused float before
     /// the focused split's client, so Mod4+Shift+C closes the dialog the
-    /// user is looking at. There is no force-kill fallback for Wayland
-    /// clients (the connection is theirs); XWayland windows get the
-    /// WM_DELETE/XKillClient treatment in M7.
+    /// user is looking at. There is no force-kill fallback: the close is
+    /// always the polite request (`shell::close_window`), whichever
+    /// backend the window speaks.
     fn close_focused_window(&mut self) {
         let Some(win) = self.focused_float().or_else(|| self.state.focused_client()) else {
             return;
@@ -125,8 +120,9 @@ impl Comp {
         self.close_client(win);
     }
 
-    /// Keep the focused leaf visible: master glides there (M5); for now the
-    /// scroll lands instantly.
+    /// Snap the focused leaf into view instantly — keyboard focus moves
+    /// don't glide, so the destination is on screen the moment the chord
+    /// lands.
     fn scroll_focus_into_view(&mut self) {
         let wa = self.layout_area();
         self.state.ensure_in_view(wa);
@@ -173,7 +169,7 @@ impl Comp {
     pub fn commit_layout(&mut self) {
         self.interaction.drag = None;
         let wa = self.layout_area();
-        self.state.clamp_scroll(wa, 0);
+        self.reclamp_scroll();
         self.state.ensure_in_view(wa);
         // An animation's placements are computed from scroll_x at arrange
         // time and held for the whole transition; a concurrent glide would

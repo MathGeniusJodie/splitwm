@@ -33,7 +33,6 @@ mod wallpaper;
 
 pub use buttons::BtnIcon;
 pub use chrome::{LeafView, SliceSpec, TitleInfo};
-#[allow(unused_imports)] // consumed when the taskbar composes (M3-b)
 pub use taskbar::{draw_close_badge, draw_plus, draw_taskbar_sep};
 
 use std::cell::RefCell;

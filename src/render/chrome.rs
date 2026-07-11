@@ -22,22 +22,19 @@ pub struct TitleInfo {
     pub title: Rc<str>,
 }
 
+/// A titlebar strip's draw inputs (`draw_titlebar_strip`); the frame around
+/// it is the GPU-sliced border art, so nothing here describes the frame body.
 pub struct LeafView {
     pub w: i32,
-    pub h: i32, // frame height (content height + gap)
     pub tb_h: i32,
     pub bw: i32,
     /// Palette index this split's border and titlebar buttons are swapped to.
     pub accent_index: Index,
     /// The split's single window, if any.
     pub titlebar: Option<TitleInfo>,
-    /// Collapsed to a thin restore strip; renders as `winmin.png` only.
-    pub minimized: bool,
     /// Whether split-control buttons are drawn over this titlebar afterward
-    /// (`Wm::compose`'s `widgets` flag; always false for floats, which have
-    /// no control buttons, and false for tiled splits during an animation
-    /// frame, which composes with `widgets: false`) — the title text stops
-    /// short of them only when they'll actually be drawn.
+    /// (always false for floats, which have no control buttons) — the title
+    /// text stops short of them only when they'll actually be drawn.
     pub buttons: bool,
 }
 

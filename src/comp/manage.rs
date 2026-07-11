@@ -142,7 +142,7 @@ impl Comp {
         // Center over the parent's frame when we know it, else the workarea.
         let around = parent
             .and_then(|p| self.state.layout.find_leaf_for_client(p))
-            .and_then(|l| self.view.prev_frame_rect.get(&l).copied())
+            .and_then(|l| self.view.frame_rects.get(&l).copied())
             .unwrap_or(wa);
         let x = (around.x + (around.w - w) / 2).clamp(wa.x, (wa.x + wa.w - w).max(wa.x));
         let y = (around.y + (around.h - h) / 2).clamp(wa.y, (wa.y + wa.h - h).max(wa.y));
@@ -181,6 +181,26 @@ impl Comp {
         let w = window.geometry().size.w.max(1);
         self.managed.insert(window, Kind::Dock(DockData { w }));
         self.arrange();
+    }
+
+    /// The dock window is gone — both protocol destroy paths land here:
+    /// drop it and re-clamp the scroll now that the extra room it reserved
+    /// is too (any layer-shell dock still mapped keeps its own room).
+    pub fn unmanage_dock(&mut self, win: Win) {
+        self.managed.remove(win);
+        self.reclamp_scroll();
+        self.arrange();
+    }
+
+    /// Refresh the dock scroll room and pull the scroll back into range —
+    /// the compositor half of `State::clamp_scroll`, called by every
+    /// mutation that can shrink the scrollable range (layout changes,
+    /// viewport resizes, dock removal) so the viewport is never stranded
+    /// past the content.
+    pub fn reclamp_scroll(&mut self) {
+        let wa = self.layout_area();
+        self.state.set_dock_extra(self.dock_extra());
+        self.state.clamp_scroll(wa);
     }
 
     /// The extra scroll room the docked sidebar needs (zero when nothing
@@ -300,12 +320,10 @@ impl Comp {
         let rect = f.frame_rect();
         let view = LeafView {
             w: rect.w,
-            h: rect.h,
             tb_h: theme::tb_h(),
             bw: theme::BORDER_LEFT,
             accent_index: f.accent,
             titlebar: Some(TitleInfo { label, icon, title }),
-            minimized: false,
             buttons: false,
         };
         // A scratch strip-sized fb; float paints are rare enough that

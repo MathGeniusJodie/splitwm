@@ -1,8 +1,7 @@
 //! App launching support: resolving the taskbar quick-launch entries
-//! (`theme::QUICK`) to commands, resolving `.desktop` entries to spawnable
-//! commands (the dock autostart, via `freedesktop-desktop-entry`), and the
-//! freedesktop icon-theme lookup behind the taskbar's icons (via
-//! `freedesktop-icons`). Pure data; the X windows and rendering live in `wm`.
+//! (`theme::QUICK`) to commands, detached spawning with the session's
+//! display env injected per child, and the freedesktop icon-theme lookup
+//! behind the taskbar's icons (via `freedesktop-icons`).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -20,6 +19,28 @@ pub struct QuickLaunch {
 /// Single-quote `s` for use as one `sh` word.
 pub(crate) fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// The session env handed to every spawned child. Kept out of the process
+/// environment on purpose: `std::env::set_var` after threads exist (the
+/// icon fetchers, the notification daemon) races their `getenv`s, so
+/// `spawn` injects the pair per child instead.
+///
+/// `WAYLAND_DISPLAY` is our socket, set once at startup. `DISPLAY` is our
+/// XWayland server, recorded when it reports Ready; until then children get
+/// *no* `DISPLAY` — an X11-pinned child must reach our XWayland or nothing,
+/// never the host X server a nested run inherited.
+static WAYLAND_DISPLAY: OnceLock<std::ffi::OsString> = OnceLock::new();
+static X11_DISPLAY: OnceLock<String> = OnceLock::new();
+
+/// Record the compositor's Wayland socket name for spawned children.
+pub fn set_wayland_display(socket: std::ffi::OsString) {
+    let _ = WAYLAND_DISPLAY.set(socket);
+}
+
+/// Record the compositor's X11 display (`:N`) once XWayland is ready.
+pub fn set_x11_display(display: String) {
+    let _ = X11_DISPLAY.set(display);
 }
 
 /// Resolve an icon name to an image file. Absolute paths are used as-is;
@@ -96,35 +117,6 @@ fn configured_icon_theme() -> Option<String> {
         .clone()
 }
 
-/// Resolve `<id>.desktop` from the standard application dirs into a
-/// spawnable command: its `Exec` line with field codes expanded away
-/// (`DesktopEntry::parse_exec`), each argument shell-quoted, prefixed with
-/// a `cd` into its `Path=` working directory when one is set. Unlike the
-/// quick-launch scan this ignores NoDisplay/Hidden — autostart doesn't care
-/// about launcher visibility.
-#[allow(dead_code)] // consumed by the dock autostart once it ports
-pub fn desktop_entry_cmd(id: &str) -> Option<String> {
-    use freedesktop_desktop_entry as fde;
-    let file = format!("{id}.desktop");
-    let path = fde::default_paths()
-        .map(|d| d.join(&file))
-        .find(|p| p.is_file())?;
-    let entry = fde::DesktopEntry::from_path(path, None::<&[String]>).ok()?;
-    let args = entry.parse_exec().ok()?;
-    if args.is_empty() {
-        return None;
-    }
-    let exec = args
-        .iter()
-        .map(|a| shell_quote(a))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some(match entry.desktop_entry("Path") {
-        Some(p) if !p.is_empty() => format!("cd {} && {exec}", shell_quote(p)),
-        _ => exec,
-    })
-}
-
 /// Resolve every `theme::QUICK` entry: its env override or default command,
 /// carrying the entry's icon name and visibility rule through.
 pub fn quick_launches() -> Vec<QuickLaunch> {
@@ -160,11 +152,16 @@ pub fn spawn(cmd: &str) {
     } else {
         format!("/bin/sh -c {} &", shell_quote(cmd))
     };
-    match std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(line)
-        .spawn()
-    {
+    let mut command = std::process::Command::new("/bin/sh");
+    command.arg("-c").arg(line);
+    if let Some(socket) = WAYLAND_DISPLAY.get() {
+        command.env("WAYLAND_DISPLAY", socket);
+    }
+    match X11_DISPLAY.get() {
+        Some(display) => command.env("DISPLAY", display),
+        None => command.env_remove("DISPLAY"),
+    };
+    match command.spawn() {
         Ok(mut sh) => {
             // Reap the short-lived `sh` off-thread: it exits as soon as
             // it has forked, but even that wait doesn't belong on the

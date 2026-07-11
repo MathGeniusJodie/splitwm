@@ -36,9 +36,9 @@ pub struct State {
     /// sidebar (see `Wm::manage_dock`), so scrolling all the way right
     /// reveals it even though it sits outside the strip and doesn't
     /// affect `compute`'s leaf geometry. Zero when nothing is docked.
-    /// Private so the only writes (`set_dock_extra`, `clamp_scroll`)
-    /// re-clamp or deliberately preserve the scroll against the changed
-    /// range.
+    /// Private so the only write (`set_dock_extra`) deliberately preserves
+    /// the scroll against the changed range, leaving re-clamping to
+    /// `clamp_scroll`.
     dock_extra: i32,
 }
 
@@ -338,26 +338,17 @@ impl State {
 
     /// Insert a new empty split at `at` — the "+" buttons' semantics. A
     /// column insert gets the default width; a row insert joins the stack
-    /// at the average share. The new split becomes focused.
-    pub fn insert_at(&mut self, wa: Rect, at: Insert) -> NodeId {
+    /// at the average share. The new split becomes focused. `None` for a
+    /// row insert into a dead column index (nothing inserted).
+    pub fn insert_at(&mut self, wa: Rect, at: Insert) -> Option<NodeId> {
         let new = match at {
             Insert::Col(idx) => self
                 .layout
                 .insert_column(idx, ColWidth::Px(theme::default_col_w(wa.w))),
-            Insert::Row { col, idx } => match self.layout.insert_row(col, idx) {
-                Some(id) => id,
-                None => return self.focused_leaf_valid(),
-            },
+            Insert::Row { col, idx } => self.layout.insert_row(col, idx)?,
         };
         self.focus_leaf(new);
-        new
-    }
-
-    /// Open a fresh empty column immediately right of the focused one —
-    /// the ⊞ button's wide-window action. The new split becomes focused.
-    pub fn open_column_right(&mut self, wa: Rect) -> NodeId {
-        let col = self.focused_col();
-        self.insert_at(wa, Insert::Col(col + 1))
+        Some(new)
     }
 
     /// Split the focused column into two side by side whose widths sum to
@@ -539,14 +530,14 @@ impl State {
         self.dock_extra = dock_extra;
     }
 
-    /// Pull both scroll positions back into `[min_scroll, max_scroll]`. This is the
-    /// companion to `set_dock_extra` not clamping: structural layout
+    /// Pull both scroll positions back into `[min_scroll, max_scroll]`,
+    /// against the dock room last recorded by `set_dock_extra`. This is
+    /// the companion to `set_dock_extra` not clamping: structural layout
     /// changes, viewport resizes and dock removal shrink the scroll range
     /// and must not strand the viewport past the content, while edge-drag
     /// margins (scroll out of range on purpose) survive everything that
     /// doesn't call this.
-    pub fn clamp_scroll(&mut self, wa: Rect, dock_extra: i32) {
-        self.dock_extra = dock_extra;
+    pub fn clamp_scroll(&mut self, wa: Rect) {
         let (min_scroll, max_scroll) = (Self::min_scroll(wa), self.max_scroll(wa));
         self.scroll_target = self.scroll_target.clamp(min_scroll, max_scroll);
         self.scroll_x = self.scroll_x.clamp(min_scroll, max_scroll);
@@ -909,7 +900,7 @@ mod tests {
         s.unpin_client(1);
         let sole = s.focused_leaf_valid();
         assert!(!s.remove_empty_leaf(sole), "sole placeholder");
-        let extra = s.insert_at(WA, Insert::Col(s.layout.ncols()));
+        let extra = s.insert_at(WA, Insert::Col(s.layout.ncols())).unwrap();
         assert!(s.remove_empty_leaf(extra));
     }
 
@@ -1129,20 +1120,6 @@ mod tests {
         );
     }
 
-    /// The ⊞ button's wide-window action: a fresh focused column right of
-    /// the focused one, even from inside a stack.
-    #[test]
-    fn open_column_right_lands_beside_the_stack() {
-        let mut s = State::new();
-        s.place_new_window(WA, 1, None);
-        s.place_new_window(WA, 2, None);
-        s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
-        s.split_focused();
-        let new = s.open_column_right(WA);
-        assert_eq!(s.layout.locate(new), Some(Pos { col: 1, row: 0 }));
-        assert_eq!(s.focused_leaf_valid(), new);
-    }
-
     // --- scroll behavior ---
 
     #[test]
@@ -1256,7 +1233,7 @@ mod tests {
             let last = *s.layout.collect_leaves().last().unwrap();
             let win = s.layout.leaf(last).unwrap().client.unwrap();
             s.unpin_client(win);
-            s.clamp_scroll(WA, 0);
+            s.clamp_scroll(WA);
         }
         assert_eq!(s.scroll_x(), 0, "single column: nothing to scroll");
     }

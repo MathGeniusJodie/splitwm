@@ -98,8 +98,7 @@ impl WlrLayerShellHandler for Comp {
         self.sync_layer_zone();
         if was_dock {
             // Re-clamp now that the scroll headroom it needed is gone.
-            let wa = self.layout_area();
-            self.state.clamp_scroll(wa, self.dock_extra());
+            self.reclamp_scroll();
         }
         // arrange refocuses: the keyboard held by an exclusive layer
         // (rofi) must return to the layout when it goes.

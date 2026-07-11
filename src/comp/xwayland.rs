@@ -41,8 +41,9 @@ pub struct OrWindow {
 
 impl Comp {
     /// Spawn the XWayland server; the WM connection arrives via the Ready
-    /// event once it is up. `DISPLAY` is set then, so children spawned by
-    /// the compositor (rofi, quick-launch X11 apps) inherit it.
+    /// event once it is up. Its `DISPLAY` is recorded then, so children
+    /// spawned by the compositor (rofi, quick-launch X11 apps) get it
+    /// injected (`launch::spawn`).
     pub fn start_xwayland(&mut self) {
         let (xwayland, client) = match XWayland::spawn(
             &self.dh,
@@ -73,7 +74,7 @@ impl Comp {
                             return;
                         }
                     }
-                    std::env::set_var("DISPLAY", format!(":{display_number}"));
+                    crate::launch::set_x11_display(format!(":{display_number}"));
                     // Announced like WAYLAND_DISPLAY at startup: harness
                     // drivers synchronize on this before launching X11
                     // clients.
@@ -140,12 +141,7 @@ impl Comp {
         match self.managed.kind_of(win) {
             Some(Kind::Tiled) => self.unmanage_tiled(win),
             Some(Kind::Float(_)) => self.forget_float(win),
-            Some(Kind::Dock(_)) => {
-                self.managed.remove(win);
-                let wa = self.layout_area();
-                self.state.clamp_scroll(wa, 0);
-                self.arrange();
-            }
+            Some(Kind::Dock(_)) => self.unmanage_dock(win),
             None => {}
         }
     }

@@ -311,7 +311,6 @@ impl LeafPaint {
     fn view(&self) -> LeafView {
         LeafView {
             w: self.w,
-            h: self.h,
             tb_h: theme::tb_h(),
             bw: theme::BORDER_LEFT,
             accent_index: self.accent,
@@ -320,7 +319,6 @@ impl LeafPaint {
                 icon: t.icon.clone(),
                 title: t.title.clone(),
             }),
-            minimized: self.minimized,
             buttons: true,
         }
     }

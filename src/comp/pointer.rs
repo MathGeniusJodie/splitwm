@@ -1,6 +1,5 @@
 //! Pointer semantics on the chrome: the priority-ordered hit-test, click
-//! dispatch, gap/edge drags, and canvas panning. Ported from master's
-//! `wm/input/pointer.rs` + `scroll.rs`; floats join in M6. Unlike X11, the
+//! dispatch, gap/edge/float/split-move drags, and canvas panning. The
 //! surface under the pointer and the modifier state are already ours — no
 //! server round-trips, no caching. The shared layout commands the clicks
 //! invoke live in `comp::actions`.
@@ -171,9 +170,10 @@ impl Comp {
             }
             Hit::Plus(at) => {
                 let wa = self.layout_area();
-                self.state.insert_at(wa, at);
-                self.view.animate = true;
-                self.commit_layout();
+                if self.state.insert_at(wa, at).is_some() {
+                    self.view.animate = true;
+                    self.commit_layout();
+                }
             }
             Hit::Handle(b) => {
                 // A gap next to a minimized leaf can't be dragged (its
@@ -419,28 +419,16 @@ impl Comp {
         }
         // Compressed taskbar tiles overlap like fanned cards, rightmost on
         // top; reverse iteration matches draw order so the topmost tile
-        // wins. The corner "x" badge outranks the tile bodies.
-        if let Some(win) = self
-            .view
-            .widgets
-            .taskbar_regions
-            .iter()
-            .rev()
-            .find(|t| rect_contains(t.close, mx, my))
-            .map(|t| t.win)
-        {
-            return Hit::TaskbarClose(win);
-        }
-        if let Some((win, leaf)) = self
-            .view
-            .widgets
-            .taskbar_regions
-            .iter()
-            .rev()
-            .find(|t| rect_contains(t.rect, mx, my))
-            .map(|t| (t.win, t.leaf))
-        {
-            return Hit::TaskbarTile(win, leaf);
+        // wins. Each tile's own "x" badge outranks its body, but a later
+        // (higher) tile's body outranks an earlier badge it covers — the
+        // hit order is exactly the paint order, reversed.
+        for t in self.view.widgets.taskbar_regions.iter().rev() {
+            if rect_contains(t.close, mx, my) {
+                return Hit::TaskbarClose(t.win);
+            }
+            if rect_contains(t.rect, mx, my) {
+                return Hit::TaskbarTile(t.win, t.leaf);
+            }
         }
         if let Some(i) = self
             .view
@@ -496,7 +484,7 @@ impl Comp {
         }
         if let Some((leaf, frame)) = self
             .view
-            .prev_frame_rect
+            .frame_rects
             .iter()
             .find(|(l, r)| self.state.layout.is_leaf(**l) && rect_contains(**r, mx, my))
             .map(|(l, r)| (*l, *r))
@@ -533,7 +521,7 @@ impl Comp {
                 // Mirror `leaf_buttons`' enabled/disabled choice for the
                 // button art (a minimized leaf's whole-frame region is
                 // always a live restore button).
-                if let Some(&frame) = self.view.prev_frame_rect.get(&leaf) {
+                if let Some(&frame) = self.view.frame_rects.get(&leaf) {
                     let meta = leaf_meta(&self.state.layout, leaf, frame);
                     let disabled = !meta.minimized
                         && match kind {
@@ -583,7 +571,7 @@ impl Comp {
         let wa = self.layout_area();
         let frame = self
             .view
-            .prev_frame_rect
+            .frame_rects
             .get(&leaf)
             .copied()
             .unwrap_or(FrameRect {

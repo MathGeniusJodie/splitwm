@@ -26,10 +26,9 @@ pixel-fonts = { path = "../pixel-fonts" }
 # Keysym constants for theme::BINDINGS. X11 keysym values are xkb keysym
 # values, so this pure-constants crate serves the Wayland keyboard unchanged.
 xkeysym = "0.2.1"
-# Freedesktop icon-theme lookup and .desktop parsing (taskbar icons, dock
-# autostart) — spec-following code not worth maintaining by hand.
+# Freedesktop icon-theme lookup (taskbar icons) — spec-following code not
+# worth maintaining by hand.
 freedesktop-icons = { version = "0.4.0", default-features = false }
-freedesktop-desktop-entry = { version = "0.8.1", default-features = false }
 # Session-bus server for org.freedesktop.Notifications (the compositor
 # doubles as the notification daemon). Pure Rust; the interface runs on
 # zbus's executor, bridged to calloop over channels.

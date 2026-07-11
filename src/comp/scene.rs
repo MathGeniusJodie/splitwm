@@ -354,6 +354,19 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
 }
 
 impl Comp {
+    /// `tiled_places` at the *settled* rects (`view.placed` targets),
+    /// ignoring any in-flight animation — for the input paths, which must
+    /// see the layout the user is aiming at, not a mid-slide frame.
+    pub fn settled_tiled_places(&self) -> Vec<TiledPlace> {
+        let settled: Vec<_> = self
+            .view
+            .placed
+            .iter()
+            .map(|p| (p.leaf, p.target))
+            .collect();
+        self.tiled_places(&settled)
+    }
+
     /// Every visible tiled window's draw placement for this frame: the
     /// fullscreen client over the whole output (frontmost), then each
     /// placed, unminimized leaf's client at the client rect inside the
