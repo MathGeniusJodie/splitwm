@@ -12,7 +12,7 @@ use pixel_graphics::{Palette, Rgb};
 use crate::Index;
 
 /// A colour in `OKLab`: `[L, a, b]`.
-type Oklab = [f32; 3];
+pub type Oklab = [f32; 3];
 
 /// A palette paired with its entries' precomputed `OKLab` coordinates, so
 /// `nearest_index` matches perceptually without re-converting 16 palette
@@ -40,6 +40,12 @@ impl OklabPalette {
     /// matching (index -> colour lookups, sprite drawing, the present LUT).
     pub fn inner(&self) -> &Palette {
         &self.palette
+    }
+
+    /// Every palette entry's `OKLab` coordinates, indexed by palette index —
+    /// the same precomputed table `nearest_index` matches against.
+    pub fn oklab_colors(&self) -> &[Oklab] {
+        &self.oklab
     }
 }
 
@@ -101,7 +107,7 @@ fn oklab_to_linear(lab: Oklab) -> (f32, f32, f32) {
 /// An 8-bit sRGB colour in `OKLab`. Goes through a per-byte linearisation
 /// table because this runs per pixel when dithering full-screen images —
 /// three `powf(2.4)` calls per pixel would dominate that loop.
-fn srgb8_to_oklab(c: Rgb) -> Oklab {
+pub fn srgb8_to_oklab(c: Rgb) -> Oklab {
     use std::sync::LazyLock;
     static LINEAR: LazyLock<[f32; 256]> =
         LazyLock::new(|| core::array::from_fn(|i| srgb_to_linear(i as f32 / 255.0)));
