@@ -40,14 +40,8 @@ pub struct Headless {
 
 impl Headless {
     /// Composite one frame, then serve any pending screenshot from it.
-    pub fn render(
-        &mut self,
-        scene: &chrome::Scene<'_>,
-        clear: Color32F,
-        quantize: &mut crate::comp::quantize::Quantize,
-    ) {
+    pub fn render(&mut self, scene: &chrome::Scene<'_>, clear: Color32F) {
         let elements = chrome::output_elements(&mut self.renderer, scene);
-        let elements = quantize.wrap(&mut self.renderer, elements, SIZE.into(), clear);
         let mut fb = match self.renderer.bind(&mut self.buffer) {
             Ok(fb) => fb,
             Err(err) => {

@@ -17,7 +17,6 @@ pub mod layers;
 pub mod manage;
 pub mod notifications;
 pub mod pointer;
-pub mod quantize;
 pub mod xwayland;
 
 use std::sync::Arc;
@@ -93,10 +92,6 @@ pub struct Comp {
     /// The palette shader and its reused upload staging, shared by every
     /// software-drawn chrome buffer on their way to the GPU.
     pub indexed: indexed::IndexedProgram,
-    /// The colour-depth post-pass (`Mod4+C`: true colour / dithered RGB332 /
-    /// dithered 18-colour palette); every backend routes its element list
-    /// through it.
-    pub quantize: quantize::Quantize,
     /// The independently-textured ex-underlay pieces (wallpaper, per-leaf
     /// frames, plus buttons, taskbar); each re-renders only when its own
     /// content fingerprint changes, so scrolling and animation are pure
@@ -368,7 +363,6 @@ impl Comp {
             cursors: cursor::CursorCache::new(),
             chrome,
             indexed,
-            quantize: quantize::Quantize::new(),
             pieces: chrome::ChromePieces::default(),
             focus_rect: None,
             focus_outline,
@@ -970,7 +964,6 @@ impl Comp {
                         &mut self.cursors,
                     );
                     elements.extend(chrome::output_elements(renderer, &scene));
-                    let elements = self.quantize.wrap(renderer, elements, size, self.clear);
                     w.damage_tracker
                         .render_output(renderer, &mut fb, 0, &elements, self.clear)
                         .inspect_err(|err| tracing::error!("render: {err:?}"))
@@ -982,9 +975,7 @@ impl Comp {
                     }
                 }
             }
-            crate::backend::Backend::Headless(h) => {
-                h.render(&scene, self.clear, &mut self.quantize)
-            }
+            crate::backend::Backend::Headless(h) => h.render(&scene, self.clear),
             #[cfg(feature = "tty")]
             crate::backend::Backend::Tty(t) => {
                 t.render(
@@ -993,7 +984,6 @@ impl Comp {
                     &self.cursor_status,
                     &mut self.cursors,
                     self.clear,
-                    &mut self.quantize,
                 );
             }
         }

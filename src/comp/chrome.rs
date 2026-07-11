@@ -71,7 +71,6 @@ render_elements! {
     Chrome=IndexedElement,
     Frame=NineSliceElement,
     Solid=smithay::backend::renderer::element::solid::SolidColorRenderElement,
-    Quantize=super::quantize::QuantizeElement,
 }
 
 /// Borrows of everything `output_elements` composites, so `redraw` can hand
