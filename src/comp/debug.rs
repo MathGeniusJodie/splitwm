@@ -97,20 +97,19 @@ fn command(comp: &mut Comp, line: &str) {
             }
             None => println!("err motion {xy}: want <x> <y>"),
         },
-        Some((cmd @ ("click" | "press" | "release"), xy)) => match parse_xy(xy) {
-            Some(pos) => {
-                const BTN_LEFT: u32 = 0x110;
+        Some((cmd @ ("click" | "press" | "release"), args)) => match parse_click(args) {
+            Some((pos, button)) => {
                 let time = comp.start.elapsed().as_millis() as u32;
                 comp.pointer_moved(pos, time);
                 if cmd != "release" {
-                    comp.pointer_button(BTN_LEFT, ButtonState::Pressed, time);
+                    comp.pointer_button(button, ButtonState::Pressed, time);
                 }
                 if cmd != "press" {
-                    comp.pointer_button(BTN_LEFT, ButtonState::Released, time);
+                    comp.pointer_button(button, ButtonState::Released, time);
                 }
-                println!("ok {cmd} {xy}");
+                println!("ok {cmd} {args}");
             }
-            None => println!("err {cmd} {xy}: want <x> <y>"),
+            None => println!("err {cmd} {args}: want <x> <y> [left|right|middle]"),
         },
         Some(("scroll", clicks)) => match clicks.parse::<f64>() {
             Ok(clicks) => {
@@ -127,7 +126,11 @@ fn command(comp: &mut Comp, line: &str) {
             }
         }
         None if line == "focus" => {
-            let focus = comp.keyboard.current_focus();
+            use smithay::wayland::seat::WaylandFocus as _;
+            let focus = comp
+                .keyboard
+                .current_focus()
+                .and_then(|t| t.wl_surface().map(std::borrow::Cow::into_owned));
             let name = match &focus {
                 None => "none".into(),
                 Some(surface) => match comp.managed.win_for_surface(surface) {
@@ -176,6 +179,24 @@ fn command(comp: &mut Comp, line: &str) {
 fn parse_xy(xy: &str) -> Option<Point<f64, Logical>> {
     let (x, y) = xy.split_once(' ')?;
     Some((x.trim().parse::<f64>().ok()?, y.trim().parse::<f64>().ok()?).into())
+}
+
+/// `<x> <y> [left|right|middle]` — the button defaults to left.
+fn parse_click(args: &str) -> Option<(Point<f64, Logical>, u32)> {
+    // input-event-codes BTN_* values, as delivered by libinput.
+    const BTN_LEFT: u32 = 0x110;
+    const BTN_RIGHT: u32 = 0x111;
+    const BTN_MIDDLE: u32 = 0x112;
+    let mut it = args.split_whitespace();
+    let x = it.next()?.parse::<f64>().ok()?;
+    let y = it.next()?.parse::<f64>().ok()?;
+    let button = match it.next() {
+        None | Some("left") => BTN_LEFT,
+        Some("right") => BTN_RIGHT,
+        Some("middle") => BTN_MIDDLE,
+        Some(_) => return None,
+    };
+    it.next().is_none().then_some(((x, y).into(), button))
 }
 
 /// Resolve `super+shift+c`-style chords against `theme::BINDINGS`, through

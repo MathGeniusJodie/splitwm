@@ -39,6 +39,22 @@ pub struct OrWindow {
     pub rect: Rectangle<i32, Logical>,
 }
 
+/// Whether an override-redirect window should take the keyboard focus when
+/// it maps. Pointer-driven popups (menus, tooltips, notifications) must
+/// not: moving the X11 focus off the client's toplevel reads as
+/// deactivation, and e.g. Chromium dismisses its context menu the moment
+/// its browser window loses focus. Everything else (rofi-style launchers,
+/// which carry no such type hint) needs the focus, or its X-side keyboard
+/// grab never sees a key (the grab only routes while XWayland holds our
+/// keyboard focus).
+fn or_wants_focus(surface: &X11Surface) -> bool {
+    use smithay::xwayland::xwm::WmWindowType as T;
+    !matches!(
+        surface.window_type(),
+        Some(T::DropdownMenu | T::Menu | T::PopupMenu | T::Tooltip | T::Notification)
+    )
+}
+
 impl Comp {
     /// Spawn the XWayland server; the WM connection arrives via the Ready
     /// event once it is up. Its `DISPLAY` is recorded then, so children
@@ -100,21 +116,13 @@ impl Comp {
         }
     }
 
-    /// Whether the keyboard focus is an X11 window's surface (managed or
+    /// Whether the keyboard focus is an X11 window (managed or
     /// override-redirect).
     fn x11_holds_focus(&self) -> bool {
-        let Some(focus) = self.keyboard.current_focus() else {
-            return false;
-        };
-        self.or_windows
-            .iter()
-            .map(|o| &o.surface)
-            .chain(
-                self.managed
-                    .entries_windows()
-                    .filter_map(|(_, w)| w.x11_surface()),
-            )
-            .any(|s| s.wl_surface().is_some_and(|ws| ws == focus))
+        matches!(
+            self.keyboard.current_focus(),
+            Some(super::focus::FocusTarget::X11(_))
+        )
     }
 
     /// An X11 window went away (unmap or destroy): drop it from whichever
@@ -158,16 +166,28 @@ impl XWaylandShellHandler for Comp {
     /// keyboard grab is dead until XWayland holds our focus). A managed
     /// window was arranged at map time when it had no surface to focus, so
     /// `refocus` re-resolves the keyboard target now that one exists.
-    fn surface_associated(&mut self, _xwm: XwmId, wl_surface: WlSurface, window: X11Surface) {
+    fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, window: X11Surface) {
         if self
             .or_windows
             .iter()
             .any(|o| o.surface.window_id() == window.window_id())
         {
-            let keyboard = self.keyboard.clone();
-            let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            keyboard.set_focus(self, Some(wl_surface), serial);
+            if or_wants_focus(&window) {
+                let keyboard = self.keyboard.clone();
+                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                keyboard.set_focus(self, Some(window.into()), serial);
+            }
         } else {
+            // The window may already hold the keyboard from its map-time
+            // arrange, focused before this surface existed. That focus
+            // target compares equal to the one refocus re-derives, so the
+            // keyboard would consider the focus unchanged and never send
+            // the surface its enter: drop the focus first to force one.
+            let keyboard = self.keyboard.clone();
+            if keyboard.current_focus() == Some(super::focus::FocusTarget::X11(window)) {
+                let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+                keyboard.set_focus(self, None, serial);
+            }
             self.refocus();
         }
     }
@@ -193,9 +213,8 @@ impl smithay::xwayland::XwmHandler for Comp {
     }
 
     /// Override-redirect windows (rofi, menus) position themselves and are
-    /// never managed: shown topmost as-is; keyboard goes to them while
-    /// mapped (rofi grabs the keyboard X11-side, but that grab only works
-    /// while XWayland holds our keyboard focus).
+    /// never managed: shown topmost as-is; keyboard goes to the ones that
+    /// want it (`or_wants_focus`).
     fn mapped_override_redirect_window(&mut self, _xwm: XwmId, window: X11Surface) {
         // The one place the cached geometry may be stale (see OrWindow):
         // ask the server where the window really is.
@@ -215,10 +234,10 @@ impl smithay::xwayland::XwmHandler for Comp {
             surface: window.clone(),
             rect,
         });
-        if let Some(surface) = window.wl_surface() {
+        if or_wants_focus(&window) && window.wl_surface().is_some() {
             let keyboard = self.keyboard.clone();
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-            keyboard.set_focus(self, Some(surface), serial);
+            keyboard.set_focus(self, Some(window.into()), serial);
         }
     }
 

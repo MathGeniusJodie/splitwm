@@ -259,7 +259,7 @@ impl XdgShellHandler for Comp {
         let Ok(root) = find_popup_root_surface(&kind) else {
             return;
         };
-        let mut grab = match self.popups.grab_popup(root, kind, &seat, serial) {
+        let mut grab = match self.popups.grab_popup(root.into(), kind, &seat, serial) {
             Ok(grab) => grab,
             Err(err) => {
                 tracing::warn!("popup grab refused: {err}");
@@ -272,10 +272,8 @@ impl XdgShellHandler for Comp {
         // client's popup chain) wins: dismiss the popup instead of
         // stealing the seat from under the holder.
         let chain_serial = grab.previous_serial().unwrap_or_else(|| grab.serial());
-        if keyboard.is_grabbed()
-            && !(keyboard.has_grab(serial) || keyboard.has_grab(chain_serial))
-            || pointer.is_grabbed()
-                && !(pointer.has_grab(serial) || pointer.has_grab(chain_serial))
+        if keyboard.is_grabbed() && !(keyboard.has_grab(serial) || keyboard.has_grab(chain_serial))
+            || pointer.is_grabbed() && !(pointer.has_grab(serial) || pointer.has_grab(chain_serial))
         {
             grab.ungrab(PopupUngrabStrategy::All);
             return;
@@ -348,18 +346,20 @@ impl DmabufHandler for Comp {
 delegate_dmabuf!(Comp);
 
 impl SeatHandler for Comp {
-    type KeyboardFocus = WlSurface;
-    type PointerFocus = WlSurface;
+    type KeyboardFocus = super::focus::FocusTarget;
+    type PointerFocus = super::focus::FocusTarget;
     type TouchFocus = WlSurface;
 
     fn seat_state(&mut self) -> &mut SeatState<Comp> {
         &mut self.globals.seat_state
     }
 
-    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
+    fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&super::focus::FocusTarget>) {
         // Selection offers follow keyboard focus: only the focused client
         // is told what is on the clipboard and primary selections.
-        let client = focused.and_then(|s| self.dh.get_client(s.id()).ok());
+        let client = focused
+            .and_then(smithay::wayland::seat::WaylandFocus::wl_surface)
+            .and_then(|s| self.dh.get_client(s.id()).ok());
         set_data_device_focus(&self.dh, seat, client.clone());
         set_primary_focus(&self.dh, seat, client);
     }

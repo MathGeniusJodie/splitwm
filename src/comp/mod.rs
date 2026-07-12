@@ -8,6 +8,7 @@ pub mod actions;
 pub mod anim;
 pub mod cursor;
 pub mod debug;
+pub mod focus;
 pub mod handlers;
 pub mod icons;
 pub mod input;
@@ -101,8 +102,7 @@ pub struct ChromeView {
     pub anim: Option<anim::LayoutAnim>,
     /// Every leaf's frame rect from the last arrange, on-screen or not —
     /// animation start rects and the empty-leaf-body hit region.
-    pub frame_rects:
-        std::collections::HashMap<crate::layout::NodeId, crate::widgets::FrameRect>,
+    pub frame_rects: std::collections::HashMap<crate::layout::NodeId, crate::widgets::FrameRect>,
     /// The rect the focus outline currently traces: the focused split's
     /// frame, or its interpolated frame mid-animation. `None` when no leaf
     /// holds focus. Tracked outside the underlay so a focus switch moves the
@@ -888,11 +888,14 @@ impl Comp {
         }
         // An exclusive-keyboard layer surface (rofi) outranks every window
         // while mapped.
-        let target = self.exclusive_layer_surface().or_else(|| {
-            focused.and_then(|c| self.managed.get(c)).and_then(|w| {
-                smithay::wayland::seat::WaylandFocus::wl_surface(w).map(|s| s.into_owned())
-            })
-        });
+        let target = self
+            .exclusive_layer_surface()
+            .map(focus::FocusTarget::from)
+            .or_else(|| {
+                focused
+                    .and_then(|c| self.managed.get(c))
+                    .and_then(focus::FocusTarget::from_window)
+            });
         let keyboard = self.keyboard.clone();
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
         keyboard.set_focus(self, target, serial);

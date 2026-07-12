@@ -273,21 +273,24 @@ impl Comp {
                     // panels; an Exclusive one already holds it) gets the
                     // keyboard by click too, like the dock.
                     None => {
-                        if let Some(s) = under.as_ref().filter(|s| {
-                            self.or_windows
+                        let target = under.as_ref().and_then(|s| {
+                            if let Some(o) = self
+                                .or_windows
                                 .iter()
-                                .any(|o| o.surface.wl_surface().as_ref() == Some(s))
-                        }) {
-                            let keyboard = self.keyboard.clone();
-                            keyboard.set_focus(self, Some(s.clone()), serial);
-                        } else if let Some(s) = under.as_ref() {
+                                .find(|o| o.surface.wl_surface().as_ref() == Some(s))
+                            {
+                                return Some(crate::comp::focus::FocusTarget::X11(
+                                    o.surface.clone(),
+                                ));
+                            }
                             let focusable = smithay::desktop::layer_map_for_output(&self.output)
                                 .layer_for_surface(s, smithay::desktop::WindowSurfaceType::ALL)
                                 .is_some_and(|l| l.can_receive_keyboard_focus());
-                            if focusable {
-                                let keyboard = self.keyboard.clone();
-                                keyboard.set_focus(self, Some(s.clone()), serial);
-                            }
+                            focusable.then(|| s.clone().into())
+                        });
+                        if let Some(target) = target {
+                            let keyboard = self.keyboard.clone();
+                            keyboard.set_focus(self, Some(target), serial);
                         }
                     }
                 }
@@ -349,7 +352,7 @@ impl Comp {
         let pointer = self.pointer.clone();
         pointer.motion(
             self,
-            under,
+            under.map(|(s, loc)| (s.into(), loc)),
             &MotionEvent {
                 location: pos,
                 serial,

@@ -167,7 +167,13 @@ impl Comp {
         } else if self.exclusive_layer_surface().as_ref() == Some(surface) {
             // Layers commit per frame; only re-point the keyboard when
             // this surface is owed it and doesn't hold it yet.
-            if self.keyboard.current_focus().as_ref() != Some(surface) {
+            use smithay::wayland::seat::WaylandFocus as _;
+            let holds_it = self
+                .keyboard
+                .current_focus()
+                .and_then(|t| t.wl_surface().map(std::borrow::Cow::into_owned))
+                .is_some_and(|s| s == *surface);
+            if !holds_it {
                 self.refocus();
             }
         }
