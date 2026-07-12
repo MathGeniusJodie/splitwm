@@ -4,6 +4,7 @@
 //! `new_toplevel` time would misfile nearly everything).
 
 use smithay::desktop::Window;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 
 use super::Comp;
 use crate::layout::Win;
@@ -238,6 +239,7 @@ impl Comp {
         self.windows.float_stack.retain(|&w| w != win);
         self.windows.float_stack.insert(0, win);
         self.windows.focused_float = Some(win);
+        self.windows.focused_layer = None;
         self.refocus();
     }
 
@@ -273,11 +275,35 @@ impl Comp {
     /// Hand the keyboard to a non-tiled window (dock click).
     pub fn focus_override(&mut self, win: Win) {
         self.windows.focused_float = Some(win);
+        self.windows.focused_layer = None;
         self.refocus();
     }
 
-    pub fn clear_focused_float(&mut self) {
+    /// Hand the keyboard to a clicked OnDemand layer surface, sticky
+    /// across `refocus` (a mid-glide arrange must not steal it back)
+    /// until the next deliberate focus move.
+    pub fn focus_layer_surface(&mut self, surface: WlSurface) {
         self.windows.focused_float = None;
+        self.windows.focused_layer = Some(surface);
+        self.refocus();
+    }
+
+    /// Reads of the click-focused layer re-validate against the layer
+    /// map, so an unmapped panel (or one that dropped keyboard
+    /// interactivity) is never handed out.
+    pub fn focused_layer(&self) -> Option<WlSurface> {
+        let surface = self.windows.focused_layer.as_ref()?;
+        let map = smithay::desktop::layer_map_for_output(&self.output);
+        map.layer_for_surface(surface, smithay::desktop::WindowSurfaceType::TOPLEVEL)
+            .is_some_and(|l| l.can_receive_keyboard_focus())
+            .then(|| surface.clone())
+    }
+
+    /// A deliberate focus move to the layout takes the keyboard off any
+    /// float, dock, or layer override.
+    pub fn clear_focus_overrides(&mut self) {
+        self.windows.focused_float = None;
+        self.windows.focused_layer = None;
     }
 
     /// A float went away: drop its records and hand focus back to its

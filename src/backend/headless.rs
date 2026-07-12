@@ -6,7 +6,6 @@
 //! `shot` requests land in `pending_shot`.
 
 use std::io::Write as _;
-use std::time::Duration;
 
 use smithay::backend::allocator::Fourcc;
 use smithay::backend::egl::native::EGLSurfacelessDisplay;
@@ -15,7 +14,6 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::{GlesRenderbuffer, GlesRenderer};
 use smithay::backend::renderer::{Bind as _, Color32F, ExportMem as _, Offscreen as _};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::{Buffer as BufferCoord, Rectangle, Size, Transform};
@@ -173,16 +171,6 @@ pub fn run() {
             pending_shot: None,
         }),
     );
-
-    // No vblank and no host clock: the same 16 ms timer the winit backend
-    // uses paces redraws and clients' frame callbacks.
-    event_loop
-        .handle()
-        .insert_source(Timer::immediate(), |_, (), comp| {
-            comp.redraw();
-            TimeoutAction::ToDuration(Duration::from_millis(16))
-        })
-        .expect("insert redraw timer");
 
     super::run(event_loop, comp);
 }

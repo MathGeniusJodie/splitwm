@@ -50,7 +50,7 @@ impl Comp {
             }
             Action::FocusNext | Action::FocusPrev => {
                 // Deliberate focus moves take the keyboard off any float.
-                self.clear_focused_float();
+                self.clear_focus_overrides();
                 if self
                     .state
                     .focus_direction(matches!(action, Action::FocusNext))
@@ -60,7 +60,7 @@ impl Comp {
                 self.arrange();
             }
             Action::MoveSplitNext | Action::MoveSplitPrev => {
-                self.clear_focused_float();
+                self.clear_focus_overrides();
                 let wa = self.layout_area();
                 if self
                     .state

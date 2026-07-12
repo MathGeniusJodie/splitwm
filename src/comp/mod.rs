@@ -33,8 +33,12 @@ use smithay::input::{Seat, SeatState};
 use smithay::output::{Mode, Output};
 use smithay::reexports::calloop;
 use smithay::reexports::calloop::generic::Generic;
-use smithay::reexports::calloop::{EventLoop, Interest, LoopHandle, LoopSignal, PostAction};
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+use smithay::reexports::calloop::{
+    EventLoop, Interest, LoopHandle, LoopSignal, PostAction, RegistrationToken,
+};
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason};
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
@@ -134,7 +138,7 @@ pub struct Interaction {
 }
 
 /// Window bookkeeping beyond the `Managed` store: toplevels not yet
-/// classified, float stacking, and the two records only handed out
+/// classified, float stacking, and the records only handed out
 /// re-validated.
 #[derive(Default)]
 pub struct WindowRoles {
@@ -148,6 +152,12 @@ pub struct WindowRoles {
     /// re-validates against the store, so a dangling record is never
     /// handed out.
     pub(super) focused_float: Option<crate::layout::Win>,
+    /// An OnDemand-keyboard layer surface holding the keyboard after a
+    /// click (cozyui's panel) — the layer-shell counterpart of the dock's
+    /// `focused_float` override, and like it, honored by `refocus` until
+    /// the next deliberate focus move. Private invariant: reads go through
+    /// `Comp::focused_layer()`, which re-validates against the layer map.
+    pub(super) focused_layer: Option<WlSurface>,
     /// The fullscreen tiled client, covering the whole output above every
     /// tiled window (floats still render above it). Private invariant:
     /// reads go through `Comp::fullscreen()`, which re-validates against
@@ -223,6 +233,16 @@ pub struct Comp {
     pub keyboard: smithay::input::keyboard::KeyboardHandle<Comp>,
     pub pointer: smithay::input::pointer::PointerHandle<Comp>,
     pub start: std::time::Instant,
+
+    /// The armed catch-up redraw, if any. `queue_redraw` arms at most one
+    /// one-shot timer; `redraw` disarms it on entry, so vblank- and
+    /// event-driven redraws absorb a pending catch-up instead of doubling
+    /// it. Redraws only happen on demand — an idle compositor arms nothing
+    /// and sleeps.
+    redraw_timer: Option<RegistrationToken>,
+    /// When the last frame was composited; queued redraws are paced off it
+    /// so back-to-back events can't push compositing past ~60 Hz.
+    last_redraw: std::time::Instant,
 
     // The layout core (pure, ported from master), the Win <-> Window
     // bridge it drives, and the window bookkeeping around the bridge.
@@ -329,6 +349,7 @@ impl Comp {
             .insert_source(icon_rx, |event, (), comp: &mut Comp| {
                 if let calloop::channel::Event::Msg(result) = event {
                     comp.on_icon_result(result);
+                    comp.queue_redraw();
                 }
             })
             .expect("insert icon channel source");
@@ -339,6 +360,7 @@ impl Comp {
             .insert_source(note_rx, |event, (), comp: &mut Comp| {
                 if let calloop::channel::Event::Msg(msg) = event {
                     comp.on_note_msg(msg);
+                    comp.queue_redraw();
                 }
             })
             .expect("insert notification channel source");
@@ -416,6 +438,8 @@ impl Comp {
             keyboard,
             pointer,
             start: std::time::Instant::now(),
+            redraw_timer: None,
+            last_redraw: std::time::Instant::now(),
             state: crate::state::State::new(),
             managed: crate::shell::Managed::default(),
             windows: WindowRoles::default(),
@@ -887,9 +911,11 @@ impl Comp {
             }
         }
         // An exclusive-keyboard layer surface (rofi) outranks every window
-        // while mapped.
+        // while mapped; a click-focused OnDemand layer (the panel) outranks
+        // the windows but not an exclusive grab.
         let target = self
             .exclusive_layer_surface()
+            .or_else(|| self.focused_layer())
             .map(focus::FocusTarget::from)
             .or_else(|| {
                 focused
@@ -954,16 +980,55 @@ impl Comp {
         }))
     }
 
+    /// Ask for a frame: composite once whatever changed has settled into
+    /// the loop, throttled to one frame per interval. Every path that
+    /// changes what's on screen (commits, input, channel messages, window
+    /// lifecycle) calls this; nothing repaints otherwise. No-op while a
+    /// redraw is already lined up — armed here, or guaranteed by the tty
+    /// backend's pending vblank / session resume.
+    pub fn queue_redraw(&mut self) {
+        /// One output frame at 60 Hz; also clients' frame-callback cadence.
+        const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
+
+        if self.redraw_timer.is_some() || self.backend.redraw_paced_externally() {
+            return;
+        }
+        let delay = REDRAW_INTERVAL.saturating_sub(self.last_redraw.elapsed());
+        let token = self
+            .handle
+            .insert_source(Timer::from_duration(delay), |_, (), comp| {
+                comp.redraw_timer = None;
+                comp.redraw();
+                TimeoutAction::Drop
+            })
+            .expect("insert redraw timer");
+        self.redraw_timer = Some(token);
+    }
+
     /// Composite one frame and pace clients' frame callbacks.
     pub fn redraw(&mut self) {
+        // This frame satisfies any queued catch-up.
+        if let Some(token) = self.redraw_timer.take() {
+            self.handle.remove(token);
+        }
+        self.last_redraw = std::time::Instant::now();
         // A client that dies mid-hover leaves its cursor surface behind;
         // fall back to the arrow.
         use smithay::utils::IsAlive;
         if matches!(&self.cursor_status, CursorImageStatus::Surface(s) if !s.alive()) {
             self.cursor_status = CursorImageStatus::default_named();
         }
-        // Scroll glide: step toward the target and re-place windows.
-        if self.state.scroll_animating() {
+        // Scroll glide: step toward the target and re-place windows — but
+        // not under a split-move drag, whose drop anchors are the placed
+        // rects: a glide would slide them out from under the pointer (the
+        // same hazard gap/edge drags avoid by landing the glide at press;
+        // a tile press *starts* this glide, so it freezes instead and
+        // resumes once the drag ends).
+        let move_dragging = matches!(
+            self.interaction.drag,
+            Some(pointer::ActiveDrag::Move(_))
+        );
+        if self.state.scroll_animating() && !move_dragging {
             self.state.step_scroll();
             self.arrange();
         }
@@ -1116,6 +1181,13 @@ impl Comp {
                 Some(Duration::ZERO),
                 |_, _| Some(output.clone()),
             );
+        }
+
+        // Animations advance per frame, so a running one keeps the redraw
+        // loop alive until it settles (client-driven motion sustains itself
+        // through commits instead).
+        if self.state.scroll_animating() || self.view.anim.is_some() {
+            self.queue_redraw();
         }
     }
 }

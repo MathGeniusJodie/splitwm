@@ -1,16 +1,13 @@
 //! Nested development backend: the compositor lives inside a winit window
-//! on the host desktop. The host session provides the clock (a 60 Hz timer
-//! stands in for vblank). The compositor draws every pointer itself with
+//! on the host desktop. Redraws are queue-driven (`Comp::queue_redraw`);
+//! there is no vblank clock. The compositor draws every pointer itself with
 //! its hand-drawn sprites, so the host window's own cursor stays hidden
 //! and each frame composites the sprite, exactly as the tty backend does.
-
-use std::time::Duration;
 
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::winit::{self, WinitEvent, WinitGraphicsBackend};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
 use smithay::utils::Transform;
@@ -79,17 +76,6 @@ pub fn run() {
             WinitEvent::Focus(_) => {}
         })
         .expect("insert winit source");
-
-    // ~60 Hz repaint pacing. The winit backend has no vblank clock, so a
-    // timer stands in; damage tracking inside redraw keeps idle frames
-    // cheap.
-    event_loop
-        .handle()
-        .insert_source(Timer::immediate(), |_, (), comp| {
-            comp.redraw();
-            TimeoutAction::ToDuration(Duration::from_millis(16))
-        })
-        .expect("insert redraw timer");
 
     super::run(event_loop, comp);
 }

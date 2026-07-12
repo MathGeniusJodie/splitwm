@@ -47,6 +47,19 @@ impl Backend {
         }
     }
 
+    /// Whether a coming redraw is already guaranteed without queueing one:
+    /// the tty backend redraws when its in-flight frame's vblank lands, and
+    /// a paused session redraws on resume (rendering is impossible until
+    /// then anyway). The winit and headless backends have no external
+    /// pacer, so their redraws are always queue-driven.
+    pub fn redraw_paced_externally(&self) -> bool {
+        match self {
+            Backend::Winit(_) | Backend::Headless(_) => false,
+            #[cfg(feature = "tty")]
+            Backend::Tty(t) => t.redraw_paced_externally(),
+        }
+    }
+
     /// Ctrl+Alt+Fn. Session-level rather than a WM binding: on master the
     /// X server owned VT switching, so here the tty session does; a nested
     /// session has no VT to switch (the host's server owns the console).
@@ -84,6 +97,10 @@ fn run(mut event_loop: smithay::reexports::calloop::EventLoop<'static, Comp>, mu
     // get the session socket injected; nested test runs read it from stdout.
     crate::launch::set_wayland_display(comp.socket_name.clone());
     println!("WAYLAND_DISPLAY={}", comp.socket_name.to_string_lossy());
+
+    // First frame; after this, redraws happen only when something queues
+    // one (commits, input, channel messages) or a tty vblank lands.
+    comp.redraw();
 
     event_loop
         .run(None, &mut comp, |comp| {

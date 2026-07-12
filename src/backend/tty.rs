@@ -25,7 +25,6 @@ use smithay::backend::session::{Event as SessionEvent, Session as _};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::drm::control::{connector, crtc, Device as _, ModeTypeFlags};
 use smithay::reexports::input::{ClickMethod, Libinput};
@@ -80,9 +79,15 @@ impl Tty {
         }
     }
 
+    /// See [`crate::backend::Backend::redraw_paced_externally`].
+    pub fn redraw_paced_externally(&self) -> bool {
+        self.paused || self.queued
+    }
+
     /// Present one frame if the pipe is idle: composite the scene plus the
     /// cursor, and queue it for the next vblank. An unchanged scene queues
-    /// nothing — the redraw timer polls until something is dirty again.
+    /// nothing — the next queued redraw picks up when something is dirty
+    /// again.
     pub fn render(
         &mut self,
         scene: &scene::Scene<'_>,
@@ -345,17 +350,6 @@ pub fn run() {
             _ => {}
         })
         .expect("insert udev source");
-
-    // Idle pickup: while frames queue, vblanks drive the redraw; when a
-    // frame comes up empty nothing is queued and no vblank will fire, so
-    // this timer polls until the scene is dirty again (damage tracking in
-    // the compositor keeps those probes cheap).
-    handle
-        .insert_source(Timer::immediate(), |_, (), comp| {
-            comp.redraw();
-            TimeoutAction::ToDuration(std::time::Duration::from_millis(16))
-        })
-        .expect("insert redraw timer");
 
     super::run(event_loop, comp);
 }

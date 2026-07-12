@@ -68,6 +68,9 @@ pub fn insert_channel(handle: &LoopHandle<'static, Comp>) {
                     command(comp, String::from_utf8_lossy(&pending[..eol]).trim());
                     pending.drain(..=eol);
                 }
+                // Commands mutate at will (and `shot` waits on the next
+                // composited frame); always follow with a redraw.
+                comp.queue_redraw();
                 Ok(PostAction::Continue)
             },
         )

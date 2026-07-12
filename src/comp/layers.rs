@@ -82,6 +82,9 @@ impl WlrLayerShellHandler for Comp {
     }
 
     fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        if self.windows.focused_layer.as_ref() == Some(surface.wl_surface()) {
+            self.windows.focused_layer = None;
+        }
         let identity = theme::dock_identity();
         let mut was_dock = false;
         {
@@ -103,6 +106,9 @@ impl WlrLayerShellHandler for Comp {
         // arrange refocuses: the keyboard held by an exclusive layer
         // (rofi) must return to the layout when it goes.
         self.arrange();
+        // A destroyed layer sends no further commits to repaint the region
+        // it uncovered.
+        self.queue_redraw();
     }
 }
 delegate_layer_shell!(Comp);

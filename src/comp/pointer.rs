@@ -149,6 +149,10 @@ impl Comp {
             // Press = click (focus + scroll the split into view); further
             // travel turns it into a split-move drag, dropped on release.
             Hit::TaskbarTile(win, leaf) => {
+                // Focusing a split by tile/title/body is a deliberate
+                // focus move: it reclaims the keyboard from a clicked
+                // layer panel.
+                self.windows.focused_layer = None;
                 self.bring_into_layout(win, true);
                 // Armed after `bring_into_layout`: its `commit_layout`
                 // clears `self.interaction.drag`.
@@ -160,11 +164,13 @@ impl Comp {
                 }
             }
             Hit::Title(leaf) => {
+                self.windows.focused_layer = None;
                 self.state.focus_leaf(leaf);
                 self.arrange();
                 self.arm_move_drag(leaf, mx, my);
             }
             Hit::LeafBody(leaf) => {
+                self.windows.focused_layer = None;
                 self.state.focus_leaf(leaf);
                 self.arrange();
             }

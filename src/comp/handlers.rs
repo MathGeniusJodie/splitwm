@@ -112,6 +112,9 @@ impl CompositorHandler for Comp {
 
         self.layer_commit(surface);
         self.popups.commit(surface);
+        // Whatever this commit changed (content, mapping, geometry) shows
+        // up next frame.
+        self.queue_redraw();
     }
 }
 delegate_compositor!(Comp);
@@ -180,6 +183,9 @@ impl XdgShellHandler for Comp {
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        // Unmanaging rearranges; a destroyed client sends no further
+        // commits, so the repaint must be queued here.
+        self.queue_redraw();
         self.windows
             .pending
             .retain(|p| p.window.toplevel().is_none_or(|t| *t != surface));
@@ -205,6 +211,7 @@ impl XdgShellHandler for Comp {
         if let Some(win) = self.managed.win_for_surface(surface.wl_surface()) {
             self.windows.fullscreen = Some(win);
             self.arrange();
+            self.queue_redraw();
         } else if let Some(p) = self.find_pending_mut(&surface) {
             // Requested before the first commit (a startup-fullscreen
             // client); honored once the window is classified.
@@ -223,6 +230,7 @@ impl XdgShellHandler for Comp {
             p.fullscreen = false;
         }
         self.arrange();
+        self.queue_redraw();
     }
 
     fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
@@ -370,6 +378,7 @@ impl SeatHandler for Comp {
         // pointer. Consumed at redraw by whichever backend presents the
         // cursor.
         self.cursor_status = image;
+        self.queue_redraw();
     }
 }
 delegate_seat!(Comp);

@@ -190,6 +190,8 @@ impl XWaylandShellHandler for Comp {
             }
             self.refocus();
         }
+        // Focus landing here moves the focus outline.
+        self.queue_redraw();
     }
 }
 delegate_xwayland_shell!(Comp);
@@ -210,6 +212,7 @@ impl smithay::xwayland::XwmHandler for Comp {
         // X11 pre-map fullscreen arrives via `fullscreen_request` on the
         // WM connection instead of a pending record.
         self.classify_and_manage(Window::new_x11_window(window), false);
+        self.queue_redraw();
     }
 
     /// Override-redirect windows (rofi, menus) position themselves and are
@@ -239,14 +242,19 @@ impl smithay::xwayland::XwmHandler for Comp {
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             keyboard.set_focus(self, Some(window.into()), serial);
         }
+        self.queue_redraw();
     }
 
+    // Gone X11 windows send no further commits; the repaint that removes
+    // them must be queued here.
     fn unmapped_window(&mut self, _xwm: XwmId, window: X11Surface) {
         self.forget_x11(&window);
+        self.queue_redraw();
     }
 
     fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
         self.forget_x11(&window);
+        self.queue_redraw();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -330,7 +338,19 @@ impl smithay::xwayland::XwmHandler for Comp {
             .find(|o| o.surface.window_id() == window.window_id())
         {
             o.rect = geometry;
+            self.queue_redraw();
         }
+    }
+
+    /// Title and class changes repaint chrome (frames, taskbar) without
+    /// any Wayland commit, so the redraw must be queued from the X11 side.
+    fn property_notify(
+        &mut self,
+        _xwm: XwmId,
+        _window: X11Surface,
+        _property: smithay::xwayland::xwm::WmWindowProperty,
+    ) {
+        self.queue_redraw();
     }
 
     fn resize_request(

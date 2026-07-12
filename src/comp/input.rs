@@ -33,6 +33,10 @@ fn vt_switch_target(sym: u32) -> Option<i32> {
 
 impl Comp {
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
+        // Every input event can move something visible (the cursor sprite
+        // at minimum); queueing is idempotent and paced, so blanket-queue
+        // rather than proving each arm inert.
+        self.queue_redraw();
         match event {
             InputEvent::Keyboard { event } => {
                 let serial = SERIAL_COUNTER.next_serial();
@@ -244,7 +248,7 @@ impl Comp {
                             // Click-to-focus through the layout, like
                             // master's activate_client.
                             Some(crate::shell::Kind::Tiled) => {
-                                self.clear_focused_float();
+                                self.clear_focus_overrides();
                                 self.state.activate_client(win);
                                 self.arrange();
                             }
@@ -271,26 +275,24 @@ impl Comp {
                     // elsewhere may have moved the focus off it. A layer
                     // surface that accepts keyboard focus (OnDemand
                     // panels; an Exclusive one already holds it) gets the
-                    // keyboard by click too, like the dock.
+                    // keyboard by click too, like the dock — through the
+                    // `focused_layer` override, so a later `refocus` (a
+                    // scroll-glide arrange, say) can't steal it right back.
                     None => {
-                        let target = under.as_ref().and_then(|s| {
-                            if let Some(o) = self
-                                .or_windows
+                        if let Some(o) = under.as_ref().and_then(|s| {
+                            self.or_windows
                                 .iter()
                                 .find(|o| o.surface.wl_surface().as_ref() == Some(s))
-                            {
-                                return Some(crate::comp::focus::FocusTarget::X11(
-                                    o.surface.clone(),
-                                ));
-                            }
-                            let focusable = smithay::desktop::layer_map_for_output(&self.output)
-                                .layer_for_surface(s, smithay::desktop::WindowSurfaceType::ALL)
-                                .is_some_and(|l| l.can_receive_keyboard_focus());
-                            focusable.then(|| s.clone().into())
-                        });
-                        if let Some(target) = target {
+                        }) {
+                            let target = crate::comp::focus::FocusTarget::X11(o.surface.clone());
                             let keyboard = self.keyboard.clone();
                             keyboard.set_focus(self, Some(target), serial);
+                        } else if let Some(s) = under.filter(|s| {
+                            smithay::desktop::layer_map_for_output(&self.output)
+                                .layer_for_surface(s, smithay::desktop::WindowSurfaceType::ALL)
+                                .is_some_and(|l| l.can_receive_keyboard_focus())
+                        }) {
+                            self.focus_layer_surface(s);
                         }
                     }
                 }
