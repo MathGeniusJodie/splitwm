@@ -448,7 +448,12 @@ const WIN_BUF: (i32, i32) = (OUTPUT_W, 800);
 
 impl Session {
     fn boot() -> Session {
-        let wm = Wm::spawn();
+        let mut wm = Wm::spawn();
+        // Keyboard delivery is hover-based: nothing takes the keyboard
+        // while the pointer sits at its (0,0) birth position in the gap
+        // margin. Park it mid-output like a real session's resting mouse;
+        // focus moves slide the focused column under it.
+        wm.cmd("motion 640 400");
         let runtime = std::env::var("XDG_RUNTIME_DIR").expect("XDG_RUNTIME_DIR");
         let stream = UnixStream::connect(format!("{runtime}/{}", wm.socket_name))
             .expect("connect to compositor socket");

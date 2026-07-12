@@ -122,10 +122,15 @@ impl Comp {
 
     /// Snap the focused leaf into view instantly — keyboard focus moves
     /// don't glide, so the destination is on screen the moment the chord
-    /// lands.
-    fn scroll_focus_into_view(&mut self) {
+    /// lands. Also slides the focused column under the pointer: keyboard
+    /// delivery is hover-based (`hover_target`), so without the alignment
+    /// the chord would move the outline while keystrokes kept landing
+    /// wherever the mouse happens to rest.
+    pub(super) fn scroll_focus_into_view(&mut self) {
         let wa = self.layout_area();
         self.state.ensure_in_view(wa);
+        let px = self.pointer.current_location().x as i32;
+        self.state.align_focus_to(wa, px);
         self.state.land_scroll();
     }
 
@@ -165,12 +170,18 @@ impl Comp {
 
     /// Shared epilogue for every layout-mutating action: invalidate drags
     /// whose tree snapshot went stale, keep the focused split in view
-    /// (gliding unless an animation is about to run), re-arrange.
+    /// (gliding unless an animation is about to run), slide the focused
+    /// column under the pointer (keyboard delivery is hover-based; a
+    /// mutation that moved the focus border — a new window, a close's
+    /// survivor, a taskbar activation — would otherwise leave keystrokes
+    /// landing wherever the mouse rests), re-arrange.
     pub fn commit_layout(&mut self) {
         self.interaction.drag = None;
         let wa = self.layout_area();
         self.reclamp_scroll();
         self.state.ensure_in_view(wa);
+        let px = self.pointer.current_location().x as i32;
+        self.state.align_focus_to(wa, px);
         // An animation's placements are computed from scroll_x at arrange
         // time and held for the whole transition; a concurrent glide would
         // make them stale every frame, so land it. Otherwise leave the

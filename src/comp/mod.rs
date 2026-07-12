@@ -135,6 +135,10 @@ pub struct Interaction {
     /// and their release must not leak to the client that never saw the
     /// press.
     pub held_bound_keys: Vec<u32>,
+    /// Where hover keyboard delivery last aimed, so pointer motion only
+    /// re-derives the seat focus when the pointer actually crossed a
+    /// window boundary.
+    pub hover_win: Option<crate::layout::Win>,
 }
 
 /// Window bookkeeping beyond the `Managed` store: toplevels not yet
@@ -890,12 +894,11 @@ impl Comp {
     }
 
     /// Point keyboard focus (and xdg activated state) at the focused
-    /// float when one holds the keyboard, else the layout's focused
-    /// client, else nothing.
+    /// float when one holds the keyboard, else the tiled window the
+    /// pointer rests in (`hover_target` — keyboard delivery follows the
+    /// mouse, decoupled from the focus outline), else nothing.
     pub fn refocus(&mut self) {
-        let focused = self
-            .keyboard_override()
-            .or_else(|| self.state.focused_client());
+        let focused = self.keyboard_override().or_else(|| self.hover_target());
         // Only windows whose activated state actually flipped get a
         // configure (set_activated reports the change).
         let mut updates: Vec<Window> = Vec::new();

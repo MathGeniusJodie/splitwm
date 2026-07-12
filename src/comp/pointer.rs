@@ -571,6 +571,67 @@ impl Comp {
         }
     }
 
+    /// The tiled window keystrokes land in for the current pointer
+    /// position — keyboard delivery follows the mouse, not the focus
+    /// outline. Within the focused column's horizontal span the focused
+    /// window wins even when the pointer sits above or below it (a
+    /// stacked sibling, a gap, the taskbar): a keyboard focus move
+    /// inside a stack can't scroll its destination under the pointer,
+    /// so the column is the hover unit for the focused split.
+    /// Everywhere else the pointer must be inside a window's frame
+    /// (border and titlebar included); over wallpaper, gaps, or bare
+    /// chrome nothing takes the keyboard. Floats, the dock,
+    /// override-redirect windows, and layer surfaces sit above the
+    /// tiled plane and are opaque to hover: their keyboard focus stays
+    /// click-driven (`keyboard_override`, `focused_layer`), and typing
+    /// through them into a covered window would be typing into
+    /// something the pointer visibly isn't in.
+    pub fn hover_target(&self) -> Option<Win> {
+        // A fullscreen client covers the output; the pointer is in it
+        // wherever it is.
+        if let Some(fs) = self.fullscreen() {
+            return Some(fs);
+        }
+        let pos = self.pointer.current_location();
+        if self.float_frame_at(pos).is_some() {
+            return None;
+        }
+        // A surface hit resolves plane opacity (floats, dock, o-r
+        // windows, layer surfaces) and catches a tiled window's popups
+        // reaching outside its frame.
+        let direct = match self.surface_under(pos) {
+            Some((s, _)) => {
+                let win = self.managed.win_for_surface(&s);
+                match win.and_then(|w| self.managed.kind_of(w)) {
+                    Some(crate::shell::Kind::Tiled) => win,
+                    _ => return None,
+                }
+            }
+            None => None,
+        };
+        let (mx, my) = (pos.x as i32, pos.y as i32);
+        if let (Some(&frame), Some(client)) = (
+            self.view.frame_rects.get(&self.state.focused_leaf_valid()),
+            self.state.focused_client(),
+        ) {
+            if mx >= frame.x && mx < frame.x + frame.w {
+                return Some(client);
+            }
+        }
+        if direct.is_some() {
+            return direct;
+        }
+        // Frame rects cover the border and titlebar the surface
+        // hit-test misses; a minimized leaf shows no window, so its
+        // frame (a restore button) delivers to nothing.
+        self.view
+            .frame_rects
+            .iter()
+            .find(|(l, r)| self.state.layout.is_leaf(**l) && rect_contains(**r, mx, my))
+            .and_then(|(l, _)| self.state.layout.leaf(*l))
+            .and_then(|leaf| if leaf.minimized { None } else { leaf.client })
+    }
+
     /// Act on a split-control button click. `secondary` is a right-click,
     /// which on the split button picks the opposite split direction.
     pub fn click_split_button(&mut self, leaf: NodeId, kind: BtnKind, secondary: bool) {

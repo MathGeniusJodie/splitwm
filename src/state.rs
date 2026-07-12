@@ -683,6 +683,31 @@ impl State {
             self.scroll_to(wa, target);
         }
     }
+
+    /// Scroll so the focused split's column spans screen-x `px` — keyboard
+    /// delivery is hover-based, so a keyboard focus move slides the split
+    /// under the pointer rather than warping the pointer to the split.
+    /// Minimal adjustment against `scroll_target` (the pending position,
+    /// so it composes with `ensure_in_view`). Deliberately unclamped: the
+    /// last column reaching a pointer on the far side of the viewport
+    /// needs margin past the strip's end, which the scroll model already
+    /// tolerates (see `max_scroll`; `min_scroll` grants nearly a viewport
+    /// of the same padding leftward). A pointer inside the viewport can't
+    /// push the target below `min_scroll`.
+    pub fn align_focus_to(&mut self, wa: Rect, px: i32) {
+        let geos = self.compute(wa);
+        let Some(g) = geos.get(&self.focused_leaf_valid()) else {
+            return;
+        };
+        let left = g.x - self.scroll_target;
+        let right = left + g.w;
+        if px < left {
+            self.scroll_target = g.x - px;
+        } else if px >= right {
+            self.scroll_target = g.x + g.w - 1 - px;
+        }
+        debug_assert!(self.scroll_target >= Self::min_scroll(wa));
+    }
 }
 
 #[cfg(test)]

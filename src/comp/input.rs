@@ -246,10 +246,13 @@ impl Comp {
                     Some(win) if button == BTN_LEFT => {
                         match self.managed.kind_of(win) {
                             // Click-to-focus through the layout, like
-                            // master's activate_client.
+                            // master's activate_client. The clicked split
+                            // scrolls fully into view with the same snap
+                            // the keyboard focus chords use.
                             Some(crate::shell::Kind::Tiled) => {
                                 self.clear_focus_overrides();
                                 self.state.activate_client(win);
+                                self.scroll_focus_into_view();
                                 self.arrange();
                             }
                             Some(crate::shell::Kind::Float(_)) => self.focus_float(win),
@@ -362,5 +365,17 @@ impl Comp {
             },
         );
         pointer.frame(self);
+        // Keyboard delivery follows the mouse: crossing a window boundary
+        // re-aims the seat. Not mid-drag or mid-grab (the gesture owns the
+        // pointer; focus churn would fight it), and never off an
+        // override-redirect window — its X-side keyboard grab (rofi) must
+        // survive pointer travel.
+        if self.interaction.drag.is_none() && !pointer.is_grabbed() && !self.or_holds_keyboard() {
+            let hover = self.hover_target();
+            if hover != self.interaction.hover_win {
+                self.interaction.hover_win = hover;
+                self.refocus();
+            }
+        }
     }
 }

@@ -125,6 +125,18 @@ impl Comp {
         )
     }
 
+    /// Whether an override-redirect X11 window holds the keyboard. Hover
+    /// keyboard delivery leaves it alone: its X-side keyboard grab (rofi)
+    /// only works while XWayland holds our focus, and mere pointer travel
+    /// must not break it. Managed X11 windows are ordinary tiled/float
+    /// windows and take no such shelter.
+    pub(super) fn or_holds_keyboard(&self) -> bool {
+        match self.keyboard.current_focus() {
+            Some(super::focus::FocusTarget::X11(s)) => s.is_override_redirect(),
+            _ => false,
+        }
+    }
+
     /// An X11 window went away (unmap or destroy): drop it from whichever
     /// store holds it, exactly like a Wayland toplevel's destruction.
     fn forget_x11(&mut self, surface: &X11Surface) {
