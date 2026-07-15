@@ -203,27 +203,27 @@ impl Comp {
     }
 
     /// The extra scroll room the docked sidebar needs (zero when nothing
-    /// is docked): its width minus the strip already tucked under the
-    /// canvas edge. The dock is either a managed window (XWayland cozyui)
-    /// or a native layer surface (see `layer_dock_extra`), whichever is
-    /// present.
+    /// is docked). An XWayland dock sits flush past the canvas — it has no
+    /// protocol to claim a tucked strip, so its whole width is scroll room;
+    /// a native layer surface states its own overlap via its exclusive
+    /// zone (see `layer_dock_extra`). Whichever is present wins.
     pub fn dock_extra(&self) -> i32 {
         if let Some((_, _, d)) = self.managed.dock() {
-            return d.w - d.overlap();
+            return d.w;
         }
         self.layer_dock_extra()
     }
 
-    /// The dock's pinned screen geometry: parked at the right end of the
-    /// tiling canvas, tucked `overlap` px under it, shifted by the current
-    /// scroll like any other leaf. Full monitor height (it overlaps the
-    /// taskbar strip in its column).
+    /// The dock's pinned screen geometry: parked flush at the right end of
+    /// the tiling canvas, shifted by the current scroll like any other
+    /// leaf. Full monitor height (it overlaps the taskbar strip in its
+    /// column).
     pub fn dock_geometry(&self, d: DockData) -> crate::layout::Rect {
         let wa = self.layout_area();
         let size = self.output_size();
         let canvas_w = self.state.canvas_w(wa);
         crate::layout::Rect {
-            x: wa.x + canvas_w - d.overlap() - self.state.scroll_x(),
+            x: wa.x + canvas_w - self.state.scroll_x(),
             y: 0,
             w: d.w.max(1),
             h: size.h.max(1),

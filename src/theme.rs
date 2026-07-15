@@ -175,15 +175,6 @@ pub fn dock_identity() -> String {
     std::env::var("SPLITWM_DOCK_TITLE").unwrap_or_else(|_| DOCK_TITLE.to_string())
 }
 
-/// How far the docked sidebar is tucked under the right end of the split
-/// canvas, in px: `Comp::dock_geometry` shifts the dock left by this much
-/// (via `DockData::overlap`) from the canvas edge, and the canvas (stacked
-/// above it) overlaps it by the same amount. The first `GAP` px only close
-/// the canvas's trailing margin; beyond that the last column's windows
-/// themselves cover the dock's edge. 0 restores the flush side-by-side
-/// layout.
-pub const DOCK_OVERLAP: i32 = 360;
-
 pub const SPLIT_RATIO: f64 = 0.618;
 pub const RESIZE_STEP: f64 = 0.05;
 /// Smallest fraction of a stack a row can be resized down to, shared by

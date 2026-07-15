@@ -114,15 +114,6 @@ pub struct DockData {
     pub w: i32,
 }
 
-impl DockData {
-    /// `theme::DOCK_OVERLAP` clamped to the dock's own width — an overlap
-    /// wider than the dock would shove its right edge permanently away
-    /// from the screen edge (fully tucked is the useful maximum).
-    pub fn overlap(self) -> i32 {
-        theme::DOCK_OVERLAP.min(self.w)
-    }
-}
-
 /// What role a managed window plays; the payload carries the role's state.
 pub enum Kind {
     Tiled,
