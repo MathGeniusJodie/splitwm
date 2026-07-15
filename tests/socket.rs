@@ -636,10 +636,15 @@ fn socket_lifecycle() {
     );
     // Honour it. The window's death takes its column with it, but
     // side-by-side splits don't merge: the survivor keeps its own width
-    // (the canvas shrinks instead), and focus lands on it by itself.
+    // (the canvas shrinks instead). The focus handoff is a side effect of
+    // the close, not a deliberate focus move: the viewport stays put
+    // instead of sliding the survivor under the pointer, so the keyboard
+    // reaches it only once the mouse rests in it — here at its slid-over
+    // spot at the canvas start, not the pointer's old 640.
     let survivor = s.app.wins[b].size;
     s.app.wins[a].toplevel.destroy();
     s.app.wins[a].surface.destroy();
+    s.wm.cmd("motion 200 400");
     s.wait_until("survivor keeps its width and takes the keyboard", |app| {
         app.wins[b].activated && app.focus_is(b)
     });

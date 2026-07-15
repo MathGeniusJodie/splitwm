@@ -246,13 +246,14 @@ impl Comp {
                     Some(win) if button == BTN_LEFT => {
                         match self.managed.kind_of(win) {
                             // Click-to-focus through the layout, like
-                            // master's activate_client. The clicked split
-                            // scrolls fully into view with the same snap
-                            // the keyboard focus chords use.
+                            // master's activate_client. The viewport stays
+                            // put: the clicked window is already under the
+                            // pointer, so there is nothing to reveal —
+                            // only deliberate focus moves (keyboard,
+                            // taskbar) scroll.
                             Some(crate::shell::Kind::Tiled) => {
                                 self.clear_focus_overrides();
                                 self.state.activate_client(win);
-                                self.scroll_focus_into_view();
                                 self.arrange();
                             }
                             Some(crate::shell::Kind::Float(_)) => self.focus_float(win),

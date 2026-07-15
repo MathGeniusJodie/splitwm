@@ -109,14 +109,16 @@ impl Comp {
     /// (Wayland and XWayland) land here. The dying window always takes its
     /// split with it (`unpin_client`); animate the layout settling —
     /// stacked neighbours reclaiming the height, or the later columns
-    /// sliding over a removed one. arrange (via `commit_layout`) refocuses,
-    /// so focus never rests on a dead client.
+    /// sliding over a removed one. arrange (via `commit_layout_in_place`)
+    /// refocuses, so focus never rests on a dead client — but the focus
+    /// handoff to the survivor is a side effect, so the viewport doesn't
+    /// scroll to it.
     pub fn unmanage_tiled(&mut self, win: Win) {
         if let Some(m) = self.managed.remove(win) {
             self.space.unmap_elem(&m.window);
         }
         self.view.animate = self.state.unpin_client(win);
-        self.commit_layout();
+        self.commit_layout_in_place();
     }
 
     /// Politely close a managed window, whichever backend it speaks.

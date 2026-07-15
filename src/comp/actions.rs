@@ -120,18 +120,17 @@ impl Comp {
         self.close_client(win);
     }
 
-    /// Snap the focused leaf into view instantly — keyboard focus moves
-    /// don't glide, so the destination is on screen the moment the chord
-    /// lands. Also slides the focused column under the pointer: keyboard
-    /// delivery is hover-based (`hover_target`), so without the alignment
-    /// the chord would move the outline while keystrokes kept landing
-    /// wherever the mouse happens to rest.
+    /// Glide the focused leaf into view — the same scroll animation a
+    /// taskbar activation gets via `commit_layout`. Also slides the
+    /// focused column under the pointer: keyboard delivery is hover-based
+    /// (`hover_target`), so without the alignment the chord would move the
+    /// outline while keystrokes kept landing wherever the mouse happens to
+    /// rest.
     pub(super) fn scroll_focus_into_view(&mut self) {
         let wa = self.layout_area();
         self.state.ensure_in_view(wa);
         let px = self.pointer.current_location().x as i32;
         self.state.align_focus_to(wa, px);
-        self.state.land_scroll();
     }
 
     /// Detached launch in its own transient scope (see `launch::spawn`).
@@ -151,7 +150,9 @@ impl Comp {
             Some(win) => self.close_client(win),
             None => self.view.animate = self.state.remove_empty_leaf(leaf),
         }
-        self.commit_layout();
+        // In place: whichever split inherits the focus, a close is not a
+        // deliberate focus move, so the viewport stays put.
+        self.commit_layout_in_place();
     }
 
     /// Focus a managed tiled window's split and scroll it into view (via
@@ -168,20 +169,36 @@ impl Comp {
         self.commit_layout();
     }
 
-    /// Shared epilogue for every layout-mutating action: invalidate drags
-    /// whose tree snapshot went stale, keep the focused split in view
-    /// (gliding unless an animation is about to run), slide the focused
-    /// column under the pointer (keyboard delivery is hover-based; a
-    /// mutation that moved the focus border — a new window, a close's
-    /// survivor, a taskbar activation — would otherwise leave keystrokes
-    /// landing wherever the mouse rests), re-arrange.
+    /// Shared epilogue for layout mutations that deliberately move or
+    /// reveal the focus (a new window, a taskbar activation, a drag drop):
+    /// invalidate drags whose tree snapshot went stale, keep the focused
+    /// split in view (gliding unless an animation is about to run), slide
+    /// the focused column under the pointer (keyboard delivery is
+    /// hover-based; the mutation moved the focus border, and without the
+    /// alignment keystrokes would keep landing wherever the mouse rests),
+    /// re-arrange.
     pub fn commit_layout(&mut self) {
-        self.interaction.drag = None;
         let wa = self.layout_area();
+        // Reclamp before aligning, never after: `align_focus_to` may
+        // legitimately target margin past `max_scroll`, which a clamp
+        // would undo.
         self.reclamp_scroll();
         self.state.ensure_in_view(wa);
         let px = self.pointer.current_location().x as i32;
         self.state.align_focus_to(wa, px);
+        self.finish_layout_commit();
+    }
+
+    /// `commit_layout` without revealing the focused split — for mutations
+    /// where a focus move is only a side effect (a close handing focus to
+    /// its survivor): the viewport stays where the user left it.
+    pub fn commit_layout_in_place(&mut self) {
+        self.reclamp_scroll();
+        self.finish_layout_commit();
+    }
+
+    fn finish_layout_commit(&mut self) {
+        self.interaction.drag = None;
         // An animation's placements are computed from scroll_x at arrange
         // time and held for the whole transition; a concurrent glide would
         // make them stale every frame, so land it. Otherwise leave the
