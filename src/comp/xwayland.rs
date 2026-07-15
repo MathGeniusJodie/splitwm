@@ -91,6 +91,12 @@ impl Comp {
                         }
                     }
                     crate::launch::set_x11_display(format!(":{display_number}"));
+                    if comp.backend.is_session() {
+                        crate::launch::publish_session_env(
+                            "DISPLAY",
+                            std::ffi::OsStr::new(&format!(":{display_number}")),
+                        );
+                    }
                     // Announced like WAYLAND_DISPLAY at startup: harness
                     // drivers synchronize on this before launching X11
                     // clients.

@@ -38,7 +38,7 @@ use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use smithay::{
     delegate_compositor, delegate_cursor_shape, delegate_data_device, delegate_dmabuf,
     delegate_output, delegate_primary_selection, delegate_seat, delegate_shm,
-    delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_virtual_keyboard_manager, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
 use super::{ClientState, Comp};
@@ -382,6 +382,10 @@ impl SeatHandler for Comp {
     }
 }
 delegate_seat!(Comp);
+// zwp_virtual_keyboard_manager_v1: lets wtype/voxtype inject synthetic key
+// events (with client-supplied keymaps, so arbitrary unicode works). No
+// handler trait — smithay routes the keys through our seat's keyboard.
+delegate_virtual_keyboard_manager!(Comp);
 
 // cursor-shape-v1 serves tablet tools too; splitwm has no tablet support,
 // so the trait's default no-op image callback is the whole implementation.

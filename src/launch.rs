@@ -131,6 +131,71 @@ pub fn quick_launches() -> Vec<QuickLaunch> {
         .collect()
 }
 
+/// Publish `key=value` to the systemd user manager and the D-Bus
+/// activation environment, so services started by either (portals,
+/// voxtype, anything dbus-activated) can reach the session's displays —
+/// they inherit the manager's environment, not ours, and per-child
+/// injection (`spawn`) can't reach them. Only the login session may call
+/// this (see `Backend::is_session`): a nested or headless run publishing
+/// its socket would hijack the real session's.
+pub fn publish_session_env(key: &str, value: &std::ffi::OsStr) {
+    let mut pair = std::ffi::OsString::from(format!("{key}="));
+    pair.push(value);
+    run_off_thread(move || {
+        for argv in [
+            &["systemctl", "--user", "set-environment"][..],
+            &["dbus-update-activation-environment"][..],
+        ] {
+            run_logged(argv, &pair);
+        }
+    });
+}
+
+/// Publish the Wayland socket session-wide, then activate
+/// `splitwm-session.target` (which `BindsTo=graphical-session.target`, the
+/// systemd-blessed signal that a graphical session is up) so units
+/// installed into the graphical session start. One sequential chain: the
+/// environment must land in the manager before the target's units spawn,
+/// or they'd start display-blind. Missing unit or no systemd is fine: the
+/// failure only costs those units their autostart.
+pub fn announce_session(socket: std::ffi::OsString) {
+    let mut pair = std::ffi::OsString::from("WAYLAND_DISPLAY=");
+    pair.push(&socket);
+    run_off_thread(move || {
+        for argv in [
+            &["systemctl", "--user", "set-environment"][..],
+            &["dbus-update-activation-environment"][..],
+        ] {
+            run_logged(argv, &pair);
+        }
+        run_logged(
+            &["systemctl", "--user", "start", "--no-block"],
+            std::ffi::OsStr::new("splitwm-session.target"),
+        );
+    });
+}
+
+/// Run `argv` + `arg` to completion, logging (never failing) on a missing
+/// binary or nonzero exit — non-systemd setups lack these commands.
+fn run_logged(argv: &[&str], arg: &std::ffi::OsStr) {
+    match std::process::Command::new(argv[0])
+        .args(&argv[1..])
+        .arg(arg)
+        .status()
+    {
+        Ok(status) if status.success() => {}
+        Ok(status) => tracing::warn!("{argv:?} {arg:?} exited with {status}"),
+        Err(e) => tracing::warn!("failed to spawn {argv:?}: {e}"),
+    }
+}
+
+/// The waits above don't belong on the event loop (a wedged user manager
+/// would stall compositing); one short-lived thread per announcement is
+/// cheap and they're rare (session start, XWayland ready).
+fn run_off_thread(f: impl FnOnce() + Send + 'static) {
+    std::thread::spawn(f);
+}
+
 /// Detached spawn of `cmd`. `sh` reaps its own fork thanks to the trailing
 /// `&`; the outer `sh` is reaped off-thread so the compositor never leaves
 /// a zombie per launch and never waits on the event loop.

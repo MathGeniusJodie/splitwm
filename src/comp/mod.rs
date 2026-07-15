@@ -43,6 +43,7 @@ use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
+use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
@@ -191,6 +192,11 @@ pub struct Globals {
     /// global (how clients name pointer shapes for us to draw).
     #[allow(dead_code)]
     pub cursor_shape_state: CursorShapeManagerState,
+    /// Never read, but dropping it would unpublish the virtual-keyboard
+    /// global (how wtype/voxtype inject keys, including emoji via custom
+    /// keymaps).
+    #[allow(dead_code)]
+    pub virtual_keyboard_state: VirtualKeyboardManagerState,
     pub dmabuf_state: DmabufState,
     /// Never read, but it identifies the live dmabuf global for teardown.
     #[allow(dead_code)]
@@ -314,6 +320,7 @@ impl Comp {
         let primary_selection_state = PrimarySelectionState::new::<Comp>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Comp>(&dh);
         let cursor_shape_state = CursorShapeManagerState::new::<Comp>(&dh);
+        let virtual_keyboard_state = VirtualKeyboardManagerState::new::<Comp, _>(&dh, |_client| true);
 
         let mut seat: Seat<Comp> = seat_state.new_wl_seat(&dh, "seat-0");
         // xkb defaults come from the environment (XKB_DEFAULT_LAYOUT etc.),
@@ -466,6 +473,7 @@ impl Comp {
                 primary_selection_state,
                 layer_shell_state,
                 cursor_shape_state,
+                virtual_keyboard_state,
                 dmabuf_state,
                 dmabuf_global,
             },

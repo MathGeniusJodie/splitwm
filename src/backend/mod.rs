@@ -60,6 +60,18 @@ impl Backend {
         }
     }
 
+    /// Whether this backend owns the login session (the seat, the VT).
+    /// Only then may the compositor publish its sockets session-wide
+    /// (`launch::publish_session_env`): a nested or headless run doing so
+    /// would hijack the real session's environment.
+    pub fn is_session(&self) -> bool {
+        match self {
+            Backend::Winit(_) | Backend::Headless(_) => false,
+            #[cfg(feature = "tty")]
+            Backend::Tty(_) => true,
+        }
+    }
+
     /// Ctrl+Alt+Fn. Session-level rather than a WM binding: on master the
     /// X server owned VT switching, so here the tty session does; a nested
     /// session has no VT to switch (the host's server owns the console).
@@ -97,6 +109,13 @@ fn run(mut event_loop: smithay::reexports::calloop::EventLoop<'static, Comp>, mu
     // get the session socket injected; nested test runs read it from stdout.
     crate::launch::set_wayland_display(comp.socket_name.clone());
     println!("WAYLAND_DISPLAY={}", comp.socket_name.to_string_lossy());
+
+    // The login session also tells systemd/D-Bus where the display is
+    // (services don't inherit from us) and raises graphical-session.target
+    // so units installed into it (voxtype) start.
+    if comp.backend.is_session() {
+        crate::launch::announce_session(comp.socket_name.clone());
+    }
 
     // First frame; after this, redraws happen only when something queues
     // one (commits, input, channel messages) or a tty vblank lands.
