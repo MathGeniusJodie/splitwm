@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
-    wl_data_source, wl_keyboard, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle, WEnum};
 use wayland_protocols::xdg::shell::client::{
@@ -93,14 +93,15 @@ impl Wm {
     }
 
     /// Block until the compositor announces its XWayland DISPLAY — X11
-    /// clients launched earlier would race the server's startup.
-    fn await_xwayland(&mut self) {
+    /// clients launched earlier would race the server's startup. Returns
+    /// the display, for tests that connect as X11 clients themselves.
+    fn await_xwayland(&mut self) -> String {
         loop {
             let mut line = String::new();
             let n = self.stdout.read_line(&mut line).expect("read stdout");
             assert!(n > 0, "compositor exited before XWayland became ready");
-            if line.starts_with("DISPLAY=") {
-                return;
+            if let Some(display) = line.trim().strip_prefix("DISPLAY=") {
+                return display.to_string();
             }
         }
     }
@@ -156,10 +157,16 @@ struct Win {
 struct App {
     wins: Vec<Win>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
     /// The wl_surface holding keyboard focus, by protocol id.
     focused: Option<wayland_client::backend::ObjectId>,
     /// The serial of the last keyboard enter — what set_selection wants.
     enter_serial: u32,
+    /// The serial of the last wl_pointer button event — what a context
+    /// menu's xdg_popup.grab wants.
+    button_serial: u32,
+    /// wl_pointer button events seen, pressed and released.
+    buttons: u32,
     /// zwlr_layer_surface configures seen (each acked on arrival).
     layer_configures: u32,
     /// xdg_surface configures seen by the test popup (each acked on
@@ -311,6 +318,25 @@ impl Dispatch<wl_seat::WlSeat, ()> for App {
             if caps.contains(wl_seat::Capability::Keyboard) && app.keyboard.is_none() {
                 app.keyboard = Some(seat.get_keyboard(qh, ()));
             }
+            if caps.contains(wl_seat::Capability::Pointer) && app.pointer.is_none() {
+                app.pointer = Some(seat.get_pointer(qh, ()));
+            }
+        }
+    }
+}
+
+impl Dispatch<wl_pointer::WlPointer, ()> for App {
+    fn event(
+        app: &mut App,
+        _: &wl_pointer::WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        if let wl_pointer::Event::Button { serial, .. } = event {
+            app.button_serial = serial;
+            app.buttons += 1;
         }
     }
 }
@@ -699,6 +725,121 @@ fn popup_grab_redirects_keyboard_and_outside_click_dismisses() {
     surface.destroy();
 }
 
+/// The full context-menu gesture a browser performs: right-button press
+/// inside the toplevel, xdg_popup + grab with the press's own serial,
+/// release, then the pointer travels toward the menu items. The travel
+/// must not dismiss the menu — neither with popup_done nor by yanking
+/// keyboard focus (or the parent's activated state) away, which makes
+/// clients roll their menus up themselves.
+#[test]
+fn context_menu_survives_pointer_motion() {
+    let mut s = Session::boot();
+    let a = s.open_window();
+    s.wait_until("keyboard enters the toplevel", |app| app.focus_is(a));
+
+    // Right-press mid-window: forwarded to the client, whose menu-open
+    // grabs with that press's serial while the button is still down.
+    s.wm.cmd("press 640 400 right");
+    s.wait_until("client sees the right press", |app| app.buttons > 0);
+
+    let surface = s.compositor.create_surface(&s.qh, ());
+    let xdg = s.wm_base.get_xdg_surface(&surface, &s.qh, ());
+    let positioner = s.wm_base.create_positioner(&s.qh, ());
+    positioner.set_size(160, 220);
+    positioner.set_anchor_rect(600, 380, 1, 1);
+    let popup = xdg.get_popup(Some(&s.app.wins[a].xdg), &positioner, &s.qh, ());
+    popup.grab(&s.seat, s.app.button_serial);
+    surface.commit();
+    s.wait_until("popup configured", |app| app.popup_configures > 0);
+    let buffer = s
+        .pool
+        .create_buffer(0, 160, 220, 160 * 4, wl_shm::Format::Argb8888, &s.qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+    s.wait_until("keyboard redirects into the popup", |app| {
+        app.focused.as_ref() == Some(&surface.id())
+    });
+
+    s.wm.cmd("release 640 400 right");
+    // Slide toward and across the menu, ending over the parent window —
+    // the travel that must not roll anything up. Checked at every stop: a
+    // browser rolls its menu up at the first transient blip of keyboard
+    // leave or deactivation, so asserting only at the end would miss it.
+    for (x, y) in [(650, 410), (700, 500), (720, 480), (500, 300)] {
+        s.wm.cmd(&format!("motion {x} {y}"));
+        s.queue.roundtrip(&mut s.app).expect("roundtrip");
+        assert!(
+            !s.app.popup_done,
+            "pointer travel to ({x}, {y}) dismissed the menu"
+        );
+        assert_eq!(
+            s.app.focused.as_ref(),
+            Some(&surface.id()),
+            "pointer travel to ({x}, {y}) moved keyboard focus off the grabbed popup"
+        );
+        assert!(
+            s.app.wins[a].activated,
+            "pointer travel to ({x}, {y}) deactivated the menu's parent window"
+        );
+    }
+
+    // Dismissal proper still works: a click outside the client.
+    s.wm.cmd("click 10 300");
+    s.wait_until("outside click sends popup_done", |app| app.popup_done);
+
+    popup.destroy();
+    surface.destroy();
+}
+
+/// A grabless popup — a tooltip, or a menu whose grab the compositor
+/// refused. The pointer resting on or crossing it must not unfocus or
+/// deactivate the parent: hover keyboard delivery resolves a popup
+/// surface to the window that owns it.
+#[test]
+fn grabless_popup_hover_keeps_parent_focus() {
+    let mut s = Session::boot();
+    let a = s.open_window();
+    s.wait_until("keyboard enters the toplevel", |app| app.focus_is(a));
+
+    let surface = s.compositor.create_surface(&s.qh, ());
+    let xdg = s.wm_base.get_xdg_surface(&surface, &s.qh, ());
+    let positioner = s.wm_base.create_positioner(&s.qh, ());
+    positioner.set_size(160, 220);
+    positioner.set_anchor_rect(600, 380, 1, 1);
+    let popup = xdg.get_popup(Some(&s.app.wins[a].xdg), &positioner, &s.qh, ());
+    surface.commit();
+    s.wait_until("popup configured", |app| app.popup_configures > 0);
+    let buffer = s
+        .pool
+        .create_buffer(0, 160, 220, 160 * 4, wl_shm::Format::Argb8888, &s.qh, ());
+    surface.attach(Some(&buffer), 0, 0);
+    surface.commit();
+
+    // Sweep across the popup and back onto the parent, checking at every
+    // stop: a browser rolls its menu up at the first transient blip of
+    // keyboard leave or deactivation, so asserting only at the end would
+    // miss the bug.
+    for (x, y) in [(650, 410), (700, 500), (720, 480), (500, 300)] {
+        s.wm.cmd(&format!("motion {x} {y}"));
+        s.queue.roundtrip(&mut s.app).expect("roundtrip");
+        assert!(
+            !s.app.popup_done,
+            "hovering a grabless popup at ({x}, {y}) dismissed it"
+        );
+        assert!(
+            s.app.focus_is(a),
+            "hovering a grabless popup at ({x}, {y}) moved keyboard focus off the parent"
+        );
+        assert!(
+            s.app.wins[a].activated,
+            "hovering a grabless popup at ({x}, {y}) deactivated the parent"
+        );
+    }
+
+    popup.destroy();
+    surface.destroy();
+}
+
 /// A popup anchored at its parent's bottom-right corner with slide
 /// adjustment — a context menu opened next to the screen edge. Keeping it
 /// on screen is the compositor's job: the client only states preferences
@@ -893,6 +1034,93 @@ fn override_redirect_keyboard_focus() {
     s.wait_until("click on rofi returns it the keyboard", |app| {
         app.focused.is_none()
     });
+}
+
+#[test]
+fn x11_menu_hover_keeps_app_focus() {
+    // An override-redirect X11 window typed as a menu — a browser's
+    // context menu under XWayland. Menu-typed o-r windows never take the
+    // keyboard (`or_wants_focus`), so it stays in the app that opened
+    // them — and must stay put while the pointer slides onto the menu:
+    // X11 apps roll their menus up the instant their toplevel loses
+    // focus, so yanking the keyboard to nothing turns every menu into a
+    // self-dismissing one the moment the mouse moves.
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::{
+        AtomEnum, ConnectionExt as _, CreateWindowAux, PropMode, WindowClass,
+    };
+    use x11rb::wrapper::ConnectionExt as _;
+
+    let mut s = Session::boot();
+    let a = s.open_window();
+    s.wait_until("client holds the keyboard", |app| app.focus_is(a));
+    // Travel within the app first, like a mouse that just right-clicked
+    // there: hover delivery must have already settled on the app for the
+    // menu hover to be a change at all.
+    s.wm.cmd("motion 400 300");
+
+    // A menu-typed o-r window mapped near the pointer, the way a context
+    // menu opens under the click that summons it.
+    let display = s.wm.await_xwayland();
+    let (conn, screen_num) = x11rb::connect(Some(&display)).expect("connect to XWayland");
+    let screen = &conn.setup().roots[screen_num];
+    let menu = conn.generate_id().expect("window id");
+    conn.create_window(
+        x11rb::COPY_DEPTH_FROM_PARENT,
+        menu,
+        screen.root,
+        600,
+        380,
+        160,
+        220,
+        0,
+        WindowClass::INPUT_OUTPUT,
+        0,
+        &CreateWindowAux::new()
+            .override_redirect(1)
+            .background_pixel(screen.white_pixel),
+    )
+    .expect("create menu window");
+    let wm_type = conn
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE")
+        .expect("intern request")
+        .reply()
+        .expect("intern reply")
+        .atom;
+    let popup_menu = conn
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE_POPUP_MENU")
+        .expect("intern request")
+        .reply()
+        .expect("intern reply")
+        .atom;
+    conn.change_property32(
+        PropMode::REPLACE,
+        menu,
+        wm_type,
+        AtomEnum::ATOM,
+        &[popup_menu],
+    )
+    .expect("set window type");
+    conn.map_window(menu).expect("map menu");
+    conn.flush().expect("flush");
+
+    // The menu is up once its white background reaches the screen.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while s.pixel(680, 480) != [255, 255, 255, 255] {
+        assert!(Instant::now() < deadline, "menu window never showed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // Slide within the menu, then back onto the app: the keyboard must
+    // never leave it, not even transiently.
+    for (x, y) in [(680, 480), (620, 560), (400, 300)] {
+        s.wm.cmd(&format!("motion {x} {y}"));
+        s.queue.roundtrip(&mut s.app).expect("roundtrip");
+        assert!(
+            s.app.focus_is(a),
+            "hovering the X11 menu at ({x}, {y}) moved the keyboard off its app"
+        );
+    }
 }
 
 #[test]

@@ -580,12 +580,17 @@ impl Comp {
     /// so the column is the hover unit for the focused split.
     /// Everywhere else the pointer must be inside a window's frame
     /// (border and titlebar included); over wallpaper, gaps, or bare
-    /// chrome nothing takes the keyboard. Floats, the dock,
-    /// override-redirect windows, and layer surfaces sit above the
-    /// tiled plane and are opaque to hover: their keyboard focus stays
+    /// chrome nothing takes the keyboard. A window's popups count as the
+    /// window: hovering a menu or tooltip is hovering the app it belongs
+    /// to. Floats, the dock, and layer surfaces sit above the tiled
+    /// plane and are opaque to hover: their keyboard focus stays
     /// click-driven (`keyboard_override`, `focused_layer`), and typing
     /// through them into a covered window would be typing into
-    /// something the pointer visibly isn't in.
+    /// something the pointer visibly isn't in. An override-redirect X11
+    /// window is also some app's menu or tooltip, but with no protocol
+    /// link back to it — hover holds still there instead: clients roll
+    /// their menus up the instant the parent loses focus, so the
+    /// keyboard must not move at all.
     pub fn hover_target(&self) -> Option<Win> {
         // A fullscreen client covers the output; the pointer is in it
         // wherever it is.
@@ -601,10 +606,26 @@ impl Comp {
         // reaching outside its frame.
         let direct = match self.surface_under(pos) {
             Some((s, _)) => {
-                let win = self.managed.win_for_surface(&s);
+                // A popup's surface is not its window's root surface;
+                // resolve it through the popup tree to the toplevel
+                // that owns it.
+                let root = self
+                    .popups
+                    .find_popup(&s)
+                    .and_then(|k| smithay::desktop::find_popup_root_surface(&k).ok())
+                    .unwrap_or_else(|| s.clone());
+                let win = self.managed.win_for_surface(&root);
                 match win.and_then(|w| self.managed.kind_of(w)) {
                     Some(crate::shell::Kind::Tiled) => win,
-                    _ => return None,
+                    Some(_) => return None,
+                    None if self
+                        .or_windows
+                        .iter()
+                        .any(|o| o.surface.wl_surface().as_ref() == Some(&s)) =>
+                    {
+                        return self.interaction.hover_win;
+                    }
+                    None => return None,
                 }
             }
             None => None,

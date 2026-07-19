@@ -57,6 +57,9 @@ wayland-protocols = { version = "0.32", features = ["client"] }
 # wlr-layer-shell client bindings for the layer-shell socket tests.
 wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 tempfile = "3"
+# Direct X11 client for the XWayland socket tests (override-redirect menu
+# windows no spawnable app reproduces); the version smithay already pulls.
+x11rb = "0.13"
 
 [build-dependencies]
 pixel-graphics = { path = "../pixel-graphics" }
