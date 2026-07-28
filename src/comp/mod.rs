@@ -18,6 +18,7 @@ pub mod notifications;
 pub mod pieces;
 pub mod pointer;
 pub mod scene;
+pub mod screencopy;
 pub mod xwayland;
 
 use std::sync::Arc;
@@ -283,6 +284,10 @@ pub struct Comp {
     // every input path — never takes the map's mutex.
     pub layer_zone: Rectangle<i32, Logical>,
 
+    /// Screenshot and recording clients (grim, wf-recorder): the published
+    /// screencopy global and the captures queued for the next frame.
+    pub screencopy: screencopy::Screencopy,
+
     // Protocol globals.
     pub globals: Globals,
 }
@@ -321,6 +326,7 @@ impl Comp {
         let layer_shell_state = WlrLayerShellState::new::<Comp>(&dh);
         let cursor_shape_state = CursorShapeManagerState::new::<Comp>(&dh);
         let virtual_keyboard_state = VirtualKeyboardManagerState::new::<Comp, _>(&dh, |_client| true);
+        let screencopy = screencopy::Screencopy::new(&dh);
 
         let mut seat: Seat<Comp> = seat_state.new_wl_seat(&dh, "seat-0");
         // xkb defaults come from the environment (XKB_DEFAULT_LAYOUT etc.),
@@ -462,6 +468,7 @@ impl Comp {
             x11_query: None,
             xwayland_shell_state,
             layer_zone,
+            screencopy,
             globals: Globals {
                 compositor_state,
                 xdg_shell_state,
@@ -1156,6 +1163,19 @@ impl Comp {
                 );
             }
         }
+
+        // Screenshot and recording clients get this same scene composited
+        // once more into their own buffer (see `comp::screencopy`); a frame
+        // nobody is capturing costs these borrows and nothing else.
+        let mut capture = screencopy::CaptureCtx {
+            renderer: self.backend.renderer(),
+            scene: &scene,
+            clear: self.clear,
+            pointer_loc,
+            cursor_status: &self.cursor_status,
+            cursors: &mut self.cursors,
+        };
+        self.screencopy.serve(&mut capture);
 
         // Frame callbacks let clients produce their next buffer; throttle to
         // once per redraw cycle. Every managed kind gets one (floats and

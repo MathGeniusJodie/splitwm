@@ -52,7 +52,9 @@ with a terminal-multiplexer-style tiling layout where:
 wl_compositor, xdg-shell, wl_shm, linux-dmabuf (v4 feedback with a render
 node), wl_seat, wl_output/xdg-output, wl_data_device, primary-selection,
 xdg-decoration (ServerSide forced on every toplevel; clients that ignore it
-keep their CSD), **wlr-layer-shell**, **cursor-shape-v1**, and full
+keep their CSD), **wlr-layer-shell**, **cursor-shape-v1**,
+**wlr-screencopy** (shm captures of the whole output or a region, cursor
+optional — what grim and wf-recorder read the screen through), and full
 **XWayland** — X11 and Wayland windows share one window abstraction and
 lifecycle.
 
@@ -97,6 +99,7 @@ Behavior notes:
 |-----|--------|
 | `Mod4+Return`        | open terminal (`$TERMINAL`, default `alacritty`) |
 | `Mod4+Space`         | app launcher (`rofi -show combi`, native layer-shell) |
+| `Mod4+s`             | screenshot a region picked with `slurp`, into `~/Downloads/screenshot-<date>-<time>.png` (needs `grim` and `slurp`) |
 | `Mod4+h`             | stack an empty split below the focused one (it takes focus, so the next window fills it) |
 | `Mod4+q`             | close current split *and* its window (a placeholder is just removed) |
 | `Mod4+Tab` / `Right` | focus next split |

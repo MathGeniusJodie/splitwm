@@ -37,16 +37,22 @@ use crate::shell::Kind;
 pub struct OrWindow {
     pub surface: X11Surface,
     pub rect: Rectangle<i32, Logical>,
+    /// Whether this window may hold the keyboard focus, read from its
+    /// window type once at map time (see `or_wants_focus`). Every path
+    /// that would focus an o-r window — the map itself, the deferred
+    /// focus once its surface exists, a click on it — consults this one
+    /// field, so no two of them can disagree.
+    pub takes_focus: bool,
 }
 
-/// Whether an override-redirect window should take the keyboard focus when
-/// it maps. Pointer-driven popups (menus, tooltips, notifications) must
-/// not: moving the X11 focus off the client's toplevel reads as
-/// deactivation, and e.g. Chromium dismisses its context menu the moment
-/// its browser window loses focus. Everything else (rofi-style launchers,
-/// which carry no such type hint) needs the focus, or its X-side keyboard
-/// grab never sees a key (the grab only routes while XWayland holds our
-/// keyboard focus).
+/// Whether an override-redirect window should take the keyboard focus.
+/// Pointer-driven popups (menus, tooltips, notifications) must not: moving
+/// the X11 focus off the client's toplevel reads as deactivation, and e.g.
+/// Chromium dismisses its context menu the moment its browser window loses
+/// focus — before the click that landed on the menu item can act on it.
+/// Everything else (rofi-style launchers, which carry no such type hint)
+/// needs the focus, or its X-side keyboard grab never sees a key (the grab
+/// only routes while XWayland holds our keyboard focus).
 fn or_wants_focus(surface: &X11Surface) -> bool {
     use smithay::xwayland::xwm::WmWindowType as T;
     !matches!(
@@ -185,12 +191,13 @@ impl XWaylandShellHandler for Comp {
     /// window was arranged at map time when it had no surface to focus, so
     /// `refocus` re-resolves the keyboard target now that one exists.
     fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, window: X11Surface) {
-        if self
+        let or = self
             .or_windows
             .iter()
-            .any(|o| o.surface.window_id() == window.window_id())
-        {
-            if or_wants_focus(&window) {
+            .find(|o| o.surface.window_id() == window.window_id())
+            .map(|o| o.takes_focus);
+        if let Some(takes_focus) = or {
+            if takes_focus {
                 let keyboard = self.keyboard.clone();
                 let serial = smithay::utils::SERIAL_COUNTER.next_serial();
                 keyboard.set_focus(self, Some(window.into()), serial);
@@ -251,11 +258,13 @@ impl smithay::xwayland::XwmHandler for Comp {
                 ))
             })
             .unwrap_or_else(|| window.geometry());
+        let takes_focus = or_wants_focus(&window);
         self.or_windows.push(OrWindow {
             surface: window.clone(),
             rect,
+            takes_focus,
         });
-        if or_wants_focus(&window) && window.wl_surface().is_some() {
+        if takes_focus && window.wl_surface().is_some() {
             let keyboard = self.keyboard.clone();
             let serial = smithay::utils::SERIAL_COUNTER.next_serial();
             keyboard.set_focus(self, Some(window.into()), serial);

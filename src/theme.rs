@@ -308,6 +308,8 @@ pub enum Action {
     SpawnTerminal,
     /// Launch the app launcher (see `LAUNCHER_CMD`).
     SpawnLauncher,
+    /// Grab a screenshot of a hand-picked region (see `SCREENSHOT_CMD`).
+    Screenshot,
     /// Ask the focused window to close via `WM_DELETE_WINDOW`, falling back
     /// to disconnecting its client if it doesn't speak the protocol.
     CloseWindow,
@@ -335,6 +337,17 @@ pub const CTRL: u16 = 0x04;
 /// layer-shell surface with exclusive keyboard focus; an X11-only build
 /// still works through XWayland as an override-redirect float.
 pub const LAUNCHER_CMD: &str = "rofi -show combi";
+/// Command `Action::Screenshot` spawns: slurp draws the region picker (an
+/// exclusive-keyboard layer surface, so Escape cancels it), grim reads the
+/// picked pixels back over wlr-screencopy (`comp::screencopy`), and the PNG
+/// lands in `~/Downloads` under the second it was taken. Chained
+/// with `&&` so a cancelled pick — slurp exits nonzero with no geometry —
+/// writes no file, and the directory is created because a fresh account
+/// may not have one.
+pub const SCREENSHOT_CMD: &str = concat!(
+    "mkdir -p ~/Downloads && region=$(slurp) && ",
+    r#"grim -g "$region" ~/Downloads/screenshot-$(date +%Y%m%d-%H%M%S).png"#
+);
 /// Command `Action::VolumeUp` spawns to raise the default sink's volume.
 pub const VOLUME_UP_CMD: &str = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ 5%+";
 /// Command `Action::VolumeDown` spawns to lower the default sink's volume.
@@ -354,6 +367,7 @@ pub const BRIGHTNESS_STEP_PERCENT: i32 = 5;
 pub const BINDINGS: &[(u16, u32, Action)] = &[
     (MOD4, ks::Return, Action::SpawnTerminal),
     (MOD4, ks::space, Action::SpawnLauncher),
+    (MOD4, ks::s, Action::Screenshot),
     (MOD4, ks::h, Action::StackBelow),
     (MOD4, ks::q, Action::Close),
     (MOD4, ks::Tab, Action::FocusNext),

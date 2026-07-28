@@ -273,22 +273,28 @@ impl Comp {
                             consumed = true;
                         }
                     }
-                    // Click on an o-r window: re-grant it the keyboard
-                    // before forwarding the button — its X-side grab only
-                    // works while XWayland holds our focus, and a click
-                    // elsewhere may have moved the focus off it. A layer
-                    // surface that accepts keyboard focus (OnDemand
-                    // panels; an Exclusive one already holds it) gets the
-                    // keyboard by click too, like the dock — through the
-                    // `focused_layer` override, so a later `refocus` (a
-                    // scroll-glide arrange, say) can't steal it right back.
+                    // Click on a focus-taking o-r window (rofi): re-grant
+                    // it the keyboard before forwarding the button — its
+                    // X-side grab only works while XWayland holds our
+                    // focus, and a click elsewhere may have moved the
+                    // focus off it. A menu or tooltip (`takes_focus`
+                    // false) is left alone: it lives only while its
+                    // client's toplevel stays focused, so focusing it
+                    // would dismiss it out from under the very click
+                    // meant to pick an item. A layer surface that accepts
+                    // keyboard focus (OnDemand panels; an Exclusive one
+                    // already holds it) gets the keyboard by click too,
+                    // like the dock — through the `focused_layer`
+                    // override, so a later `refocus` (a scroll-glide
+                    // arrange, say) can't steal it right back.
                     None => {
-                        if let Some(o) = under.as_ref().and_then(|s| {
+                        if let Some(target) = under.as_ref().and_then(|s| {
                             self.or_windows
                                 .iter()
                                 .find(|o| o.surface.wl_surface().as_ref() == Some(s))
+                                .filter(|o| o.takes_focus)
+                                .map(|o| crate::comp::focus::FocusTarget::X11(o.surface.clone()))
                         }) {
-                            let target = crate::comp::focus::FocusTarget::X11(o.surface.clone());
                             let keyboard = self.keyboard.clone();
                             keyboard.set_focus(self, Some(target), serial);
                         } else if let Some(s) = under.filter(|s| {

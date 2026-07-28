@@ -84,6 +84,7 @@ impl Comp {
                 self.spawn(&term);
             }
             Action::SpawnLauncher => self.spawn(theme::LAUNCHER_CMD),
+            Action::Screenshot => self.spawn(theme::SCREENSHOT_CMD),
             Action::CloseWindow => self.close_focused_window(),
             Action::VolumeUp => self.spawn(theme::VOLUME_UP_CMD),
             Action::VolumeDown => self.spawn(theme::VOLUME_DOWN_CMD),

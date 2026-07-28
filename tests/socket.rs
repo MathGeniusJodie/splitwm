@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::os::fd::AsFd as _;
+use std::os::unix::fs::FileExt as _;
 use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -16,13 +17,17 @@ use std::time::{Duration, Instant};
 use wayland_client::globals::{registry_queue_init, GlobalListContents};
 use wayland_client::protocol::{
     wl_buffer, wl_compositor, wl_data_device, wl_data_device_manager, wl_data_offer,
-    wl_data_source, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool, wl_surface,
+    wl_data_source, wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
+    wl_surface,
 };
 use wayland_client::{Connection, Dispatch, EventQueue, Proxy as _, QueueHandle, WEnum};
 use wayland_protocols::xdg::shell::client::{
     xdg_popup, xdg_positioner, xdg_surface, xdg_toplevel, xdg_wm_base,
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{zwlr_layer_shell_v1, zwlr_layer_surface_v1};
+use wayland_protocols_wlr::screencopy::v1::client::{
+    zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
+};
 
 /// The headless backend's fixed output, and the taskbar strip under the
 /// layout area — a generous bound; the exact chrome insets stay the
@@ -182,6 +187,24 @@ struct App {
     offer_mimes: HashMap<wayland_client::backend::ObjectId, Vec<String>>,
     /// What our own wl_data_source answers Send events with.
     paste_payload: String,
+    /// How far the pending screencopy frame has got.
+    capture: Capture,
+    /// The shm parameters that frame advertised: format, width, height,
+    /// stride.
+    capture_buffer: Option<(wl_shm::Format, i32, i32, i32)>,
+}
+
+/// A screencopy frame's progress, as its events report it.
+#[derive(Default, PartialEq, Eq, Debug)]
+enum Capture {
+    /// Still enumerating the buffer types the compositor supports.
+    #[default]
+    Enumerating,
+    /// `buffer_done`: a matching buffer may now be copied into.
+    Ready,
+    /// `ready`: the pixels are in the buffer.
+    Copied,
+    Failed,
 }
 
 impl App {
@@ -437,7 +460,36 @@ impl Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for App {
     }
 }
 
+impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for App {
+    fn event(
+        app: &mut App,
+        _: &zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
+        event: zwlr_screencopy_frame_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<App>,
+    ) {
+        match event {
+            zwlr_screencopy_frame_v1::Event::Buffer {
+                format,
+                width,
+                height,
+                stride,
+            } => {
+                let format = format.into_result().expect("a known shm format");
+                app.capture_buffer = Some((format, width as i32, height as i32, stride as i32));
+            }
+            zwlr_screencopy_frame_v1::Event::BufferDone => app.capture = Capture::Ready,
+            zwlr_screencopy_frame_v1::Event::Ready { .. } => app.capture = Capture::Copied,
+            zwlr_screencopy_frame_v1::Event::Failed => app.capture = Capture::Failed,
+            _ => {}
+        }
+    }
+}
+
 wayland_client::delegate_noop!(App: ignore xdg_positioner::XdgPositioner);
+wayland_client::delegate_noop!(App: ignore wl_output::WlOutput);
+wayland_client::delegate_noop!(App: ignore zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1);
 wayland_client::delegate_noop!(App: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 wayland_client::delegate_noop!(App: ignore wl_compositor::WlCompositor);
 wayland_client::delegate_noop!(App: ignore wl_surface::WlSurface);
@@ -587,10 +639,9 @@ impl Session {
         win
     }
 
-    /// Screenshot the output and sample one pixel as R,G,B,A (`shot`
-    /// writes raw rows for a `.rgba` path and acks after the file is
-    /// complete).
-    fn pixel(&mut self, x: i32, y: i32) -> [u8; 4] {
+    /// Screenshot the output as raw R,G,B,A rows (`shot` writes them for a
+    /// `.rgba` path and acks after the file is complete).
+    fn frame(&mut self) -> Vec<u8> {
         // Tests share the process and run concurrently: the path must be
         // unique per session, not just per process.
         let path = std::env::temp_dir().join(format!(
@@ -602,9 +653,70 @@ impl Session {
         self.wm.cmd(&format!("shot {path}"));
         let frame = std::fs::read(&path).expect("read screenshot");
         std::fs::remove_file(&path).ok();
+        frame
+    }
+
+    /// Screenshot the output and sample one pixel as R,G,B,A.
+    fn pixel(&mut self, x: i32, y: i32) -> [u8; 4] {
+        let frame = self.frame();
         let at = ((y * OUTPUT_W + x) * 4) as usize;
         frame[at..at + 4].try_into().expect("pixel in bounds")
     }
+
+    /// Capture `region` over wlr-screencopy the way grim does: take the
+    /// frame's advertised shm parameters, copy into a buffer matching
+    /// them, and read the rows back once `ready` lands.
+    fn capture_region(&mut self, (x, y, w, h): (i32, i32, i32, i32)) -> Captured {
+        let manager: zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1 = self
+            .globals
+            .bind(&self.qh, 1..=3, ())
+            .expect("bind zwlr_screencopy_manager_v1");
+        let output: wl_output::WlOutput =
+            self.globals.bind(&self.qh, 1..=4, ()).expect("bind wl_output");
+        let frame = manager.capture_output_region(0, &output, x, y, w, h, &self.qh, ());
+        let (format, width, height, stride) = self.await_buffer_params();
+        assert_eq!((width, height), (w, h), "region capture size");
+
+        // Its own pool, so the rows can be read straight back out of the
+        // file the compositor wrote through.
+        let file = tempfile::tempfile().expect("capture shm file");
+        let len = stride * height;
+        file.set_len(len as u64).expect("size capture file");
+        let shm: wl_shm::WlShm = self.globals.bind(&self.qh, 1..=1, ()).expect("bind wl_shm");
+        let pool = shm.create_pool(file.as_fd(), len, &self.qh, ());
+        let buffer = pool.create_buffer(0, width, height, stride, format, &self.qh, ());
+        frame.copy(&buffer);
+        self.wait_until("screencopy ready", |app| app.capture == Capture::Copied);
+
+        let mut rows = vec![0u8; len as usize];
+        file.read_exact_at(&mut rows, 0).expect("read capture buffer");
+        frame.destroy();
+        Captured {
+            format,
+            width,
+            stride,
+            rows,
+        }
+    }
+
+    /// Pump until the pending screencopy frame has enumerated its buffer
+    /// types, and return the shm ones it advertised.
+    fn await_buffer_params(&mut self) -> (wl_shm::Format, i32, i32, i32) {
+        self.wait_until("screencopy buffer parameters", |app| {
+            app.capture == Capture::Ready
+        });
+        self.app.capture = Capture::Enumerating;
+        self.app.capture_buffer.take().expect("frame buffer event")
+    }
+}
+
+/// A screencopy capture's client buffer: the parameters the frame
+/// advertised, and the raw rows the compositor wrote into it.
+struct Captured {
+    format: wl_shm::Format,
+    width: i32,
+    stride: i32,
+    rows: Vec<u8>,
 }
 
 #[test]
@@ -1037,14 +1149,16 @@ fn override_redirect_keyboard_focus() {
 }
 
 #[test]
-fn x11_menu_hover_keeps_app_focus() {
+fn x11_menu_hover_and_click_keep_app_focus() {
     // An override-redirect X11 window typed as a menu — a browser's
     // context menu under XWayland. Menu-typed o-r windows never take the
     // keyboard (`or_wants_focus`), so it stays in the app that opened
-    // them — and must stay put while the pointer slides onto the menu:
-    // X11 apps roll their menus up the instant their toplevel loses
-    // focus, so yanking the keyboard to nothing turns every menu into a
-    // self-dismissing one the moment the mouse moves.
+    // them — and must stay put both while the pointer slides onto the
+    // menu and when it clicks an item: X11 apps roll their menus up the
+    // instant their toplevel loses focus, so yanking the keyboard away
+    // turns every menu into one that self-dismisses on hover, and one
+    // whose items can never be picked because the click that lands on
+    // them is also the click that closes the menu.
     use x11rb::connection::Connection as _;
     use x11rb::protocol::xproto::{
         AtomEnum, ConnectionExt as _, CreateWindowAux, PropMode, WindowClass,
@@ -1121,6 +1235,15 @@ fn x11_menu_hover_keeps_app_focus() {
             "hovering the X11 menu at ({x}, {y}) moved the keyboard off its app"
         );
     }
+
+    // Picking an item: the press lands on the menu, and the keyboard must
+    // stay with the app for the menu to still be alive to act on it.
+    s.wm.cmd("click 680 480");
+    s.queue.roundtrip(&mut s.app).expect("roundtrip");
+    assert!(
+        s.app.focus_is(a),
+        "clicking the X11 menu moved the keyboard off its app"
+    );
 }
 
 #[test]
@@ -1544,6 +1667,68 @@ fn clipboard_bridges_x11_and_wayland() {
         std::thread::sleep(Duration::from_millis(50));
     }
     std::fs::remove_file(&out).ok();
+}
+
+#[test]
+fn screencopy_hands_clients_the_composited_frame() {
+    /// The headless output's height, for the whole-output capture below.
+    const OUTPUT_H: i32 = 800;
+    /// A patch of the mapped window's top-left corner: gap background on
+    /// one side of the frame border, titlebar on the other, so neither a
+    /// flipped nor a shifted capture can pass the comparison.
+    const REGION: (i32, i32, i32, i32) = (0, 0, 96, 96);
+    let (x, y, w, h) = REGION;
+
+    let mut s = Session::boot();
+    let win = s.open_window();
+    s.wait_until("window mapped", |app| app.wins[win].activated);
+
+    // The reference screenshot is its own composite, so the frame has to
+    // hold still across the pair: anything repainting in between (a
+    // notification bubble timing out, say) would move pixels under the
+    // comparison rather than fail it honestly.
+    let (captured, shot) = (0..5)
+        .find_map(|_| {
+            let before = s.frame();
+            let captured = s.capture_region(REGION);
+            (before == s.frame()).then_some((captured, before))
+        })
+        .expect("a still frame to capture");
+
+    // Xrgb8888 is the format every screenshot tool understands.
+    assert_eq!(captured.format, wl_shm::Format::Xrgb8888);
+    assert!(captured.stride >= captured.width * 4, "stride fits a row");
+
+    let mut colors = std::collections::HashSet::new();
+    for row in 0..h {
+        for col in 0..w {
+            let px = &captured.rows[(row * captured.stride + col * 4) as usize..][..4];
+            let want = &shot[(((y + row) * OUTPUT_W + x + col) * 4) as usize..][..4];
+            // The capture's rows are Xrgb8888 (little-endian B,G,R,X); the
+            // harness screenshot's are R,G,B,A.
+            assert_eq!(
+                [px[2], px[1], px[0]],
+                [want[0], want[1], want[2]],
+                "captured pixel {col},{row}"
+            );
+            colors.insert([px[0], px[1], px[2]]);
+        }
+    }
+    assert!(
+        colors.len() > 1,
+        "a single-coloured region would prove nothing about orientation"
+    );
+
+    // The whole-output request offers a buffer the size of the output.
+    let manager: zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1 = s
+        .globals
+        .bind(&s.qh, 1..=3, ())
+        .expect("bind zwlr_screencopy_manager_v1");
+    let output: wl_output::WlOutput = s.globals.bind(&s.qh, 1..=4, ()).expect("bind wl_output");
+    let frame = manager.capture_output(0, &output, &s.qh, ());
+    let (_, width, height, _) = s.await_buffer_params();
+    assert_eq!((width, height), (OUTPUT_W, OUTPUT_H));
+    frame.destroy();
 }
 
 #[test]
