@@ -38,7 +38,7 @@ use crate::layout::{NodeId, Side};
 use crate::render::indexed::{IndexedProgram, IndexedTexture};
 use crate::render::{BtnIcon, LeafView, Renderer, SliceSpec, TitleInfo};
 use crate::theme;
-use crate::widgets::{BtnKind, FrameRect, Placement, N_BTNS};
+use crate::widgets::{compass_rect, BtnKind, FrameRect, Placement, N_BTNS};
 use crate::Index;
 use pixel_graphics::Framebuffer;
 use smithay::backend::renderer::element::Id;
@@ -453,10 +453,15 @@ fn update_leaf(
     for b in paint.buttons.iter().flatten() {
         chrome.draw_button(&mut fb, b.cx, b.cy, b.icon, b.accent);
     }
-    // Reuse the previous texture's GL storage when the size matches.
+    // Reuse the previous texture's GL storage when the size matches. A
+    // failed upload (lost GL context) hides the strip for a frame; the
+    // fingerprint mismatch retries it next frame.
     let mut tex = piece.titlebar.take().map(|(_, t)| t);
-    indexed.upload(renderer, &mut tex, &fb, false);
-    piece.titlebar = Some((key, tex.expect("titlebar strip uploaded")));
+    if indexed.upload(renderer, &mut tex, &fb, false) {
+        piece.titlebar = Some((key, tex.expect("upload reported success")));
+    } else {
+        piece.titlebar = None;
+    }
 }
 
 /// Render the taskbar strip into its texture, reusing it when the
@@ -503,8 +508,12 @@ fn render_taskbar(
             q.hover,
         );
     }
-    indexed.upload(renderer, &mut piece.tex, &fb, false);
-    piece.key = Some(paint.key());
+    // The fingerprint is recorded only on a successful upload, so a
+    // failed one (empty texture) is retried on the next frame instead of
+    // being remembered as fresh.
+    if indexed.upload(renderer, &mut piece.tex, &fb, false) {
+        piece.key = Some(paint.key());
+    }
 }
 
 impl Comp {
@@ -525,7 +534,7 @@ impl Comp {
     /// repaints nothing. The wallpaper and taskbar depend on the output size
     /// and settled widgets, not `leaf_rects`, so they never churn per tick.
     pub fn update_chrome_pieces(&mut self, leaf_rects: &[(NodeId, FrameRect)]) {
-        let size = self.output_size();
+        let size = self.output.size();
         let (ow, oh) = (size.w.max(1), size.h.max(1));
 
         // Gather (immutable) before any texture upload borrows the pieces.
@@ -550,29 +559,38 @@ impl Comp {
                 let mut tex = None;
                 self.view
                     .indexed
-                    .upload(self.backend.renderer(), &mut tex, fb, false);
-                tex.expect("frame art uploaded")
+                    .upload(self.backend.renderer(), &mut tex, fb, false)
+                    .then(|| tex.expect("upload reported success"))
             };
             let (border_fb, border_spec) = self.view.chrome.border_art();
             let (min_v_fb, min_v_spec) = self.view.chrome.minimized_art(true);
             let (min_h_fb, min_h_spec) = self.view.chrome.minimized_art(false);
-            self.view.pieces.art = Some(FrameArt {
-                border: (upload(&border_fb), border_spec),
-                min_v: (upload(&min_v_fb), min_v_spec),
-                min_h: (upload(&min_h_fb), min_h_spec),
-            });
+            // All three or none: a partial FrameArt would render some
+            // leaves frameless. A failure (lost GL context) leaves `art`
+            // unset; the next frame retries.
+            if let (Some(border), Some(min_v), Some(min_h)) =
+                (upload(&border_fb), upload(&min_v_fb), upload(&min_h_fb))
+            {
+                self.view.pieces.art = Some(FrameArt {
+                    border: (border, border_spec),
+                    min_v: (min_v, min_v_spec),
+                    min_h: (min_h, min_h_spec),
+                });
+            }
         }
 
-        // Wallpaper: only on load / resize.
+        // Wallpaper: only on load / resize. The size is recorded only on a
+        // successful upload so a failed one is rebuilt next frame.
         if self.view.pieces.wallpaper.tex.is_none() || self.view.pieces.wallpaper.size != (ow, oh) {
             let fb = self.view.chrome.wallpaper_base(ow as u32, oh as u32);
-            self.view.indexed.upload(
+            if self.view.indexed.upload(
                 self.backend.renderer(),
                 &mut self.view.pieces.wallpaper.tex,
                 &fb,
                 true,
-            );
-            self.view.pieces.wallpaper.size = (ow, oh);
+            ) {
+                self.view.pieces.wallpaper.size = (ow, oh);
+            }
         }
 
         // Leaves: refresh changed ones, drop vanished ones.
@@ -680,7 +698,7 @@ impl Comp {
             .widgets
             .quick_regions
             .iter()
-            .map(|t| t.icon.y - crate::render::QUICK_ICON_REACH)
+            .map(|t| compass_rect(t.icon).y)
             .min();
         let origin_y = shard_top.map_or(bar_top, |y| bar_top.min(y)).max(0);
         let tiles = self

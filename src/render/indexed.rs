@@ -120,31 +120,34 @@ impl IndexedProgram {
     /// Upload `fb`'s indices into `target`, reusing the shared staging
     /// buffer. For the chrome buffers re-uploaded as the layout changes
     /// (underlay, float frames, notes), where a per-frame allocation would
-    /// be churn.
+    /// be churn. Returns whether `target` now holds an up-to-date texture —
+    /// `false` when the GL context refused it (a lost context across a VT
+    /// switch), leaving `target` empty for the next frame to retry.
     pub fn upload(
         &mut self,
         renderer: &mut GlesRenderer,
         target: &mut Option<IndexedTexture>,
         fb: &Framebuffer,
         opaque: bool,
-    ) {
-        upload_into(renderer, target, fb, opaque, &mut self.staging);
+    ) -> bool {
+        let ok = upload_into(renderer, target, fb, opaque, &mut self.staging);
         if self.staging.capacity() > Self::STAGING_KEEP {
             self.staging.shrink_to(Self::STAGING_KEEP);
         }
+        ok
     }
 
     /// Upload `fb` with a throwaway staging buffer, for one-off uploads (the
     /// cursor cache, one per shape) that can't borrow the shared staging
-    /// mutably while a scene holds the program shared.
+    /// mutably while a scene holds the program shared. See `upload`.
     pub fn upload_owned(
         &self,
         renderer: &mut GlesRenderer,
         target: &mut Option<IndexedTexture>,
         fb: &Framebuffer,
         opaque: bool,
-    ) {
-        upload_into(renderer, target, fb, opaque, &mut Vec::new());
+    ) -> bool {
+        upload_into(renderer, target, fb, opaque, &mut Vec::new())
     }
 
     /// A render element drawing `tex` at `loc` (output-relative, scale 1)
@@ -211,14 +214,16 @@ impl IndexedTexture {
 /// the GL texture on first use and refreshing it in place while its size is
 /// unchanged (bumping the commit so the damage tracker repaints the whole
 /// element). `opaque` states whether every texel is a real palette colour;
-/// it never changes for a given source.
+/// it never changes for a given source. Returns whether `target` holds a
+/// current texture afterwards — a failed create drops whatever was there
+/// (its size no longer matches `fb`) rather than leave a stale one to draw.
 fn upload_into(
     renderer: &mut GlesRenderer,
     target: &mut Option<IndexedTexture>,
     fb: &Framebuffer,
     opaque: bool,
     staging: &mut Vec<u8>,
-) {
+) -> bool {
     let size = Size::<i32, Buffer>::from((fb.width as i32, fb.height as i32));
     staging.clear();
     staging.reserve(fb.width * fb.height);
@@ -229,15 +234,25 @@ fn upload_into(
     match target {
         Some(t) if t.size == size => {
             let tex_id = t.texture.tex_id();
+            // An in-place refresh has no failure mode short of a lost
+            // context, which the next full create reports.
             let _ = renderer.with_context(|gl| unsafe {
                 upload_sub(gl, tex_id, size, staging);
             });
             t.commit.increment();
+            true
         }
         _ => {
-            let tex_id = renderer
-                .with_context(|gl| unsafe { create_texture(gl, size, ffi::R8, ffi::RED, staging) })
-                .expect("indexed texture upload");
+            let created = renderer
+                .with_context(|gl| unsafe { create_texture(gl, size, ffi::R8, ffi::RED, staging) });
+            let tex_id = match created {
+                Ok(tex_id) => tex_id,
+                Err(err) => {
+                    tracing::warn!("indexed texture upload failed: {err}");
+                    *target = None;
+                    return false;
+                }
+            };
             // The `internal_format` is only consulted to pick a shader
             // variant (`variant_for_format`): `RGBA8` + opaque selects the
             // plain `sampler2D` variant. The real texture is `R8`, which that
@@ -251,6 +266,7 @@ fn upload_into(
                 size,
                 opaque,
             });
+            true
         }
     }
 }

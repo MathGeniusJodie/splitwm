@@ -41,16 +41,22 @@ impl CursorCache {
     }
 
     /// The image for a named shape, uploading it on first request. Every
-    /// shape maps onto a baked sprite, so this always yields an image.
+    /// shape maps onto a baked sprite, so the only `None` is a failed GL
+    /// upload (a lost context) — uncached, so the next frame retries.
     pub fn get(
         &mut self,
         renderer: &mut GlesRenderer,
         indexed: &IndexedProgram,
         icon: CursorIcon,
-    ) -> &CursorBuf {
-        self.cache
-            .entry(icon)
-            .or_insert_with(|| sprite_buf(renderer, indexed, icon))
+    ) -> Option<&CursorBuf> {
+        // Not the entry API: a failed upload (None) must stay uncached so
+        // the next frame retries, which `entry`'s or_insert can't express.
+        #[allow(clippy::map_entry)]
+        if !self.cache.contains_key(&icon) {
+            let buf = sprite_buf(renderer, indexed, icon)?;
+            self.cache.insert(icon, buf);
+        }
+        self.cache.get(&icon)
     }
 }
 
@@ -63,7 +69,7 @@ fn sprite_buf(
     renderer: &mut GlesRenderer,
     indexed: &IndexedProgram,
     icon: CursorIcon,
-) -> CursorBuf {
+) -> Option<CursorBuf> {
     let (sprite, hot) = match icon {
         // Selectable text: the I-beam, hot-spotted at its center.
         CursorIcon::Text | CursorIcon::VerticalText => (crate::assets::cursor_text(), None),
@@ -90,8 +96,9 @@ fn sprite_buf(
         pixel_graphics::Framebuffer::new(sprite.width, sprite.height, pixel_graphics::TRANSPARENT);
     fb.draw_sprite(&sprite, 0, 0, &palette);
     let mut tex = None;
-    indexed.upload_owned(renderer, &mut tex, &fb, false);
-    (tex.expect("cursor sprite uploaded"), hot.into())
+    indexed
+        .upload_owned(renderer, &mut tex, &fb, false)
+        .then(|| (tex.expect("upload reported success"), hot.into()))
 }
 
 /// The composited cursor's render elements: the named shape's sprite, a
@@ -107,15 +114,17 @@ pub fn cursor_elements(
 ) -> Vec<OutputElement> {
     match status {
         CursorImageStatus::Hidden => Vec::new(),
-        CursorImageStatus::Named(icon) => {
-            let (tex, hotspot) = cache.get(renderer, indexed, *icon);
-            let loc = hotspot_origin(loc, *hotspot);
-            vec![OutputElement::Chrome(indexed.element(
-                tex,
-                loc.to_physical(1),
-                Kind::Cursor,
-            ))]
-        }
+        CursorImageStatus::Named(icon) => match cache.get(renderer, indexed, *icon) {
+            Some((tex, hotspot)) => {
+                let loc = hotspot_origin(loc, *hotspot);
+                vec![OutputElement::Chrome(indexed.element(
+                    tex,
+                    loc.to_physical(1),
+                    Kind::Cursor,
+                ))]
+            }
+            None => Vec::new(),
+        },
         CursorImageStatus::Surface(surface) => {
             // The hotspot rides on the surface as its cursor-role data,
             // updated by each set_cursor request.
@@ -123,7 +132,8 @@ pub fn cursor_elements(
                 states
                     .data_map
                     .get::<CursorImageSurfaceData>()
-                    .map_or_else(Point::default, |data| data.lock().unwrap().hotspot)
+                    .and_then(|data| data.lock().ok().map(|d| d.hotspot))
+                    .unwrap_or_default()
             });
             let loc = hotspot_origin(loc, hotspot);
             render_elements_from_surface_tree(

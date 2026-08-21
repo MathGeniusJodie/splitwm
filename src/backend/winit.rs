@@ -10,13 +10,52 @@ use smithay::backend::winit::{self, WinitEvent, WinitGraphicsBackend};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::Transform;
+use smithay::utils::{Physical, Rectangle, Transform};
 
 use crate::comp::Comp;
+use crate::comp::{self, scene};
+
+use super::Frame;
 
 pub struct Winit {
     pub backend: WinitGraphicsBackend<GlesRenderer>,
     pub damage_tracker: OutputDamageTracker,
+}
+
+impl Winit {
+    /// Composite the scene plus the composited cursor sprite into the
+    /// nested window (the host cursor stays hidden over our surface) and
+    /// submit. Redraws are queue-driven; there is no vblank clock.
+    pub fn present(&mut self, frame: Frame<'_>) {
+        let size = self.backend.window_size();
+        let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
+        let rendered = {
+            let Ok((renderer, mut fb)) = self
+                .backend
+                .bind()
+                .inspect_err(|err| tracing::error!("bind: {err}"))
+            else {
+                return;
+            };
+            let mut elements = comp::cursor::cursor_elements(
+                renderer,
+                frame.scene.indexed,
+                frame.pointer_loc,
+                frame.cursor,
+                frame.cursors,
+            );
+            elements.extend(scene::output_elements(renderer, frame.scene));
+            self.damage_tracker
+                .render_output(renderer, &mut fb, 0, &elements, frame.clear)
+                .inspect_err(|err| tracing::error!("render: {err:?}"))
+                .is_ok()
+        };
+        if rendered {
+            if let Err(err) = self.backend.submit(Some(&[full])) {
+                tracing::error!("submit: {err}");
+            }
+        }
+    }
 }
 
 pub fn run() {

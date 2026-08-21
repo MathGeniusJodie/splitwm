@@ -63,7 +63,7 @@ impl WlrLayerShellHandler for Comp {
         // One output by design (master had one X screen): whatever output
         // the client named, the surface lands on ours. The initial
         // configure goes out on the surface's first commit.
-        let mut map = layer_map_for_output(&self.output);
+        let mut map = layer_map_for_output(self.output.handle());
         if let Err(err) = map.map_layer(&LayerSurface::new(surface, namespace)) {
             tracing::warn!("map layer surface: {err}");
         }
@@ -88,7 +88,7 @@ impl WlrLayerShellHandler for Comp {
         let identity = theme::dock_identity();
         let mut was_dock = false;
         {
-            let mut map = layer_map_for_output(&self.output);
+            let mut map = layer_map_for_output(self.output.handle());
             if let Some(layer) = map
                 .layer_for_surface(surface.wl_surface(), WindowSurfaceType::TOPLEVEL)
                 .cloned()
@@ -120,7 +120,7 @@ impl Comp {
     pub fn sync_layer_zone(&mut self) -> bool {
         let identity = theme::dock_identity();
         let zone = {
-            let mut map = layer_map_for_output(&self.output);
+            let mut map = layer_map_for_output(self.output.handle());
             map.arrange();
             let mut zone = map.non_exclusive_zone();
             // The dock panel's exclusive zone becomes scroll room past the
@@ -135,10 +135,10 @@ impl Comp {
             }
             zone
         };
-        if zone == self.layer_zone {
+        if zone == self.output.zone() {
             return false;
         }
-        self.layer_zone = zone;
+        self.output.set_zone(zone);
         true
     }
 
@@ -147,20 +147,20 @@ impl Comp {
     /// an exclusive-keyboard surface the keyboard the moment it maps.
     /// Returns `false` when `surface` is no layer surface.
     pub fn layer_commit(&mut self, surface: &WlSurface) -> bool {
-        let Some(layer) = layer_map_for_output(&self.output)
+        let Some(layer) = layer_map_for_output(self.output.handle())
             .layer_for_surface(surface, WindowSurfaceType::TOPLEVEL)
             .cloned()
         else {
             return false;
         };
+        // A poisoned or missing role record reads as "configure not yet
+        // sent", which only costs a duplicate configure — never a session.
         let initial_configure_sent = smithay::wayland::compositor::with_states(surface, |states| {
             states
                 .data_map
                 .get::<LayerSurfaceData>()
-                .expect("layer surface data on layer surface")
-                .lock()
-                .expect("no poisoned layer data")
-                .initial_configure_sent
+                .and_then(|d| d.lock().ok())
+                .is_some_and(|d| d.initial_configure_sent)
         });
         // The dock layer's zone add-back cancels out of the cached zone, so
         // its mapping/resizing never flips `sync_layer_zone` — compare the
@@ -191,7 +191,7 @@ impl Comp {
     /// (the protocol's lock-screen/launcher semantics). Bottom/Background
     /// exclusivity keeps normal focus semantics per spec.
     pub fn exclusive_layer_surface(&self) -> Option<WlSurface> {
-        let map = layer_map_for_output(&self.output);
+        let map = layer_map_for_output(self.output.handle());
         let pick = |l: Layer| {
             map.layers_on(l)
                 .rev()
@@ -209,7 +209,7 @@ impl Comp {
     /// window supersedes it — `dock_extra` checks that first).
     pub fn layer_dock_extra(&self) -> i32 {
         let identity = theme::dock_identity();
-        let map = layer_map_for_output(&self.output);
+        let map = layer_map_for_output(self.output.handle());
         dock_layer(&map, &identity).map_or(0, dock_zone)
     }
 
@@ -221,7 +221,7 @@ impl Comp {
     pub fn layer_dock_place(&self) -> Option<(WlSurface, Point<i32, Logical>)> {
         let identity = theme::dock_identity();
         let (surface, geo, zone) = {
-            let map = layer_map_for_output(&self.output);
+            let map = layer_map_for_output(self.output.handle());
             let layer = dock_layer(&map, &identity)?;
             let geo = map.layer_geometry(layer)?;
             (layer.wl_surface().clone(), geo, dock_zone(layer))
@@ -243,7 +243,7 @@ impl Comp {
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
         let dock = self.layer_dock_place();
-        let map = layer_map_for_output(&self.output);
+        let map = layer_map_for_output(self.output.handle());
         layers.iter().find_map(|&l| {
             map.layers_on(l).rev().find_map(|layer| {
                 let loc = match &dock {

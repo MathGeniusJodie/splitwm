@@ -43,7 +43,9 @@ const SLOT_ICON_INSET: i32 = 3;
 pub const QUICK_ICON_REACH: i32 = SHARD_GROWTH / 2 + SHARD_SPREAD + ICON_BORDER - SLOT_ICON_INSET;
 
 /// One slot's icon as it sits on the bar: the content that fills it, the
-/// box it is scaled into, and the slot centre the letter fallback sits at.
+/// box it is scaled into, the slot centre the letter fallback sits at, and
+/// how far it has broken into its four compass shards. One value, so the
+/// box and the shards can never be built from different phases.
 struct SlotIcon<'a> {
     icon: Option<&'a Icon>,
     label: char,
@@ -52,15 +54,23 @@ struct SlotIcon<'a> {
     y: i32,
     size: i32,
     /// How far each shard has slid out along its own axis — the other half
-    /// of what the split phase resolves to, kept with the box it grew so
-    /// the two can't be built from different phases.
+    /// of what the split phase resolves to.
     spread: i32,
+    /// What is traced around this icon's silhouette; everything not
+    /// traced is shadowed.
+    trace: Trace,
 }
 
 impl<'a> SlotIcon<'a> {
     /// The icon of slot `r`, its box grown and its shards slid out by
     /// `split` (0 = whole, at the resting size) about the slot's centre.
-    fn new(r: crate::layout::Rect, icon: Option<&'a Icon>, label: char, split: f32) -> Self {
+    fn new(
+        r: crate::layout::Rect,
+        icon: Option<&'a Icon>,
+        label: char,
+        split: f32,
+        trace: Trace,
+    ) -> Self {
         let (grown, spread) = shard_steps(split);
         let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
         let size = r.h.min(r.w) - 2 * SLOT_ICON_INSET + grown;
@@ -71,6 +81,7 @@ impl<'a> SlotIcon<'a> {
             y: cy - size / 2,
             size,
             spread,
+            trace,
         }
     }
 
@@ -79,63 +90,16 @@ impl<'a> SlotIcon<'a> {
     fn centre(&self) -> (i32, i32) {
         (self.x + self.size / 2, self.y + self.size / 2)
     }
-}
-
-/// The only two integers a split phase resolves to on screen: how much
-/// wider the icon box is, and how far its shards have slid. Two phases
-/// that agree here draw the same pixels, so this is the granularity a
-/// repaint fingerprint needs — anything finer redraws for nothing.
-pub fn shard_steps(split: f32) -> (i32, i32) {
-    let split = split.max(0.0);
-    (
-        (SHARD_GROWTH as f32 * split) as i32,
-        (SHARD_SPREAD as f32 * split) as i32,
-    )
-}
-
-/// A quick-launch icon broken into its four compass shards: which wedge
-/// each of its pixels belongs to, where that wedge has slid to, and the
-/// colour tracing it. A whole icon is the same thing at zero spread.
-struct Shards {
-    /// Doubled centre of the icon box — doubling keeps the centre of an
-    /// even-sided box exact.
-    cx2: i32,
-    cy2: i32,
-    /// How far each shard has slid out along its own axis.
-    spread: i32,
-    /// What is traced around this icon's silhouette; everything not
-    /// traced is shadowed.
-    trace: Trace,
-}
-
-/// What traces a slot icon's silhouette.
-#[derive(Clone, Copy)]
-enum Trace {
-    /// Nothing: the icon is shadowed whole, the resting look.
-    Nothing,
-    /// The whole silhouette, in the accent of the split the window is
-    /// shown in — how a taskbar tile marks itself.
-    Whole(Index),
-    /// Only the shard under the pointer, in cream — a quick-launch icon
-    /// the compass is aimed at. Its other three shards stay shadowed.
-    Aimed(Side),
-}
-
-impl Shards {
-    fn new(slot: &SlotIcon, trace: Trace) -> Self {
-        Self {
-            cx2: 2 * slot.x + slot.size,
-            cy2: 2 * slot.y + slot.size,
-            spread: slot.spread,
-            trace,
-        }
-    }
 
     /// The wedge a pixel of the icon belongs to — `compass_side`, the same
     /// answer the compass hit-test gives, so a shard covers exactly the
-    /// wedge that launches its direction.
+    /// wedge that launches its direction. Doubled coordinates keep the
+    /// centre of an even-sided box exact.
     fn wedge(&self, px: i32, py: i32) -> Side {
-        crate::widgets::compass_side(2 * px + 1 - self.cx2, 2 * py + 1 - self.cy2)
+        crate::widgets::compass_side(
+            2 * px + 1 - (2 * self.x + self.size),
+            2 * py + 1 - (2 * self.y + self.size),
+        )
     }
 
     /// Where a pixel of `wedge` lands once its shard has slid out. The
@@ -159,6 +123,31 @@ impl Shards {
             Trace::Aimed(side) => (wedge == side).then_some(palette_color::CREAM),
         }
     }
+}
+
+/// The only two integers a split phase resolves to on screen: how much
+/// wider the icon box is, and how far its shards have slid. Two phases
+/// that agree here draw the same pixels, so this is the granularity a
+/// repaint fingerprint needs — anything finer redraws for nothing.
+pub fn shard_steps(split: f32) -> (i32, i32) {
+    let split = split.max(0.0);
+    (
+        (SHARD_GROWTH as f32 * split) as i32,
+        (SHARD_SPREAD as f32 * split) as i32,
+    )
+}
+
+/// What traces a slot icon's silhouette.
+#[derive(Clone, Copy)]
+enum Trace {
+    /// Nothing: the icon is shadowed whole, the resting look.
+    Nothing,
+    /// The whole silhouette, in the accent of the split the window is
+    /// shown in — how a taskbar tile marks itself.
+    Whole(Index),
+    /// Only the shard under the pointer, in cream — a quick-launch icon
+    /// the compass is aimed at. Its other three shards stay shadowed.
+    Aimed(Side),
 }
 
 /// The stamp that traces one icon pixel: every offset within
@@ -223,10 +212,9 @@ impl Renderer {
         split: f32,
         trace: Trace,
     ) {
-        let slot = SlotIcon::new(r, icon, label, split);
-        let shards = Shards::new(&slot, trace);
-        self.draw_slot_backing(fb, &slot, &shards);
-        self.draw_slot_icon(fb, &slot, &shards);
+        let slot = SlotIcon::new(r, icon, label, split, trace);
+        self.draw_slot_backing(fb, &slot);
+        self.draw_slot_icon(fb, &slot);
     }
 
     /// Walk the pixels of whatever fills a slot: its app icon, or the
@@ -249,16 +237,16 @@ impl Renderer {
     /// breaks along exactly the seams they open and travels out with them
     /// instead of lying under them uncut. Shadows go down first: where a
     /// trace meets a neighbouring shard's shadow, the trace wins.
-    fn draw_slot_backing(&self, fb: &mut Framebuffer, slot: &SlotIcon, shards: &Shards) {
+    fn draw_slot_backing(&self, fb: &mut Framebuffer, slot: &SlotIcon) {
         // A wholly traced icon casts no shadow, and an untraced one has
         // nothing to trace: only an aimed icon needs both walks.
-        if !matches!(shards.trace, Trace::Whole(_)) {
+        if !matches!(slot.trace, Trace::Whole(_)) {
             self.for_each_slot_pixel(slot, |px, py, _| {
-                let wedge = shards.wedge(px, py);
-                if shards.traced(wedge).is_some() {
+                let wedge = slot.wedge(px, py);
+                if slot.traced(wedge).is_some() {
                     return;
                 }
-                let (sx, sy) = shards.place(wedge, px, py);
+                let (sx, sy) = slot.place(wedge, px, py);
                 fb.set_pixel(
                     (sx + SHADOW_OFFSET) as isize,
                     (sy + SHADOW_OFFSET) as isize,
@@ -266,18 +254,18 @@ impl Renderer {
                 );
             });
         }
-        if matches!(shards.trace, Trace::Nothing) {
+        if matches!(slot.trace, Trace::Nothing) {
             return;
         }
         // Trace by stamping each traced pixel's own neighbourhood; the icon
         // pass covers the middle back up, leaving a border of `ICON_BORDER`
         // around the silhouette.
         self.for_each_slot_pixel(slot, |px, py, _| {
-            let wedge = shards.wedge(px, py);
-            let Some(color) = shards.traced(wedge) else {
+            let wedge = slot.wedge(px, py);
+            let Some(color) = slot.traced(wedge) else {
                 return;
             };
-            let (sx, sy) = shards.place(wedge, px, py);
+            let (sx, sy) = slot.place(wedge, px, py);
             for (ox, oy) in border_stamp() {
                 fb.set_pixel((sx + ox) as isize, (sy + oy) as isize, color);
             }
@@ -285,9 +273,9 @@ impl Renderer {
     }
 
     /// A slot's own content, each pixel moved out with its shard.
-    fn draw_slot_icon(&self, fb: &mut Framebuffer, slot: &SlotIcon, shards: &Shards) {
+    fn draw_slot_icon(&self, fb: &mut Framebuffer, slot: &SlotIcon) {
         self.for_each_slot_pixel(slot, |px, py, i| {
-            let (sx, sy) = shards.place(shards.wedge(px, py), px, py);
+            let (sx, sy) = slot.place(slot.wedge(px, py), px, py);
             fb.set_pixel(sx as isize, sy as isize, i);
         });
     }

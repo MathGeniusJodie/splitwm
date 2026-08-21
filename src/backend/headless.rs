@@ -12,7 +12,7 @@ use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::{GlesRenderbuffer, GlesRenderer};
-use smithay::backend::renderer::{Bind as _, Color32F, ExportMem as _, Offscreen as _};
+use smithay::backend::renderer::{Bind as _, ExportMem as _, Offscreen as _};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::wayland_server::Display;
@@ -38,8 +38,10 @@ pub struct Headless {
 
 impl Headless {
     /// Composite one frame, then serve any pending screenshot from it.
-    pub fn render(&mut self, scene: &scene::Scene<'_>, clear: Color32F) {
-        let elements = scene::output_elements(&mut self.renderer, scene);
+    /// Headless composites no cursor, so harness screenshots stay
+    /// pointer-free.
+    pub fn render(&mut self, frame: super::Frame<'_>) {
+        let elements = scene::output_elements(&mut self.renderer, frame.scene);
         let mut fb = match self.renderer.bind(&mut self.buffer) {
             Ok(fb) => fb,
             Err(err) => {
@@ -47,10 +49,13 @@ impl Headless {
                 return;
             }
         };
-        if let Err(err) =
-            self.damage_tracker
-                .render_output(&mut self.renderer, &mut fb, 0, &elements, clear)
-        {
+        if let Err(err) = self.damage_tracker.render_output(
+            &mut self.renderer,
+            &mut fb,
+            0,
+            &elements,
+            frame.clear,
+        ) {
             tracing::error!("render: {err:?}");
             return;
         }
@@ -104,12 +109,18 @@ fn shot(
                 continue;
             }
         };
-        child
-            .stdin
-            .take()
-            .expect("piped stdin")
-            .write_all(bytes)
-            .map_err(|err| format!("{prog} stdin: {err}"))?;
+        // Close our end of the child's stdin *before* waiting: the encoder
+        // finishes only at EOF, so a still-open pipe would deadlock the
+        // read-back below.
+        {
+            let Some(mut stdin) = child.stdin.take() else {
+                last_err = format!("{prog}: no stdin pipe");
+                continue;
+            };
+            stdin
+                .write_all(bytes)
+                .map_err(|err| format!("{prog} stdin: {err}"))?;
+        }
         let out = child
             .wait_with_output()
             .map_err(|err| format!("{prog}: {err}"))?;

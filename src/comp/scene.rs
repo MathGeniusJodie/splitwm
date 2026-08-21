@@ -352,12 +352,10 @@ impl Comp {
     /// iterator for the input paths, which must see the layout the user is
     /// aiming at and which run per pointer event, so they must not collect
     /// or clone window handles.
-    pub fn settled_tiled(
-        &self,
-    ) -> impl Iterator<Item = (&smithay::desktop::Window, FrameRect)> {
+    pub fn settled_tiled(&self) -> impl Iterator<Item = (&smithay::desktop::Window, FrameRect)> {
         let fullscreen = self.fullscreen();
         let fs = fullscreen.and_then(|c| self.managed.get(c)).map(|window| {
-            let size = self.output_size();
+            let size = self.output.size();
             (
                 window,
                 FrameRect {
@@ -398,7 +396,7 @@ impl Comp {
         let mut out = Vec::new();
         let fullscreen = self.fullscreen();
         if let Some(window) = fullscreen.and_then(|fs| self.managed.get(fs)) {
-            let size = self.output_size();
+            let size = self.output.size();
             out.push(TiledPlace {
                 window: window.clone(),
                 rect: FrameRect {

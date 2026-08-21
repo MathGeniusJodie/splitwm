@@ -339,7 +339,7 @@ impl Comp {
                 }
             };
         }
-        if my >= self.output_size().h - theme::TASKBAR_H {
+        if my >= self.output.size().h - theme::TASKBAR_H {
             // The strip ends where the quick-launch separator starts; a
             // drop over the quick icons means nothing.
             let strip_end = self.view.widgets.taskbar_sep.map_or(i32::MAX, |s| s.x);
@@ -661,6 +661,7 @@ impl Comp {
                     Some(crate::shell::Kind::Tiled) => win,
                     Some(_) => return None,
                     None if self
+                        .xwayland
                         .or_windows
                         .iter()
                         .any(|o| o.surface.wl_surface().as_ref() == Some(&s)) =>

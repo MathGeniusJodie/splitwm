@@ -90,7 +90,7 @@ impl Comp {
                     display_number,
                 } => {
                     match X11Wm::start_wm(comp.handle.clone(), x11_socket, client.clone()) {
-                        Ok(wm) => comp.xwm = Some(wm),
+                        Ok(wm) => comp.xwayland.wm = Some(wm),
                         Err(err) => {
                             tracing::error!("X11Wm start failed: {err}");
                             return;
@@ -114,7 +114,7 @@ impl Comp {
                     match smithay::reexports::x11rb::rust_connection::RustConnection::connect(Some(
                         &format!(":{display_number}"),
                     )) {
-                        Ok((conn, _)) => comp.x11_query = Some(conn),
+                        Ok((conn, _)) => comp.xwayland.query = Some(conn),
                         Err(err) => tracing::warn!("x11 query connection failed: {err}"),
                     }
                     tracing::info!("XWayland ready on DISPLAY=:{display_number}");
@@ -153,11 +153,12 @@ impl Comp {
     /// store holds it, exactly like a Wayland toplevel's destruction.
     fn forget_x11(&mut self, surface: &X11Surface) {
         if let Some(idx) = self
+            .xwayland
             .or_windows
             .iter()
             .position(|o| o.surface.window_id() == surface.window_id())
         {
-            self.or_windows.remove(idx);
+            self.xwayland.or_windows.remove(idx);
             self.refocus();
             return;
         }
@@ -181,7 +182,7 @@ impl Comp {
 
 impl XWaylandShellHandler for Comp {
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState {
-        &mut self.xwayland_shell_state
+        &mut self.xwayland.shell_state
     }
 
     /// The wl_surface for an X11 window arrives only with a later commit,
@@ -192,6 +193,7 @@ impl XWaylandShellHandler for Comp {
     /// `refocus` re-resolves the keyboard target now that one exists.
     fn surface_associated(&mut self, _xwm: XwmId, _wl_surface: WlSurface, window: X11Surface) {
         let or = self
+            .xwayland
             .or_windows
             .iter()
             .find(|o| o.surface.window_id() == window.window_id())
@@ -223,7 +225,10 @@ delegate_xwayland_shell!(Comp);
 
 impl smithay::xwayland::XwmHandler for Comp {
     fn xwm_state(&mut self, _xwm: XwmId) -> &mut X11Wm {
-        self.xwm.as_mut().expect("xwm events imply a live X11Wm")
+        self.xwayland
+            .wm
+            .as_mut()
+            .expect("xwm events imply a live X11Wm")
     }
 
     fn new_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
@@ -247,7 +252,8 @@ impl smithay::xwayland::XwmHandler for Comp {
         // The one place the cached geometry may be stale (see OrWindow):
         // ask the server where the window really is.
         let rect = self
-            .x11_query
+            .xwayland
+            .query
             .as_ref()
             .and_then(|conn| {
                 use smithay::reexports::x11rb::protocol::xproto::ConnectionExt as _;
@@ -259,7 +265,7 @@ impl smithay::xwayland::XwmHandler for Comp {
             })
             .unwrap_or_else(|| window.geometry());
         let takes_focus = or_wants_focus(&window);
-        self.or_windows.push(OrWindow {
+        self.xwayland.or_windows.push(OrWindow {
             surface: window.clone(),
             rect,
             takes_focus,
@@ -360,6 +366,7 @@ impl smithay::xwayland::XwmHandler for Comp {
         _above: Option<smithay::reexports::x11rb::protocol::xproto::Window>,
     ) {
         if let Some(o) = self
+            .xwayland
             .or_windows
             .iter_mut()
             .find(|o| o.surface.window_id() == window.window_id())

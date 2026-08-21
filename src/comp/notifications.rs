@@ -32,36 +32,42 @@ impl Comp {
                 );
                 let (w, h) = (fb.width as i32, fb.height as i32);
                 // The bubble has TRANSPARENT-indexed corners, so it is not
-                // opaque.
+                // opaque. A failed upload (lost GL context) skips the popup
+                // this frame; the daemon's expiry still closes it out.
                 let mut tex = None;
-                self.view
+                if !self
+                    .view
                     .indexed
-                    .upload(self.backend.renderer(), &mut tex, &fb, false);
+                    .upload(self.backend.renderer(), &mut tex, &fb, false)
+                {
+                    tracing::warn!("notification bubble upload failed; dropped");
+                    return;
+                }
                 let popup = NotePopup {
                     id: note.id,
-                    tex: tex.expect("note bubble uploaded"),
+                    tex: tex.expect("upload reported success"),
                     w,
                     h,
                 };
                 // A replaces_id re-show keeps its stack slot; a new note
                 // joins as newest (top of the pile).
-                match self.note_popups.iter_mut().find(|p| p.id == note.id) {
+                match self.notes.popups.iter_mut().find(|p| p.id == note.id) {
                     Some(slot) => *slot = popup,
-                    None => self.note_popups.push(popup),
+                    None => self.notes.popups.push(popup),
                 }
             }
-            NoteMsg::Close(id) => self.note_popups.retain(|p| p.id != id),
+            NoteMsg::Close(id) => self.notes.popups.retain(|p| p.id != id),
         }
     }
 
     /// Screen rects of the popups, stacked bottom-right above the taskbar,
     /// oldest nearest the corner, growing upward.
     pub fn note_rects(&self) -> Vec<(u32, FrameRect)> {
-        let size = self.output_size();
+        let size = self.output.size();
         let gap = theme::GAP;
         let mut bottom = size.h - theme::TASKBAR_H;
-        let mut rects = Vec::with_capacity(self.note_popups.len());
-        for p in &self.note_popups {
+        let mut rects = Vec::with_capacity(self.notes.popups.len());
+        for p in &self.notes.popups {
             bottom -= gap + p.h;
             rects.push((
                 p.id,
@@ -87,8 +93,8 @@ impl Comp {
         let Some((id, _)) = hit else {
             return false;
         };
-        self.note_popups.retain(|p| p.id != id);
-        let _ = self.note_dismiss_tx.send((id, CloseReason::Dismissed));
+        self.notes.popups.retain(|p| p.id != id);
+        let _ = self.notes.dismiss_tx.send((id, CloseReason::Dismissed));
         true
     }
 }

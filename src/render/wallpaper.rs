@@ -335,7 +335,13 @@ fn dbs_refine(
                         scope.spawn(move || sweep.band(off, idx, ext_cpe, ext_dirty))
                     })
                     .collect();
-                workers.into_iter().any(|w| w.join().unwrap())
+                // A panicked worker (only possible via an allocation
+                // failure) counts as "no change" rather than taking the
+                // session down mid-redraw; the sweep just converges slower.
+                workers
+                    .into_iter()
+                    .filter_map(|w| w.join().ok())
+                    .any(|changed| changed)
             });
         }
         if !changed {

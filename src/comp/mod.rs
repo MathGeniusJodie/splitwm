@@ -22,7 +22,7 @@ pub mod screencopy;
 pub mod xwayland;
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use smithay::backend::egl::EGLDevice;
 use smithay::backend::renderer::element::solid::{SolidColorBuffer, SolidColorRenderElement};
@@ -123,6 +123,158 @@ pub struct ChromeView {
     pub focus_outline: [SolidColorBuffer; 4],
 }
 
+impl ChromeView {
+    /// Build the render-side state for a fresh session: the software chrome
+    /// renderer, the GPU palette shader, the focus-outline strip buffers,
+    /// the configured wallpaper, and the quick-launch slots with their
+    /// icons resolved once (a handful of ImageMagick decodes, before the
+    /// loop). Everything else starts empty; the first arrange fills it.
+    fn new(
+        renderer: &mut smithay::backend::renderer::gles::GlesRenderer,
+        wallpaper_path: Option<String>,
+        size: smithay::utils::Size<i32, Physical>,
+    ) -> ChromeView {
+        let indexed = crate::render::indexed::IndexedProgram::new(renderer);
+        let mut chrome = crate::render::Renderer::new();
+        // The outline colour never changes; bake it into each strip buffer
+        // once so a focus move only resizes/relocates them.
+        let outline_color = Color32F::from(chrome.focus_color());
+        let focus_outline = std::array::from_fn(|_| SolidColorBuffer::new((0, 0), outline_color));
+        if let Some(path) = &wallpaper_path {
+            if !chrome.set_wallpaper(path, size.w, size.h) {
+                tracing::warn!("could not load wallpaper {path}");
+            }
+        }
+        let quick: Vec<crate::widgets::QuickSlot> = crate::launch::quick_launches()
+            .into_iter()
+            .map(|q| crate::widgets::QuickSlot {
+                icon: crate::launch::find_icon_file(q.icon)
+                    .and_then(|p| crate::icon::load_image(&p))
+                    .map(|i| std::rc::Rc::new(crate::icon::quantize(chrome.palette(), &i))),
+                cmd: q.cmd,
+                label: q
+                    .label
+                    .chars()
+                    .next()
+                    .map_or('?', |c| c.to_ascii_uppercase()),
+                show: q.show,
+            })
+            .collect();
+        ChromeView {
+            chrome,
+            indexed,
+            pieces: pieces::ChromePieces::default(),
+            placed: Vec::new(),
+            widgets: crate::widgets::Widgets::default(),
+            quick,
+            wallpaper_path,
+            animate: false,
+            anim: None,
+            quick_split: None,
+            frame_rects: std::collections::HashMap::new(),
+            focus_rect: None,
+            focus_outline,
+        }
+    }
+}
+
+/// The session's single output: the `wl_output` handle, the mode cached at
+/// every publish, the clear colour, and the layer-shell exclusive zone.
+/// One output by design (the tty backend drives one connector, the others
+/// one window); everything size-related reads the *cached* mode, so no hot
+/// path ever re-reads — or panics on — the handle's fallible `current_mode`.
+pub struct OutputCtx {
+    wl: Output,
+    /// The last mode published to the output. Written only by `change_mode`,
+    /// which every mode change goes through.
+    mode: Mode,
+    /// Gap background (na16 gunmetal), resolved once from the baked palette.
+    clear: Color32F,
+    /// The layer map's non-exclusive zone (`sync_layer_zone`), cached so
+    /// `layout_area` — called from every input path — never takes the map's
+    /// mutex.
+    zone: Rectangle<i32, Logical>,
+}
+
+impl OutputCtx {
+    /// Take over an output the backend has already configured (mode,
+    /// transform, global). The one `current_mode` read in the session: it
+    /// happens before the event loop exists, where failing loudly is right.
+    fn new(wl: Output) -> OutputCtx {
+        let mode = wl
+            .current_mode()
+            .expect("backend configures the output's mode before Comp::new");
+        let size = mode.size.to_logical(1);
+        OutputCtx {
+            wl,
+            mode,
+            clear: {
+                let g = crate::assets::palette().color(crate::theme::palette_color::GUNMETAL);
+                Color32F::new(
+                    f32::from(g.r) / 255.0,
+                    f32::from(g.g) / 255.0,
+                    f32::from(g.b) / 255.0,
+                    1.0,
+                )
+            },
+            zone: Rectangle::from_size(size),
+        }
+    }
+
+    /// The output's protocol handle (for layer maps, frame callbacks).
+    pub fn handle(&self) -> &Output {
+        &self.wl
+    }
+
+    /// The output's pixel size — from the cache, never fallible.
+    pub fn size(&self) -> Size<i32, Physical> {
+        self.mode.size
+    }
+
+    /// The frame clear colour (the gap background).
+    pub fn clear(&self) -> Color32F {
+        self.clear
+    }
+
+    /// The layer map's cached non-exclusive zone.
+    pub fn zone(&self) -> Rectangle<i32, Logical> {
+        self.zone
+    }
+
+    /// Record a re-arranged layer zone (`sync_layer_zone`).
+    pub fn set_zone(&mut self, zone: Rectangle<i32, Logical>) {
+        self.zone = zone;
+    }
+
+    /// Publish `mode` to the output (a no-op when it already holds it —
+    /// reconnect paths re-publish the mode they just read back). The cache
+    /// is written here and nowhere else.
+    pub fn change_mode(&mut self, mode: Mode) {
+        if mode == self.mode {
+            return;
+        }
+        self.mode = mode;
+        self.wl.change_current_state(Some(mode), None, None, None);
+        self.wl.set_preferred(mode);
+    }
+
+    /// The split-layout area: the output minus the bottom taskbar strip,
+    /// further shrunk by layer-shell exclusive zones (panels, OSDs). Scale
+    /// is 1 — this compositor lives in the same pixel world as its chrome
+    /// art.
+    pub fn layout_area(&self) -> crate::layout::Rect {
+        let size = self.size();
+        let z = self.zone;
+        let bottom = (z.loc.y + z.size.h).min(size.h - crate::theme::TASKBAR_H);
+        crate::layout::Rect {
+            x: z.loc.x,
+            y: z.loc.y,
+            w: z.size.w.max(1),
+            h: (bottom - z.loc.y).max(1),
+        }
+    }
+}
+
 /// In-flight input interaction state (see `comp::pointer`, `comp::input`).
 #[derive(Default)]
 pub struct Interaction {
@@ -212,12 +364,40 @@ pub struct Globals {
     pub dmabuf_global: DmabufGlobal,
 }
 
+/// XWayland session state: the WM connection (once Ready), the unmanaged
+/// override-redirect windows (rofi, menus; topmost last), and the plain
+/// X11 client connection for queries the WM connection doesn't expose
+/// (o-r geometry at map, see `xwayland::OrWindow`).
+pub struct XwaylandCtx {
+    pub wm: Option<smithay::xwayland::X11Wm>,
+    pub or_windows: Vec<xwayland::OrWindow>,
+    pub query: Option<smithay::reexports::x11rb::rust_connection::RustConnection>,
+    pub shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
+}
+
+/// Served-notification popups and the dismissal path back to the daemon
+/// thread (which emits NotificationClosed on the bus).
+pub struct NotesCtx {
+    pub popups: Vec<notifications::NotePopup>,
+    pub dismiss_tx: std::sync::mpsc::Sender<(u32, crate::notify::CloseReason)>,
+}
+
+/// Redraw pacing: the armed catch-up timer and the last present time.
+/// `queue_redraw` arms at most one one-shot timer; `redraw` disarms it on
+/// entry, so vblank- and event-driven redraws absorb a pending catch-up
+/// instead of doubling it. Private state — every mutation goes through
+/// `Comp::queue_redraw` and `Comp::redraw`; an idle compositor arms nothing
+/// and sleeps.
+struct FrameClock {
+    timer: Option<RegistrationToken>,
+    last: std::time::Instant,
+}
+
 pub struct Comp {
     // Presentation (winit window or DRM output; see crate::backend).
     pub backend: crate::backend::Backend,
-    pub output: Output,
-    /// Gap background (na16 gunmetal), resolved once from the baked palette.
-    pub clear: Color32F,
+    /// The session's one output and everything read from it per event.
+    pub output: OutputCtx,
     /// What the seat's pointer shows: a named shape (from chrome hover
     /// feedback or a cursor-shape-v1 request), a client's own cursor
     /// surface (`wl_pointer.set_cursor` with committed pixels — XWayland
@@ -253,15 +433,8 @@ pub struct Comp {
     pub pointer: smithay::input::pointer::PointerHandle<Comp>,
     pub start: std::time::Instant,
 
-    /// The armed catch-up redraw, if any. `queue_redraw` arms at most one
-    /// one-shot timer; `redraw` disarms it on entry, so vblank- and
-    /// event-driven redraws absorb a pending catch-up instead of doubling
-    /// it. Redraws only happen on demand — an idle compositor arms nothing
-    /// and sleeps.
-    redraw_timer: Option<RegistrationToken>,
-    /// When the last frame was composited; queued redraws are paced off it
-    /// so back-to-back events can't push compositing past ~60 Hz.
-    last_redraw: std::time::Instant,
+    /// The armed catch-up redraw and present-time bookkeeping.
+    frame_clock: FrameClock,
 
     // The layout core (pure, ported from master), the Win <-> Window
     // bridge it drives, and the window bookkeeping around the bridge.
@@ -273,24 +446,12 @@ pub struct Comp {
     /// `comp::icons`).
     pub icon_tx: calloop::channel::Sender<icons::IconResult>,
 
-    // Served-notification popups and the dismissal path back to the
-    // daemon thread (which emits NotificationClosed on the bus).
-    pub note_popups: Vec<notifications::NotePopup>,
-    pub note_dismiss_tx: std::sync::mpsc::Sender<(u32, crate::notify::CloseReason)>,
+    /// Served notification popups and their dismissal channel.
+    pub notes: NotesCtx,
 
-    // XWayland: the WM connection (once Ready) and unmanaged
-    // override-redirect windows (rofi, menus), topmost last.
-    pub xwm: Option<smithay::xwayland::X11Wm>,
-    pub or_windows: Vec<xwayland::OrWindow>,
-    /// Plain X11 client connection for queries the WM connection doesn't
-    /// expose (o-r geometry at map, see `xwayland::OrWindow`).
-    pub x11_query: Option<smithay::reexports::x11rb::rust_connection::RustConnection>,
-    pub xwayland_shell_state: smithay::wayland::xwayland_shell::XWaylandShellState,
-
-    // Layer-shell surfaces live in the output's LayerMap (smithay); this
-    // caches the map's non-exclusive zone so `layout_area` — called from
-    // every input path — never takes the map's mutex.
-    pub layer_zone: Rectangle<i32, Logical>,
+    /// XWayland: the WM connection, o-r windows, query connection, and
+    /// shell state, as one unit.
+    pub xwayland: XwaylandCtx,
 
     /// Screenshot and recording clients (grim, wf-recorder): the published
     /// screencopy global and the captures queued for the next frame.
@@ -298,6 +459,40 @@ pub struct Comp {
 
     // Protocol globals.
     pub globals: Globals,
+}
+
+/// Wire the two cross-thread channels into the loop: off-thread icon
+/// fetches reporting back, and the notification daemon feeding Show/Close.
+/// Both wake the loop and queue a redraw per message. Startup-time wiring;
+/// failing to insert a source means no session worth running.
+fn wire_channels(
+    handle: LoopHandle<'static, Comp>,
+) -> (
+    calloop::channel::Sender<icons::IconResult>,
+    calloop::channel::Sender<crate::notify::NoteMsg>,
+) {
+    // Off-thread icon fetches land back on the loop over this channel.
+    let (icon_tx, icon_rx) = calloop::channel::channel();
+    handle
+        .insert_source(icon_rx, |event, (), comp: &mut Comp| {
+            if let calloop::channel::Event::Msg(result) = event {
+                comp.on_icon_result(result);
+                comp.queue_redraw();
+            }
+        })
+        .expect("insert icon channel source");
+
+    // The notification daemon feeds Show/Close over its own channel.
+    let (note_tx, note_rx) = calloop::channel::channel();
+    handle
+        .insert_source(note_rx, |event, (), comp: &mut Comp| {
+            if let calloop::channel::Event::Msg(msg) = event {
+                comp.on_note_msg(msg);
+                comp.queue_redraw();
+            }
+        })
+        .expect("insert notification channel source");
+    (icon_tx, note_tx)
 }
 
 impl Comp {
@@ -312,14 +507,6 @@ impl Comp {
     ) -> Comp {
         let dh = display.handle();
         let handle = event_loop.handle();
-
-        let g = crate::assets::palette().color(crate::theme::palette_color::GUNMETAL);
-        let clear = Color32F::new(
-            f32::from(g.r) / 255.0,
-            f32::from(g.g) / 255.0,
-            f32::from(g.b) / 255.0,
-            1.0,
-        );
 
         let compositor_state = CompositorState::new::<Comp>(&dh);
         let xdg_shell_state = XdgShellState::new::<Comp>(&dh);
@@ -336,6 +523,10 @@ impl Comp {
         let virtual_keyboard_state =
             VirtualKeyboardManagerState::new::<Comp, _>(&dh, |_client| true);
         let screencopy = screencopy::Screencopy::new(&dh);
+
+        // The one `current_mode` read of the session happens here, before
+        // the loop exists; everything afterwards reads the cache.
+        let output = OutputCtx::new(output);
 
         let mut seat: Seat<Comp> = seat_state.new_wl_seat(&dh, "seat-0");
         // xkb defaults come from the environment (XKB_DEFAULT_LAYOUT etc.),
@@ -365,95 +556,22 @@ impl Comp {
         };
 
         let mut space = Space::default();
-        space.map_output(&output, (0, 0));
+        space.map_output(output.handle(), (0, 0));
 
         let socket_name = Self::init_wayland_listener(display, event_loop);
 
-        // Off-thread icon fetches land back on the loop over this channel.
-        let (icon_tx, icon_rx) = calloop::channel::channel();
-        handle
-            .insert_source(icon_rx, |event, (), comp: &mut Comp| {
-                if let calloop::channel::Event::Msg(result) = event {
-                    comp.on_icon_result(result);
-                    comp.queue_redraw();
-                }
-            })
-            .expect("insert icon channel source");
-
-        // The notification daemon feeds Show/Close over its own channel.
-        let (note_tx, note_rx) = calloop::channel::channel();
-        handle
-            .insert_source(note_rx, |event, (), comp: &mut Comp| {
-                if let calloop::channel::Event::Msg(msg) = event {
-                    comp.on_note_msg(msg);
-                    comp.queue_redraw();
-                }
-            })
-            .expect("insert notification channel source");
+        let (icon_tx, note_tx) = wire_channels(handle.clone());
         let note_dismiss_tx = crate::notify::spawn(note_tx);
 
-        let indexed = crate::render::indexed::IndexedProgram::new(backend.renderer());
-
-        let mut chrome = crate::render::Renderer::new();
-        // The outline colour never changes; bake it into each strip buffer
-        // once so a focus move only resizes/relocates them.
-        let outline_color = Color32F::from(chrome.focus_color());
-        let focus_outline = std::array::from_fn(|_| SolidColorBuffer::new((0, 0), outline_color));
         let wallpaper_path = std::env::var("SPLITWM_WALLPAPER").ok();
-        if let Some(path) = &wallpaper_path {
-            let size = output.current_mode().expect("output has a mode").size;
-            if !chrome.set_wallpaper(path, size.w, size.h) {
-                tracing::warn!("could not load wallpaper {path}");
-            }
-        }
-
-        // Quick-launch entries with their theme icons, resolved once at
-        // startup (a handful of ImageMagick decodes, before the loop).
-        let quick: Vec<crate::widgets::QuickSlot> = crate::launch::quick_launches()
-            .into_iter()
-            .map(|q| crate::widgets::QuickSlot {
-                icon: crate::launch::find_icon_file(q.icon)
-                    .and_then(|p| crate::icon::load_image(&p))
-                    .map(|i| std::rc::Rc::new(crate::icon::quantize(chrome.palette(), &i))),
-                cmd: q.cmd,
-                label: q
-                    .label
-                    .chars()
-                    .next()
-                    .map_or('?', |c| c.to_ascii_uppercase()),
-                show: q.show,
-            })
-            .collect();
-
-        let layer_zone = Rectangle::from_size(
-            output
-                .current_mode()
-                .expect("output has a mode")
-                .size
-                .to_logical(1),
-        );
+        let view = ChromeView::new(backend.renderer(), wallpaper_path, output.size());
 
         Comp {
             backend,
             output,
-            clear,
             cursor_status: CursorImageStatus::default_named(),
             cursors: cursor::CursorCache::new(),
-            view: ChromeView {
-                chrome,
-                indexed,
-                pieces: pieces::ChromePieces::default(),
-                placed: Vec::new(),
-                widgets: crate::widgets::Widgets::default(),
-                quick,
-                wallpaper_path,
-                animate: false,
-                anim: None,
-                quick_split: None,
-                frame_rects: std::collections::HashMap::new(),
-                focus_rect: None,
-                focus_outline,
-            },
+            view,
             interaction: Interaction::default(),
             dh,
             handle,
@@ -465,19 +583,24 @@ impl Comp {
             keyboard,
             pointer,
             start: std::time::Instant::now(),
-            redraw_timer: None,
-            last_redraw: std::time::Instant::now(),
+            frame_clock: FrameClock {
+                timer: None,
+                last: Instant::now(),
+            },
             state: crate::state::State::new(),
             managed: crate::shell::Managed::default(),
             windows: WindowRoles::default(),
             icon_tx,
-            note_popups: Vec::new(),
-            note_dismiss_tx,
-            xwm: None,
-            or_windows: Vec::new(),
-            x11_query: None,
-            xwayland_shell_state,
-            layer_zone,
+            notes: NotesCtx {
+                popups: Vec::new(),
+                dismiss_tx: note_dismiss_tx,
+            },
+            xwayland: XwaylandCtx {
+                wm: None,
+                or_windows: Vec::new(),
+                query: None,
+                shell_state: xwayland_shell_state,
+            },
             screencopy,
             globals: Globals {
                 compositor_state,
@@ -509,9 +632,15 @@ impl Comp {
 
         handle
             .insert_source(socket, move |client_stream, (), comp| {
-                comp.dh
+                // A refused connect (a client that vanished between accept
+                // and insert) must not take the session down: drop the
+                // stream and let the client reconnect.
+                if let Err(err) = comp
+                    .dh
                     .insert_client(client_stream, Arc::new(ClientState::default()))
-                    .expect("insert client");
+                {
+                    tracing::warn!("refusing wayland client: {err}");
+                }
             })
             .expect("insert socket source");
 
@@ -521,11 +650,12 @@ impl Comp {
                 |_, display, comp| {
                     // SAFETY: the display is never dropped or replaced while
                     // this source lives; calloop owns it for the loop's life.
-                    unsafe {
-                        display
-                            .get_mut()
-                            .dispatch_clients(comp)
-                            .expect("dispatch clients");
+                    // A dispatch error (a protocol bug surfacing past the
+                    // per-client handlers) is logged, not fatal: killing the
+                    // session over one bad request would take every window
+                    // down with it.
+                    if let Err(err) = unsafe { display.get_mut().dispatch_clients(comp) } {
+                        tracing::error!("dispatching wayland clients: {err}");
                     }
                     Ok(PostAction::Continue)
                 },
@@ -556,7 +686,7 @@ impl Comp {
         if let Some(hit) = self.layer_surface_under(&[Layer::Overlay], pos) {
             return Some(hit);
         }
-        if let Some(hit) = xwayland::or_surface_under(&self.or_windows, pos) {
+        if let Some(hit) = xwayland::or_surface_under(&self.xwayland.or_windows, pos) {
             return Some(hit);
         }
         if let Some(hit) = self.layer_surface_under(&[Layer::Top], pos) {
@@ -650,7 +780,7 @@ impl Comp {
         let Some(root_loc) = self.popup_root_loc(&root) else {
             return fallback;
         };
-        let size: Size<i32, Logical> = self.output_size().to_logical(1);
+        let size: Size<i32, Logical> = self.output.size().to_logical(1);
         // The positioner works relative to the parent's geometry origin;
         // express the output rect in that space.
         let mut target = Rectangle::new((0, 0).into(), size);
@@ -685,32 +815,16 @@ impl Comp {
                 return Some(loc);
             }
         }
-        let map = smithay::desktop::layer_map_for_output(&self.output);
+        let map = smithay::desktop::layer_map_for_output(self.output.handle());
         let layer = map.layer_for_surface(root, smithay::desktop::WindowSurfaceType::TOPLEVEL)?;
         map.layer_geometry(layer).map(|geo| geo.loc)
     }
 
-    /// Current output size in pixels. The backend configures a mode before
-    /// `Comp` exists and keeps it current on every resize, so a modeless
-    /// output is a backend bug.
-    pub fn output_size(&self) -> Size<i32, Physical> {
-        self.output.current_mode().expect("output has a mode").size
-    }
-
     /// The split-layout area: the output minus the bottom taskbar strip
     /// (master's `la()`), further shrunk by layer-shell exclusive zones
-    /// (panels, OSDs). Scale is 1 — this compositor lives in the same
-    /// pixel world as its chrome art.
+    /// (panels, OSDs). See `OutputCtx::layout_area`.
     pub fn layout_area(&self) -> crate::layout::Rect {
-        let size = self.output_size();
-        let z = self.layer_zone;
-        let bottom = (z.loc.y + z.size.h).min(size.h - crate::theme::TASKBAR_H);
-        crate::layout::Rect {
-            x: z.loc.x,
-            y: z.loc.y,
-            w: z.size.w.max(1),
-            h: (bottom - z.loc.y).max(1),
-        }
+        self.output.layout_area()
     }
 
     /// Re-place every window from the layout state: compute this arrange's
@@ -777,7 +891,7 @@ impl Comp {
         // client, regardless of where (or whether) its split is on screen.
         if let Some(fs) = fullscreen {
             if let Some(window) = self.managed.get(fs).cloned() {
-                let size = self.output_size();
+                let size = self.output.size();
                 crate::shell::configure_rect(&window, 0, 0, size.w, size.h);
                 crate::shell::set_x11_mapped(&window, true);
                 self.space.map_element(window, (0, 0), true);
@@ -809,7 +923,7 @@ impl Comp {
         crate::widgets::compute_boundary_widgets(&mut self.view.widgets, &self.state, wa);
         // The taskbar strip spans the full output, not the (possibly
         // zone-shrunk) layout area.
-        let size = self.output_size();
+        let size = self.output.size();
         let full = crate::layout::Rect {
             x: 0,
             y: 0,
@@ -951,9 +1065,7 @@ impl Comp {
     /// swap standing in for RandR): republish, rescale the wallpaper, and
     /// relayout everything into the new area.
     pub fn resize_output(&mut self, mode: Mode) {
-        self.output
-            .change_current_state(Some(mode), None, None, None);
-        self.output.set_preferred(mode);
+        self.output.change_mode(mode);
         // Layer surfaces re-anchor to the new size; the zone follows.
         self.sync_layer_zone();
         // A shrink also shrinks the scroll range; don't strand the
@@ -1010,28 +1122,31 @@ impl Comp {
         /// One output frame at 60 Hz; also clients' frame-callback cadence.
         const REDRAW_INTERVAL: Duration = Duration::from_millis(16);
 
-        if self.redraw_timer.is_some() || self.backend.redraw_paced_externally() {
+        if self.frame_clock.timer.is_some() || self.backend.redraw_paced_externally() {
             return;
         }
-        let delay = REDRAW_INTERVAL.saturating_sub(self.last_redraw.elapsed());
-        let token = self
+        let delay = REDRAW_INTERVAL.saturating_sub(self.frame_clock.last.elapsed());
+        // A failed insert (the loop already shutting down) only costs the
+        // catch-up frame; whatever triggered this was handled inline.
+        if let Ok(token) = self
             .handle
             .insert_source(Timer::from_duration(delay), |_, (), comp| {
-                comp.redraw_timer = None;
+                comp.frame_clock.timer = None;
                 comp.redraw();
                 TimeoutAction::Drop
             })
-            .expect("insert redraw timer");
-        self.redraw_timer = Some(token);
+        {
+            self.frame_clock.timer = Some(token);
+        }
     }
 
     /// Composite one frame and pace clients' frame callbacks.
     pub fn redraw(&mut self) {
         // This frame satisfies any queued catch-up.
-        if let Some(token) = self.redraw_timer.take() {
+        if let Some(token) = self.frame_clock.timer.take() {
             self.handle.remove(token);
         }
-        self.last_redraw = std::time::Instant::now();
+        self.frame_clock.last = std::time::Instant::now();
         // A client that dies mid-hover leaves its cursor surface behind;
         // fall back to the arrow.
         use smithay::utils::IsAlive;
@@ -1101,13 +1216,13 @@ impl Comp {
         // Scene borrows and the backend borrow are disjoint `Comp` fields,
         // so the backend can consume the scene while borrowed mutably.
         let scene = scene::Scene {
-            or_windows: &self.or_windows,
-            note_popups: &self.note_popups,
+            or_windows: &self.xwayland.or_windows,
+            note_popups: &self.notes.popups,
             note_rects: &note_rects,
             float_stack: &self.windows.float_stack,
             managed: &self.managed,
             tiled: &tiled,
-            output: &self.output,
+            output: self.output.handle(),
             dock_place: &dock_place,
             layer_dock: &layer_dock,
             indexed: &self.view.indexed,
@@ -1117,49 +1232,17 @@ impl Comp {
             taskbar,
             focus_outline: focus_outline.as_ref().map_or(&[][..], <[_; 4]>::as_slice),
         };
-        match &mut self.backend {
-            crate::backend::Backend::Winit(w) => {
-                let size = w.backend.window_size();
-                let full: Rectangle<i32, Physical> = Rectangle::from_size(size);
-                let rendered = {
-                    let Ok((renderer, mut fb)) = w
-                        .backend
-                        .bind()
-                        .inspect_err(|err| tracing::error!("bind: {err}"))
-                    else {
-                        return;
-                    };
-                    let mut elements = cursor::cursor_elements(
-                        renderer,
-                        scene.indexed,
-                        pointer_loc,
-                        &self.cursor_status,
-                        &mut self.cursors,
-                    );
-                    elements.extend(scene::output_elements(renderer, &scene));
-                    w.damage_tracker
-                        .render_output(renderer, &mut fb, 0, &elements, self.clear)
-                        .inspect_err(|err| tracing::error!("render: {err:?}"))
-                        .is_ok()
-                };
-                if rendered {
-                    if let Err(err) = w.backend.submit(Some(&[full])) {
-                        tracing::error!("submit: {err}");
-                    }
-                }
-            }
-            crate::backend::Backend::Headless(h) => h.render(&scene, self.clear),
-            #[cfg(feature = "tty")]
-            crate::backend::Backend::Tty(t) => {
-                t.render(
-                    &scene,
-                    pointer_loc,
-                    &self.cursor_status,
-                    &mut self.cursors,
-                    self.clear,
-                );
-            }
-        }
+        // Present through the backend: the frame carries the scene plus
+        // what the cursor-compositing backends need beyond it. The scene's
+        // borrows and the backend/cursor borrows are disjoint `Comp`
+        // fields, so the frame can be assembled and handed off in one go.
+        self.backend.present(crate::backend::Frame {
+            scene: &scene,
+            pointer_loc,
+            cursor: &self.cursor_status,
+            cursors: &mut self.cursors,
+            clear: self.output.clear(),
+        });
 
         // Screenshot and recording clients get this same scene composited
         // once more into their own buffer (see `comp::screencopy`); a frame
@@ -1167,7 +1250,8 @@ impl Comp {
         let mut capture = screencopy::CaptureCtx {
             renderer: self.backend.renderer(),
             scene: &scene,
-            clear: self.clear,
+            size: self.output.size(),
+            clear: self.output.clear(),
             pointer_loc,
             cursor_status: &self.cursor_status,
             cursors: &mut self.cursors,
@@ -1177,14 +1261,14 @@ impl Comp {
         // Frame callbacks let clients produce their next buffer; throttle to
         // once per redraw cycle. Every managed kind gets one (floats and
         // the dock live outside the Space).
-        let output = self.output.clone();
+        let output = self.output.handle().clone();
         let elapsed = self.start.elapsed();
         for window in self.managed.windows() {
             window.send_frame(&output, elapsed, Some(Duration::ZERO), |_, _| {
                 Some(output.clone())
             });
         }
-        for or in &self.or_windows {
+        for or in &self.xwayland.or_windows {
             if let Some(surface) = or.surface.wl_surface() {
                 smithay::desktop::utils::send_frames_surface_tree(
                     &surface,

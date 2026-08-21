@@ -130,7 +130,8 @@ impl Comp {
     }
 
     /// xdg surfaces may not be mapped before their first configure; send it
-    /// on the surface's first commit.
+    /// on the surface's first commit. A poisoned or missing role record
+    /// reads as "configure not yet sent", which only costs a duplicate.
     fn ensure_initial_configure(&mut self, surface: &WlSurface) {
         if let Some(window) = self
             .windows
@@ -145,10 +146,8 @@ impl Comp {
                 states
                     .data_map
                     .get::<XdgToplevelSurfaceData>()
-                    .expect("xdg toplevel data on xdg surface")
-                    .lock()
-                    .expect("no poisoned toplevel data")
-                    .initial_configure_sent
+                    .and_then(|d| d.lock().ok())
+                    .is_some_and(|d| d.initial_configure_sent)
             });
             if !initial_configure_sent {
                 toplevel.send_configure();
@@ -158,10 +157,11 @@ impl Comp {
 
         if let Some(PopupKind::Xdg(ref xdg)) = self.popups.find_popup(surface) {
             if !xdg.is_initial_configure_sent() {
-                // A popup positioner is valid by construction, so the
-                // only send_configure error (invalid positioner) can't
-                // happen.
-                xdg.send_configure().expect("initial popup configure");
+                // The only send_configure error is an invalid positioner,
+                // which a tracked popup cannot have; log all the same.
+                if let Err(err) = xdg.send_configure() {
+                    tracing::warn!("initial popup configure: {err}");
+                }
             }
         }
     }
@@ -262,7 +262,11 @@ impl XdgShellHandler for Comp {
         // browsers watch their menus' grab state and flakily self-dismiss
         // when the compositor neither grants the grab nor sends
         // popup_done.
-        let seat: Seat<Comp> = Seat::from_resource(&seat).expect("seat resource has a Seat handle");
+        // A seat resource that resolves to nothing (a destroyed seat, or a
+        // client racing its own teardown) simply gets no grab.
+        let Some(seat) = Seat::from_resource(&seat) else {
+            return;
+        };
         let kind = PopupKind::Xdg(surface);
         let Ok(root) = find_popup_root_surface(&kind) else {
             return;
@@ -274,8 +278,13 @@ impl XdgShellHandler for Comp {
                 return;
             }
         };
-        let keyboard = seat.get_keyboard().expect("seat has a keyboard");
-        let pointer = seat.get_pointer().expect("seat has a pointer");
+        // The seat's keyboard/pointer were added at construction and are
+        // never removed; a missing handle degrades to no grab rather than
+        // taking the session down.
+        let (Some(keyboard), Some(pointer)) = (seat.get_keyboard(), seat.get_pointer()) else {
+            tracing::warn!("popup grab without seat capabilities");
+            return;
+        };
         // A grab held by anyone else (an ongoing chrome drag, another
         // client's popup chain) wins: dismiss the popup instead of
         // stealing the seat from under the holder.
@@ -405,7 +414,7 @@ impl SelectionHandler for Comp {
         source: Option<SelectionSource>,
         _seat: Seat<Self>,
     ) {
-        if let Some(xwm) = self.xwm.as_mut() {
+        if let Some(xwm) = self.xwayland.wm.as_mut() {
             if let Err(err) = xwm.new_selection(ty, source.map(|source| source.mime_types())) {
                 tracing::warn!("advertising selection to X11 failed: {err}");
             }
@@ -421,7 +430,7 @@ impl SelectionHandler for Comp {
         _user_data: &(),
     ) {
         let handle = self.handle.clone();
-        if let Some(xwm) = self.xwm.as_mut() {
+        if let Some(xwm) = self.xwayland.wm.as_mut() {
             if let Err(err) = xwm.send_selection(ty, mime_type, fd, handle) {
                 tracing::warn!("reading X11 selection failed: {err}");
             }

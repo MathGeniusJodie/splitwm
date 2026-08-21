@@ -105,30 +105,19 @@ impl Comp {
                 }
             }
             InputEvent::PointerMotionAbsolute { event } => {
-                let output_geo = self
-                    .space
-                    .output_geometry(&self.output)
-                    .expect("output is mapped");
-                let pos = event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+                // The single output sits at the origin (see `OutputCtx`),
+                // so transformed absolute coordinates are already global.
+                let pos = event.position_transformed(self.output.size().to_logical(1));
                 self.pointer_moved(pos, event.time_msec());
             }
             // Relative motion (libinput mice/touchpads on the tty backend;
             // winit only ever reports absolute). The compositor owns the
             // cursor position: integrate and clamp to the output.
             InputEvent::PointerMotion { event } => {
-                let output_geo = self
-                    .space
-                    .output_geometry(&self.output)
-                    .expect("output is mapped");
+                let size = self.output.size();
                 let mut pos = self.pointer.current_location() + event.delta();
-                pos.x = pos.x.clamp(
-                    f64::from(output_geo.loc.x),
-                    f64::from(output_geo.loc.x + output_geo.size.w) - 1.0,
-                );
-                pos.y = pos.y.clamp(
-                    f64::from(output_geo.loc.y),
-                    f64::from(output_geo.loc.y + output_geo.size.h) - 1.0,
-                );
+                pos.x = pos.x.clamp(0.0, f64::from(size.w) - 1.0);
+                pos.y = pos.y.clamp(0.0, f64::from(size.h) - 1.0);
                 self.pointer_moved(pos, event.time_msec());
             }
             InputEvent::PointerButton { event } => {
@@ -289,7 +278,8 @@ impl Comp {
                     // arrange, say) can't steal it right back.
                     None => {
                         if let Some(target) = under.as_ref().and_then(|s| {
-                            self.or_windows
+                            self.xwayland
+                                .or_windows
                                 .iter()
                                 .find(|o| o.surface.wl_surface().as_ref() == Some(s))
                                 .filter(|o| o.takes_focus)
@@ -298,7 +288,7 @@ impl Comp {
                             let keyboard = self.keyboard.clone();
                             keyboard.set_focus(self, Some(target), serial);
                         } else if let Some(s) = under.filter(|s| {
-                            smithay::desktop::layer_map_for_output(&self.output)
+                            smithay::desktop::layer_map_for_output(self.output.handle())
                                 .layer_for_surface(s, smithay::desktop::WindowSurfaceType::ALL)
                                 .is_some_and(|l| l.can_receive_keyboard_focus())
                         }) {

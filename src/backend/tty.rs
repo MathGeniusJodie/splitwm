@@ -19,20 +19,18 @@ use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode};
 use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::backend::renderer::Color32F;
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::{Event as SessionEvent, Session as _};
 use smithay::backend::udev::{self, UdevBackend, UdevEvent};
-use smithay::input::pointer::CursorImageStatus;
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::reexports::drm::control::{connector, crtc, Device as _, ModeTypeFlags};
 use smithay::reexports::input::{ClickMethod, Libinput};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::reexports::wayland_server::Display;
-use smithay::utils::{DeviceFd, Logical, Point, Transform};
+use smithay::utils::{DeviceFd, Transform};
 
-use crate::comp::cursor::{cursor_elements, CursorCache};
+use crate::comp::cursor::cursor_elements;
 use crate::comp::scene::{self, OutputElement};
 use crate::comp::Comp;
 
@@ -88,14 +86,7 @@ impl Tty {
     /// cursor, and queue it for the next vblank. An unchanged scene queues
     /// nothing — the next queued redraw picks up when something is dirty
     /// again.
-    pub fn render(
-        &mut self,
-        scene: &scene::Scene<'_>,
-        pointer_loc: Point<f64, Logical>,
-        cursor: &CursorImageStatus,
-        cursors: &mut CursorCache,
-        clear: Color32F,
-    ) {
+    pub fn render(&mut self, frame: super::Frame<'_>) {
         if self.paused || self.queued {
             return;
         }
@@ -104,13 +95,18 @@ impl Tty {
         };
         let mut elements = cursor_elements(
             &mut self.renderer,
-            scene.indexed,
-            pointer_loc,
-            cursor,
-            cursors,
+            frame.scene.indexed,
+            frame.pointer_loc,
+            frame.cursor,
+            frame.cursors,
         );
-        elements.extend(scene::output_elements(&mut self.renderer, scene));
-        match out.render_frame(&mut self.renderer, &elements, clear, FrameFlags::DEFAULT) {
+        elements.extend(scene::output_elements(&mut self.renderer, frame.scene));
+        match out.render_frame(
+            &mut self.renderer,
+            &elements,
+            frame.clear,
+            FrameFlags::DEFAULT,
+        ) {
             Ok(res) => {
                 if !res.is_empty {
                     match out.queue_frame(()) {
@@ -395,9 +391,10 @@ fn pick_connector(
 /// every udev change event). A vanished connector goes dark; a new one
 /// replaces the old, relayouting to its mode.
 fn reconnect(comp: &mut Comp) {
-    let output = comp.output.clone();
-    let t = tty(comp);
-    let Some((info, crtc, mode)) = pick_connector(t.drm.device()) else {
+    let wl_output = comp.output.handle().clone();
+    let found = pick_connector(tty(comp).drm.device());
+    let Some((info, crtc, mode)) = found else {
+        let t = tty(comp);
         if t.connector.is_some() {
             tracing::warn!("no connected connector; output dark until replug");
         }
@@ -405,6 +402,7 @@ fn reconnect(comp: &mut Comp) {
         t.connector = None;
         return;
     };
+    let t = tty(comp);
     if t.connector == Some(info.handle()) && t.scanout.is_some() {
         return;
     }
@@ -413,14 +411,15 @@ fn reconnect(comp: &mut Comp) {
     t.queued = false;
 
     let wl_mode = Mode::from(mode);
-    // The DrmOutput tracks the output's mode, so publish it first.
-    output.change_current_state(Some(wl_mode), None, None, None);
-    output.set_preferred(wl_mode);
+    // The DrmOutput tracks the output's mode, so publish it first
+    // (`change_mode` writes the cache every later size read answers from).
+    comp.output.change_mode(wl_mode);
+    let t = tty(comp);
     match t.drm.initialize_output::<_, OutputElement>(
         crtc,
         mode,
         &[info.handle()],
-        &output,
+        &wl_output,
         None,
         &mut t.renderer,
         &DrmOutputRenderElements::new(),
@@ -442,6 +441,8 @@ fn reconnect(comp: &mut Comp) {
             return;
         }
     }
+    // Relayout into the new mode (its publish above makes this a no-op
+    // republish; the zone, scroll clamp, wallpaper and arrange follow).
     comp.resize_output(wl_mode);
     comp.redraw();
 }

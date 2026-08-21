@@ -12,8 +12,25 @@ pub mod winit;
 pub mod tty;
 
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::Color32F;
+use smithay::input::pointer::CursorImageStatus;
+use smithay::utils::{Logical, Point};
 
-use crate::comp::Comp;
+use crate::comp::cursor::CursorCache;
+use crate::comp::{scene, Comp};
+
+/// Everything one frame needs to reach glass: the assembled scene, the
+/// seat pointer's spot and what it draws as (the tty and winit backends
+/// composite the cursor sprite themselves; headless renders none), and the
+/// clear colour. Built once per redraw; the scene's borrows and the
+/// backend/cursor borrows are disjoint `Comp` fields.
+pub struct Frame<'a> {
+    pub scene: &'a scene::Scene<'a>,
+    pub pointer_loc: Point<f64, Logical>,
+    pub cursor: &'a CursorImageStatus,
+    pub cursors: &'a mut CursorCache,
+    pub clear: Color32F,
+}
 
 pub enum Backend {
     Winit(winit::Winit),
@@ -84,6 +101,19 @@ impl Backend {
             Backend::Tty(t) => t.change_vt(vt),
         }
     }
+
+    /// Composite one frame and present it, whichever backend this is. Each
+    /// variant owns its own element assembly (the cursor compositing and
+    /// damage/submit details differ); `redraw` only builds the shared
+    /// [`Frame`].
+    pub fn present(&mut self, frame: Frame<'_>) {
+        match self {
+            Backend::Winit(w) => w.present(frame),
+            Backend::Headless(h) => h.render(frame),
+            #[cfg(feature = "tty")]
+            Backend::Tty(t) => t.render(frame),
+        }
+    }
 }
 
 /// The backend-independent tail of a session: XWayland, the launch probe,
@@ -125,7 +155,12 @@ fn run(mut event_loop: smithay::reexports::calloop::EventLoop<'static, Comp>, mu
         .run(None, &mut comp, |comp| {
             comp.space.refresh();
             comp.popups.cleanup();
-            comp.dh.flush_clients().expect("flush clients");
+            // A failed flush means a stuck client connection; smithay has
+            // already killed the offending client, so log and carry on —
+            // one wedged client must not take the session down.
+            if let Err(err) = comp.dh.flush_clients() {
+                tracing::error!("flushing wayland clients: {err}");
+            }
         })
         .expect("event loop run");
 }

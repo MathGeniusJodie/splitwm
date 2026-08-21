@@ -22,7 +22,6 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::{GlesRenderbuffer, GlesRenderer};
 use smithay::backend::renderer::{Bind as _, Color32F, ExportMem as _, Offscreen as _};
 use smithay::input::pointer::CursorImageStatus;
-use smithay::output::Output;
 use smithay::reexports::wayland_protocols_wlr::screencopy::v1::server::zwlr_screencopy_frame_v1::{
     self, ZwlrScreencopyFrameV1,
 };
@@ -127,6 +126,9 @@ pub struct Screencopy {
 pub struct CaptureCtx<'a> {
     pub renderer: &'a mut GlesRenderer,
     pub scene: &'a scene::Scene<'a>,
+    /// The output's pixel size, from the mode cache (the scene's `Output`
+    /// handle would answer the same, fallibly).
+    pub size: Size<i32, Physical>,
     pub clear: Color32F,
     /// Where the seat pointer is and what it draws as — composited in only
     /// for the captures that asked for the cursor.
@@ -163,7 +165,7 @@ impl Screencopy {
     /// Composite the scene offscreen and copy `capture`'s region into its
     /// client buffer. `false` on any renderer or buffer failure.
     fn grab(&mut self, ctx: &mut CaptureCtx<'_>, capture: &Capture) -> bool {
-        let size = output_rect(ctx.scene.output).size;
+        let size = ctx.size;
         if !Rectangle::from_size(size).contains_rect(capture.region) {
             // The output resized under a capture promised against the old
             // size; the client's buffer no longer fits what it asked for.
@@ -241,13 +243,6 @@ fn target<'a>(
             .ok();
     }
     slot.as_mut()
-}
-
-/// The output's pixel rect. Captures are requested in output *logical*
-/// coordinates; splitwm composites at scale 1 with no transform (every
-/// element places with `to_physical(1)`), so the two coincide.
-fn output_rect(output: &Output) -> Rectangle<i32, Physical> {
-    Rectangle::from_size(output.current_mode().expect("output has a mode").size)
 }
 
 /// Whether the pool behind `data` actually covers `size` rows of pixels —
@@ -329,8 +324,9 @@ impl Dispatch<ZwlrScreencopyManagerV1, ()> for Comp {
     ) {
         use zwlr_screencopy_manager_v1::Request;
         // Whichever output the client named, it is ours: splitwm drives one
-        // output by design (the same assumption `comp::layers` makes).
-        let full = output_rect(&state.output);
+        // output by design (the same assumption `comp::layers` makes). The
+        // size comes from the mode cache — never a panicking read.
+        let full = Rectangle::from_size(state.output.size());
         let (frame, overlay_cursor, region) = match request {
             Request::CaptureOutput {
                 frame,

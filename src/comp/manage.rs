@@ -222,7 +222,7 @@ impl Comp {
     /// column).
     pub fn dock_geometry(&self, d: DockData) -> crate::layout::Rect {
         let wa = self.layout_area();
-        let size = self.output_size();
+        let size = self.output.size();
         let canvas_w = self.state.canvas_w(wa);
         crate::layout::Rect {
             x: wa.x + canvas_w - self.state.scroll_x(),
@@ -295,7 +295,7 @@ impl Comp {
     /// interactivity) is never handed out.
     pub fn focused_layer(&self) -> Option<WlSurface> {
         let surface = self.windows.focused_layer.as_ref()?;
-        let map = smithay::desktop::layer_map_for_output(&self.output);
+        let map = smithay::desktop::layer_map_for_output(self.output.handle());
         map.layer_for_surface(surface, smithay::desktop::WindowSurfaceType::TOPLEVEL)
             .is_some_and(|l| l.can_receive_keyboard_focus())
             .then(|| surface.clone())

@@ -17,8 +17,9 @@ use crate::Index;
 use super::{insert_capped, Renderer};
 
 /// Palette index is a valid `Index` for every real colour, so a distinct
-/// out-of-band value marks "no pixel here" in the icon index cache.
-pub(super) const TRANSPARENT_INDEX: Index = Index::MAX;
+/// out-of-band value marks "no pixel here" in the icon index cache — the
+/// same out-of-band value the framebuffers use.
+pub(super) const TRANSPARENT_INDEX: Index = pixel_graphics::TRANSPARENT;
 
 /// Entry cap on the icon render caches. Entries for dropped icons are never
 /// individually evicted (nothing tracks icon lifetimes here), so the maps
@@ -68,14 +69,7 @@ impl Renderer {
             return;
         }
         let sz = size as usize;
-        walk_indices(
-            &self.cached_icon_indices(img, size),
-            sz,
-            dx,
-            dy,
-            TRANSPARENT_INDEX,
-            paint,
-        );
+        walk_indices(&self.cached_icon_indices(img, size), sz, dx, dy, paint);
     }
 
     /// Walk the ink of `ch` in `label_font`, centred at (cx, cy), reporting
@@ -90,14 +84,7 @@ impl Renderer {
         let Some((w, h, idx)) = self.cached_glyph_indices(ch) else {
             return;
         };
-        walk_indices(
-            &idx,
-            w,
-            cx - w as i32 / 2,
-            cy - h as i32 / 2,
-            pixel_graphics::TRANSPARENT,
-            paint,
-        );
+        walk_indices(&idx, w, cx - w as i32 / 2, cy - h as i32 / 2, paint);
     }
 
     /// The index buffer of `ch` rendered in `label_font`, with its cell
@@ -182,20 +169,13 @@ impl Renderer {
 }
 
 /// Walk a `w`-wide index buffer laid out row-major, invoking `paint` at
-/// each pixel that is not `transparent`, positioned at (`dx`, `dy`).
-/// Destinations are signed and unclipped: a caller may move a pixel
-/// anywhere before drawing it (the taskbar's shards do), and `set_pixel`
-/// drops whatever lands off the buffer.
-fn walk_indices(
-    idx: &[Index],
-    w: usize,
-    dx: i32,
-    dy: i32,
-    transparent: Index,
-    mut paint: impl FnMut(i32, i32, Index),
-) {
+/// each opaque pixel, positioned at (`dx`, `dy`). Destinations are signed
+/// and unclipped: a caller may move a pixel anywhere before drawing it
+/// (the taskbar's shards do), and `set_pixel` drops whatever lands off the
+/// buffer.
+fn walk_indices(idx: &[Index], w: usize, dx: i32, dy: i32, mut paint: impl FnMut(i32, i32, Index)) {
     for (n, &i) in idx.iter().enumerate() {
-        if i == transparent {
+        if i == TRANSPARENT_INDEX {
             continue;
         }
         let (tx, ty) = (n % w, n / w);
