@@ -9,6 +9,7 @@ use super::Comp;
 use crate::layout::Win;
 use crate::state::Activation;
 use crate::theme::{self, Action};
+use crate::widgets::BtnKind;
 
 fn mask_of(mods: &ModifiersState) -> u16 {
     let mut mask = 0;
@@ -44,8 +45,8 @@ impl Comp {
             // The titlebar close button's semantics, on the focused split:
             // politely close its window, which takes the split with it.
             Action::Close => {
-                if let Some(win) = self.state.focused_client() {
-                    self.close_client(win);
+                if let Some(leaf) = self.state.focused_leaf_valid() {
+                    self.click_split_button(leaf, BtnKind::Close);
                 }
             }
             Action::FocusNext | Action::FocusPrev => {

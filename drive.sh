@@ -115,7 +115,9 @@ shot 12_closed
 
 # 8: closing every window leaves the strip empty — bare wallpaper and the
 # taskbar, with no split left behind
-for _ in $(seq 1 12); do echo "key super+q" >&3; wait_line "ok key super+q"; sleep 0.4; done
+# More closes than the drive ever opens, so the strip ends up empty
+# whatever ran before.
+for _ in $(seq 1 12); do key super+q; done
 sleep 1.0
 cmd "layout"
 shot 13_no_windows

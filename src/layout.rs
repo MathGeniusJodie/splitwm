@@ -304,41 +304,13 @@ impl Layout {
         before: bool,
         default_w: ColWidth,
     ) -> bool {
-        if src == dst || !self.is_leaf(src) || !self.is_leaf(dst) {
+        if src == dst {
             return false;
         }
-        // Already a lone column adjacent to dst's column on the requested
-        // side: the move is a no-op; doing it anyway would only churn
-        // focus and animations.
-        let (sp, dp) = match (self.locate(src), self.locate(dst)) {
-            (Some(s), Some(d)) => (s, d),
-            _ => return false,
-        };
-        if self.columns[sp.col].rows.len() == 1 {
-            let target = if before {
-                dp.col.wrapping_sub(1)
-            } else {
-                dp.col + 1
-            };
-            if sp.col == target {
-                return false;
-            }
-        }
-        let Some((row, width)) = self.detach(src) else {
+        let Some(dp) = self.locate(dst) else {
             return false;
         };
-        // dst survives every detach (only src's row leaves), so re-locating
-        // it after the column indices shifted always succeeds.
-        let dcol = self.locate(dst).expect("dst survives the detach").col;
-        let at = if before { dcol } else { dcol + 1 };
-        self.columns.insert(
-            at,
-            Column {
-                width: width.unwrap_or(default_w),
-                rows: vec![row],
-            },
-        );
-        true
+        self.move_to_column(src, dp.col + usize::from(!before), default_w)
     }
 
     /// Relocate split `src` into its own column at strip position `idx`
@@ -364,8 +336,13 @@ impl Layout {
         let Some((row, width)) = self.detach(src) else {
             return false;
         };
-        // Detaching a lone column shifted every later column one left.
-        let at = if lone && idx > sp.col { idx - 1 } else { idx };
+        // `width` is `Some` exactly when the detach dissolved a column,
+        // shifting every later column one left.
+        let at = if width.is_some() && idx > sp.col {
+            idx - 1
+        } else {
+            idx
+        };
         self.columns.insert(
             at.min(self.columns.len()),
             Column {
@@ -475,22 +452,9 @@ fn child_sizes(children: &[(bool, f64)], usable: i32, min_sz: i32) -> Vec<i32> {
     sizes
 }
 
-/// Where a new window opens in the strip. `State::place_new_window`
-/// resolves one of these — from the compass wedge that launched the
-/// window, or from the focused split when nothing asked for a side.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Insert {
-    /// A new column at strip position `idx` (`0` = far left, `ncols()` =
-    /// far right).
-    Col(usize),
-    /// A new row at stack position `idx` of column `col` (`0` = top, the
-    /// row count = bottom).
-    Row { col: usize, idx: usize },
-}
-
 /// One of the four sides a new split can open on, relative to an existing
 /// split. The taskbar's quick-launch hover compass names its four zones
-/// with this; `State::open_split_beside` turns one into the `Insert` it
+/// with this; `State::next_insert` turns one into the strip position it
 /// means for a given split.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
@@ -574,7 +538,7 @@ impl Layout {
     }
 
     /// Canvas-space rect of each column (before per-row subdivision).
-    fn col_rects(&self, wa: Rect, gap: i32) -> Vec<Rect> {
+    pub(crate) fn col_rects(&self, wa: Rect, gap: i32) -> Vec<Rect> {
         let mut x = wa.x + gap;
         let y = wa.y + gap;
         let h = (wa.h - 2 * gap).max(0);

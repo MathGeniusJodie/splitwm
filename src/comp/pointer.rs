@@ -61,7 +61,6 @@ pub struct GapDrag {
     pub idx: usize,
     pub start: i32,
     pub combined: i32,
-    pub gap: i32,
 }
 
 /// Dragging an outer canvas edge: the far edge of the leftmost/rightmost
@@ -83,11 +82,6 @@ pub struct BorderDrag {
     pub anchor_x: i32,
 }
 
-/// The quick-launch hover compass currently on screen: the tile it
-/// belongs to (its icon rect centres the compass, its hover rect keeps it
-/// up) — re-resolved per read, never stored.
-pub type QuickCompass = crate::widgets::QuickTile;
-
 /// What a click on the chrome resolved to, in priority order.
 enum Hit {
     Btn(NodeId, BtnKind),
@@ -98,10 +92,10 @@ enum Hit {
     /// always states where its window opens.
     QuickLaunch(usize, Side),
     Title(NodeId),
-    /// The gap between two stacked rows, with the drag it arms and
-    /// whether that drag can move anything (a pinned neighbour's height
-    /// ignores the stored share).
-    RowGap(GapDrag, bool),
+    /// The gap between two stacked rows, with the drag it arms — `None`
+    /// beside a minimized neighbour, whose pinned height ignores the
+    /// stored share, so the gap resizes nothing.
+    RowGap(Option<GapDrag>),
     Edge(bool),
     /// A window frame's left (`true`) / right border band.
     Border(NodeId, bool),
@@ -175,11 +169,9 @@ impl Comp {
                 self.state.focus_leaf(leaf);
                 self.arrange();
             }
-            Hit::RowGap(drag, resizable) => {
-                // A gap next to a minimized leaf can't be dragged (its
-                // pixel size is pinned); ignore the press.
-                if resizable {
-                    self.interaction.drag = Some(ActiveDrag::Gap(drag));
+            Hit::RowGap(drag) => {
+                if let Some(d) = drag {
+                    self.interaction.drag = Some(ActiveDrag::Gap(d));
                 }
             }
             Hit::Edge(left) => {
@@ -266,12 +258,9 @@ impl Comp {
                 true
             }
             Some(ActiveDrag::Gap(d)) => {
-                if d.combined <= 0 {
-                    return true;
-                }
                 // A stack lays out down the column's height, which doesn't
                 // scroll: screen y is canvas y.
-                let new_first = pos.y as i32 - d.start - d.gap / 2;
+                let new_first = pos.y as i32 - d.start - theme::GAP / 2;
                 self.state.resize_rows(d.col, d.idx, new_first, d.combined);
                 self.arrange();
                 true
@@ -398,7 +387,7 @@ impl Comp {
 
     /// The compass to draw and hit-test, re-resolved from this arrange's
     /// quick-launch regions.
-    pub fn quick_compass(&self) -> Option<QuickCompass> {
+    pub fn quick_compass(&self) -> Option<crate::widgets::QuickTile> {
         let slot = self.interaction.quick_hover?;
         self.view
             .widgets
@@ -408,12 +397,14 @@ impl Comp {
             .copied()
     }
 
-    /// Which wedge of the shown compass the pointer is in, for the
-    /// drawing pass; `None` only when no compass is up.
-    pub fn quick_compass_zone(&self) -> Option<Side> {
+    /// The compass to draw: the square it covers and the wedge under the
+    /// pointer, resolved together so the two can't describe different
+    /// tiles. `None` only when no compass is up.
+    pub fn compass_paint(&self) -> Option<(crate::widgets::FrameRect, Side)> {
         let compass = self.quick_compass()?;
         let pos = self.pointer.current_location();
-        Some(compass_zone(compass.icon, pos.x as i32, pos.y as i32))
+        let zone = compass_zone(compass.icon, pos.x as i32, pos.y as i32);
+        Some((compass_rect(compass.icon), zone))
     }
 
     /// Re-aim the compass at the pointer: it appears as soon as the
@@ -444,21 +435,16 @@ impl Comp {
     /// (the stack's own gap) falls back to the column's first row, so
     /// every point of the gap names a window.
     fn column_leaf_at(&self, col: usize, my: i32) -> Option<NodeId> {
-        let first = self.state.layout.leaf_at(Pos { col, row: 0 })?;
-        for row in 0..self.state.layout.col_len(col) {
-            let Some(leaf) = self.state.layout.leaf_at(Pos { col, row }) else {
-                continue;
-            };
-            if self
-                .view
-                .frame_rects
-                .get(&leaf)
-                .is_some_and(|r| my >= r.y && my < r.y + r.h)
-            {
-                return Some(leaf);
-            }
-        }
-        Some(first)
+        let layout = &self.state.layout;
+        (0..layout.col_len(col))
+            .filter_map(|row| layout.leaf_at(Pos { col, row }))
+            .find(|leaf| {
+                self.view
+                    .frame_rects
+                    .get(leaf)
+                    .is_some_and(|r| my >= r.y && my < r.y + r.h)
+            })
+            .or_else(|| layout.leaf_at(Pos { col, row: 0 }))
     }
 
     /// Priority-ordered hit-test of everything clickable on the chrome,
@@ -482,11 +468,10 @@ impl Comp {
         // reaches — its own hover rect included, which the wedges don't
         // quite cover at the bar's edges. Only the hovered slot has one,
         // so this can never shadow another icon.
-        if let Some(c) = self.quick_compass() {
-            let square = compass_rect(c.icon);
-            if rect_contains(square, mx, my) || rect_contains(c.hover, mx, my) {
-                return Hit::QuickLaunch(c.slot, compass_zone(square, mx, my));
-            }
+        if let Some(c) = self.quick_compass().filter(|c| {
+            rect_contains(compass_rect(c.icon), mx, my) || rect_contains(c.hover, mx, my)
+        }) {
+            return Hit::QuickLaunch(c.slot, compass_zone(c.icon, mx, my));
         }
         // Compressed taskbar tiles overlap like fanned cards, rightmost on
         // top; reverse iteration matches draw order so the topmost tile
@@ -545,16 +530,12 @@ impl Comp {
                         None => Hit::Miss,
                     }
                 }
-                GapAt::Row { col, idx } => Hit::RowGap(
-                    GapDrag {
-                        col,
-                        idx,
-                        start: b.start,
-                        combined: b.first + b.second,
-                        gap: theme::GAP,
-                    },
-                    b.resizable,
-                ),
+                GapAt::Row { col, idx } => Hit::RowGap(b.resizable.then_some(GapDrag {
+                    col,
+                    idx,
+                    start: b.start,
+                    combined: b.first + b.second,
+                })),
             };
         }
         if let Some(&(_, left)) = self
@@ -608,8 +589,8 @@ impl Comp {
             | Hit::Title(_) => CursorIcon::Pointer,
             // A gap next to a minimized leaf can't be dragged; don't
             // advertise a resize that won't happen.
-            Hit::RowGap(_, resizable) => {
-                if resizable {
+            Hit::RowGap(drag) => {
+                if drag.is_some() {
                     CursorIcon::NsResize
                 } else {
                     CursorIcon::Default

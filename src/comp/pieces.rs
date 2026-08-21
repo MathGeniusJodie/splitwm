@@ -655,16 +655,23 @@ impl Comp {
     /// The taskbar strip's draw data: one tile per split's window, in split
     /// order (accent highlight box, corner close badge), the separator, and
     /// the visible quick-launch icons. The strip spans the full output width
-    /// and the bottom `theme::TASKBAR_H` pixels.
+    /// and the bottom `theme::TASKBAR_H` pixels, plus the band above them a
+    /// hover compass reaches into.
     fn taskbar_paint(&self, ow: i32, oh: i32) -> TaskbarPaint {
-        // The compass reaches above the bar, so the strip grows upwards to
-        // hold it — it is transparent outside its tiles either way.
-        let compass = self
-            .quick_compass()
-            .zip(self.quick_compass_zone())
-            .map(|(c, zone)| (compass_rect(c.icon), zone));
+        let compass = self.compass_paint();
+        // A compass reaches above the bar, so the strip runs up to where one
+        // would sit whether or not one is up — it is transparent outside its
+        // tiles either way, and a fixed extent means a hover rewrites the
+        // texture in place instead of reallocating it.
         let bar_top = (oh - theme::TASKBAR_H).max(0);
-        let origin_y = compass.map_or(bar_top, |(r, _)| bar_top.min(r.y)).max(0);
+        let ring_top = self
+            .view
+            .widgets
+            .quick_regions
+            .iter()
+            .map(|t| compass_rect(t.icon).y)
+            .min();
+        let origin_y = ring_top.map_or(bar_top, |y| bar_top.min(y)).max(0);
         let tiles = self
             .view
             .widgets

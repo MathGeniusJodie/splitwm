@@ -4,8 +4,21 @@
 //! split, and a dying window takes its split with it. With no window open
 //! the strip is empty and the screen is bare wallpaper.
 
-use crate::layout::{Boundary, ColWidth, Insert, Layout, NodeId, Pos, Rect, Side, Win};
+use crate::layout::{Boundary, ColWidth, Layout, NodeId, Pos, Rect, Side, Win};
 use crate::theme;
+
+/// Where a new window opens in the strip. `State::place_new_window`
+/// resolves one of these — from the compass wedge that launched the
+/// window, or from the focused split when nothing asked for a side.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Insert {
+    /// A new column at strip position `idx` (`0` = far left, `ncols()` =
+    /// far right).
+    Col(usize),
+    /// A new row at stack position `idx` of column `col` (`0` = top, the
+    /// row count = bottom).
+    Row { col: usize, idx: usize },
+}
 
 /// Where a dragged split lands when it is dropped, in the vocabulary of
 /// the three relocations `State` performs.
@@ -169,18 +182,20 @@ impl State {
             .aim
             .take()
             .and_then(|(leaf, side)| Some((self.layout.locate(leaf)?, side)));
-        match aimed {
-            Some((pos, Side::Left)) => Insert::Col(pos.col),
-            Some((pos, Side::Right)) => Insert::Col(pos.col + 1),
-            Some((pos, Side::Up)) => Insert::Row {
+        let Some((pos, side)) = aimed else {
+            return Insert::Col(self.focused_pos().map_or(0, |p| p.col + 1));
+        };
+        match side {
+            Side::Left => Insert::Col(pos.col),
+            Side::Right => Insert::Col(pos.col + 1),
+            Side::Up => Insert::Row {
                 col: pos.col,
                 idx: pos.row,
             },
-            Some((pos, Side::Down)) => Insert::Row {
+            Side::Down => Insert::Row {
                 col: pos.col,
                 idx: pos.row + 1,
             },
-            None => Insert::Col(self.focused_pos().map_or(0, |p| p.col + 1)),
         }
     }
 
@@ -647,33 +662,31 @@ impl State {
     /// the near end. `None` only for an empty strip, which has no margins
     /// to speak of. Screen coordinates: the scroll is applied here.
     pub fn margin_drop(&self, wa: Rect, mx: i32, my: i32) -> Option<MoveDrop> {
-        let last_col = self.layout.ncols().checked_sub(1)?;
-        let geos = self.compute(wa);
-        let head = |col: usize| self.layout.leaf_at(Pos { col, row: 0 });
-        // A column's rows all share its x-span, so its first row states it.
-        let span = |col: usize| {
-            let g = geos.get(&head(col)?)?;
-            Some((g.x - self.scroll_x, g.w))
-        };
-        let (first_x, _) = span(0)?;
+        let cols = self.layout.col_rects(wa, theme::GAP);
+        let screen = |r: &Rect| (r.x - self.scroll_x, r.w);
+        let (first_x, _) = screen(cols.first()?);
         if mx < first_x {
             return Some(MoveDrop::ColumnAt(0));
         }
-        let (last_x, last_w) = span(last_col)?;
+        let (last_x, last_w) = screen(cols.last()?);
         if mx >= last_x + last_w {
-            return Some(MoveDrop::ColumnAt(last_col + 1));
+            return Some(MoveDrop::ColumnAt(cols.len()));
         }
-        let col = (0..=last_col).find(|&c| span(c).is_some_and(|(x, w)| mx >= x && mx < x + w))?;
-        let top = head(col)?;
-        let bottom = self.layout.leaf_at(Pos {
-            col,
-            row: self.layout.col_len(col).checked_sub(1)?,
+        let col = cols.iter().position(|r| {
+            let (x, w) = screen(r);
+            mx >= x && mx < x + w
         })?;
-        if geos.get(&top).is_some_and(|g| my < g.y) {
-            Some(MoveDrop::Stack(top, true))
-        } else {
-            Some(MoveDrop::Stack(bottom, false))
+        if my < cols[col].y {
+            return Some(MoveDrop::Stack(
+                self.layout.leaf_at(Pos { col, row: 0 })?,
+                true,
+            ));
         }
+        let last_row = self.layout.col_len(col).checked_sub(1)?;
+        Some(MoveDrop::Stack(
+            self.layout.leaf_at(Pos { col, row: last_row })?,
+            false,
+        ))
     }
 
     /// Scroll so the focused split sits inside the viewport (one gap margin).

@@ -165,10 +165,11 @@ const COMPASS_GAP: i32 = 4;
 /// Draw the hover compass around a quick-launch icon: a square, a ring
 /// wider than the icon on every side, cut by its diagonals into the four
 /// wedges that place the launched window left of, right of, above or below
-/// the focused split. The wedge under the pointer (`hover`) is filled
-/// solid; the rest carry the chrome dither. The icon is drawn over the
-/// square's middle, which the wedges run under — it is part of them, not
-/// a hole in them.
+/// the focused split. The wedge under the pointer (`hover`) is solid white;
+/// the rest are the same white on a checker, so they read as half-lit next
+/// to it and let what they cover show between their pixels. The icon is
+/// drawn over the square's middle, which the wedges run under — it is part
+/// of them, not a hole in them.
 pub fn draw_compass(fb: &mut Framebuffer, r: crate::layout::Rect, hover: Side) {
     // Doubled coordinates keep the centre of an even-sided square exact.
     let (cx2, cy2) = (2 * r.x + r.w, 2 * r.y + r.h);
@@ -186,14 +187,10 @@ pub fn draw_compass(fb: &mut Framebuffer, r: crate::layout::Rect, hover: Side) {
             if (dx.abs() - dy.abs()).abs() < 2 * COMPASS_GAP {
                 continue;
             }
-            let color = if crate::widgets::compass_zone(r, x, y) == hover {
-                palette_color::LAVENDER
-            } else if (x + y) % 2 == 0 {
-                palette_color::BLACK
-            } else {
-                palette_color::GUNMETAL
-            };
-            fb.set_pixel(x as isize, y as isize, color);
+            if crate::widgets::compass_side(dx, dy) != hover && (x + y) % 2 != 0 {
+                continue;
+            }
+            fb.set_pixel(x as isize, y as isize, palette_color::CREAM);
         }
     }
 }

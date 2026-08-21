@@ -72,7 +72,7 @@ pub fn compute_placements(
 /// each of its four wedges extends past the icon's edge. The ring reaches
 /// over the neighbouring icons, so only the hovered icon's compass is ever
 /// drawn or hit-tested.
-pub const COMPASS_RING: i32 = 12;
+pub const COMPASS_RING: i32 = 9;
 
 /// The hover compass square drawn around the quick-launch icon at `icon`:
 /// the icon's rect grown by `COMPASS_RING` on every side.
@@ -94,8 +94,17 @@ pub const fn compass_rect(icon: FrameRect) -> FrameRect {
 /// and the drawing pass and the hit-test can't disagree.
 pub fn compass_zone(around: FrameRect, mx: i32, my: i32) -> Side {
     // Doubled so the centre of an even-sided rect is exact.
-    let dx = 2 * mx + 1 - (2 * around.x + around.w);
-    let dy = 2 * my + 1 - (2 * around.y + around.h);
+    compass_side(
+        2 * mx + 1 - (2 * around.x + around.w),
+        2 * my + 1 - (2 * around.y + around.h),
+    )
+}
+
+/// The wedge a point at doubled offset (`dx`, `dy`) from the compass's
+/// centre falls in: whichever axis it sits furthest along. The drawing
+/// pass has these deltas in hand already, so it names its wedges through
+/// here rather than re-deriving them from the square.
+pub const fn compass_side(dx: i32, dy: i32) -> Side {
     if dx.abs() > dy.abs() {
         if dx < 0 {
             Side::Left
@@ -591,7 +600,7 @@ mod tests {
         assert_eq!(compass_zone(icon, r.x + r.w - 2, 121), Side::Right);
         assert_eq!(compass_zone(icon, 121, r.y + 1), Side::Up);
         assert_eq!(compass_zone(icon, 121, r.y + r.h - 2), Side::Down);
-        // Over the icon too: it is no click target of its own any more.
+        // The icon's own area belongs to a wedge like the rest of the square.
         assert_eq!(compass_zone(icon, 121, icon.y + 2), Side::Up);
         assert_eq!(compass_zone(icon, icon.x + 2, 121), Side::Left);
         // The compass rect shares the icon's centre, so it answers alike.
