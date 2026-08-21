@@ -1,11 +1,27 @@
 //! Layout state plus every mutation of the column strip and the scroll
 //! bookkeeping — there is exactly one layout (no workspaces/tags). Windows
-//! and splits are paired for life: a new window opens in (or as) its own
-//! split, and a dying window usually takes its split with it; only empty
-//! placeholder splits exist without a window, never the reverse.
+//! and splits are paired one to one for life: a new window opens as its own
+//! split, and a dying window takes its split with it. With no window open
+//! the strip is empty and the screen is bare wallpaper.
 
-use crate::layout::{Boundary, ColWidth, GapAt, Insert, Layout, NodeId, Pos, Rect, Win};
+use crate::layout::{Boundary, ColWidth, Insert, Layout, NodeId, Pos, Rect, Side, Win};
 use crate::theme;
+
+/// Where a dragged split lands when it is dropped, in the vocabulary of
+/// the three relocations `State` performs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MoveDrop {
+    /// Its own column at strip position `idx` — what the empty places
+    /// mean: a gap between two columns, or the canvas past the strip's
+    /// ends. They name a place rather than a neighbour, so a split leaves
+    /// its stack for one even when the place is beside its own column.
+    ColumnAt(usize),
+    /// Its own column before (`true`) or after `dst`'s — what a drop onto
+    /// something means: a split's frame, or a taskbar tile.
+    Column(NodeId, bool),
+    /// A row above (`true`) or below `dst` within `dst`'s stack.
+    Stack(NodeId, bool),
+}
 
 /// Outcome of `activate_client`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -18,13 +34,20 @@ pub enum Activation {
 
 pub struct State {
     pub layout: Layout,
-    /// Private so every write outside `#[cfg(test)]` goes through
+    /// The split holding layout focus; `None` only while the strip is
+    /// empty. Private so every write outside `#[cfg(test)]` goes through
     /// `focus_leaf` (which accepts only live leaf ids) and every read
     /// through `focused_leaf_valid` (the focused leaf can still be
     /// *removed* by a later mutation, so reads re-validate) — a dangling
-    /// focus is never handed out. Tests assign the field directly to set up
-    /// states.
-    focused_leaf: NodeId,
+    /// focus is never handed out.
+    focused_leaf: Option<NodeId>,
+    /// Where the next window to map opens, when a launch asked for a side
+    /// (the taskbar's quick-launch compass). Held as the split it was
+    /// aimed at plus that side, so a stale aim — its split closed before
+    /// the window arrived — is simply dropped. Consumed by the next
+    /// `place_new_window`, which otherwise opens a column right of the
+    /// focused split.
+    aim: Option<(NodeId, Side)>,
     /// Current and target scroll offsets — `scroll_x` glides toward
     /// `scroll_target` one frame at a time via `step_scroll`, driven by the
     /// main event loop while they differ (`scroll_animating`). Private so
@@ -44,22 +67,21 @@ pub struct State {
 
 impl State {
     pub fn new() -> Self {
-        let layout = Layout::new();
-        let first = layout.first_leaf();
         Self {
-            layout,
-            focused_leaf: first,
+            layout: Layout::new(),
+            focused_leaf: None,
+            aim: None,
             scroll_x: 0,
             scroll_target: 0,
             dock_extra: 0,
         }
     }
 
-    pub fn focused_leaf_valid(&self) -> NodeId {
-        if self.layout.is_leaf(self.focused_leaf) {
-            self.focused_leaf
-        } else {
-            self.layout.first_leaf()
+    /// The focused split, or `None` while the strip holds no window.
+    pub fn focused_leaf_valid(&self) -> Option<NodeId> {
+        match self.focused_leaf {
+            Some(l) if self.layout.is_leaf(l) => Some(l),
+            _ => self.layout.first_leaf(),
         }
     }
 
@@ -68,37 +90,32 @@ impl State {
     /// focus must never come to rest on a split `compute` doesn't lay out.
     pub fn focus_leaf(&mut self, leaf: NodeId) {
         if self.layout.is_leaf(leaf) {
-            self.focused_leaf = leaf;
+            self.focused_leaf = Some(leaf);
         }
     }
 
-    /// The column holding the focused split.
-    fn focused_col(&self) -> usize {
-        self.layout
-            .locate(self.focused_leaf_valid())
-            .expect("focused_leaf_valid returns a live leaf")
-            .col
+    /// Where the focused split sits, or `None` while the strip is empty.
+    fn focused_pos(&self) -> Option<Pos> {
+        self.layout.locate(self.focused_leaf_valid()?)
     }
 
     // --- window placement helpers ---
 
-    /// Place a newly mapped window: into the focused split if that split
-    /// is an empty placeholder, else into a fresh column immediately right
-    /// of the focused one — the same insertion the gap `+` button
-    /// performs. An empty split that isn't focused attracts nothing; it
-    /// waits for a window placed *into* it deliberately. Every window
+    /// Place a newly mapped window: where the launch that started it
+    /// aimed (`aim_next_window`, whose split must still be alive), else in
+    /// a fresh column immediately right of the focused one. Every window
     /// lives in exactly one split from map to destroy — there is no
-    /// off-layout stash.
+    /// off-layout stash and no split waiting empty for it.
     ///
     /// `want_w` is the frame width the window's own first-commit size asks
     /// for (`None` when the client stated nothing). It sizes the fresh
-    /// column instead of `theme::default_col_w`, and re-sizes a lone
-    /// placeholder column the window fills — a stacked placeholder's width
-    /// is shared with its siblings, so their deliberate arrangement wins
-    /// there. Never below the chrome's minimum; a window asking for the
-    /// whole viewport strip (or more) gets `ColWidth::Viewport`, so it
-    /// keeps tracking the viewport like the bootstrap column — panels
-    /// reserving exclusive zones still resize it.
+    /// column instead of `theme::default_col_w`; a window joining a stack
+    /// shares its column's width with its siblings, so their deliberate
+    /// arrangement wins there. Never below the chrome's minimum; a window
+    /// asking for the whole viewport strip (or more) gets
+    /// `ColWidth::Viewport`, so it keeps tracking the viewport — panels
+    /// reserving exclusive zones still resize it. The first window on an
+    /// empty strip tracks the viewport unless it asked for a width.
     pub fn place_new_window(&mut self, wa: Rect, c: Win, want_w: Option<i32>) {
         if self.layout.find_leaf_for_client(c).is_some() {
             return;
@@ -111,58 +128,77 @@ impl State {
                 ColWidth::Px(w.max(theme::min_split_w()))
             }
         });
-        let focused = self.focused_leaf_valid();
-        if self
-            .layout
-            .leaf(focused)
-            .is_some_and(|l| l.client.is_none())
-        {
-            if let (Some(width), false) = (want, self.layout.stacked(focused)) {
-                let pos = self.layout.locate(focused).expect("focused leaf is live");
-                self.layout.set_col_width(pos.col, width);
-            }
-            if let Some(l) = self.layout.leaf_mut(focused) {
-                l.show(c);
-            }
-            return;
-        }
-        let col = self.focused_col();
-        let width = want.unwrap_or(ColWidth::Px(theme::default_col_w(wa.w)));
-        let new = self.layout.insert_column(col + 1, width);
-        if let Some(l) = self.layout.leaf_mut(new) {
-            l.show(c);
-        }
+        let new = match self.next_insert() {
+            Insert::Col(idx) => self.open_column(wa, idx, c, want),
+            Insert::Row { col, idx } => match self.layout.insert_row(col, idx, c) {
+                Some(new) => new,
+                // A dead column index, which `next_insert` never names —
+                // and a window without a split must stay impossible.
+                None => self.open_column(wa, col, c, want),
+            },
+        };
         self.focus_leaf(new);
     }
 
-    /// A window is gone: clear it from its split and collapse that split —
-    /// windows and splits live and die together — unless the split is the
-    /// strip's sole one (the layout always keeps one). Focus follows to
-    /// the nearest surviving neighbour only when the dying split held it.
-    /// Returns whether the layout changed (a split collapsed).
+    /// Open a column at strip position `idx` holding `c`, at its stated
+    /// width (`want`) or the default — the viewport-tracking one while the
+    /// strip is still empty.
+    fn open_column(&mut self, wa: Rect, idx: usize, c: Win, want: Option<ColWidth>) -> NodeId {
+        let width = want.unwrap_or(if self.layout.ncols() == 0 {
+            ColWidth::Viewport
+        } else {
+            ColWidth::Px(theme::default_col_w(wa.w))
+        });
+        self.layout.insert_column(idx, width, c)
+    }
+
+    /// Open the next window that maps on `side` of the focused split — the
+    /// taskbar compass's wedges, which choose a side before the launched
+    /// window exists. A second aim before that window arrives replaces the
+    /// first: only one window can be the next one.
+    pub fn aim_next_window(&mut self, side: Side) {
+        self.aim = self.focused_leaf_valid().map(|leaf| (leaf, side));
+    }
+
+    /// Where the next window opens, consuming any aim: the side a launch
+    /// asked for, resolved against the split it named (dropped when that
+    /// split is gone), else a fresh column right of the focused one — the
+    /// strip's first column while it is empty.
+    fn next_insert(&mut self) -> Insert {
+        let aimed = self
+            .aim
+            .take()
+            .and_then(|(leaf, side)| Some((self.layout.locate(leaf)?, side)));
+        match aimed {
+            Some((pos, Side::Left)) => Insert::Col(pos.col),
+            Some((pos, Side::Right)) => Insert::Col(pos.col + 1),
+            Some((pos, Side::Up)) => Insert::Row {
+                col: pos.col,
+                idx: pos.row,
+            },
+            Some((pos, Side::Down)) => Insert::Row {
+                col: pos.col,
+                idx: pos.row + 1,
+            },
+            None => Insert::Col(self.focused_pos().map_or(0, |p| p.col + 1)),
+        }
+    }
+
+    /// A window is gone: its split collapses out of the strip — windows
+    /// and splits live and die together. A whole column vanishes without
+    /// its neighbours resizing (the strip just gets shorter); a row leaves
+    /// its stack to the surviving rows, which reclaim the height; the last
+    /// window leaves the strip empty. Focus follows to the nearest
+    /// surviving neighbour only when the dying split held it. Returns
+    /// whether the layout changed.
     pub fn unpin_client(&mut self, c: Win) -> bool {
         let Some(lid) = self.layout.find_leaf_for_client(c) else {
             return false;
         };
-        if let Some(l) = self.layout.leaf_mut(lid) {
-            l.client = None;
-        }
-        self.collapse_leaf(lid)
-    }
-
-    /// Collapse `leaf` out of the strip. A whole column vanishes without
-    /// its neighbours resizing (the strip just gets shorter); a row leaves
-    /// its stack to the surviving rows, which reclaim the height. Refused
-    /// for the strip's sole split. Focus follows to the nearest surviving
-    /// neighbour only when the collapsed leaf held it. Returns whether the
-    /// layout changed.
-    fn collapse_leaf(&mut self, leaf: NodeId) -> bool {
-        let had_focus = self.focused_leaf_valid() == leaf;
-        let Some(new_focus) = self.layout.remove(leaf) else {
-            return false;
-        };
+        let had_focus = self.focused_leaf_valid() == Some(lid);
+        let new_focus = self.layout.remove(lid);
         if had_focus {
-            self.focus_leaf(new_focus);
+            self.focused_leaf = new_focus;
         }
         true
     }
@@ -195,11 +231,8 @@ impl State {
     /// nothing — its window is unmapped, and handing it out as a focus
     /// target would mean focusing an unviewable window.
     pub fn focused_client(&self) -> Option<Win> {
-        let l = self.layout.leaf(self.focused_leaf_valid())?;
-        if l.minimized {
-            return None;
-        }
-        l.client
+        let l = self.layout.leaf(self.focused_leaf_valid()?)?;
+        (!l.minimized).then_some(l.client)
     }
 
     // --- focus / move between splits ---
@@ -220,7 +253,10 @@ impl State {
     }
 
     pub fn focus_direction(&mut self, next: bool) -> bool {
-        if let Some(l) = self.adjacent_leaf(self.focused_leaf_valid(), next) {
+        let Some(from) = self.focused_leaf_valid() else {
+            return false;
+        };
+        if let Some(l) = self.adjacent_leaf(from, next) {
             self.focus_leaf(l);
             true
         } else {
@@ -238,7 +274,9 @@ impl State {
         if leaves.len() < 2 {
             return false;
         }
-        let src = self.focused_leaf_valid();
+        let Some(src) = self.focused_leaf_valid() else {
+            return false;
+        };
         let Some(cur) = leaves.iter().position(|&l| l == src) else {
             return false;
         };
@@ -283,6 +321,19 @@ impl State {
         true
     }
 
+    /// Relocate split `src` into its own column at strip position `idx`,
+    /// keeping it focused — the drop into a gap or onto the bare canvas
+    /// past the strip (see `MoveDrop::ColumnAt`). Returns whether the
+    /// strip changed.
+    pub fn move_leaf_to_column(&mut self, wa: Rect, src: NodeId, idx: usize) -> bool {
+        let default = ColWidth::Px(theme::default_col_w(wa.w));
+        if !self.layout.move_to_column(src, idx, default) {
+            return false;
+        }
+        self.focus_leaf(src);
+        true
+    }
+
     /// Relocate split `src` into `dst`'s stack, above (`before`) or below
     /// its row — the horizontal-gap drop. Keeps `src` focused. Returns
     /// whether the strip changed.
@@ -294,15 +345,10 @@ impl State {
         true
     }
 
-    /// Toggle a leaf's minimized flag (the layout collapses it to min size).
-    /// Refused for the strip's sole split: it has no siblings to yield space
-    /// to, and its whole-frame restore button is disabled (`LeafMeta::sole`),
-    /// so a minimized sole split would be a full-screen strip with no way
-    /// back. Returns whether the flag changed.
+    /// Toggle a leaf's minimized flag (the layout collapses it to min size,
+    /// and its whole frame becomes the restore button). Returns whether the
+    /// flag changed.
     pub fn toggle_minimize(&mut self, leaf: NodeId) -> bool {
-        if self.layout.sole_split() {
-            return false;
-        }
         match self.layout.leaf_mut(leaf) {
             Some(l) => {
                 l.minimized = !l.minimized;
@@ -310,76 +356,6 @@ impl State {
             }
             None => false,
         }
-    }
-
-    // --- splitting / inserting ---
-
-    /// Stack a new empty split below the focused one; the existing window
-    /// keeps the major share of the row, and the new placeholder takes the
-    /// focus — like every other insert, so the next window opened lands in
-    /// the split the user just made room in. Refused for a minimized leaf:
-    /// a minimized child cloned from it would be a split state the rest of
-    /// the system treats as impossible. Returns whether the split
-    /// happened, so callers that queue an animation for the action can
-    /// cancel it on refusal.
-    pub fn split_focused(&mut self) -> bool {
-        let leaf = self.focused_leaf_valid();
-        if self.layout.leaf(leaf).is_none_or(|l| l.minimized) {
-            return false;
-        }
-        match self.layout.split_below(leaf, theme::SPLIT_RATIO) {
-            Some(new) => {
-                self.focus_leaf(new);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Insert a new empty split at `at` — the "+" buttons' semantics. A
-    /// column insert gets the default width; a row insert joins the stack
-    /// at the average share. The new split becomes focused. `None` for a
-    /// row insert into a dead column index (nothing inserted).
-    pub fn insert_at(&mut self, wa: Rect, at: Insert) -> Option<NodeId> {
-        let new = match at {
-            Insert::Col(idx) => self
-                .layout
-                .insert_column(idx, ColWidth::Px(theme::default_col_w(wa.w))),
-            Insert::Row { col, idx } => self.layout.insert_row(col, idx)?,
-        };
-        self.focus_leaf(new);
-        Some(new)
-    }
-
-    /// Split the focused column into two side by side whose widths sum to
-    /// its current width — the titlebar ⊞'s wide-window action. The window
-    /// keeps the golden major share and the fresh placeholder to its right
-    /// takes the minor, so the pair occupies exactly the space the window
-    /// had. Both shares hold to the chrome minimum, at the cost of the sum
-    /// growing past the original when the column was too narrow to halve.
-    /// The placeholder becomes focused.
-    pub fn split_column_right(&mut self, wa: Rect) -> NodeId {
-        let col = self.focused_col();
-        let w = self.layout.col_px(col, wa.w, theme::GAP);
-        let minor =
-            ((f64::from(w) * (1.0 - theme::SPLIT_RATIO)).round() as i32).max(theme::min_split_w());
-        let major = (w - minor).max(theme::min_split_w());
-        self.layout.set_col_width(col, ColWidth::Px(major));
-        let new = self.layout.insert_column(col + 1, ColWidth::Px(minor));
-        self.focus_leaf(new);
-        new
-    }
-
-    /// Remove `leaf` if it is an empty placeholder. An occupied split is
-    /// never removed directly — it collapses when its window dies
-    /// (`unpin_client`), so a window can't be left splitless. Refused for
-    /// the strip's sole split. Focus moves to the nearest surviving
-    /// neighbour when the removed leaf held it.
-    pub fn remove_empty_leaf(&mut self, leaf: NodeId) -> bool {
-        if self.layout.leaf(leaf).is_none_or(|l| l.client.is_some()) {
-            return false;
-        }
-        self.collapse_leaf(leaf)
     }
 
     // --- resize ---
@@ -390,7 +366,9 @@ impl State {
     /// the strip absorbs the difference and no sibling moves. Returns
     /// whether anything changed.
     pub fn resize_focused(&mut self, wa: Rect, grow: bool) -> bool {
-        let leaf = self.focused_leaf_valid();
+        let Some(leaf) = self.focused_leaf_valid() else {
+            return false;
+        };
         let Some(pos) = self.layout.locate(leaf) else {
             return false;
         };
@@ -447,32 +425,24 @@ impl State {
         true
     }
 
-    /// Apply a gap drag. A column gap sets the left column's width to the
-    /// dragged size (later columns slide; nothing resizes); a row gap sets
-    /// the split so the upper row occupies fraction `frac` of the two
-    /// rows' combined height (their sum is preserved).
-    pub fn resize_gap(&mut self, at: GapAt, first_px: i32, combined_px: i32) {
-        match at {
-            GapAt::Col(idx) => {
-                self.layout
-                    .set_col_width(idx, ColWidth::Px(first_px.max(theme::min_split_w())));
-            }
-            GapAt::Row { col, idx } => {
-                if combined_px <= 0 {
-                    return;
-                }
-                let frac = (f64::from(first_px) / f64::from(combined_px))
-                    .clamp(theme::MIN_SPLIT_FRAC, 1.0 - theme::MIN_SPLIT_FRAC);
-                let (a, b) = (Pos { col, row: idx }, Pos { col, row: idx + 1 });
-                let (Some(fa), Some(fb)) = (self.layout.row_frac(a), self.layout.row_frac(b))
-                else {
-                    return;
-                };
-                let combined = fa + fb;
-                self.layout.set_row_frac(a, combined * frac);
-                self.layout.set_row_frac(b, combined * (1.0 - frac));
-            }
+    /// Apply a stack-gap drag: re-split rows `idx` and `idx + 1` of `col`
+    /// so the upper one occupies fraction `first_px / combined_px` of
+    /// their combined height (their sum is preserved). The gap between two
+    /// *columns* has no drag of its own — each half of it belongs to the
+    /// window on that side, and resizes that column (`resize_col`).
+    pub fn resize_rows(&mut self, col: usize, idx: usize, first_px: i32, combined_px: i32) {
+        if combined_px <= 0 {
+            return;
         }
+        let frac = (f64::from(first_px) / f64::from(combined_px))
+            .clamp(theme::MIN_SPLIT_FRAC, 1.0 - theme::MIN_SPLIT_FRAC);
+        let (a, b) = (Pos { col, row: idx }, Pos { col, row: idx + 1 });
+        let (Some(fa), Some(fb)) = (self.layout.row_frac(a), self.layout.row_frac(b)) else {
+            return;
+        };
+        let combined = fa + fb;
+        self.layout.set_row_frac(a, combined * frac);
+        self.layout.set_row_frac(b, combined * (1.0 - frac));
     }
 
     /// Resize column `col` to `target_w` pixels: the column absorbs the
@@ -504,8 +474,10 @@ impl State {
     /// Resize the leftmost or rightmost column (the outer canvas-edge
     /// handles' target) — see `resize_col`.
     pub fn resize_edge(&mut self, wa: Rect, left: bool, target_w: i32) -> i32 {
-        let col = if left { 0 } else { self.layout.ncols() - 1 };
-        self.resize_col(wa, col, target_w)
+        let Some(last) = self.layout.ncols().checked_sub(1) else {
+            return 0;
+        };
+        self.resize_col(wa, if left { 0 } else { last }, target_w)
     }
 
     // --- canvas ---
@@ -639,7 +611,7 @@ impl State {
         self.layout.compute(wa, theme::GAP)
     }
 
-    /// Gaps between adjacent splits, for drag handles / insert buttons.
+    /// Gaps between adjacent splits, for the drag handles.
     pub fn boundaries(&self, wa: Rect) -> Vec<Boundary> {
         self.layout.boundaries(wa, theme::GAP)
     }
@@ -647,14 +619,17 @@ impl State {
     /// Canvas-space x-span `(start_x, width)` of the leftmost/rightmost
     /// column — used to seed and drive an edge-of-strip resize drag (see
     /// `resize_edge`). With a single column, `left`/`right` both describe
-    /// the same span.
+    /// the same span; `None` on an empty strip, which has no edges to drag.
     pub fn edge_span(&self, wa: Rect, left: bool) -> Option<(i32, i32)> {
         let gap = theme::GAP;
         let start_x = wa.x + gap;
+        let n = self.layout.ncols();
+        if n == 0 {
+            return None;
+        }
         if left {
             Some((start_x, self.layout.col_px(0, wa.w, gap)))
         } else {
-            let n = self.layout.ncols();
             let before: i32 = (0..n - 1).map(|i| self.layout.col_px(i, wa.w, gap)).sum();
             let gaps_before = gap * i32::try_from(n - 1).unwrap_or(0);
             Some((
@@ -664,10 +639,50 @@ impl State {
         }
     }
 
+    /// Where a split dropped on bare wallpaper lands: the strip's own
+    /// margins name a place just like the gaps between splits do. Left of
+    /// the first column or right of the last — the empty canvas beyond the
+    /// strip — the split becomes a column at that end; over a column's own
+    /// width, in its top or bottom margin, it joins that column's stack at
+    /// the near end. `None` only for an empty strip, which has no margins
+    /// to speak of. Screen coordinates: the scroll is applied here.
+    pub fn margin_drop(&self, wa: Rect, mx: i32, my: i32) -> Option<MoveDrop> {
+        let last_col = self.layout.ncols().checked_sub(1)?;
+        let geos = self.compute(wa);
+        let head = |col: usize| self.layout.leaf_at(Pos { col, row: 0 });
+        // A column's rows all share its x-span, so its first row states it.
+        let span = |col: usize| {
+            let g = geos.get(&head(col)?)?;
+            Some((g.x - self.scroll_x, g.w))
+        };
+        let (first_x, _) = span(0)?;
+        if mx < first_x {
+            return Some(MoveDrop::ColumnAt(0));
+        }
+        let (last_x, last_w) = span(last_col)?;
+        if mx >= last_x + last_w {
+            return Some(MoveDrop::ColumnAt(last_col + 1));
+        }
+        let col = (0..=last_col).find(|&c| span(c).is_some_and(|(x, w)| mx >= x && mx < x + w))?;
+        let top = head(col)?;
+        let bottom = self.layout.leaf_at(Pos {
+            col,
+            row: self.layout.col_len(col).checked_sub(1)?,
+        })?;
+        if geos.get(&top).is_some_and(|g| my < g.y) {
+            Some(MoveDrop::Stack(top, true))
+        } else {
+            Some(MoveDrop::Stack(bottom, false))
+        }
+    }
+
     /// Scroll so the focused split sits inside the viewport (one gap margin).
     pub fn ensure_in_view(&mut self, wa: Rect) {
+        let Some(focused) = self.focused_leaf_valid() else {
+            return;
+        };
         let geos = self.compute(wa);
-        let geo = match geos.get(&self.focused_leaf_valid()) {
+        let geo = match geos.get(&focused) {
             Some(g) => *g,
             None => return,
         };
@@ -695,8 +710,11 @@ impl State {
     /// of the same padding leftward). A pointer inside the viewport can't
     /// push the target below `min_scroll`.
     pub fn align_focus_to(&mut self, wa: Rect, px: i32) {
+        let Some(focused) = self.focused_leaf_valid() else {
+            return;
+        };
         let geos = self.compute(wa);
-        let Some(g) = geos.get(&self.focused_leaf_valid()) else {
+        let Some(g) = geos.get(&focused) else {
             return;
         };
         let left = g.x - self.scroll_target;
@@ -722,7 +740,7 @@ mod tests {
     };
     const GAP: i32 = crate::theme::GAP;
 
-    fn leaf_clients(s: &State) -> Vec<Option<Win>> {
+    fn leaf_clients(s: &State) -> Vec<Win> {
         s.layout
             .collect_leaves()
             .into_iter()
@@ -730,31 +748,85 @@ mod tests {
             .collect()
     }
 
-    /// A new window fills the focused split when (and only when) that
-    /// split is an empty placeholder.
+    /// A compass zone aims the next window at that side of the focused
+    /// split: left/right open a neighbouring column, up/down a row of the
+    /// focused split's own stack.
     #[test]
-    fn place_fills_focused_empty_placeholder() {
-        let mut s = State::new();
-        s.place_new_window(WA, 1, None);
-        assert_eq!(s.focused_client(), Some(1));
-        assert_eq!(s.layout.collect_leaves().len(), 1, "no new column opened");
+    fn an_aimed_window_opens_on_that_side() {
+        for (side, expected) in [
+            (Side::Left, vec![2, 1]),
+            (Side::Right, vec![1, 2]),
+            (Side::Up, vec![2, 1]),
+            (Side::Down, vec![1, 2]),
+        ] {
+            let mut s = State::new();
+            s.place_new_window(WA, 1, None);
+            s.aim_next_window(side);
+            s.place_new_window(WA, 2, None);
+            assert_eq!(leaf_clients(&s), expected, "{side:?}");
+            let stacked = matches!(side, Side::Up | Side::Down);
+            assert_eq!(s.layout.ncols(), if stacked { 1 } else { 2 }, "{side:?}");
+            assert_eq!(s.focused_client(), Some(2), "{side:?}");
+        }
     }
 
-    /// A stated preferred width sizes the window's column: the bootstrap
-    /// placeholder stops tracking the viewport, and a fresh column opens
-    /// at the hint instead of `default_col_w`.
+    /// An aim is spent by the window it was made for: the one after it
+    /// opens where an unaimed window would.
+    #[test]
+    fn an_aim_lasts_for_one_window_only() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1, None);
+        s.aim_next_window(Side::Down);
+        s.place_new_window(WA, 2, None);
+        s.place_new_window(WA, 3, None);
+        assert_eq!(s.layout.ncols(), 2, "the third window opened a column");
+    }
+
+    /// An aim whose split closed before the window arrived is dropped —
+    /// the window opens beside the focused split instead.
+    #[test]
+    fn an_aim_at_a_closed_split_is_dropped() {
+        let mut s = State::new();
+        s.place_new_window(WA, 1, None);
+        s.place_new_window(WA, 2, None);
+        s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
+        s.aim_next_window(Side::Down);
+        s.unpin_client(1);
+        s.place_new_window(WA, 3, None);
+        assert_eq!(s.layout.ncols(), 2, "a column, not a row of a dead stack");
+        assert_eq!(leaf_clients(&s), vec![2, 3]);
+    }
+
+    /// The strip starts empty: the first window is its only column, and
+    /// closing it leaves nothing behind.
+    #[test]
+    fn an_empty_strip_holds_no_split() {
+        let mut s = State::new();
+        assert_eq!(s.focused_leaf_valid(), None);
+        assert_eq!(s.focused_client(), None);
+        s.place_new_window(WA, 1, None);
+        assert_eq!(s.focused_client(), Some(1));
+        assert_eq!(s.layout.collect_leaves().len(), 1);
+        assert!(s.unpin_client(1));
+        assert_eq!(s.layout.collect_leaves(), Vec::new());
+        assert_eq!(s.focused_leaf_valid(), None);
+    }
+
+    /// A stated preferred width sizes the window's column: the first
+    /// column stops tracking the viewport, and a fresh column opens at the
+    /// hint instead of `default_col_w`.
     #[test]
     fn place_honors_the_windows_preferred_width() {
         let mut s = State::new();
         s.place_new_window(WA, 1, Some(500));
-        assert_eq!(s.layout.widths(WA.w, GAP)[0], 500, "bootstrap fill");
+        assert_eq!(s.layout.widths(WA.w, GAP)[0], 500, "first column");
         s.place_new_window(WA, 2, Some(300));
         assert_eq!(s.layout.widths(WA.w, GAP)[1], 300, "fresh column");
     }
 
     /// Preferred widths are clamped to sane bounds: a hint at (or past)
     /// the viewport strip's width becomes `Viewport` — the column keeps
-    /// tracking viewport changes like the bootstrap one — and one below
+    /// tracking viewport changes like the first one — and one below
     /// the chrome's minimum is raised to it. No hint falls back to the
     /// default width.
     #[test]
@@ -772,32 +844,17 @@ mod tests {
         );
     }
 
-    /// A hint never resizes a stacked placeholder's column — its width is
-    /// shared with siblings the user already arranged.
+    /// A hint never resizes the column a window joins as a row — its
+    /// width is shared with siblings the user already arranged.
     #[test]
-    fn place_hint_leaves_stacked_placeholder_width_alone() {
+    fn place_hint_leaves_a_joined_stacks_width_alone() {
         let mut s = State::new();
         s.place_new_window(WA, 1, None);
-        s.split_focused(); // stack below window 1; placeholder focused
         let before = s.layout.widths(WA.w, GAP)[0];
+        s.aim_next_window(Side::Down);
         s.place_new_window(WA, 2, Some(300));
         assert_eq!(s.layout.widths(WA.w, GAP)[0], before);
-        assert_eq!(s.focused_client(), Some(2), "still fills the placeholder");
-    }
-
-    /// An empty split that is *not* focused attracts nothing: the new
-    /// window opens its own column even though a placeholder exists.
-    #[test]
-    fn place_ignores_unfocused_placeholders() {
-        let mut s = State::new();
-        s.place_new_window(WA, 1, None);
-        s.insert_at(WA, Insert::Col(0)); // placeholder column, focused
-        let placeholder = s.focused_leaf_valid();
-        s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
-        s.place_new_window(WA, 2, None);
-        assert_eq!(s.layout.leaf(placeholder).unwrap().client, None);
-        assert_eq!(s.focused_client(), Some(2));
-        assert_eq!(leaf_clients(&s), vec![None, Some(1), Some(2)]);
+        assert_eq!(s.layout.col_len(0), 2, "joined the stack");
     }
 
     /// With the focused split occupied, a new window opens in a fresh
@@ -808,30 +865,29 @@ mod tests {
         for w in [1, 2, 3] {
             s.place_new_window(WA, w, None);
         }
-        assert_eq!(leaf_clients(&s), vec![Some(1), Some(2), Some(3)]);
+        assert_eq!(leaf_clients(&s), vec![1, 2, 3]);
         assert_eq!(s.focused_client(), Some(3));
 
         // Opening from the middle lands between, not at the end.
         s.focus_leaf(s.layout.find_leaf_for_client(2).unwrap());
         s.place_new_window(WA, 4, None);
-        assert_eq!(leaf_clients(&s), vec![Some(1), Some(2), Some(4), Some(3)]);
+        assert_eq!(leaf_clients(&s), vec![1, 2, 4, 3]);
     }
 
-    /// Stacking focuses the fresh placeholder, so the next window lands in
-    /// the room just made; an *occupied* stacked split sends a new window
-    /// to a fresh column beside its whole stack, not into the stack.
+    /// A stacked split sends an unaimed new window to a fresh column
+    /// beside its whole stack, not into the stack.
     #[test]
     fn place_from_a_stacked_split_opens_a_column() {
         let mut s = State::new();
         s.place_new_window(WA, 1, None);
         s.place_new_window(WA, 2, None);
         s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
-        s.split_focused(); // column 0 becomes a stack; its placeholder focused
+        s.aim_next_window(Side::Down);
         s.place_new_window(WA, 3, None);
         assert_eq!(
             s.layout.locate(s.layout.find_leaf_for_client(3).unwrap()),
             Some(Pos { col: 0, row: 1 }),
-            "fills the placeholder the split just opened"
+            "the row the aim asked for"
         );
         s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
         s.place_new_window(WA, 4, None);
@@ -870,9 +926,8 @@ mod tests {
     fn unpin_in_a_stack_still_merges() {
         let mut s = State::new();
         s.place_new_window(WA, 1, None);
-        s.split_focused();
-        s.focus_leaf(s.layout.collect_leaves()[1]);
-        s.place_new_window(WA, 2, None); // fills the focused empty bottom row
+        s.aim_next_window(Side::Down);
+        s.place_new_window(WA, 2, None);
         let strip = s.canvas_w(WA);
         let full = {
             let g = s.compute(WA);
@@ -909,36 +964,77 @@ mod tests {
         assert_eq!(s.focused_client(), Some(1));
     }
 
-    /// The last split survives its window: the layout always keeps one leaf.
+    /// A split dropped on bare wallpaper lands where that wallpaper is:
+    /// beyond either end of the strip it becomes a column at that end,
+    /// and in a column's top/bottom margin it joins that column's stack.
     #[test]
-    fn unpin_of_the_last_window_leaves_the_root_placeholder() {
+    fn margin_drops_land_at_the_strips_edges() {
         let mut s = State::new();
-        s.place_new_window(WA, 1, None);
-        assert!(!s.unpin_client(1), "no rect moved");
-        assert_eq!(s.layout.collect_leaves().len(), 1);
-        assert_eq!(s.focused_client(), None);
+        s.place_new_window(WA, 1, Some(300));
+        s.place_new_window(WA, 2, Some(300));
+        let leaf = |c: Win| s.layout.find_leaf_for_client(c).unwrap();
+        // Columns at 20..320 and 340..640, rows spanning 20..780.
+        assert_eq!(
+            s.margin_drop(WA, 5, 400),
+            Some(MoveDrop::ColumnAt(0)),
+            "left of the strip"
+        );
+        assert_eq!(
+            s.margin_drop(WA, 700, 400),
+            Some(MoveDrop::ColumnAt(2)),
+            "right of the strip"
+        );
+        assert_eq!(
+            s.margin_drop(WA, 100, 5),
+            Some(MoveDrop::Stack(leaf(1), true)),
+            "the first column's top margin"
+        );
+        assert_eq!(
+            s.margin_drop(WA, 100, WA.h - 5),
+            Some(MoveDrop::Stack(leaf(1), false)),
+            "its bottom margin"
+        );
     }
 
+    /// The margins name a column position, not a neighbour, so the *top*
+    /// row of a stack leaves it just like the bottom row does — naming a
+    /// neighbour would name the dragged split itself and move nothing.
     #[test]
-    fn remove_empty_leaf_refuses_occupied_and_sole() {
-        let mut s = State::new();
-        s.place_new_window(WA, 1, None);
-        let occupied = s.focused_leaf_valid();
-        assert!(!s.remove_empty_leaf(occupied), "occupied split");
-        s.unpin_client(1);
-        let sole = s.focused_leaf_valid();
-        assert!(!s.remove_empty_leaf(sole), "sole placeholder");
-        let extra = s.insert_at(WA, Insert::Col(s.layout.ncols())).unwrap();
-        assert!(s.remove_empty_leaf(extra));
+    fn a_stacks_top_row_leaves_it_for_the_margins() {
+        for (mx, expect) in [(5, vec![1, 2]), (700, vec![2, 1])] {
+            let mut s = State::new();
+            s.place_new_window(WA, 1, Some(300));
+            s.aim_next_window(Side::Down);
+            s.place_new_window(WA, 2, None);
+            let top = s.layout.find_leaf_for_client(1).unwrap();
+            let MoveDrop::ColumnAt(idx) = s.margin_drop(WA, mx, 400).expect("a margin") else {
+                panic!("the canvas past the strip names a column position");
+            };
+            assert!(s.move_leaf_to_column(WA, top, idx), "mx={mx}");
+            assert_eq!(s.layout.ncols(), 2, "mx={mx}");
+            assert_eq!(leaf_clients(&s), expect, "mx={mx}");
+        }
     }
 
+    /// A column's bottom margin names its *last* row, so a drop there
+    /// joins the stack below everything already in it.
     #[test]
-    fn remove_empty_leaf_moves_focus_to_neighbour() {
+    fn a_stacks_bottom_margin_names_its_last_row() {
         let mut s = State::new();
-        s.place_new_window(WA, 1, None);
-        s.insert_at(WA, Insert::Col(s.layout.ncols()));
-        assert!(s.remove_empty_leaf(s.focused_leaf_valid()));
-        assert_eq!(s.focused_client(), Some(1));
+        s.place_new_window(WA, 1, Some(300));
+        s.aim_next_window(Side::Down);
+        s.place_new_window(WA, 2, None);
+        let bottom = s.layout.find_leaf_for_client(2).unwrap();
+        assert_eq!(
+            s.margin_drop(WA, 100, WA.h - 5),
+            Some(MoveDrop::Stack(bottom, false))
+        );
+    }
+
+    /// An empty strip has no margins to drop into.
+    #[test]
+    fn an_empty_strip_takes_no_margin_drop() {
+        assert_eq!(State::new().margin_drop(WA, 100, 100), None);
     }
 
     /// Focus cycling walks the strip order and wraps at the ends.
@@ -964,10 +1060,10 @@ mod tests {
         }
         s.focus_leaf(s.layout.find_leaf_for_client(2).unwrap());
         assert!(s.move_focused_split(WA, true));
-        assert_eq!(leaf_clients(&s), vec![Some(1), Some(3), Some(2)]);
+        assert_eq!(leaf_clients(&s), vec![1, 3, 2]);
         assert_eq!(s.focused_client(), Some(2), "focus follows the move");
         assert!(s.move_focused_split(WA, true), "wraps to the front");
-        assert_eq!(leaf_clients(&s), vec![Some(2), Some(1), Some(3)]);
+        assert_eq!(leaf_clients(&s), vec![2, 1, 3]);
     }
 
     /// Moving within a stack reorders the rows instead of leaving the
@@ -976,32 +1072,12 @@ mod tests {
     fn move_focused_split_reorders_within_a_stack() {
         let mut s = State::new();
         s.place_new_window(WA, 1, None);
-        s.split_focused();
-        s.focus_leaf(s.layout.collect_leaves()[1]);
+        s.aim_next_window(Side::Down);
         s.place_new_window(WA, 2, None);
         s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
         assert!(s.move_focused_split(WA, true));
         assert_eq!(s.layout.ncols(), 1, "stayed one column");
-        assert_eq!(leaf_clients(&s), vec![Some(2), Some(1)]);
-    }
-
-    #[test]
-    fn toggle_minimize_refuses_the_sole_split() {
-        let mut s = State::new();
-        s.place_new_window(WA, 1, None);
-        assert!(!s.toggle_minimize(s.focused_leaf_valid()));
-        s.place_new_window(WA, 2, None);
-        assert!(s.toggle_minimize(s.focused_leaf_valid()));
-    }
-
-    #[test]
-    fn split_focused_refuses_a_minimized_leaf() {
-        let mut s = State::new();
-        s.place_new_window(WA, 1, None);
-        s.place_new_window(WA, 2, None);
-        s.toggle_minimize(s.focused_leaf_valid());
-        assert!(!s.split_focused());
-        assert_eq!(s.layout.collect_leaves().len(), 2);
+        assert_eq!(leaf_clients(&s), vec![2, 1]);
     }
 
     /// A minimized leaf's window is hidden, so it can't be the focused
@@ -1044,7 +1120,8 @@ mod tests {
     fn resize_focused_stacked_conserves_the_pair() {
         let mut s = State::new();
         s.place_new_window(WA, 1, None);
-        s.split_focused();
+        s.aim_next_window(Side::Down);
+        s.place_new_window(WA, 2, None);
         let rows = s.layout.collect_leaves();
         s.focus_leaf(rows[0]);
         let before = s.compute(WA);
@@ -1055,37 +1132,20 @@ mod tests {
         assert_eq!(after[&rows[0]].h + after[&rows[1]].h, pair);
     }
 
-    /// A row-gap drag preserves the two rows' combined height.
+    /// A stack-gap drag preserves the two rows' combined height.
     #[test]
     fn resize_gap_preserves_row_sum() {
         let mut s = State::new();
         s.place_new_window(WA, 1, None);
-        s.split_focused();
+        s.aim_next_window(Side::Down);
+        s.place_new_window(WA, 2, None);
         let rows = s.layout.collect_leaves();
         let before = s.compute(WA);
         let pair = before[&rows[0]].h + before[&rows[1]].h;
-        s.resize_gap(GapAt::Row { col: 0, idx: 0 }, pair / 4, pair);
+        s.resize_rows(0, 0, pair / 4, pair);
         let after = s.compute(WA);
         assert_eq!(after[&rows[0]].h + after[&rows[1]].h, pair);
         assert!(after[&rows[0]].h < before[&rows[0]].h);
-    }
-
-    /// A column-gap drag sets the left column's width; the right neighbour
-    /// keeps its width and slides.
-    #[test]
-    fn resize_gap_col_moves_only_the_left_column() {
-        let mut s = State::new();
-        for w in [1, 2] {
-            s.place_new_window(WA, w, None);
-        }
-        let l1 = s.layout.find_leaf_for_client(1).unwrap();
-        let l2 = s.layout.find_leaf_for_client(2).unwrap();
-        let before = s.compute(WA);
-        s.resize_gap(GapAt::Col(0), before[&l1].w + 100, 0);
-        let after = s.compute(WA);
-        assert_eq!(after[&l1].w, before[&l1].w + 100);
-        assert_eq!(after[&l2].w, before[&l2].w);
-        assert_eq!(after[&l2].x, before[&l2].x + 100, "right column slides");
     }
 
     #[test]
@@ -1123,29 +1183,9 @@ mod tests {
         for w in [1, 2] {
             s.place_new_window(WA, w, None);
         }
-        s.toggle_minimize(s.focused_leaf_valid()); // rightmost pinned
+        let focused = s.focused_leaf_valid().expect("a window is open");
+        s.toggle_minimize(focused); // rightmost pinned
         assert_eq!(s.resize_edge(WA, false, 500), 0);
-    }
-
-    /// The "+" buttons: a column insert focuses a fresh placeholder at the
-    /// gap; a row insert grows that stack.
-    #[test]
-    fn insert_at_places_and_focuses() {
-        let mut s = State::new();
-        for w in [1, 2] {
-            s.place_new_window(WA, w, None);
-        }
-        s.insert_at(WA, Insert::Col(1));
-        assert_eq!(leaf_clients(&s), vec![Some(1), None, Some(2)]);
-        assert_eq!(s.focused_client(), None);
-        s.focus_leaf(s.layout.find_leaf_for_client(1).unwrap());
-        s.split_focused();
-        s.insert_at(WA, Insert::Row { col: 0, idx: 1 });
-        assert_eq!(s.layout.col_len(0), 3);
-        assert_eq!(
-            s.layout.locate(s.focused_leaf_valid()),
-            Some(Pos { col: 0, row: 1 })
-        );
     }
 
     // --- scroll behavior ---
@@ -1219,7 +1259,7 @@ mod tests {
         s.scroll_to(WA, i32::MIN);
         s.land_scroll();
         assert_eq!(s.scroll_x(), State::min_scroll(WA));
-        let first = s.layout.first_leaf();
+        let first = s.layout.first_leaf().expect("a window is open");
         let geo = s.compute(WA)[&first];
         assert!(
             geo.x - s.scroll_x() >= WA.x + WA.w,
@@ -1259,7 +1299,7 @@ mod tests {
         s.land_scroll();
         while s.layout.collect_leaves().len() > 1 {
             let last = *s.layout.collect_leaves().last().unwrap();
-            let win = s.layout.leaf(last).unwrap().client.unwrap();
+            let win = s.layout.leaf(last).unwrap().client;
             s.unpin_client(win);
             s.clamp_scroll(WA);
         }

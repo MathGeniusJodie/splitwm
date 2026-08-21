@@ -68,11 +68,14 @@ shot 01_two_splits
 cterm "#006400"
 shot 02_third_split_right
 
-# 2: split vertically (Mod4+h) -> empty placeholder below; the next
-# terminal fills it
-key super+h
-term
-shot 03_split_v_filled
+# 2: the quick-launch compass: hover the Terminal icon to raise its
+# wedges, then click the lower one — the terminal it spawns stacks below
+# the focused split
+cmd "motion 211 752"
+shot 03a_compass
+cmd "click 211 780"
+sleep 1.2
+shot 03_compass_down_stacked
 
 # 3: focus prev / next (brackets cycle focus too)
 key super+Left
@@ -109,6 +112,13 @@ shot 11_scrolled
 key super+q
 sleep 1.0
 shot 12_closed
+
+# 8: closing every window leaves the strip empty — bare wallpaper and the
+# taskbar, with no split left behind
+for _ in $(seq 1 12); do echo "key super+q" >&3; wait_line "ok key super+q"; sleep 0.4; done
+sleep 1.0
+cmd "layout"
+shot 13_no_windows
 
 echo "=== splitwm.log tail ==="
 tail -5 "$LOG"

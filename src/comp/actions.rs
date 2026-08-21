@@ -6,7 +6,7 @@
 use smithay::input::keyboard::ModifiersState;
 
 use super::Comp;
-use crate::layout::{NodeId, Win};
+use crate::layout::Win;
 use crate::state::Activation;
 use crate::theme::{self, Action};
 
@@ -41,12 +41,12 @@ pub fn binding_action(mods: &ModifiersState, sym: u32) -> Option<Action> {
 impl Comp {
     pub fn do_action(&mut self, action: Action) {
         match action {
-            Action::StackBelow => self.stack_below(),
-            // The titlebar close button's semantics, on the focused split
-            // (see `Comp::close_split`).
+            // The titlebar close button's semantics, on the focused split:
+            // politely close its window, which takes the split with it.
             Action::Close => {
-                let leaf = self.state.focused_leaf_valid();
-                self.close_split(leaf);
+                if let Some(win) = self.state.focused_client() {
+                    self.close_client(win);
+                }
             }
             Action::FocusNext | Action::FocusPrev => {
                 // Deliberate focus moves take the keyboard off any float.
@@ -94,21 +94,6 @@ impl Comp {
         }
     }
 
-    /// Stack an empty split below the focused one if its frame is tall
-    /// enough for two rows (the same gate as the ⊞ button's).
-    fn stack_below(&mut self) {
-        let wa = self.layout_area();
-        let leaf = self.state.focused_leaf_valid();
-        let fits = self
-            .state
-            .compute(wa)
-            .get(&leaf)
-            .is_some_and(|g| theme::stack_fits(g.h));
-        if fits && self.state.split_focused() {
-            self.arrange();
-        }
-    }
-
     /// Politely ask the focused window to close — a focused float before
     /// the focused split's client, so Mod4+Shift+C closes the dialog the
     /// user is looking at. There is no force-kill fallback: the close is
@@ -137,23 +122,6 @@ impl Comp {
     /// Detached launch in its own transient scope (see `launch::spawn`).
     pub fn spawn(&self, cmd: &str) {
         crate::launch::spawn(cmd);
-    }
-
-    /// Close the split at `leaf` — the titlebar close button's and
-    /// `Action::Close`'s shared semantics. Window and split live and die
-    /// together: an occupied split's close politely closes the window, and
-    /// the split collapses when it actually dies (`unpin_client` — so a
-    /// "do you want to save?" refusal keeps the split). An empty
-    /// placeholder is removed on the spot; the sole placeholder is the one
-    /// split that can't go.
-    pub fn close_split(&mut self, leaf: NodeId) {
-        match self.state.layout.leaf(leaf).and_then(|l| l.client) {
-            Some(win) => self.close_client(win),
-            None => self.view.animate = self.state.remove_empty_leaf(leaf),
-        }
-        // In place: whichever split inherits the focus, a close is not a
-        // deliberate focus move, so the viewport stays put.
-        self.commit_layout_in_place();
     }
 
     /// Focus a managed tiled window's split and scroll it into view (via

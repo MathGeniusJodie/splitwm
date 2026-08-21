@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use crate::layout::{Boundary, Dir, GapAt, Insert, Layout, NodeId, Rect, Win};
+use crate::layout::{Boundary, GapAt, Layout, NodeId, Rect, Side, Win};
 use crate::state::State;
 use crate::theme;
 
@@ -16,13 +16,13 @@ use crate::theme;
 pub type FrameRect = Rect;
 
 /// One on-screen leaf's placement for an arrange: its screen-space frame
-/// (scroll applied), its shown window, and whether it holds layout focus.
-/// Present for every visible leaf — empty and minimized ones draw chrome.
+/// (scroll applied), its window, and whether it holds layout focus.
+/// Present for every visible leaf — a minimized one draws chrome too.
 #[derive(Clone, Copy)]
 pub struct Placement {
     pub leaf: NodeId,
     pub target: FrameRect,
-    pub active_client: Option<Win>,
+    pub client: Win,
     pub focused: bool,
 }
 
@@ -30,7 +30,7 @@ pub struct Placement {
 /// current scroll (on-screen or not — a leaf scrolled out of view keeps a
 /// sane animation start / hit rect for its return), and a `Placement` for
 /// each on-screen leaf. Every visible leaf gets a placement (chrome draws
-/// empty and minimized frames too); which ones actually map a window is the
+/// minimized frames too); which ones actually map a window is the
 /// compositor's business (`Comp::apply_placements`).
 pub fn compute_placements(
     state: &State,
@@ -55,44 +55,76 @@ pub fn compute_placements(
         if frame.x + frame.w <= wa.x || frame.x >= wa.x + wa.w {
             continue;
         }
+        let Some(client) = state.layout.leaf(leaf).map(|l| l.client) else {
+            continue;
+        };
         placed.push(Placement {
             leaf,
             target: frame,
-            active_client: state.layout.leaf(leaf).and_then(|l| l.client),
-            focused: focused == leaf,
+            client,
+            focused: focused == Some(leaf),
         });
     }
     (placed, frame_rects)
 }
 
-/// Side of a "+" insert / drag square, sized to sit inside a gap.
-pub const PLUS_SZ: i32 = theme::GAP - 4;
-/// How much narrower than the gap a boundary drag handle is drawn/hit.
-pub const HANDLE_INSET: i32 = 10;
+/// Width of the hover compass's ring around a quick-launch icon: how far
+/// each of its four wedges extends past the icon's edge. The ring reaches
+/// over the neighbouring icons, so only the hovered icon's compass is ever
+/// drawn or hit-tested.
+pub const COMPASS_RING: i32 = 12;
 
-/// A `PLUS_SZ`-square hit/draw rect centred on (`cx`, `cy`).
-pub const fn plus_rect(cx: i32, cy: i32) -> FrameRect {
+/// The hover compass square drawn around the quick-launch icon at `icon`:
+/// the icon's rect grown by `COMPASS_RING` on every side.
+pub const fn compass_rect(icon: FrameRect) -> FrameRect {
     FrameRect {
-        x: cx - PLUS_SZ / 2,
-        y: cy - PLUS_SZ / 2,
-        w: PLUS_SZ,
-        h: PLUS_SZ,
+        x: icon.x - COMPASS_RING,
+        y: icon.y - COMPASS_RING,
+        w: icon.w + 2 * COMPASS_RING,
+        h: icon.h + 2 * COMPASS_RING,
     }
 }
 
+/// Which wedge of the compass the point (`mx`, `my`) falls in: the square
+/// is quartered by its diagonals, so the wedge is whichever axis the point
+/// sits furthest along from the centre. Every point of the compass names a
+/// wedge, the icon in the middle included — a quick-launch icon showing
+/// its compass has no plain-launch spot left. `around` may be the icon
+/// rect or the compass rect: they share a centre, so both answer alike,
+/// and the drawing pass and the hit-test can't disagree.
+pub fn compass_zone(around: FrameRect, mx: i32, my: i32) -> Side {
+    // Doubled so the centre of an even-sided rect is exact.
+    let dx = 2 * mx + 1 - (2 * around.x + around.w);
+    let dy = 2 * my + 1 - (2 * around.y + around.h);
+    if dx.abs() > dy.abs() {
+        if dx < 0 {
+            Side::Left
+        } else {
+            Side::Right
+        }
+    } else if dy < 0 {
+        Side::Up
+    } else {
+        Side::Down
+    }
+}
+
+/// Whether `r` covers the point (`mx`, `my`).
+pub const fn rect_contains(r: FrameRect, mx: i32, my: i32) -> bool {
+    mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h
+}
+
 /// Every hit-testable widget rect computed for the current layout: gap drag
-/// handles, "+" insert buttons, titlebar titles, split-control buttons,
-/// taskbar tiles, the quick-launch icons, and the canvas-edge resize
-/// handles. Grouped so the whole set is rebuilt (and cleared) as one unit —
-/// the caches must always describe the same arrange.
+/// handles, titlebar titles, split-control buttons, taskbar tiles, the
+/// quick-launch icons, and the canvas-edge resize handles. Grouped so the
+/// whole set is rebuilt (and cleared) as one unit — the caches must always
+/// describe the same arrange.
 #[derive(Default)]
 pub struct Widgets {
     pub handle_regions: Vec<(FrameRect, Boundary)>,
-    pub plus_regions: Vec<(FrameRect, Insert)>,
-    /// Quick-launch icons in the bottom taskbar (after the window tiles),
-    /// paired with their quick-slot index; entries hidden by their
-    /// `ShowWhen` rule get no region.
-    pub quick_regions: Vec<(FrameRect, usize)>,
+    /// Quick-launch icons in the bottom taskbar (after the window tiles);
+    /// entries hidden by their `ShowWhen` rule get no region.
+    pub quick_regions: Vec<QuickTile>,
     /// The pill separating window tiles from the quick-launch icons; only
     /// present when both groups are (an unpaired separator is just clutter).
     pub taskbar_sep: Option<FrameRect>,
@@ -109,7 +141,6 @@ impl Widgets {
     /// Drop every region (and stale rect) from the previous layout.
     pub fn clear(&mut self) {
         self.handle_regions.clear();
-        self.plus_regions.clear();
         self.quick_regions.clear();
         self.taskbar_sep = None;
         self.title_regions.clear();
@@ -117,6 +148,18 @@ impl Widgets {
         self.taskbar_regions.clear();
         self.edge_handle_regions.clear();
     }
+}
+
+/// One quick-launch icon's place in the bar: where the icon draws, the
+/// larger rect that raises its hover compass, and which `QuickSlot` it
+/// launches. The hover rects of neighbouring icons meet and fill the bar's
+/// height, so no part of the quick-launch run is neutral — the pointer
+/// always has a compass up somewhere over it.
+#[derive(Clone, Copy)]
+pub struct QuickTile {
+    pub icon: FrameRect,
+    pub hover: FrameRect,
+    pub slot: usize,
 }
 
 /// One taskbar quick-launch entry: the command it spawns and its icon,
@@ -133,14 +176,17 @@ pub struct QuickSlot {
     pub show: theme::ShowWhen,
 }
 
-/// The three split-control buttons on the right of every leaf's titlebar
-/// (count mirrored by `theme::N_SPLIT_BTNS`).
+/// The split-control buttons on the right of every leaf's titlebar (count
+/// mirrored by `theme::N_SPLIT_BTNS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BtnKind {
     Minimize,
-    Split,
     Close,
 }
+
+/// How many buttons a titlebar's fixed array holds — `BtnKind`'s variants,
+/// as `theme::N_SPLIT_BTNS` counts them for the strip's width.
+pub const N_BTNS: usize = theme::N_SPLIT_BTNS as usize;
 
 /// A bottom-bar tile with its window and accent resolved once at compute
 /// time, so per-frame compositing needs no tree walks. Tiles mirror the
@@ -156,53 +202,6 @@ pub struct TaskTile {
     /// Both the accent below and drag-drop targeting resolve through it.
     pub leaf: NodeId,
     pub accent: crate::Index,
-}
-
-/// Per-leaf metadata driving the split-control buttons' icons/enabled state.
-#[derive(Clone, Copy)]
-pub struct LeafMeta {
-    /// Whether the split shares its column with other rows: it minimizes
-    /// to a horizontal strip, and its ⊞ always stacks below.
-    pub stacked: bool,
-    /// The strip's one guaranteed split: it can't be closed (when empty)
-    /// or minimized.
-    pub sole: bool,
-    /// What the split's ⊞ button does. `None` disables the button (a
-    /// too-short lone split can neither stack nor claim a preference);
-    /// `Dir::H` opens a new column right of this one, `Dir::V` stacks an
-    /// empty split below. A stacked split always stacks; a lone one goes
-    /// by shape — wide opens a column, tall stacks. Right-click flips
-    /// where the flipped action is possible.
-    pub split_dir: Option<Dir>,
-    pub minimized: bool,
-    /// Whether the leaf shows a window. Close always works on an occupied
-    /// split (it closes the window; the split follows on its death); only
-    /// an empty sole placeholder has nothing to close.
-    pub occupied: bool,
-}
-
-/// Position / split-eligibility metadata used to choose each
-/// split-control button's icon and enabled state.
-pub fn leaf_meta(layout: &Layout, leaf: NodeId, frame: FrameRect) -> LeafMeta {
-    let stacked = layout.stacked(leaf);
-    let can_stack = theme::stack_fits(frame.h);
-    let split_dir = if stacked || frame.w < frame.h {
-        // A stacked split only ever stacks further; a tall lone one
-        // prefers stacking too. Opening a column needs no room, so it is
-        // never the *disabled* fallback — only a too-short stack target
-        // disables the button.
-        can_stack.then_some(Dir::V)
-    } else {
-        Some(Dir::H)
-    };
-    let leaf = layout.leaf(leaf);
-    LeafMeta {
-        stacked,
-        sole: layout.sole_split(),
-        split_dir,
-        minimized: leaf.is_some_and(|l| l.minimized),
-        occupied: leaf.is_some_and(|l| l.client.is_some()),
-    }
 }
 
 /// Each split's persistent accent palette index, stored on the leaf so it
@@ -322,15 +321,24 @@ pub fn compute_taskbar(
         None => left,
     };
     for i in visible {
-        widgets.quick_regions.push((
-            FrameRect {
-                x: qx,
-                y,
-                w: isz,
-                h: isz,
+        let icon = FrameRect {
+            x: qx,
+            y,
+            w: isz,
+            h: isz,
+        };
+        widgets.quick_regions.push(QuickTile {
+            icon,
+            // Half the pitch's gap on each side (so neighbours meet
+            // exactly) and the bar's full height.
+            hover: FrameRect {
+                x: icon.x - gap / 2,
+                y: y - pad,
+                w: isz + gap,
+                h: theme::TASKBAR_H,
             },
-            i,
-        ));
+            slot: i,
+        });
         qx += isz + gap;
     }
     widgets.taskbar_regions = tiles;
@@ -342,8 +350,6 @@ pub fn compute_leaf_widgets(widgets: &mut Widgets, layout: &Layout, placed: &[Pl
     let bw = theme::BORDER_LEFT;
     for p in placed {
         let minimized = layout.leaf(p.leaf).is_some_and(|l| l.minimized);
-        // Placeholders get a title region too: an empty split's titlebar
-        // is grabbable for a move drag even though it paints no title.
         if !minimized {
             widgets.title_regions.push((
                 FrameRect {
@@ -380,15 +386,12 @@ pub fn leaf_btn_rects(frame: FrameRect) -> impl Iterator<Item = (BtnKind, FrameR
             },
         )
     };
-    // At most three buttons, in a fixed array: this runs per leaf per frame
-    // (the baked-chrome fingerprint), so it must not allocate.
-    let mut btns = [None; 3];
+    // At most `N_SPLIT_BTNS` buttons, in a fixed array: this runs per leaf
+    // per frame (the baked-chrome fingerprint), so it must not allocate.
+    let mut btns = [None; N_BTNS];
     if frame.w >= theme::min_split_w() {
         let right = theme::btn_strip_right(frame.x, frame.w, theme::BORDER_LEFT);
-        for (i, kind) in [BtnKind::Close, BtnKind::Split, BtnKind::Minimize]
-            .into_iter()
-            .enumerate()
-        {
+        for (i, kind) in [BtnKind::Close, BtnKind::Minimize].into_iter().enumerate() {
             let bcx = right - bsz / 2 - i32::try_from(i).unwrap_or(0) * (bsz + bsp);
             btns[i] = Some(at(bcx, kind));
         }
@@ -413,32 +416,34 @@ fn compute_btn_regions(widgets: &mut Widgets, p: &Placement, minimized: bool) {
     }
 }
 
-/// Gap resize handles and "+" insert buttons. Every gap *and margin*
-/// carries a "+" through one shared path (`Layout::insert_slots`): the
-/// outer margins and column gaps insert a new column, a column's
-/// top/bottom margins and stack gaps insert a row into that stack.
+/// Gap resize handles: one per gap between two columns or two stacked
+/// rows, plus the outer canvas-edge handles.
 pub fn compute_boundary_widgets(widgets: &mut Widgets, state: &State, wa: Rect) {
     let gap = theme::GAP;
-    let hw = (gap - HANDLE_INSET).max(4);
     let scroll_x = state.scroll_x();
     for b in state.boundaries(wa) {
         let rect = match b.at {
-            // Vertical gap between columns: a full-height pill dragged
-            // along x (scrolls with the canvas).
+            // Vertical gap between columns: the whole gap, full height
+            // (it scrolls with the canvas). Its two halves belong to the
+            // columns either side — see `Comp::hit_test`.
             GapAt::Col(_) => {
                 let vis_x = b.pos - scroll_x;
-                if vis_x + hw / 2 <= wa.x || vis_x - hw / 2 >= wa.x + wa.w {
+                if vis_x + gap / 2 <= wa.x || vis_x - gap / 2 >= wa.x + wa.w {
                     continue;
                 }
                 FrameRect {
-                    x: vis_x - hw / 2,
+                    x: vis_x - gap / 2,
                     y: b.cross,
-                    w: hw,
+                    w: gap,
                     h: b.cross_len.max(1),
                 }
             }
             // Horizontal gap between stacked rows: a full-width strip
-            // dragged along y.
+            // dragged along y, spanning the whole gap *and* the bottom
+            // border of the split above it. Border and gap read as one
+            // divider between two stacked windows, so the whole of it
+            // drags — unlike a column gap, whose flanking side borders
+            // are their own (column-resizing) drag.
             GapAt::Row { .. } => {
                 let vis_x = b.cross - scroll_x;
                 if vis_x + b.cross_len <= wa.x || vis_x >= wa.x + wa.w {
@@ -446,20 +451,13 @@ pub fn compute_boundary_widgets(widgets: &mut Widgets, state: &State, wa: Rect) 
                 }
                 FrameRect {
                     x: vis_x,
-                    y: b.pos - hw / 2,
+                    y: b.pos - gap / 2 - theme::BORDER_BOTTOM,
                     w: b.cross_len.max(1),
-                    h: hw,
+                    h: gap + theme::BORDER_BOTTOM,
                 }
             }
         };
         widgets.handle_regions.push((rect, b));
-    }
-    for (cx, cy, at) in state.layout.insert_slots(wa, gap) {
-        let vis_x = cx - scroll_x;
-        if vis_x + PLUS_SZ / 2 <= wa.x || vis_x - PLUS_SZ / 2 >= wa.x + wa.w {
-            continue;
-        }
-        widgets.plus_regions.push((plus_rect(vis_x, cy), at));
     }
     compute_edge_handle_widgets(widgets, state, wa);
 }
@@ -527,11 +525,80 @@ mod tests {
                         w: geo.w.max(1),
                         h: geo.h.max(1),
                     },
-                    active_client: state.layout.leaf(leaf).and_then(|l| l.client),
-                    focused: focused == leaf,
+                    client: state.layout.leaf(leaf)?.client,
+                    focused: focused == Some(leaf),
                 })
             })
             .collect()
+    }
+
+    /// A strip holding `n` windows, each in its own column.
+    fn windows(n: Win) -> State {
+        let mut s = State::new();
+        for w in 1..=n {
+            s.place_new_window(WA, w, None);
+        }
+        s
+    }
+
+    /// Neighbouring quick-launch icons' hover rects meet exactly and each
+    /// spans the bar's full height, so the pointer crossing the run of
+    /// icons is never over a spot that raises no compass.
+    #[test]
+    fn quick_launch_hover_rects_tile_the_bar_without_gaps() {
+        let quick: Vec<QuickSlot> = (0..3)
+            .map(|_| QuickSlot {
+                cmd: "term".into(),
+                icon: None,
+                label: 'T',
+                show: theme::ShowWhen::Always,
+            })
+            .collect();
+        let mut widgets = Widgets::default();
+        compute_taskbar(&mut widgets, &Layout::new(), &[], &quick, &[], WA);
+        let tiles = &widgets.quick_regions;
+        assert_eq!(tiles.len(), 3);
+        let bar_top = WA.y + WA.h - theme::TASKBAR_H;
+        for t in tiles {
+            assert_eq!((t.hover.y, t.hover.h), (bar_top, theme::TASKBAR_H));
+            assert!(
+                t.hover.x <= t.icon.x && t.hover.x + t.hover.w >= t.icon.x + t.icon.w,
+                "the hover rect covers its icon"
+            );
+        }
+        for pair in tiles.windows(2) {
+            assert_eq!(
+                pair[0].hover.x + pair[0].hover.w,
+                pair[1].hover.x,
+                "no neutral gap between two icons"
+            );
+        }
+    }
+
+    /// The compass's wedges are the square's four quarters cut by its
+    /// diagonals: whichever axis the point sits furthest along from the
+    /// centre names the wedge, over the icon as much as around it.
+    #[test]
+    fn compass_zones_quarter_the_square_around_the_icon() {
+        let icon = FrameRect {
+            x: 100,
+            y: 100,
+            w: 42,
+            h: 42,
+        };
+        let r = compass_rect(icon);
+        assert_eq!(compass_zone(icon, r.x + 1, 121), Side::Left);
+        assert_eq!(compass_zone(icon, r.x + r.w - 2, 121), Side::Right);
+        assert_eq!(compass_zone(icon, 121, r.y + 1), Side::Up);
+        assert_eq!(compass_zone(icon, 121, r.y + r.h - 2), Side::Down);
+        // Over the icon too: it is no click target of its own any more.
+        assert_eq!(compass_zone(icon, 121, icon.y + 2), Side::Up);
+        assert_eq!(compass_zone(icon, icon.x + 2, 121), Side::Left);
+        // The compass rect shares the icon's centre, so it answers alike.
+        assert_eq!(compass_zone(r, 121, r.y + 1), Side::Up);
+        // Just off the icon's corner, the diagonal decides by a pixel.
+        assert_eq!(compass_zone(icon, icon.x - 1, icon.y - 2), Side::Up);
+        assert_eq!(compass_zone(icon, icon.x - 2, icon.y - 1), Side::Left);
     }
 
     /// A single leaf still spans the whole row (see `State::edge_span`), so
@@ -539,7 +606,7 @@ mod tests {
     /// not gated on having 2+ root-level columns.
     #[test]
     fn edge_handles_present_even_with_a_single_root_leaf() {
-        let s = State::new();
+        let s = windows(1);
         let mut widgets = Widgets::default();
         compute_boundary_widgets(&mut widgets, &s, WA);
         assert_eq!(widgets.edge_handle_regions.len(), 2, "left and right edge");
@@ -554,9 +621,7 @@ mod tests {
     /// Three narrow columns that all fit inside the viewport, so no
     /// handle is culled as off-screen.
     fn three_visible_columns() -> State {
-        let mut s = State::new();
-        s.insert_at(WA, Insert::Col(1));
-        s.insert_at(WA, Insert::Col(1));
+        let mut s = windows(3);
         for col in 0..3 {
             s.layout
                 .set_col_width(col, crate::layout::ColWidth::Px(300));
@@ -574,36 +639,86 @@ mod tests {
         assert_eq!(widgets.edge_handle_regions.len(), 2);
     }
 
-    /// Every gap gets one drag handle, and every gap *and margin* gets a
-    /// "+" button — column and row positions alike.
+    /// Every gap between two splits gets exactly one drag handle —
+    /// between columns and within a stack alike.
     #[test]
-    fn one_handle_per_gap_and_one_plus_per_insert_position() {
+    fn one_handle_per_gap() {
         let mut s = three_visible_columns(); // 3 columns -> 2 gaps
-        s.split_focused(); // a stack -> 1 more gap
+        s.aim_next_window(Side::Down); // a stack -> 1 more gap
+        s.place_new_window(WA, 4, None);
         let mut widgets = Widgets::default();
         compute_boundary_widgets(&mut widgets, &s, WA);
         assert_eq!(widgets.handle_regions.len(), 3);
-        let row_plus = widgets
-            .plus_regions
+    }
+
+    /// The gap between two columns is one band edge to edge: it starts
+    /// where the left frame ends and ends where the right frame starts,
+    /// over the strip's full height — so with the frames' own border
+    /// bands nothing between two side-by-side windows is neutral.
+    #[test]
+    fn column_handle_covers_the_whole_gap() {
+        let s = three_visible_columns();
+        let mut widgets = Widgets::default();
+        compute_boundary_widgets(&mut widgets, &s, WA);
+        let leaves = s.layout.collect_leaves();
+        let geos = s.compute(WA);
+        let (left, right) = (geos[&leaves[0]], geos[&leaves[1]]);
+        let (rect, _) = widgets
+            .handle_regions
             .iter()
-            .filter(|(_, at)| matches!(at, Insert::Row { .. }))
-            .count();
-        // Column slots: 2 margins + 2 gaps. Row slots: top + bottom margin
-        // per column, plus the stacked column's one inter-row gap.
-        assert_eq!((widgets.plus_regions.len(), row_plus), (11, 7));
+            .find(|(_, b)| matches!(b.at, GapAt::Col(0)))
+            .expect("the first column gap");
+        assert_eq!(rect.x, left.x + left.w, "starts at the left frame's edge");
+        assert_eq!(rect.x + rect.w, right.x, "ends at the right frame's edge");
+        assert_eq!(
+            (rect.y, rect.h),
+            (WA.y + theme::GAP, WA.h - 2 * theme::GAP),
+            "the strip's full height"
+        );
+    }
+
+    /// The divider between two stacked windows is one drag target end to
+    /// end: the bottom border of the split above plus the whole gap, up
+    /// to (not into) the lower split's titlebar.
+    #[test]
+    fn row_handle_covers_the_gap_and_the_border_above_it() {
+        let mut s = windows(1);
+        s.aim_next_window(Side::Down);
+        s.place_new_window(WA, 2, None);
+        let mut widgets = Widgets::default();
+        compute_boundary_widgets(&mut widgets, &s, WA);
+        let rows = s.layout.collect_leaves();
+        let geos = s.compute(WA);
+        let (above, below) = (geos[&rows[0]], geos[&rows[1]]);
+        let (rect, _) = widgets
+            .handle_regions
+            .iter()
+            .find(|(_, b)| matches!(b.at, GapAt::Row { .. }))
+            .expect("the stack's one gap");
+        assert_eq!(
+            rect.y,
+            above.y + above.h - theme::BORDER_BOTTOM,
+            "starts at the top of the border above"
+        );
+        assert_eq!(
+            rect.y + rect.h,
+            below.y,
+            "ends where the lower titlebar starts"
+        );
     }
 
     #[test]
     fn taskbar_stride_never_overlaps_within_available_width() {
-        let layout = Layout::new();
-        let leaf = layout.first_leaf();
+        let s = windows(1);
+        let layout = &s.layout;
+        let leaf = layout.first_leaf().expect("one window");
         let clients: Vec<(Win, String)> = Vec::new();
         // A pathological number of windows: the stride must compress
         // (clamped at a floor of 10px) rather than run tiles off-screen or
         // silently drop any of them.
         let bar_order: Vec<(Win, NodeId)> = (0..200).map(|w| (w, leaf)).collect();
         let mut widgets = Widgets::default();
-        compute_taskbar(&mut widgets, &layout, &clients, &[], &bar_order, WA);
+        compute_taskbar(&mut widgets, layout, &clients, &[], &bar_order, WA);
         assert_eq!(
             widgets.taskbar_regions.len(),
             200,
@@ -651,14 +766,12 @@ mod tests {
         assert_eq!(widgets.quick_regions.len(), 1);
     }
 
-    /// An empty placeholder's titlebar is a drag handle like any other:
-    /// it gets a title region even with no client, so a split-move drag
-    /// can start on it. Only minimizing removes the region.
+    /// A titlebar is a drag handle: every shown split gets a title region
+    /// so a split-move drag can start on it. Only minimizing removes it.
     #[test]
-    fn placeholder_titlebar_is_grabbable() {
-        let s = State::new(); // one empty placeholder leaf
-        let leaf = s.layout.first_leaf();
-        assert_eq!(s.layout.leaf(leaf).unwrap().client, None);
+    fn titlebars_are_grabbable() {
+        let s = windows(1);
+        let leaf = s.layout.first_leaf().expect("one window");
         let placed = placement(&s, WA);
         let mut widgets = Widgets::default();
         compute_leaf_widgets(&mut widgets, &s.layout, &placed);
@@ -667,9 +780,8 @@ mod tests {
 
     #[test]
     fn minimized_leaf_gets_one_full_frame_restore_button() {
-        let mut s = State::new();
-        s.insert_at(WA, Insert::Col(1)); // a sole split can't be minimized
-        let minimized_leaf = s.layout.first_leaf();
+        let mut s = windows(2);
+        let minimized_leaf = s.layout.first_leaf().expect("two windows");
         assert!(s.toggle_minimize(minimized_leaf));
         let placed = placement(&s, WA);
         let mut widgets = Widgets::default();
@@ -684,7 +796,7 @@ mod tests {
             .iter()
             .filter(|(_, l, _)| *l == minimized_leaf)
             .collect();
-        assert_eq!(btns.len(), 1, "one region, not the usual three");
+        assert_eq!(btns.len(), 1, "one region, not the usual pair");
         assert_eq!(btns[0].2, BtnKind::Minimize);
         assert_eq!(btns[0].0, target, "whole frame is the restore button");
     }

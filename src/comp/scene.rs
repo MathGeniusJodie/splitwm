@@ -5,8 +5,8 @@
 //! software-drawn chrome pieces cached in `comp::pieces`, and the focus
 //! outline's GPU solid strips. Stacking within the ex-underlay's slot,
 //! front-to-back: the focus outline, the taskbar (in front of the leaf
-//! frames, as the old single buffer drew it last), the plus buttons, the
-//! leaf frames (which never overlap, so their order is free), then the
+//! frames, as the old single buffer drew it last), the leaf frames (which
+//! never overlap, so their order is free), then the
 //! opaque wallpaper at the back.
 
 use super::pieces::{FrameArt, FrameMode, LeafFrame};
@@ -25,7 +25,7 @@ use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 render_elements! {
     /// Everything one output frame is made of: client surfaces of every
     /// kind (tiled, floats, dock, layer, o-r), the software-drawn chrome
-    /// pieces (wallpaper, leaf frames, plus buttons, taskbar, float frames,
+    /// pieces (wallpaper, leaf frames, taskbar, float frames,
     /// notes, cursor) that the palette shader resolves straight from their
     /// indexed GPU textures, and the focused split's 2px focus outline as
     /// GPU solid strips.
@@ -72,9 +72,6 @@ pub struct Scene<'a> {
     /// `output_elements` (leaves resolve theirs in `leaf_elements`). `None`
     /// only before the first `update_chrome_pieces`, like `wallpaper`.
     pub frame_art: Option<&'a FrameArt>,
-    /// The "+" insert-button textures with the gap/edge origins they draw
-    /// at; empty while a layout animation runs.
-    pub plus: &'a [(Point<i32, Logical>, &'a IndexedTexture)],
     /// The taskbar strip texture and its top-left origin.
     pub taskbar: Option<(Point<i32, Logical>, &'a IndexedTexture)>,
     /// The focused split's 2px outline as four solid strips (empty when no
@@ -140,8 +137,8 @@ fn chrome_at(
 /// topmost, override-redirect X11 windows (rofi, menus), notification
 /// bubbles, the Top layer, floats with their frame chrome, the tiled and
 /// fullscreen windows, the dock, the Bottom layer, then the ex-underlay
-/// group — the focus outline, the taskbar, the plus buttons, the leaf
-/// frames, and the opaque wallpaper — and the Background layer behind
+/// group — the focus outline, the taskbar, the leaf frames, and the
+/// opaque wallpaper — and the Background layer behind
 /// everything.
 pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<OutputElement> {
     use smithay::backend::renderer::element::AsRenderElements as _;
@@ -307,11 +304,6 @@ pub fn output_elements(renderer: &mut GlesRenderer, scene: &Scene<'_>) -> Vec<Ou
     if let Some((loc, tex)) = scene.taskbar {
         elements.push(chrome_at(scene.indexed, tex, loc));
     }
-    // Plus buttons sit in the gaps between frames; they never overlap a
-    // frame, so their order relative to the leaf group is cosmetic.
-    for (loc, tex) in scene.plus {
-        elements.push(chrome_at(scene.indexed, tex, *loc));
-    }
     // Leaf frames: non-overlapping, so relative order is free. Each is the
     // shared border art sliced over the leaf rect in the shader, with the
     // titlebar-contents strip (icon, title, baked buttons) in front of it.
@@ -379,7 +371,7 @@ impl Comp {
         fs.into_iter()
             .chain(self.view.placed.iter().filter_map(move |p| {
                 let l = self.state.layout.leaf(p.leaf)?;
-                let c = l.client?;
+                let c = l.client;
                 if l.minimized || Some(c) == fullscreen {
                     return None;
                 }
@@ -421,9 +413,7 @@ impl Comp {
             let Some(l) = self.state.layout.leaf(leaf) else {
                 continue;
             };
-            let Some(c) = l.client else {
-                continue;
-            };
+            let c = l.client;
             if l.minimized || Some(c) == fullscreen {
                 continue;
             }

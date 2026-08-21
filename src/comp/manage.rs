@@ -40,10 +40,10 @@ impl Comp {
                 entry.icon_slot = slot;
             }
             self.spawn_icon_fetch(win, class);
-            // Into the focused split if it's an empty placeholder, else a
-            // fresh column right of the focused one, as the gap `+`
-            // button would (see `State::place_new_window`). Animate the
-            // new column sliding in and scroll it into view.
+            // Where the launch aimed it (the taskbar compass), else a
+            // fresh column right of the focused one (see
+            // `State::place_new_window`). Animate the new column sliding
+            // in and scroll it into view.
             let wa = self.layout_area();
             self.state.place_new_window(wa, win, want_w);
             if fullscreen {

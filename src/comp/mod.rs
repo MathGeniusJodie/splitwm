@@ -88,7 +88,7 @@ pub struct ChromeView {
     /// software-drawn chrome buffer on their way to the GPU.
     pub indexed: crate::render::indexed::IndexedProgram,
     /// The independently-textured ex-underlay pieces (wallpaper, per-leaf
-    /// frames, plus buttons, taskbar); each re-renders only when its own
+    /// frames, taskbar); each re-renders only when its own
     /// content fingerprint changes, so scrolling and animation are pure
     /// element placement (see `comp::pieces`).
     pub pieces: pieces::ChromePieces,
@@ -107,7 +107,7 @@ pub struct ChromeView {
     /// In-flight layout transition (chrome-only interpolation).
     pub anim: Option<anim::LayoutAnim>,
     /// Every leaf's frame rect from the last arrange, on-screen or not —
-    /// animation start rects and the empty-leaf-body hit region.
+    /// animation start rects and the leaf-body hit region.
     pub frame_rects: std::collections::HashMap<crate::layout::NodeId, crate::widgets::FrameRect>,
     /// The rect the focus outline currently traces: the focused split's
     /// frame, or its interpolated frame mid-animation. `None` when no leaf
@@ -137,6 +137,11 @@ pub struct Interaction {
     /// and their release must not leak to the client that never saw the
     /// press.
     pub held_bound_keys: Vec<u32>,
+    /// The quick-launch slot whose hover compass is showing, if any.
+    /// Private invariant: reads go through `Comp::quick_compass()`, which
+    /// re-resolves the slot against the current taskbar regions, so a
+    /// rebuilt bar never leaves a stale rect behind.
+    pub(super) quick_hover: Option<usize>,
     /// Where hover keyboard delivery last aimed, so pointer motion only
     /// re-derives the seat focus when the pointer actually crossed a
     /// window boundary.
@@ -732,9 +737,7 @@ impl Comp {
         // mutably but never touches `view.placed`.
         let placed = std::mem::take(&mut self.view.placed);
         for &p in &placed {
-            let Some(c) = p.active_client else {
-                continue;
-            };
+            let c = p.client;
             let minimized = self.state.layout.leaf(p.leaf).is_some_and(|l| l.minimized);
             // The fullscreen client is configured below, over the whole
             // output; don't fight it with split geometry.
@@ -822,13 +825,7 @@ impl Comp {
             .layout
             .collect_leaves()
             .iter()
-            .filter_map(|&l| {
-                self.state
-                    .layout
-                    .leaf(l)
-                    .and_then(|lf| lf.client)
-                    .map(|c| (c, l))
-            })
+            .filter_map(|&l| Some((self.state.layout.leaf(l)?.client, l)))
             .collect();
         debug_assert_eq!(
             bar_order.len(),
@@ -1093,10 +1090,6 @@ impl Comp {
         // caches `update_chrome_pieces` just refreshed. These borrow only
         // `self.view.pieces`, disjoint from the backend the scene renders through.
         let leaf_chrome = self.view.pieces.leaf_elements(&leaf_rects);
-        let plus = self
-            .view
-            .pieces
-            .plus_elements(&self.view.widgets.plus_regions, self.view.anim.is_some());
         let taskbar = self.view.pieces.taskbar_element();
         let wallpaper = self.view.pieces.wallpaper_element();
 
@@ -1116,7 +1109,6 @@ impl Comp {
             wallpaper,
             leaf_chrome: &leaf_chrome,
             frame_art: self.view.pieces.frame_art(),
-            plus: &plus,
             taskbar,
             focus_outline: focus_outline.as_ref().map_or(&[][..], <[_; 4]>::as_slice),
         };

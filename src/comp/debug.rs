@@ -28,9 +28,9 @@
 //!   driver observe focus on clients that aren't the test's own Wayland
 //!   connection (XWayland windows).
 //! - `layout` — report the splits in depth-first (left-to-right) order,
-//!   one token per leaf: its window's title, or `-` for an empty
-//!   placeholder. This is also the taskbar's tile order, so a driver can
-//!   verify reorders without pixel-reading the bar.
+//!   one token per leaf: its window's title, or `-` when the window is no
+//!   longer managed. This is also the taskbar's tile order, so a driver
+//!   can verify reorders without pixel-reading the bar.
 
 use std::io::Read as _;
 
@@ -156,7 +156,7 @@ fn command(comp: &mut Comp, line: &str) {
                     comp.state
                         .layout
                         .leaf(l)
-                        .and_then(|lf| lf.client)
+                        .map(|lf| lf.client)
                         .and_then(|c| comp.managed.get(c))
                         .map_or_else(
                             || "-".to_string(),

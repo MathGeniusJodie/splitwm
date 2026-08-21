@@ -175,28 +175,27 @@ pub fn dock_identity() -> String {
     std::env::var("SPLITWM_DOCK_TITLE").unwrap_or_else(|_| DOCK_TITLE.to_string())
 }
 
-pub const SPLIT_RATIO: f64 = 0.618;
 pub const RESIZE_STEP: f64 = 0.05;
 /// Smallest fraction of a stack a row can be resized down to, shared by
 /// keyboard resizing and boundary drags so both stop at the same point.
 pub const MIN_SPLIT_FRAC: f64 = 0.05;
 
-/// Width a fresh column opens at (new windows, "+" buttons, splits pulled
-/// out of a stack by a drag): a comfortable third of the viewport, never
-/// below the chrome's minimum. The bootstrap column instead tracks the
+/// Width a fresh column opens at (new windows, splits pulled out of a
+/// stack by a drag): a comfortable third of the viewport, never below the
+/// chrome's minimum. The first column of an empty strip instead tracks the
 /// viewport (`ColWidth::Viewport`).
 pub fn default_col_w(viewport_w: i32) -> i32 {
     (viewport_w / 3).max(min_split_w())
 }
 pub const SCROLL_STEP: i32 = 100;
 
-// Split-control button geometry: native pixel size of the close/minimize/
-// hsplit/vsplit PNGs, drawn at 1:1 scale (no stretching).
+// Split-control button geometry: native pixel size of the close/minimize
+// PNGs, drawn at 1:1 scale (no stretching).
 pub const BTN_SIZE: i32 = 19;
 pub const BTN_SPACING: i32 = 4;
-/// How many split-control buttons a titlebar holds (close/split/minimize);
-/// must match `BtnKind`'s variants — `min_split_w` derives from it.
-pub const N_SPLIT_BTNS: i32 = 3;
+/// How many split-control buttons a titlebar holds (close/minimize); must
+/// match `BtnKind`'s variants — `min_split_w` derives from it.
+pub const N_SPLIT_BTNS: i32 = 2;
 /// Vertical nudge (down = positive) applied to titlebar buttons, to fine-tune
 /// their alignment within the bitmap titlebar. Folds in a 2px correction
 /// against the naive titlebar-midpoint calculation (`tb_h / 2`), which sits
@@ -215,7 +214,7 @@ pub const fn btn_strip_right(x: i32, w: i32, bw: i32) -> i32 {
     x + w - bw - 4
 }
 
-/// Left edge of the full 3-button strip, i.e. where title text must stop.
+/// Left edge of the full button strip, i.e. where title text must stop.
 /// Only meaningful when `w >= min_split_w()`; below that threshold the strip
 /// collapses to a single centred button with no dedicated free strip (see
 /// `compute_btn_regions`).
@@ -226,15 +225,6 @@ pub const fn btn_strip_left(x: i32, w: i32, bw: i32) -> i32 {
 /// Titlebar height: the top inset of the bitmap window border.
 pub const fn tb_h() -> i32 {
     BORDER_TOP
-}
-
-/// Whether a frame of height `h` is tall enough to stack: it must fit
-/// two rows of the minimum row height plus the gap between them. The
-/// single threshold behind the titlebar ⊞ button's enabled state
-/// (`widgets::leaf_meta`) and the keyboard stack gate
-/// (`Comp::stack_below`), so the two can't drift apart.
-pub fn stack_fits(h: i32) -> bool {
-    h >= 2 * tb_h() + GAP
 }
 
 // Palette indices cycled through to give each split its own persistent
@@ -292,10 +282,8 @@ pub use xkeysym::key as ks;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Action {
-    /// Stack a new empty split below the focused one (a column's rows are
-    /// the only nesting; a new *column* comes from the gap "+" buttons or
-    /// a new window).
-    StackBelow,
+    /// Close the focused split — politely closing its window, which takes
+    /// the split with it.
     Close,
     FocusNext,
     FocusPrev,
@@ -368,7 +356,6 @@ pub const BINDINGS: &[(u16, u32, Action)] = &[
     (MOD4, ks::Return, Action::SpawnTerminal),
     (MOD4, ks::space, Action::SpawnLauncher),
     (MOD4, ks::s, Action::Screenshot),
-    (MOD4, ks::h, Action::StackBelow),
     (MOD4, ks::q, Action::Close),
     (MOD4, ks::Tab, Action::FocusNext),
     (MOD4 | SHIFT, ks::Tab, Action::FocusPrev),

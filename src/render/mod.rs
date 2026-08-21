@@ -1,17 +1,17 @@
 //! Software rendering of the chrome pieces (wallpaper, leaf decorations,
-//! taskbar, insert buttons) as indexed-colour `pixel_graphics::Framebuffer`s.
+//! taskbar) as indexed-colour `pixel_graphics::Framebuffer`s.
 //! The index bytes upload straight to the GPU as `R8` textures and the
 //! palette lookup happens in a fragment shader (`render::indexed`, the one
 //! GPU-side module here); the rest of this module only draws the indices.
 //! Each piece is drawn into its own small buffer at its own origin (leaf
 //! frames at (0,0) into a leaf-sized buffer, the taskbar into a strip-sized
-//! buffer, each "+" into a square) — see `comp::pieces`, which owns the
-//! per-piece texture caches and composites them by position.
+//! buffer) — see `comp::pieces`, which owns the per-piece texture caches
+//! and composites them by position.
 //! Each concern owns its own module: wallpaper loading/caching in
 //! `wallpaper`, a leaf's border/titlebar chrome in `chrome`, its
 //! split-control buttons in `buttons`, icon blitting/caching (shared by the
 //! titlebar and the taskbar) in `icon_cache`, the taskbar's own
-//! tiles/badges/insert-button in `taskbar`, and served-notification speech
+//! tiles/badges/compass in `taskbar`, and served-notification speech
 //! bubbles in `notify_popup`. The `Renderer` struct itself and the handful
 //! of drawing primitives genuinely shared across all of the above live here.
 
@@ -33,7 +33,7 @@ mod wallpaper;
 
 pub use buttons::BtnIcon;
 pub use chrome::{LeafView, SliceSpec, TitleInfo};
-pub use taskbar::{draw_close_badge, draw_plus, draw_taskbar_sep};
+pub use taskbar::{draw_close_badge, draw_compass, draw_taskbar_sep};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -45,7 +45,6 @@ use crate::oklch::OklabPalette;
 use crate::theme::{self, palette_color};
 use crate::Index;
 
-use buttons::ButtonArt;
 use chrome::NineSlice;
 use icon_cache::IconCache;
 use wallpaper::Wallpaper;
@@ -77,9 +76,8 @@ pub struct Renderer {
     minimized: pixel_graphics::Sprite,
     minimized_h: pixel_graphics::Sprite,
     /// Titlebar buttons, indexed by `BtnIcon::index`; accent-swapped at draw
-    /// time. `Minimize`/`MinimizeH` are two separate slots (not
-    /// enabled/disabled of the same button) — see `BtnIcon::MinimizeH`.
-    buttons: [ButtonArt; BtnIcon::COUNT],
+    /// time.
+    buttons: [pixel_graphics::Sprite; BtnIcon::COUNT],
     /// `draw_icon`'s per-pixel `nearest_index` lookups are wasted work every
     /// frame — icons are already quantized to exact palette colours, so the
     /// resulting index buffer never changes for a given icon+size. Keyed by
@@ -182,26 +180,9 @@ impl Renderer {
             minimized_h: crate::assets::winmin_h(),
             // Order must match `BtnIcon::index`.
             buttons: [
-                ButtonArt {
-                    normal: crate::assets::close(),
-                    disabled: crate::assets::close_disabled(),
-                },
-                ButtonArt {
-                    normal: crate::assets::minimize(),
-                    disabled: crate::assets::minimize_disabled(),
-                },
-                ButtonArt {
-                    normal: crate::assets::minimize_h(),
-                    disabled: crate::assets::minimize_h_disabled(),
-                },
-                ButtonArt {
-                    normal: crate::assets::hsplit(),
-                    disabled: crate::assets::hsplit_disabled(),
-                },
-                ButtonArt {
-                    normal: crate::assets::vsplit(),
-                    disabled: crate::assets::vsplit_disabled(),
-                },
+                crate::assets::close(),
+                crate::assets::minimize(),
+                crate::assets::minimize_h(),
             ],
             palette,
             icon_idx_cache: RefCell::new(HashMap::new()),

@@ -1,23 +1,16 @@
 //! The bottom taskbar's own drawing: icon tiles (with drop shadow and
 //! shown-in-a-split highlight), the separator pill before the quick-launch
-//! icons, the close badge on each tile, and the "+" insert button drawn
-//! between columns.
+//! icons, the close badge on each tile, and the hover compass around a
+//! quick-launch icon.
 
 use pixel_graphics::{Framebuffer, Paint as PgPaint, PaletteIndex};
 
 use crate::icon::Icon;
+use crate::layout::Side;
 use crate::theme::palette_color;
 use crate::Index;
 
 use super::{fill, fill_paint, Renderer};
-
-/// Dithered "translucent" chrome background: a checker of black and gunmetal
-/// stands in for a 50%-alpha black fill, keeping everything on the 16-colour
-/// palette.
-const CHROME_BG: PgPaint = PgPaint::Checker(
-    PaletteIndex::new(palette_color::BLACK),
-    PaletteIndex::new(palette_color::GUNMETAL),
-);
 
 /// Pixel offset (down and right) of a taskbar icon's drop shadow from the
 /// icon itself.
@@ -104,27 +97,6 @@ fn draw_rounded_box(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, color:
     fill_paint(fb, x + w - t, y + 2, t, h - 4, paint); // right
 }
 
-/// Half-length of each "+" arm as a percentage of the icon's overall size
-/// (clamped to a 2px minimum so the arms stay visible at the smallest icon
-/// sizes); picked by eye to look proportionate against `draw_plus`'s notched
-/// tile.
-const PLUS_ARM_PCT: i32 = 28;
-
-/// Draw a dithered pixel-art "+" insert button centred at (cx, cy).
-pub fn draw_plus(fb: &mut Framebuffer, cx: i32, cy: i32, sz: i32) {
-    let half = sz / 2;
-    let (x, y) = (cx - half, cy - half);
-    // Notched-corner tile, same chrome dither as the taskbar.
-    fill_paint(fb, x + 2, y, sz - 4, sz, CHROME_BG);
-    fill_paint(fb, x, y + 2, 2, sz - 4, CHROME_BG);
-    fill_paint(fb, x + sz - 2, y + 2, 2, sz - 4, CHROME_BG);
-
-    // 2px-thick plus arms.
-    let arm = (sz * PLUS_ARM_PCT / 100).max(2);
-    fill(fb, cx - arm, cy - 1, 2 * arm, 2, palette_color::CREAM);
-    fill(fb, cx - 1, cy - arm, 2, 2 * arm, palette_color::CREAM);
-}
-
 /// Draw the vertical pill separating the taskbar's window tiles from its
 /// quick-launch icons: a cream rounded bar, corners notched pixel-art style
 /// like the tiles around it.
@@ -181,6 +153,47 @@ pub fn draw_close_badge(fb: &mut Framebuffer, x: i32, y: i32, sz: i32) {
             if px >= 0 && sy >= 0 {
                 fb.set_pixel(px as isize, sy as isize, palette_color::CREAM);
             }
+        }
+    }
+}
+
+/// Width of the gap the diagonals cut between two neighbouring compass
+/// wedges, in pixels. The wedges carry no outline, so this gap is what
+/// separates them.
+const COMPASS_GAP: i32 = 4;
+
+/// Draw the hover compass around a quick-launch icon: a square, a ring
+/// wider than the icon on every side, cut by its diagonals into the four
+/// wedges that place the launched window left of, right of, above or below
+/// the focused split. The wedge under the pointer (`hover`) is filled
+/// solid; the rest carry the chrome dither. The icon is drawn over the
+/// square's middle, which the wedges run under — it is part of them, not
+/// a hole in them.
+pub fn draw_compass(fb: &mut Framebuffer, r: crate::layout::Rect, hover: Side) {
+    // Doubled coordinates keep the centre of an even-sided square exact.
+    let (cx2, cy2) = (2 * r.x + r.w, 2 * r.y + r.h);
+    for y in r.y.max(0)..r.y + r.h {
+        for x in r.x.max(0)..r.x + r.w {
+            // Notched corners, the pixel-art rounding the rest of the
+            // chrome uses.
+            let notch = (x < r.x + 2 || x >= r.x + r.w - 2) && (y < r.y + 2 || y >= r.y + r.h - 2);
+            if notch {
+                continue;
+            }
+            let (dx, dy) = (2 * x + 1 - cx2, 2 * y + 1 - cy2);
+            // The diagonals themselves stay clear: equidistant from both
+            // axes is the gap between two wedges.
+            if (dx.abs() - dy.abs()).abs() < 2 * COMPASS_GAP {
+                continue;
+            }
+            let color = if crate::widgets::compass_zone(r, x, y) == hover {
+                palette_color::LAVENDER
+            } else if (x + y) % 2 == 0 {
+                palette_color::BLACK
+            } else {
+                palette_color::GUNMETAL
+            };
+            fb.set_pixel(x as isize, y as isize, color);
         }
     }
 }

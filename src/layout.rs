@@ -18,14 +18,6 @@ pub type Win = u32;
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId(u32);
 
-/// A gap's orientation: `H` is a vertical gap between columns (dragged
-/// along x), `V` a horizontal gap between stacked rows (dragged along y).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Dir {
-    H,
-    V,
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
@@ -34,28 +26,16 @@ pub struct Rect {
     pub h: i32,
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct Leaf {
-    /// The single window shown in this split, if any. An empty leaf is a
-    /// placeholder awaiting the next new window; a window is never without
-    /// a leaf (windows and splits live and die together).
-    pub client: Option<Win>,
+    /// The window this split shows. Splits and windows are the same thing
+    /// seen from two sides: a split exists because a window does, and dies
+    /// with it.
+    pub client: Win,
     pub minimized: bool,
-    /// Persistent accent palette index for this split (kept across
-    /// splits/closes), used to palette-swap the bitmap window border.
+    /// Persistent accent palette index for this split (kept across moves
+    /// and closes), used to palette-swap the bitmap window border.
     pub color: crate::Index,
-}
-
-impl Leaf {
-    /// Show `c` in this leaf. Owns the "a leaf showing a window is never
-    /// minimized" invariant: a minimized leaf's window is never mapped, so
-    /// assigning a client without clearing the flag would leave the window
-    /// unviewable. Every path that puts a window into a leaf goes through
-    /// here.
-    pub fn show(&mut self, c: Win) {
-        self.client = Some(c);
-        self.minimized = false;
-    }
 }
 
 /// A split's place in the strip: which column, and which row within it.
@@ -91,8 +71,8 @@ pub struct Column {
 }
 
 pub struct Layout {
-    /// Non-empty by construction: every mutation below either keeps at
-    /// least one column or refuses (the strip always shows one split).
+    /// Empty while no window is open — the strip then shows bare
+    /// wallpaper, since a split without a window cannot exist.
     columns: Vec<Column>,
     next_id: u32,
 }
@@ -100,18 +80,8 @@ pub struct Layout {
 impl Layout {
     pub fn new() -> Self {
         Self {
-            columns: vec![Column {
-                width: ColWidth::Viewport,
-                rows: vec![Row {
-                    id: NodeId(1),
-                    frac: 1.0,
-                    leaf: Leaf {
-                        color: crate::theme::cycled_leaf_color(1),
-                        ..Leaf::default()
-                    },
-                }],
-            }],
-            next_id: 2,
+            columns: Vec::new(),
+            next_id: 1,
         }
     }
 
@@ -140,14 +110,15 @@ impl Layout {
             .unwrap_or_else(|| crate::theme::cycled_leaf_color(id.0))
     }
 
-    fn make_row(&mut self, frac: f64) -> Row {
+    fn make_row(&mut self, frac: f64, client: Win) -> Row {
         let id = self.gen_id();
         Row {
             id,
             frac,
             leaf: Leaf {
+                client,
+                minimized: false,
                 color: self.unused_leaf_color(id),
-                ..Leaf::default()
             },
         }
     }
@@ -201,14 +172,14 @@ impl Layout {
         self.rows().map(|(_, r)| r.id).collect()
     }
 
-    /// The strip's first split (top-left).
-    pub fn first_leaf(&self) -> NodeId {
-        self.columns[0].rows[0].id
+    /// The strip's first split (top-left), or `None` while it is empty.
+    pub fn first_leaf(&self) -> Option<NodeId> {
+        Some(self.columns.first()?.rows[0].id)
     }
 
     pub fn find_leaf_for_client(&self, c: Win) -> Option<NodeId> {
         self.rows()
-            .find(|(_, r)| r.leaf.client == Some(c))
+            .find(|(_, r)| r.leaf.client == c)
             .map(|(_, r)| r.id)
     }
 
@@ -227,12 +198,6 @@ impl Layout {
             .is_some_and(|p| self.columns[p.col].rows.len() > 1)
     }
 
-    /// Whether the strip is down to its one guaranteed split — the split
-    /// that can't be closed or minimized.
-    pub fn sole_split(&self) -> bool {
-        self.columns.len() == 1 && self.columns[0].rows.len() == 1
-    }
-
     #[cfg(test)]
     pub fn col_width(&self, col: usize) -> Option<ColWidth> {
         self.columns.get(col).map(|c| c.width)
@@ -240,10 +205,10 @@ impl Layout {
 
     // --- mutations ---
 
-    /// Insert a new empty column at `at` (clamped) with the given width.
-    /// Returns the new split.
-    pub fn insert_column(&mut self, at: usize, width: ColWidth) -> NodeId {
-        let row = self.make_row(1.0);
+    /// Insert a new column at `at` (clamped) with the given width, holding
+    /// `client`. Returns the new split.
+    pub fn insert_column(&mut self, at: usize, width: ColWidth, client: Win) -> NodeId {
+        let row = self.make_row(1.0, client);
         let id = row.id;
         let at = at.min(self.columns.len());
         self.columns.insert(
@@ -256,14 +221,15 @@ impl Layout {
         id
     }
 
-    /// Insert a new empty row into `col`'s stack at `at` (clamped), taking
-    /// the average share of the column's height (all renormalised).
-    /// Returns the new split, or `None` for a dead column index.
+    /// Insert a new row holding `client` into `col`'s stack at `at`
+    /// (clamped), taking the average share of the column's height (all
+    /// renormalised). Returns the new split, or `None` for a dead column
+    /// index.
     #[allow(clippy::cast_precision_loss)]
-    pub fn insert_row(&mut self, col: usize, at: usize) -> Option<NodeId> {
+    pub fn insert_row(&mut self, col: usize, at: usize, client: Win) -> Option<NodeId> {
         let n = self.columns.get(col)?.rows.len();
         let avg = self.columns[col].rows.iter().map(|r| r.frac).sum::<f64>() / n as f64;
-        let row = self.make_row(avg);
+        let row = self.make_row(avg, client);
         let id = row.id;
         let c = &mut self.columns[col];
         c.rows.insert(at.min(n), row);
@@ -274,30 +240,14 @@ impl Layout {
         Some(id)
     }
 
-    /// Stack a new empty row directly below `id`, the existing row keeping
-    /// fraction `ratio` of its own share. Returns the new split, or `None`
-    /// for a dead id.
-    pub fn split_below(&mut self, id: NodeId, ratio: f64) -> Option<NodeId> {
-        let p = self.locate(id)?;
-        let old = self.columns[p.col].rows[p.row].frac;
-        let row = self.make_row(old * (1.0 - ratio));
-        let new = row.id;
-        self.columns[p.col].rows[p.row].frac = old * ratio;
-        self.columns[p.col].rows.insert(p.row + 1, row);
-        Some(new)
-    }
-
     /// Remove the split `id`. A row leaving a stack hands its share to the
     /// surviving rows (they reclaim the height — their extent is fixed by
     /// the viewport); a lone row takes its whole column with it, and the
-    /// strip just gets shorter — sibling columns are untouched. Refused
-    /// (`None`) for the strip's sole split. Returns the split focus should
-    /// land on: the nearest surviving row in the same column, else the
-    /// nearest column's first row.
+    /// strip just gets shorter — sibling columns are untouched. Returns
+    /// the split focus should land on: the nearest surviving row in the
+    /// same column, else the nearest column's first row — and `None` once
+    /// the strip is empty (or for a dead id, which removes nothing).
     pub fn remove(&mut self, id: NodeId) -> Option<NodeId> {
-        if self.sole_split() {
-            return None;
-        }
         let p = self.locate(id)?;
         let col = &mut self.columns[p.col];
         if col.rows.len() > 1 {
@@ -312,7 +262,7 @@ impl Layout {
             return Some(col.rows[neighbour].id);
         }
         self.columns.remove(p.col);
-        let neighbour = p.col.min(self.columns.len() - 1);
+        let neighbour = p.col.min(self.columns.len().checked_sub(1)?);
         Some(self.columns[neighbour].rows[0].id)
     }
 
@@ -383,6 +333,41 @@ impl Layout {
         let at = if before { dcol } else { dcol + 1 };
         self.columns.insert(
             at,
+            Column {
+                width: width.unwrap_or(default_w),
+                rows: vec![row],
+            },
+        );
+        true
+    }
+
+    /// Relocate split `src` into its own column at strip position `idx`
+    /// (clamped), the columns from there on shifting right — what a drop
+    /// into a gap, or onto the canvas past the strip's end, means: those
+    /// name a place, not a neighbour, so the split can leave a stack even
+    /// when nothing else in the strip stands beside the place it lands.
+    /// A `src` that was a whole column keeps its width; one pulled out of
+    /// a stack gets `default_w`. `idx` counts the columns as they are
+    /// *before* the move. Returns whether the strip changed — a lone
+    /// column already occupying that position doesn't move.
+    pub fn move_to_column(&mut self, src: NodeId, idx: usize, default_w: ColWidth) -> bool {
+        let Some(sp) = self.locate(src) else {
+            return false;
+        };
+        let lone = self.columns[sp.col].rows.len() == 1;
+        // A lone column is already at `idx` both when it *is* that column
+        // and when it is the one just left of it (the columns after it
+        // close up as it leaves).
+        if lone && (sp.col == idx || sp.col + 1 == idx) {
+            return false;
+        }
+        let Some((row, width)) = self.detach(src) else {
+            return false;
+        };
+        // Detaching a lone column shifted every later column one left.
+        let at = if lone && idx > sp.col { idx - 1 } else { idx };
+        self.columns.insert(
+            at.min(self.columns.len()),
             Column {
                 width: width.unwrap_or(default_w),
                 rows: vec![row],
@@ -490,10 +475,9 @@ fn child_sizes(children: &[(bool, f64)], usable: i32, min_sz: i32) -> Vec<i32> {
     sizes
 }
 
-/// Where a "+" insert button adds a new empty split. Every margin and gap
-/// carries exactly one `Insert` (see `insert_slots`): the outer margins
-/// and inter-column gaps insert a column, a column's top/bottom margins
-/// and inter-row gaps insert a row into its stack.
+/// Where a new window opens in the strip. `State::place_new_window`
+/// resolves one of these — from the compass wedge that launched the
+/// window, or from the focused split when nothing asked for a side.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Insert {
     /// A new column at strip position `idx` (`0` = far left, `ncols()` =
@@ -502,6 +486,18 @@ pub enum Insert {
     /// A new row at stack position `idx` of column `col` (`0` = top, the
     /// row count = bottom).
     Row { col: usize, idx: usize },
+}
+
+/// One of the four sides a new split can open on, relative to an existing
+/// split. The taskbar's quick-launch hover compass names its four zones
+/// with this; `State::open_split_beside` turns one into the `Insert` it
+/// means for a given split.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Side {
+    Left,
+    Right,
+    Up,
+    Down,
 }
 
 /// A gap between two adjacent columns, or two adjacent rows of one stack.
@@ -513,17 +509,8 @@ pub enum GapAt {
     Row { col: usize, idx: usize },
 }
 
-impl GapAt {
-    pub const fn dir(self) -> Dir {
-        match self {
-            Self::Col(_) => Dir::H,
-            Self::Row { .. } => Dir::V,
-        }
-    }
-}
-
-/// A gap's laid-out slot: the place a drag handle and a "+" insert button
-/// sit. Coordinates are canvas-space.
+/// A gap's laid-out slot: the place its drag handle sits. Coordinates are
+/// canvas-space.
 #[derive(Clone, Copy)]
 pub struct Boundary {
     pub at: GapAt,
@@ -575,9 +562,13 @@ impl Layout {
     }
 
     /// The scrollable strip's total width: the columns end to end, plus
-    /// the outer margins and inter-column gaps.
+    /// the outer margins and inter-column gaps. Zero while the strip is
+    /// empty — there is no margin around nothing.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn strip_w(&self, viewport_w: i32, gap: i32) -> i32 {
+        if self.columns.is_empty() {
+            return 0;
+        }
         let n = self.columns.len() as i32;
         2 * gap + self.widths_iter(viewport_w, gap).sum::<i32>() + gap * (n - 1)
     }
@@ -678,29 +669,6 @@ impl Layout {
         }
         out
     }
-
-    /// Every place a new split can be inserted, as the canvas-space centre
-    /// its "+" button sits on: one slot per column position — the outer
-    /// margins and every inter-column gap, centred in the strip's height —
-    /// and one slot per row position of every column — its top/bottom
-    /// margins and every inter-row gap, centred on the column's width.
-    pub fn insert_slots(&self, wa: Rect, gap: i32) -> Vec<(i32, i32, Insert)> {
-        let mut out = Vec::new();
-        let strip_cy = wa.y + wa.h / 2;
-        out.push((wa.x + gap / 2, strip_cy, Insert::Col(0)));
-        for (ci, r) in self.col_rects(wa, gap).into_iter().enumerate() {
-            out.push((r.x + r.w + gap / 2, strip_cy, Insert::Col(ci + 1)));
-            let cx = r.x + r.w / 2;
-            out.push((cx, r.y - gap / 2, Insert::Row { col: ci, idx: 0 }));
-            let mut y = r.y;
-            for (ri, sz) in self.row_sizes(ci, r.h, gap).iter().enumerate() {
-                y += sz + gap;
-                let idx = ri + 1;
-                out.push((cx, y - gap / 2, Insert::Row { col: ci, idx }));
-            }
-        }
-        out
-    }
 }
 
 #[cfg(test)]
@@ -769,18 +737,34 @@ mod tests {
     };
     const GAP: i32 = 20;
 
+    /// `n` columns, one window each (client `1..=n`), the first tracking
+    /// the viewport as the strip's first column does.
     fn columns(l: &mut Layout, n: usize) -> Vec<NodeId> {
-        for i in 1..n {
-            l.insert_column(i, ColWidth::Px(400));
+        for i in 0..n {
+            let width = if i == 0 {
+                ColWidth::Viewport
+            } else {
+                ColWidth::Px(400)
+            };
+            l.insert_column(i, width, i as Win + 1);
         }
         l.collect_leaves()
     }
 
     #[test]
-    fn bootstrap_column_fills_the_viewport() {
+    fn an_empty_strip_lays_out_nothing() {
         let l = Layout::new();
-        let geo = l.compute(WA, GAP)[&l.first_leaf()];
-        assert_eq!(geo.w, WA.w - 2 * GAP);
+        assert_eq!(l.first_leaf(), None);
+        assert!(l.compute(WA, GAP).is_empty());
+        assert!(l.boundaries(WA, GAP).is_empty());
+        assert_eq!(l.strip_w(WA.w, GAP), 0);
+    }
+
+    #[test]
+    fn first_column_fills_the_viewport() {
+        let mut l = Layout::new();
+        let ids = columns(&mut l, 1);
+        assert_eq!(l.compute(WA, GAP)[&ids[0]].w, WA.w - 2 * GAP);
         assert_eq!(l.strip_w(WA.w, GAP), WA.w);
     }
 
@@ -789,7 +773,7 @@ mod tests {
         let mut l = Layout::new();
         let ids = columns(&mut l, 3);
         let before = l.compute(WA, GAP);
-        l.insert_column(1, ColWidth::Px(300));
+        l.insert_column(1, ColWidth::Px(300), 9);
         let after = l.compute(WA, GAP);
         for id in ids {
             assert_eq!(before[&id].w, after[&id].w);
@@ -806,7 +790,7 @@ mod tests {
         let ids = columns(&mut l, 3);
         let before = l.compute(WA, GAP);
         let strip = l.strip_w(WA.w, GAP);
-        let focus = l.remove(ids[1]).expect("removable");
+        let focus = l.remove(ids[1]).expect("a survivor takes the focus");
         assert_eq!(focus, ids[2], "nearest surviving column's row");
         let after = l.compute(WA, GAP);
         assert_eq!(before[&ids[0]].w, after[&ids[0]].w);
@@ -817,43 +801,30 @@ mod tests {
     #[test]
     fn removing_a_stacked_row_hands_its_share_to_the_stack() {
         let mut l = Layout::new();
-        let top = l.first_leaf();
-        let bottom = l.split_below(top, 0.618).expect("splittable");
-        let full = l.compute(WA, GAP)[&top].h + l.compute(WA, GAP)[&bottom].h + GAP;
-        let focus = l.remove(bottom).expect("removable");
-        assert_eq!(focus, top);
-        assert_eq!(l.compute(WA, GAP)[&top].h, full, "height reclaimed");
+        let ids = columns(&mut l, 1);
+        let bottom = l.insert_row(0, 1, 2).expect("live column");
+        let geos = l.compute(WA, GAP);
+        let full = geos[&ids[0]].h + geos[&bottom].h + GAP;
+        let focus = l.remove(bottom).expect("a survivor takes the focus");
+        assert_eq!(focus, ids[0]);
+        assert_eq!(l.compute(WA, GAP)[&ids[0]].h, full, "height reclaimed");
         assert_eq!(l.ncols(), 1);
     }
 
     #[test]
-    fn sole_split_cannot_be_removed() {
+    fn removing_the_last_split_empties_the_strip() {
         let mut l = Layout::new();
-        assert!(l.remove(l.first_leaf()).is_none());
-        assert_eq!(l.collect_leaves().len(), 1);
-    }
-
-    #[test]
-    fn split_below_keeps_ratio_and_identity() {
-        let mut l = Layout::new();
-        columns(&mut l, 2);
-        let top = l.collect_leaves()[1];
-        let bottom = l.split_below(top, 0.618).expect("splittable");
-        let geos = l.compute(WA, GAP);
-        assert!(
-            geos[&top].h > geos[&bottom].h,
-            "content keeps the major share"
-        );
-        assert_eq!(l.locate(top), Some(Pos { col: 1, row: 0 }));
-        assert_eq!(l.locate(bottom), Some(Pos { col: 1, row: 1 }));
+        let ids = columns(&mut l, 1);
+        assert_eq!(l.remove(ids[0]), None, "nothing left to focus");
+        assert!(l.collect_leaves().is_empty());
     }
 
     #[test]
     fn insert_row_takes_the_average_share() {
         let mut l = Layout::new();
-        let top = l.first_leaf();
-        l.split_below(top, 0.618).expect("splittable");
-        let mid = l.insert_row(0, 1).expect("live column");
+        columns(&mut l, 1);
+        l.insert_row(0, 1, 2).expect("live column");
+        let mid = l.insert_row(0, 1, 3).expect("live column");
         let geos = l.compute(WA, GAP);
         let usable = WA.h - 2 * GAP - 2 * GAP;
         let third = usable / 3;
@@ -880,10 +851,54 @@ mod tests {
     fn move_out_of_a_stack_gets_the_default_width() {
         let mut l = Layout::new();
         let ids = columns(&mut l, 2);
-        let bottom = l.split_below(ids[0], 0.5).expect("splittable");
+        let bottom = l.insert_row(0, 1, 3).expect("live column");
         assert!(l.move_beside_column(bottom, ids[1], false, ColWidth::Px(321)));
         assert_eq!(l.col_width(2), Some(ColWidth::Px(321)));
         assert_eq!(l.col_len(0), 1, "the stack dissolved to a lone row");
+    }
+
+    /// A place, not a neighbour: a stacked row moves out into a column
+    /// at the named position — including the position right beside its
+    /// own column, where naming a neighbour would have named itself.
+    #[test]
+    fn move_to_column_pulls_a_row_out_of_its_own_stack() {
+        for (idx, expect) in [(0, vec![1, 2]), (1, vec![2, 1]), (2, vec![2, 1])] {
+            let mut l = Layout::new();
+            let ids = columns(&mut l, 1);
+            let bottom = l.insert_row(0, 1, 2).expect("live column");
+            // The top row leaves the stack; the bottom row keeps column 0.
+            assert!(l.move_to_column(ids[0], idx, ColWidth::Px(300)), "{idx}");
+            assert_eq!(l.ncols(), 2, "{idx}");
+            assert_eq!(l.col_len(0), 1, "{idx}");
+            let clients: Vec<Win> = l
+                .collect_leaves()
+                .iter()
+                .map(|&id| l.leaf(id).expect("live").client)
+                .collect();
+            assert_eq!(clients, expect, "{idx}");
+            assert!(l.is_leaf(bottom));
+        }
+    }
+
+    /// A lone column already at the named position stays put — moving it
+    /// would only churn focus and animations.
+    #[test]
+    fn move_to_column_leaves_a_column_already_there_alone() {
+        let mut l = Layout::new();
+        let ids = columns(&mut l, 3);
+        assert!(
+            !l.move_to_column(ids[1], 1, ColWidth::Px(300)),
+            "its own slot"
+        );
+        assert!(
+            !l.move_to_column(ids[1], 2, ColWidth::Px(300)),
+            "the slot after it"
+        );
+        assert!(
+            l.move_to_column(ids[1], 3, ColWidth::Px(300)),
+            "past the end"
+        );
+        assert_eq!(l.collect_leaves(), vec![ids[0], ids[2], ids[1]]);
     }
 
     #[test]
@@ -894,7 +909,7 @@ mod tests {
         assert_eq!(l.ncols(), 1);
         assert_eq!(l.locate(ids[1]), Some(Pos { col: 0, row: 1 }));
         // Detaching a lone column while targeting a stack keeps working.
-        let third = l.insert_column(1, ColWidth::Px(200));
+        let third = l.insert_column(1, ColWidth::Px(200), 3);
         assert!(l.move_into_stack(third, ids[0], true));
         assert_eq!(l.locate(third), Some(Pos { col: 0, row: 0 }));
         assert_eq!(l.col_len(0), 3);
@@ -904,10 +919,9 @@ mod tests {
     fn detached_leaf_keeps_its_window_and_color() {
         let mut l = Layout::new();
         let ids = columns(&mut l, 2);
-        l.leaf_mut(ids[1]).expect("live").show(7);
         let color = l.leaf(ids[1]).expect("live").color;
         assert!(l.move_beside_column(ids[1], ids[0], true, ColWidth::Px(1)));
-        assert_eq!(l.leaf(ids[1]).expect("live").client, Some(7));
+        assert_eq!(l.leaf(ids[1]).expect("live").client, 2);
         assert_eq!(l.leaf(ids[1]).expect("live").color, color);
     }
 
@@ -927,7 +941,7 @@ mod tests {
     fn pinned_column_rows_span_the_full_height() {
         let mut l = Layout::new();
         let ids = columns(&mut l, 2);
-        let bottom = l.split_below(ids[0], 0.5).expect("splittable");
+        let bottom = l.insert_row(0, 1, 3).expect("live column");
         l.leaf_mut(ids[0]).expect("live").minimized = true;
         l.leaf_mut(bottom).expect("live").minimized = true;
         let geos = l.compute(WA, GAP);
@@ -947,20 +961,19 @@ mod tests {
     fn minimized_row_pins_within_its_stack_only() {
         let mut l = Layout::new();
         let ids = columns(&mut l, 2);
-        let bottom = l.split_below(ids[0], 0.5).expect("splittable");
+        let bottom = l.insert_row(0, 1, 3).expect("live column");
         l.leaf_mut(bottom).expect("live").minimized = true;
         let geos = l.compute(WA, GAP);
         assert_eq!(geos[&bottom].h, GAP, "row pinned");
         assert_eq!(l.widths(WA.w, GAP)[0], WA.w - 2 * GAP, "width kept");
+        assert!(ids.contains(&l.first_leaf().expect("non-empty")));
     }
 
     #[test]
     fn splits_get_unique_colors_up_to_palette_size() {
         let mut l = Layout::new();
         let n = crate::theme::LEAF_PALETTE.len();
-        for i in 1..n {
-            l.insert_column(i, ColWidth::Px(100));
-        }
+        columns(&mut l, n);
         let mut colors: Vec<_> = l
             .collect_leaves()
             .iter()
@@ -979,7 +992,7 @@ mod tests {
     fn boundaries_cover_every_gap_once() {
         let mut l = Layout::new();
         let ids = columns(&mut l, 3);
-        l.split_below(ids[1], 0.5).expect("splittable");
+        l.insert_row(1, 1, 4).expect("live column");
         let b = l.boundaries(WA, GAP);
         let cols = b.iter().filter(|b| matches!(b.at, GapAt::Col(_))).count();
         let rows = b
@@ -987,25 +1000,6 @@ mod tests {
             .filter(|b| matches!(b.at, GapAt::Row { .. }))
             .count();
         assert_eq!((cols, rows), (2, 1));
-    }
-
-    /// One slot per insert position: column slots at both margins and each
-    /// gap (`0..=ncols`), and per column a row slot at its top/bottom
-    /// margins and each stack gap (`0..=nrows`), each exactly once.
-    #[test]
-    fn insert_slots_cover_every_position_once() {
-        let mut l = Layout::new();
-        let ids = columns(&mut l, 3);
-        l.split_below(ids[1], 0.5).expect("splittable");
-        let mut inserts: Vec<Insert> =
-            l.insert_slots(WA, GAP).into_iter().map(|(_, _, at)| at).collect();
-        let mut expected: Vec<Insert> = (0..=3).map(Insert::Col).collect();
-        for (col, rows) in [(0, 1), (1, 2), (2, 1)] {
-            expected.extend((0..=rows).map(|idx| Insert::Row { col, idx }));
-        }
-        let key = |at: &Insert| format!("{at:?}");
-        inserts.sort_by_key(key);
-        expected.sort_by_key(key);
-        assert_eq!(inserts, expected);
+        assert_eq!(l.locate(ids[1]), Some(Pos { col: 1, row: 0 }));
     }
 }

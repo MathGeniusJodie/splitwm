@@ -8,16 +8,23 @@ with a terminal-multiplexer-style tiling layout where:
   deeper. Columns own their width in pixels; the strip is exactly the
   columns laid end to end.
 - Each split shows **one window**, and every window has a split: a new
-  window fills the focused split if it's an empty placeholder, else it
-  opens as a fresh column right of the focused one — never resizing any
-  other column — and a dying window takes its split with it (a whole
-  column just leaves the strip; a stacked row's neighbours reclaim its
-  height). The **bottom taskbar** mirrors the splits one icon per split,
-  in the same left-to-right order.
+  window opens as a fresh column right of the focused one — never
+  resizing any other column — and a dying window takes its split with it
+  (a whole column just leaves the strip; a stacked row's neighbours
+  reclaim its height). A split never exists without its window, so with
+  nothing open the screen is bare wallpaper. The **bottom taskbar**
+  mirrors the splits one icon per split, in the same left-to-right order.
+- **Quick-launch icons aim their window**: hovering one raises a compass
+  of four wedges around it, and clicking a wedge opens the launched
+  window left of, right of, above or below the focused split.
 - Splits reorder by **drag and drop**: grab a titlebar or a taskbar icon
   and drop it. On either half of a split or icon it lands as a column —
-  left half before, right half after; on a vertical gap it becomes a
-  column right there; on a horizontal gap it slots into that stack.
+  left half before, right half after; on a vertical gap it leaves
+  whatever it was in and becomes a column right there; on a horizontal
+  gap it slots into that stack; on the bare canvas past either end of
+  the strip it becomes a column at that end, and in a column's top or
+  bottom margin it joins that column's stack. Every point of the canvas
+  takes a drop.
 - The whole layout lives on a **horizontally-scrollable canvas** that can be
   wider than the screen (trackpad two-finger swipe, or Mod4+swipe over a
   window).
@@ -100,8 +107,7 @@ Behavior notes:
 | `Mod4+Return`        | open terminal (`$TERMINAL`, default `alacritty`) |
 | `Mod4+Space`         | app launcher (`rofi -show combi`, native layer-shell) |
 | `Mod4+s`             | screenshot a region picked with `slurp`, into `~/Downloads/screenshot-<date>-<time>.png` (needs `grim` and `slurp`) |
-| `Mod4+h`             | stack an empty split below the focused one (it takes focus, so the next window fills it) |
-| `Mod4+q`             | close current split *and* its window (a placeholder is just removed) |
+| `Mod4+q`             | close the focused split's window (the split goes with it) |
 | `Mod4+Tab` / `Right` | focus next split |
 | `Mod4+Shift+Tab` / `Left` | focus previous split |
 | `Mod4+]` / `[`       | focus next / previous split |
@@ -113,14 +119,13 @@ Behavior notes:
 | `XF86MonBrightness{Up,Down}` | step the backlight by 5% |
 | `Ctrl+Alt+F1..F12`   | VT switch (tty backend) |
 | trackpad h-swipe     | scroll the canvas (over gaps; hold Mod4 over a window) |
-| drag a column gap handle | resize the column left of it (the rest of the strip slides) |
-| drag a stack gap handle  | re-split the two rows' heights |
+| drag a window's side border, or the gap half next to it | resize that column (the rest of the strip slides) |
+| drag the gap between two stacked windows (its bottom border included) | re-split the two rows' heights |
 | drag a canvas edge   | resize the outer column into its margin |
-| click a gap/edge `+` | insert an empty column there (in a stack gap: an empty row) |
 | taskbar tile         | focus that split and scroll it into view; drag to reorder |
 | taskbar tile corner `x` | close that window politely (its split collapses when it dies) |
-| taskbar quick-launch icons | spawn that app (right of the pill separator) |
-| titlebar buttons     | minimize / ⊞ split (wide lone window: new column right; else stack below; right-click flips) / close window+split |
+| taskbar quick-launch icons | hover raises the compass; clicking a wedge spawns that app left of / right of / above / below the focused split |
+| titlebar buttons     | minimize / close window+split |
 | drag a titlebar      | move that split; drop on a frame/icon half or into a gap |
 
 There is deliberately no quit binding: `SIGTERM` (from another VT or a
@@ -174,13 +179,12 @@ cargo run
   columns, each one split or one vertical stack — deeper nesting is
   unrepresentable. Opening, closing, and resizing a column never
   resizes any other column; the strip absorbs the difference (only
-  stacked rows still trade height). A new window fills the focused
-  split only when it's an empty placeholder, else it opens a fresh
-  column right of the focused one at a third of the viewport — an
-  unfocused placeholder attracts nothing. `Mod4+h` stacks below and
-  focuses the new placeholder. The ⊞ titlebar button opens a column
-  right of a wide lone window and stacks below otherwise (right-click
-  flips); drops into gaps insert by the gap's orientation.
+  stacked rows still trade height). A new window opens a fresh column
+  right of the focused one at a third of the viewport, unless the
+  quick-launch compass aimed it at a side of the focused split; the
+  first window on an empty strip fills the viewport. Drops into gaps
+  insert by the gap's orientation, and drops onto bare wallpaper by
+  which margin of the strip they land in.
 - The launcher runs as a **native layer-shell surface** (a
   wayland-capable rofi picks its wayland backend; an X11-only rofi still
   works through XWayland as an override-redirect float).

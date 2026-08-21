@@ -8,9 +8,10 @@ use smithay::input::pointer::CursorIcon;
 use smithay::utils::{Logical, Point};
 
 use super::Comp;
-use crate::layout::{Boundary, Dir, GapAt, Insert, NodeId, Win};
+use crate::layout::{GapAt, NodeId, Pos, Side, Win};
+use crate::state::MoveDrop;
 use crate::theme;
-use crate::widgets::{leaf_meta, BtnKind, FrameRect};
+use crate::widgets::{compass_rect, compass_zone, rect_contains, BtnKind};
 
 /// An in-progress drag, keyed off button-1 press on a handle/edge/float
 /// frame, a titlebar, or a taskbar tile.
@@ -49,12 +50,15 @@ pub struct FloatDrag {
     pub dy: i32,
 }
 
-/// Dragging a gap between two columns or two stacked rows. A column gap
-/// sets the left column's width outright; a row gap re-splits the pair,
-/// fraction = (pointer - start) / combined extent of the two rows.
+/// Dragging the gap between two stacked rows: it re-splits the pair,
+/// fraction = (pointer - start) / combined extent of the two rows. Only
+/// a *stack* gap drags this way — each half of a column gap belongs to
+/// the window on that side and resizes that column (`BorderDrag`), so a
+/// column boundary can never reach here.
 #[derive(Clone, Copy)]
 pub struct GapDrag {
-    pub at: GapAt,
+    pub col: usize,
+    pub idx: usize,
     pub start: i32,
     pub combined: i32,
     pub gap: i32,
@@ -79,31 +83,30 @@ pub struct BorderDrag {
     pub anchor_x: i32,
 }
 
+/// The quick-launch hover compass currently on screen: the tile it
+/// belongs to (its icon rect centres the compass, its hover rect keeps it
+/// up) — re-resolved per read, never stored.
+pub type QuickCompass = crate::widgets::QuickTile;
+
 /// What a click on the chrome resolved to, in priority order.
 enum Hit {
     Btn(NodeId, BtnKind),
     TaskbarClose(Win),
     TaskbarTile(Win, NodeId),
-    QuickLaunch(usize),
+    /// A quick-launch icon, with the compass wedge the press landed in:
+    /// every point of the compass names one, so a launch from the bar
+    /// always states where its window opens.
+    QuickLaunch(usize, Side),
     Title(NodeId),
-    Plus(Insert),
-    Handle(Boundary),
+    /// The gap between two stacked rows, with the drag it arms and
+    /// whether that drag can move anything (a pinned neighbour's height
+    /// ignores the stored share).
+    RowGap(GapDrag, bool),
     Edge(bool),
     /// A window frame's left (`true`) / right border band.
     Border(NodeId, bool),
     LeafBody(NodeId),
     Miss,
-}
-
-const fn rect_contains(r: FrameRect, x: i32, y: i32) -> bool {
-    x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h
-}
-
-/// Where a split-move drop resolved to: a new column beside `dst`'s, or a
-/// row of `dst`'s stack (`bool` is before/above).
-enum MoveDrop {
-    Column(NodeId, bool),
-    Stack(NodeId, bool),
 }
 
 impl Comp {
@@ -138,13 +141,8 @@ impl Comp {
             self.finish_animation();
         }
         match self.hit_test(mx, my) {
-            // The split button takes left and right click (right picks the
-            // opposite direction); everything else is left only.
-            Hit::Btn(leaf, kind @ BtnKind::Split) => {
-                self.click_split_button(leaf, kind, secondary);
-            }
             _ if secondary => {}
-            Hit::Btn(leaf, kind) => self.click_split_button(leaf, kind, false),
+            Hit::Btn(leaf, kind) => self.click_split_button(leaf, kind),
             Hit::TaskbarClose(win) => self.close_client(win),
             // Press = click (focus + scroll the split into view); further
             // travel turns it into a split-move drag, dropped on release.
@@ -158,8 +156,11 @@ impl Comp {
                 // clears `self.interaction.drag`.
                 self.arm_move_drag(leaf, mx, my);
             }
-            Hit::QuickLaunch(i) => {
+            Hit::QuickLaunch(i, side) => {
                 if let Some(cmd) = self.view.quick.get(i).map(|q| q.cmd.clone()) {
+                    // The wedge only aims: the split appears when the
+                    // launched window maps, on the side clicked.
+                    self.state.aim_next_window(side);
                     self.spawn(&cmd);
                 }
             }
@@ -174,27 +175,11 @@ impl Comp {
                 self.state.focus_leaf(leaf);
                 self.arrange();
             }
-            Hit::Plus(at) => {
-                let wa = self.layout_area();
-                if self.state.insert_at(wa, at).is_some() {
-                    self.view.animate = true;
-                    self.commit_layout();
-                }
-            }
-            Hit::Handle(b) => {
+            Hit::RowGap(drag, resizable) => {
                 // A gap next to a minimized leaf can't be dragged (its
                 // pixel size is pinned); ignore the press.
-                if b.resizable {
-                    // Land any in-flight glide: the drag reads scroll_x
-                    // fresh per motion, and a glide underneath would drift
-                    // the anchor math out from under the pointer.
-                    self.state.land_scroll();
-                    self.interaction.drag = Some(ActiveDrag::Gap(GapDrag {
-                        at: b.at,
-                        start: b.start,
-                        combined: b.first + b.second,
-                        gap: theme::GAP,
-                    }));
+                if resizable {
+                    self.interaction.drag = Some(ActiveDrag::Gap(drag));
                 }
             }
             Hit::Edge(left) => {
@@ -284,13 +269,10 @@ impl Comp {
                 if d.combined <= 0 {
                     return true;
                 }
-                // Only x scrolls; a row-boundary drag reads y directly.
-                let canvas_pos = match d.at.dir() {
-                    Dir::V => pos.y as i32,
-                    Dir::H => pos.x as i32 + self.state.scroll_x(),
-                };
-                let new_first = canvas_pos - d.start - d.gap / 2;
-                self.state.resize_gap(d.at, new_first, d.combined);
+                // A stack lays out down the column's height, which doesn't
+                // scroll: screen y is canvas y.
+                let new_first = pos.y as i32 - d.start - d.gap / 2;
+                self.state.resize_rows(d.col, d.idx, new_first, d.combined);
                 self.arrange();
                 true
             }
@@ -326,6 +308,7 @@ impl Comp {
         };
         let wa = self.layout_area();
         let changed = match drop {
+            MoveDrop::ColumnAt(idx) => self.state.move_leaf_to_column(wa, leaf, idx),
             MoveDrop::Column(dst, before) => self.state.move_leaf_beside(wa, leaf, dst, before),
             MoveDrop::Stack(dst, before) => self.state.move_leaf_into_stack(leaf, dst, before),
         };
@@ -337,15 +320,18 @@ impl Comp {
 
     /// Where a split-move drop at (`mx`, `my`) lands, by what's under the
     /// pointer: a *gap* adopts the gap's own orientation — a vertical gap
-    /// makes the dragged split a new column right there, a horizontal gap
-    /// slots it into that stack. Anywhere over the taskbar's tile strip
-    /// re-slots by tile centres — before the first tile whose centre lies
-    /// right of the pointer, after the last one otherwise — so the gaps
-    /// between tiles and the strip's ends take drops too, and a drop
-    /// inside a tile keeps the left-half-before / right-half-after rule.
-    /// A split frame places it as a column before/after the target's
-    /// (split down the middle), using the same last-arrange rects
-    /// `LeafBody` hits.
+    /// takes the dragged split out of wherever it was and makes it a new
+    /// column right there, a horizontal gap slots it into that stack.
+    /// Anywhere over the taskbar's tile strip re-slots by tile centres —
+    /// before the first tile whose centre lies right of the pointer,
+    /// after the last one otherwise — so the gaps between tiles and the
+    /// strip's ends take drops too, and a drop inside a tile keeps the
+    /// left-half-before / right-half-after rule. A split frame places it
+    /// as a column before/after the target's (split down the middle),
+    /// using the same last-arrange rects `LeafBody` hits. Bare wallpaper
+    /// — the canvas beyond the strip's ends, and the margins above and
+    /// below it — is the strip's own margin (`State::margin_drop`), so
+    /// every point of the canvas takes a drop.
     fn move_drop_target(&self, mx: i32, my: i32) -> Option<MoveDrop> {
         if let Some(&(_, b)) = self
             .view
@@ -354,14 +340,12 @@ impl Comp {
             .iter()
             .find(|(r, _)| rect_contains(*r, mx, my))
         {
-            let anchor = |pos| self.state.layout.leaf_at(pos);
             return match b.at {
-                GapAt::Col(idx) => {
-                    let dst = anchor(crate::layout::Pos { col: idx, row: 0 })?;
-                    Some(MoveDrop::Column(dst, false))
-                }
+                // The gap between columns `idx` and `idx + 1` is where a
+                // new column `idx + 1` goes.
+                GapAt::Col(idx) => Some(MoveDrop::ColumnAt(idx + 1)),
                 GapAt::Row { col, idx } => {
-                    let dst = anchor(crate::layout::Pos { col, row: idx })?;
+                    let dst = self.state.layout.leaf_at(Pos { col, row: idx })?;
                     Some(MoveDrop::Stack(dst, false))
                 }
             };
@@ -378,11 +362,15 @@ impl Comp {
                 .or_else(|| tiles.last().map(|t| MoveDrop::Column(t.leaf, false)));
             return dst.filter(|_| mx < strip_end);
         }
-        self.view
+        if let Some(p) = self
+            .view
             .placed
             .iter()
             .find(|p| rect_contains(p.target, mx, my))
-            .map(|p| MoveDrop::Column(p.leaf, mx < p.target.x + p.target.w / 2))
+        {
+            return Some(MoveDrop::Column(p.leaf, mx < p.target.x + p.target.w / 2));
+        }
+        self.state.margin_drop(self.layout_area(), mx, my)
     }
 
     /// Arm a split-move drag on a fresh titlebar/tile press (see
@@ -408,6 +396,71 @@ impl Comp {
         })
     }
 
+    /// The compass to draw and hit-test, re-resolved from this arrange's
+    /// quick-launch regions.
+    pub fn quick_compass(&self) -> Option<QuickCompass> {
+        let slot = self.interaction.quick_hover?;
+        self.view
+            .widgets
+            .quick_regions
+            .iter()
+            .find(|t| t.slot == slot)
+            .copied()
+    }
+
+    /// Which wedge of the shown compass the pointer is in, for the
+    /// drawing pass; `None` only when no compass is up.
+    pub fn quick_compass_zone(&self) -> Option<Side> {
+        let compass = self.quick_compass()?;
+        let pos = self.pointer.current_location();
+        Some(compass_zone(compass.icon, pos.x as i32, pos.y as i32))
+    }
+
+    /// Re-aim the compass at the pointer: it appears as soon as the
+    /// pointer is over a quick-launch icon's hover rect (they tile the
+    /// bar's quick-launch run, so there is no neutral spot between two
+    /// icons) and stays while the pointer roams that icon's own compass —
+    /// the wedges reach well past the bar, so leaving it must not dismiss
+    /// what the user is aiming at. Entering a neighbouring icon's rect
+    /// hands the compass straight over.
+    pub fn update_quick_hover(&mut self, pos: Point<f64, Logical>) {
+        let (mx, my) = (pos.x as i32, pos.y as i32);
+        let entered = self
+            .view
+            .widgets
+            .quick_regions
+            .iter()
+            .find(|t| rect_contains(t.hover, mx, my))
+            .map(|t| t.slot);
+        let held = self
+            .quick_compass()
+            .filter(|c| rect_contains(compass_rect(c.icon), mx, my))
+            .map(|c| c.slot);
+        self.interaction.quick_hover = entered.or(held);
+    }
+
+    /// The split of column `col` at screen-y `my`: which window a press in
+    /// the gap flanking that column is aiming at. A `my` between two rows
+    /// (the stack's own gap) falls back to the column's first row, so
+    /// every point of the gap names a window.
+    fn column_leaf_at(&self, col: usize, my: i32) -> Option<NodeId> {
+        let first = self.state.layout.leaf_at(Pos { col, row: 0 })?;
+        for row in 0..self.state.layout.col_len(col) {
+            let Some(leaf) = self.state.layout.leaf_at(Pos { col, row }) else {
+                continue;
+            };
+            if self
+                .view
+                .frame_rects
+                .get(&leaf)
+                .is_some_and(|r| my >= r.y && my < r.y + r.h)
+            {
+                return Some(leaf);
+            }
+        }
+        Some(first)
+    }
+
     /// Priority-ordered hit-test of everything clickable on the chrome,
     /// shared by `on_chrome_button` (dispatch) and `hover_cursor`
     /// (feedback) — a single ordering both consume, so click handling and
@@ -423,6 +476,18 @@ impl Comp {
         {
             return Hit::Btn(leaf, kind);
         }
+        // The hovered quick-launch icon's compass is drawn over whatever
+        // it overlaps (tiles, the separator, its neighbours) and over the
+        // icon in its own middle, so it takes the click everywhere it
+        // reaches — its own hover rect included, which the wedges don't
+        // quite cover at the bar's edges. Only the hovered slot has one,
+        // so this can never shadow another icon.
+        if let Some(c) = self.quick_compass() {
+            let square = compass_rect(c.icon);
+            if rect_contains(square, mx, my) || rect_contains(c.hover, mx, my) {
+                return Hit::QuickLaunch(c.slot, compass_zone(square, mx, my));
+            }
+        }
         // Compressed taskbar tiles overlap like fanned cards, rightmost on
         // top; reverse iteration matches draw order so the topmost tile
         // wins. Each tile's own "x" badge outranks its body, but a later
@@ -436,15 +501,16 @@ impl Comp {
                 return Hit::TaskbarTile(t.win, t.leaf);
             }
         }
-        if let Some(i) = self
+        // A press on an icon whose compass has not come up yet (no motion
+        // preceded it) still picks the wedge its point falls in.
+        if let Some(t) = self
             .view
             .widgets
             .quick_regions
             .iter()
-            .find(|(r, _)| rect_contains(*r, mx, my))
-            .map(|(_, i)| *i)
+            .find(|t| rect_contains(t.hover, mx, my))
         {
-            return Hit::QuickLaunch(i);
+            return Hit::QuickLaunch(t.slot, compass_zone(t.icon, mx, my));
         }
         if let Some(leaf) = self
             .view
@@ -456,28 +522,40 @@ impl Comp {
         {
             return Hit::Title(leaf);
         }
-        // "+" buttons sit centred inside their drag handle's larger hit
-        // region — check the narrower "+" rects first so they aren't
-        // shadowed by the handles.
-        if let Some(at) = self
-            .view
-            .widgets
-            .plus_regions
-            .iter()
-            .find(|(r, _)| rect_contains(*r, mx, my))
-            .map(|(_, at)| *at)
-        {
-            return Hit::Plus(at);
-        }
-        if let Some(b) = self
+        if let Some((rect, b)) = self
             .view
             .widgets
             .handle_regions
             .iter()
             .find(|(r, _)| rect_contains(*r, mx, my))
-            .map(|(_, b)| *b)
+            .map(|(r, b)| (*r, *b))
         {
-            return Hit::Handle(b);
+            return match b.at {
+                // The gap between two columns belongs to the windows
+                // either side of it: its left half drags the left
+                // column's right border, its right half the right
+                // column's left border — the same drag their own border
+                // bands arm, so band and gap-half read as one strip with
+                // nothing neutral between them.
+                GapAt::Col(idx) => {
+                    let right = mx >= rect.x + rect.w / 2;
+                    let col = if right { idx + 1 } else { idx };
+                    match self.column_leaf_at(col, my) {
+                        Some(leaf) => Hit::Border(leaf, right),
+                        None => Hit::Miss,
+                    }
+                }
+                GapAt::Row { col, idx } => Hit::RowGap(
+                    GapDrag {
+                        col,
+                        idx,
+                        start: b.start,
+                        combined: b.first + b.second,
+                        gap: theme::GAP,
+                    },
+                    b.resizable,
+                ),
+            };
         }
         if let Some(&(_, left)) = self
             .view
@@ -523,38 +601,18 @@ impl Comp {
             return CursorIcon::Pointer;
         }
         match self.hit_test(mx, my) {
-            Hit::Btn(leaf, kind) => {
-                // Mirror `leaf_buttons`' enabled/disabled choice for the
-                // button art (a minimized leaf's whole-frame region is
-                // always a live restore button).
-                if let Some(&frame) = self.view.frame_rects.get(&leaf) {
-                    let meta = leaf_meta(&self.state.layout, leaf, frame);
-                    let disabled = !meta.minimized
-                        && match kind {
-                            BtnKind::Close => !meta.occupied && meta.sole,
-                            BtnKind::Minimize => meta.sole,
-                            BtnKind::Split => meta.split_dir.is_none(),
-                        };
-                    if disabled {
-                        return CursorIcon::NotAllowed;
-                    }
-                }
-                CursorIcon::Pointer
-            }
-            Hit::TaskbarClose(_)
+            Hit::Btn(..)
+            | Hit::TaskbarClose(_)
             | Hit::TaskbarTile(..)
-            | Hit::QuickLaunch(_)
-            | Hit::Title(_)
-            | Hit::Plus(_) => CursorIcon::Pointer,
-            Hit::Handle(b) => {
-                // A gap next to a minimized leaf can't be dragged; don't
-                // advertise a resize that won't happen.
-                if !b.resizable {
-                    CursorIcon::Default
-                } else if b.at.dir() == Dir::V {
+            | Hit::QuickLaunch(..)
+            | Hit::Title(_) => CursorIcon::Pointer,
+            // A gap next to a minimized leaf can't be dragged; don't
+            // advertise a resize that won't happen.
+            Hit::RowGap(_, resizable) => {
+                if resizable {
                     CursorIcon::NsResize
                 } else {
-                    CursorIcon::EwResize
+                    CursorIcon::Default
                 }
             }
             Hit::Edge(_) => CursorIcon::EwResize,
@@ -632,7 +690,9 @@ impl Comp {
         };
         let (mx, my) = (pos.x as i32, pos.y as i32);
         if let (Some(&frame), Some(client)) = (
-            self.view.frame_rects.get(&self.state.focused_leaf_valid()),
+            self.state
+                .focused_leaf_valid()
+                .and_then(|l| self.view.frame_rects.get(&l)),
             self.state.focused_client(),
         ) {
             if mx >= frame.x && mx < frame.x + frame.w {
@@ -650,62 +710,25 @@ impl Comp {
             .iter()
             .find(|(l, r)| self.state.layout.is_leaf(**l) && rect_contains(**r, mx, my))
             .and_then(|(l, _)| self.state.layout.leaf(*l))
-            .and_then(|leaf| if leaf.minimized { None } else { leaf.client })
+            .and_then(|leaf| (!leaf.minimized).then_some(leaf.client))
     }
 
-    /// Act on a split-control button click. `secondary` is a right-click,
-    /// which on the split button picks the opposite split direction.
-    pub fn click_split_button(&mut self, leaf: NodeId, kind: BtnKind, secondary: bool) {
-        let wa = self.layout_area();
-        let frame = self
-            .view
-            .frame_rects
-            .get(&leaf)
-            .copied()
-            .unwrap_or(FrameRect {
-                x: 0,
-                y: 0,
-                w: wa.w,
-                h: wa.h,
-            });
-        let meta = leaf_meta(&self.state.layout, leaf, frame);
+    /// Act on a split-control button click: close politely closes the
+    /// leaf's window (the split follows on its death, so a "do you want to
+    /// save?" refusal keeps it), minimize collapses the leaf to its
+    /// restore strip.
+    pub fn click_split_button(&mut self, leaf: NodeId, kind: BtnKind) {
         match kind {
-            BtnKind::Split => {
-                // Right-click flips the advertised action where the
-                // flipped one is possible: a column insert always is, a
-                // stack insert needs the frame's height.
-                let dir = if secondary {
-                    match meta.split_dir {
-                        Some(Dir::H) => theme::stack_fits(frame.h).then_some(Dir::V),
-                        Some(Dir::V) => Some(Dir::H),
-                        // A disabled button (advertised NotAllowed) stays
-                        // inert on right-click too.
-                        None => None,
-                    }
-                } else {
-                    meta.split_dir
-                };
-                self.state.focus_leaf(leaf);
-                self.view.animate = match dir {
-                    Some(Dir::H) => {
-                        self.state.split_column_right(wa);
-                        true
-                    }
-                    Some(Dir::V) => self.state.split_focused(),
-                    None => return,
-                };
-            }
             BtnKind::Close => {
-                return self.close_split(leaf);
+                if let Some(win) = self.state.layout.leaf(leaf).map(|l| l.client) {
+                    self.close_client(win);
+                }
             }
             BtnKind::Minimize => {
-                if meta.sole {
-                    return;
-                }
                 self.view.animate = self.state.toggle_minimize(leaf);
+                self.commit_layout();
             }
         }
-        self.commit_layout();
     }
 
     /// Accumulated horizontal scroll (in wheel-click units) pans the

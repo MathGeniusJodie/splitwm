@@ -2,7 +2,7 @@
 //! and layout animation stay pure GPU element placement.
 //!
 //! The chrome that renders behind the client windows — the wallpaper, every
-//! placed leaf's frame, the "+" insert buttons and the bottom taskbar — is
+//! placed leaf's frame and the bottom taskbar — is
 //! not one full-output framebuffer but a set of separately-cached pieces,
 //! each an 8bpp palette-indexed `pixel_graphics::Framebuffer` uploaded as an
 //! `R8` GPU texture the palette shader resolves (see `crate::render::indexed`):
@@ -13,10 +13,9 @@
 //!   titlebar text/icon, the baked split-control buttons, or the minimized
 //!   restore strip), rebuilt only when that leaf's content fingerprint
 //!   (`LeafKey`) changes; its corners are transparent, so it is not opaque;
-//! * **plus buttons** — one texture per distinct "+" size, shared across
-//!   every gap/edge insert region;
 //! * **taskbar** — one strip-sized texture over the bottom bar (tiles,
-//!   close badges, separator, quick-launch), rebuilt only when its
+//!   close badges, separator, quick-launch, and the hover compass, which
+//!   grows the strip above the bar), rebuilt only when its
 //!   fingerprint (`TaskbarKey`) changes; transparent between tiles so the
 //!   wallpaper shows through.
 //!
@@ -35,11 +34,11 @@ use std::rc::Rc;
 
 use super::Comp;
 use crate::icon::Icon;
-use crate::layout::{Dir, NodeId};
+use crate::layout::{NodeId, Side};
 use crate::render::indexed::{IndexedProgram, IndexedTexture};
 use crate::render::{BtnIcon, LeafView, Renderer, SliceSpec, TitleInfo};
 use crate::theme;
-use crate::widgets::{leaf_meta, BtnKind, FrameRect, Placement};
+use crate::widgets::{compass_rect, BtnKind, FrameRect, Placement, N_BTNS};
 use crate::Index;
 use pixel_graphics::Framebuffer;
 use smithay::backend::renderer::element::Id;
@@ -59,9 +58,6 @@ pub struct ChromePieces {
     /// Per-leaf frame identity and titlebar-contents strip, keyed by leaf
     /// id; stale entries are dropped as leaves vanish.
     leaves: HashMap<NodeId, LeafPiece>,
-    /// One texture per distinct "+" square size (all edge/gap plus buttons
-    /// of a size share it).
-    plus: HashMap<i32, IndexedTexture>,
     taskbar: TaskbarPiece,
 }
 
@@ -104,7 +100,7 @@ struct LeafPiece {
     accent: Index,
     mode: FrameMode,
     /// The `w`x`tb_h` strip holding the icon/label, title text and baked
-    /// split buttons; `None` while minimized. The band fill behind it is
+    /// split-control buttons; `None` while minimized. The band fill behind it is
     /// the frame's top margin.
     titlebar: Option<(TitlebarKey, IndexedTexture)>,
 }
@@ -159,26 +155,6 @@ impl ChromePieces {
                         .as_ref()
                         .map(|(_, t)| (Point::<i32, Logical>::from((rect.x, rect.y)), t)),
                 })
-            })
-            .collect()
-    }
-
-    /// The plus-button elements at their gap/edge origins, or none while an
-    /// animation runs (the old buffer omitted the insert glyphs mid-slide).
-    pub fn plus_elements(
-        &self,
-        plus_regions: &[(FrameRect, crate::layout::Insert)],
-        animating: bool,
-    ) -> Vec<(Point<i32, Logical>, &IndexedTexture)> {
-        if animating {
-            return Vec::new();
-        }
-        plus_regions
-            .iter()
-            .filter_map(|(r, _)| {
-                self.plus
-                    .get(&r.w.max(1))
-                    .map(|t| (Point::<i32, Logical>::from((r.x, r.y)), t))
             })
             .collect()
     }
@@ -249,12 +225,12 @@ struct LeafPaint {
     accent: Index,
     minimized: bool,
     title: Option<TitlePaint>,
-    /// The at-most-three baked buttons (`leaf_btn_rects`' fixed capacity),
-    /// inline so gathering a paint per leaf per frame never allocates.
-    buttons: [Option<BtnPaint>; 3],
+    /// The baked buttons (`leaf_btn_rects`' fixed capacity), inline so
+    /// gathering a paint per leaf per frame never allocates.
+    buttons: [Option<BtnPaint>; N_BTNS],
 }
 
-/// A leaf titlebar's contents (drawn only when unminimized and occupied).
+/// A leaf titlebar's contents (drawn only when unminimized).
 struct TitlePaint {
     label: char,
     icon: Option<Rc<Icon>>,
@@ -267,7 +243,6 @@ struct BtnPaint {
     cx: i32,
     cy: i32,
     icon: BtnIcon,
-    disabled: bool,
     accent: Index,
 }
 
@@ -282,7 +257,7 @@ struct TitlebarKey {
     w: i32,
     accent: Index,
     title: Option<(char, Option<u64>, Rc<str>)>,
-    buttons: [Option<BtnPaint>; 3],
+    buttons: [Option<BtnPaint>; N_BTNS],
 }
 
 impl LeafPaint {
@@ -334,6 +309,9 @@ struct TaskbarPaint {
     tiles: Vec<TilePaint>,
     sep: Option<FrameRect>,
     quick: Vec<QuickPaint>,
+    /// The hover compass around one quick-launch icon: the square it
+    /// covers and the wedge under the pointer.
+    compass: Option<(FrameRect, Side)>,
 }
 
 struct TilePaint {
@@ -360,6 +338,7 @@ struct TaskbarKey {
     tiles: Vec<(FrameRect, FrameRect, Option<u64>, char, Index)>,
     sep: Option<FrameRect>,
     quick: Vec<(FrameRect, Option<u64>, char)>,
+    compass: Option<(FrameRect, Side)>,
 }
 
 fn tile_key(t: &TilePaint) -> (FrameRect, FrameRect, Option<u64>, char, Index) {
@@ -385,6 +364,7 @@ impl TaskbarKey {
             && self.h == p.h
             && self.origin == p.origin
             && self.sep == p.sep
+            && self.compass == p.compass
             && self.tiles.len() == p.tiles.len()
             && self.quick.len() == p.quick.len()
             && self.tiles.iter().zip(&p.tiles).all(|(k, t)| *k == tile_key(t))
@@ -401,6 +381,7 @@ impl TaskbarPaint {
             tiles: self.tiles.iter().map(tile_key).collect(),
             sep: self.sep,
             quick: self.quick.iter().map(quick_key).collect(),
+            compass: self.compass,
         }
     }
 }
@@ -449,31 +430,12 @@ fn update_leaf(
     );
     chrome.draw_titlebar_strip(&mut fb, &paint.view());
     for b in paint.buttons.iter().flatten() {
-        chrome.draw_button(&mut fb, b.cx, b.cy, b.icon, b.disabled, b.accent);
+        chrome.draw_button(&mut fb, b.cx, b.cy, b.icon, b.accent);
     }
     // Reuse the previous texture's GL storage when the size matches.
     let mut tex = piece.titlebar.take().map(|(_, t)| t);
     indexed.upload(renderer, &mut tex, &fb, false);
     piece.titlebar = Some((key, tex.expect("titlebar strip uploaded")));
-}
-
-/// Render one "+" insert button of side `sz` into its shared texture (once
-/// per distinct size).
-fn render_plus(
-    indexed: &mut IndexedProgram,
-    renderer: &mut GlesRenderer,
-    cache: &mut HashMap<i32, IndexedTexture>,
-    sz: i32,
-) {
-    if cache.contains_key(&sz) {
-        return;
-    }
-    let s = sz.max(1) as usize;
-    let mut fb = Framebuffer::new(s, s, pixel_graphics::TRANSPARENT);
-    crate::render::draw_plus(&mut fb, sz / 2, sz / 2, sz);
-    let mut tex = None;
-    indexed.upload(renderer, &mut tex, &fb, false);
-    cache.insert(sz, tex.expect("plus texture uploaded"));
 }
 
 /// Render the taskbar strip into its texture, reusing it when the
@@ -517,6 +479,9 @@ fn render_taskbar(
     if let Some(sep) = paint.sep {
         crate::render::draw_taskbar_sep(&mut fb, shift(sep));
     }
+    if let Some((rect, zone)) = paint.compass {
+        crate::render::draw_compass(&mut fb, shift(rect), zone);
+    }
     for q in &paint.quick {
         chrome.draw_taskbar_item(
             &mut fb,
@@ -541,7 +506,7 @@ impl Comp {
     }
 
     /// Re-render any chrome piece whose content fingerprint changed and drop
-    /// the textures of leaves/plus sizes that vanished. `leaf_rects` are this
+    /// the textures of leaves that vanished. `leaf_rects` are this
     /// frame's leaf rects from `tick_layout` (interpolated mid-animation,
     /// settled otherwise); a leaf whose rect actually changed re-renders at
     /// the new size (its `LeafKey` carries w/h), while an unchanged rect hits
@@ -615,24 +580,6 @@ impl Comp {
             .leaves
             .retain(|l, _| leaf_paints.iter().any(|(p, _)| p == l));
 
-        // Plus buttons: one texture per distinct size. `widgets.plus_regions`
-        // and `pieces.plus` are disjoint `ChromeView` fields, so the regions
-        // are read in place rather than copied out first.
-        for i in 0..self.view.widgets.plus_regions.len() {
-            let sz = self.view.widgets.plus_regions[i].0.w.max(1);
-            render_plus(
-                &mut self.view.indexed,
-                self.backend.renderer(),
-                &mut self.view.pieces.plus,
-                sz,
-            );
-        }
-        let plus_regions = &self.view.widgets.plus_regions;
-        self.view
-            .pieces
-            .plus
-            .retain(|s, _| plus_regions.iter().any(|(r, _)| r.w.max(1) == *s));
-
         // Taskbar strip.
         render_taskbar(
             &self.view.chrome,
@@ -654,13 +601,11 @@ impl Comp {
         let title = if minimized {
             None
         } else {
-            p.active_client
-                .and_then(|c| self.managed.get(c).map(|w| (c, w)))
-                .map(|(c, window)| TitlePaint {
-                    label: crate::shell::toplevel_label(window),
-                    icon: self.icon_for(c),
-                    title: crate::shell::toplevel_title(window),
-                })
+            self.managed.get(p.client).map(|window| TitlePaint {
+                label: crate::shell::toplevel_label(window),
+                icon: self.icon_for(p.client),
+                title: crate::shell::toplevel_title(window),
+            })
         };
         LeafPaint {
             w: rect.w,
@@ -674,53 +619,33 @@ impl Comp {
 
     /// The split-control buttons baked into a leaf's titlebar: right-aligned
     /// in `rect` (the shared `leaf_btn_rects` geometry the hit-regions use, so
-    /// a click lands where the button drew), their icon and enabled state from
-    /// `leaf_meta`. Positioned relative to `rect`'s origin, so mid-animation
-    /// they ride the interpolated titlebar. A minimized leaf draws none — its
-    /// whole restore strip is the button.
+    /// a click lands where the button drew). Positioned relative to `rect`'s
+    /// origin, so mid-animation they ride the interpolated titlebar. A
+    /// minimized leaf draws none — its whole restore strip is the button.
     fn leaf_buttons(
         &self,
         leaf: NodeId,
         rect: FrameRect,
         minimized: bool,
         accent: Index,
-    ) -> [Option<BtnPaint>; 3] {
-        let mut out = [None; 3];
+    ) -> [Option<BtnPaint>; N_BTNS] {
+        let mut out = [None; N_BTNS];
         if minimized {
             return out;
         }
-        let meta = leaf_meta(&self.state.layout, leaf, rect);
-        let paints = crate::widgets::leaf_btn_rects(rect).map(|(kind, r)| {
-                let (icon, disabled) = match kind {
-                    // A stacked split collapses to a row (short/wide) when
-                    // minimized, so its button previews that with the
-                    // horizontal glyph.
-                    BtnKind::Minimize => (
-                        if meta.stacked {
-                            BtnIcon::MinimizeH
-                        } else {
-                            BtnIcon::Minimize
-                        },
-                        meta.sole,
-                    ),
-                    // The glyph previews the divider the click draws: a
-                    // vertical one for a new column, a horizontal one for
-                    // stacking below.
-                    BtnKind::Split => match meta.split_dir {
-                        Some(Dir::H) => (BtnIcon::VSplit, false),
-                        Some(Dir::V) => (BtnIcon::HSplit, false),
-                        None => (BtnIcon::HSplit, true),
-                    },
-                    BtnKind::Close => (BtnIcon::Close, !meta.occupied && meta.sole),
-                };
-                BtnPaint {
-                    cx: r.x + r.w / 2 - rect.x,
-                    cy: r.y + r.h / 2 - rect.y,
-                    icon,
-                    disabled,
-                    accent,
-                }
-            });
+        // A stacked split collapses to a row (short/wide) when minimized,
+        // so its button previews that with the horizontal glyph.
+        let stacked = self.state.layout.stacked(leaf);
+        let paints = crate::widgets::leaf_btn_rects(rect).map(|(kind, r)| BtnPaint {
+            cx: r.x + r.w / 2 - rect.x,
+            cy: r.y + r.h / 2 - rect.y,
+            icon: match kind {
+                BtnKind::Minimize if stacked => BtnIcon::MinimizeH,
+                BtnKind::Minimize => BtnIcon::Minimize,
+                BtnKind::Close => BtnIcon::Close,
+            },
+            accent,
+        });
         for (slot, b) in out.iter_mut().zip(paints) {
             *slot = Some(b);
         }
@@ -732,7 +657,14 @@ impl Comp {
     /// the visible quick-launch icons. The strip spans the full output width
     /// and the bottom `theme::TASKBAR_H` pixels.
     fn taskbar_paint(&self, ow: i32, oh: i32) -> TaskbarPaint {
-        let origin_y = (oh - theme::TASKBAR_H).max(0);
+        // The compass reaches above the bar, so the strip grows upwards to
+        // hold it — it is transparent outside its tiles either way.
+        let compass = self
+            .quick_compass()
+            .zip(self.quick_compass_zone())
+            .map(|(c, zone)| (compass_rect(c.icon), zone));
+        let bar_top = (oh - theme::TASKBAR_H).max(0);
+        let origin_y = compass.map_or(bar_top, |(r, _)| bar_top.min(r.y)).max(0);
         let tiles = self
             .view
             .widgets
@@ -754,9 +686,9 @@ impl Comp {
             .widgets
             .quick_regions
             .iter()
-            .filter_map(|&(r, i)| {
-                self.view.quick.get(i).map(|q| QuickPaint {
-                    rect: r,
+            .filter_map(|t| {
+                self.view.quick.get(t.slot).map(|q| QuickPaint {
+                    rect: t.icon,
                     icon: q.icon.clone(),
                     label: q.label,
                 })
@@ -764,11 +696,12 @@ impl Comp {
             .collect();
         TaskbarPaint {
             w: ow,
-            h: theme::TASKBAR_H,
+            h: oh - origin_y,
             origin: (0, origin_y),
             tiles,
             sep: self.view.widgets.taskbar_sep,
             quick,
+            compass,
         }
     }
 }

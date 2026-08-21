@@ -336,16 +336,23 @@ impl Comp {
         } else {
             self.surface_under(pos)
         };
+        // The quick-launch compass follows the pointer over the taskbar,
+        // but a gesture owns the pointer while it runs: a drag passing
+        // over the icons must not raise one.
+        if self.interaction.drag.is_none() {
+            self.update_quick_hover(pos);
+        } else {
+            self.interaction.quick_hover = None;
+        }
         // Off every surface, the cursor is the compositor's: hover
         // feedback over the chrome (master's hover_cursor), and during a
         // drag the gesture's own shape wherever the pointer strays.
         if under.is_none() {
             use smithay::input::pointer::CursorIcon;
             let icon = match self.interaction.drag {
-                Some(crate::comp::pointer::ActiveDrag::Gap(d)) => match d.at.dir() {
-                    crate::layout::Dir::V => CursorIcon::NsResize,
-                    crate::layout::Dir::H => CursorIcon::EwResize,
-                },
+                // Only a stack gap drags as a gap; a column gap's halves
+                // are border drags (below).
+                Some(crate::comp::pointer::ActiveDrag::Gap(_)) => CursorIcon::NsResize,
                 Some(crate::comp::pointer::ActiveDrag::Edge(_))
                 | Some(crate::comp::pointer::ActiveDrag::Border(_)) => CursorIcon::EwResize,
                 Some(crate::comp::pointer::ActiveDrag::Float(_)) => CursorIcon::Pointer,
