@@ -44,7 +44,6 @@ use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Logical, Physical, Point, Rectangle, Size};
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
 use smithay::wayland::cursor_shape::CursorShapeManagerState;
-use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
@@ -54,6 +53,7 @@ use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::virtual_keyboard::VirtualKeyboardManagerState;
 
 /// Per-client protocol state, stored as the client's `ClientData`.
 #[derive(Default)]
@@ -106,6 +106,9 @@ pub struct ChromeView {
     pub animate: bool,
     /// In-flight layout transition (chrome-only interpolation).
     pub anim: Option<anim::LayoutAnim>,
+    /// The quick-launch icon currently breaking into (or back out of) its
+    /// four compass shards. `None` once the last one has closed up.
+    pub quick_split: Option<anim::QuickSplit>,
     /// Every leaf's frame rect from the last arrange, on-screen or not —
     /// animation start rects and the leaf-body hit region.
     pub frame_rects: std::collections::HashMap<crate::layout::NodeId, crate::widgets::FrameRect>,
@@ -330,7 +333,8 @@ impl Comp {
         let primary_selection_state = PrimarySelectionState::new::<Comp>(&dh);
         let layer_shell_state = WlrLayerShellState::new::<Comp>(&dh);
         let cursor_shape_state = CursorShapeManagerState::new::<Comp>(&dh);
-        let virtual_keyboard_state = VirtualKeyboardManagerState::new::<Comp, _>(&dh, |_client| true);
+        let virtual_keyboard_state =
+            VirtualKeyboardManagerState::new::<Comp, _>(&dh, |_client| true);
         let screencopy = screencopy::Screencopy::new(&dh);
 
         let mut seat: Seat<Comp> = seat_state.new_wl_seat(&dh, "seat-0");
@@ -445,6 +449,7 @@ impl Comp {
                 wallpaper_path,
                 animate: false,
                 anim: None,
+                quick_split: None,
                 frame_rects: std::collections::HashMap::new(),
                 focus_rect: None,
                 focus_outline,
@@ -1039,14 +1044,14 @@ impl Comp {
         // same hazard gap/edge drags avoid by landing the glide at press;
         // a tile press *starts* this glide, so it freezes instead and
         // resumes once the drag ends).
-        let move_dragging = matches!(
-            self.interaction.drag,
-            Some(pointer::ActiveDrag::Move(_))
-        );
+        let move_dragging = matches!(self.interaction.drag, Some(pointer::ActiveDrag::Move(_)));
         if self.state.scroll_animating() && !move_dragging {
             self.state.step_scroll();
             self.arrange();
         }
+        // Point the quick-launch shard animation at the hovered icon; it
+        // rides the same tick as the layout transition below.
+        self.tick_quick_split();
         // Advance any layout animation and take this frame's leaf rects
         // (interpolated mid-slide, settled otherwise); `tick_layout` also
         // updates `focus_rect` to ride the focused leaf.
@@ -1209,7 +1214,8 @@ impl Comp {
         // Animations advance per frame, so a running one keeps the redraw
         // loop alive until it settles (client-driven motion sustains itself
         // through commits instead).
-        if self.state.scroll_animating() || self.view.anim.is_some() {
+        let splitting = self.view.quick_split.as_ref().is_some_and(|s| !s.settled());
+        if self.state.scroll_animating() || self.view.anim.is_some() || splitting {
             self.queue_redraw();
         }
     }

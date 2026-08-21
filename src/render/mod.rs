@@ -11,7 +11,7 @@
 //! `wallpaper`, a leaf's border/titlebar chrome in `chrome`, its
 //! split-control buttons in `buttons`, icon blitting/caching (shared by the
 //! titlebar and the taskbar) in `icon_cache`, the taskbar's own
-//! tiles/badges/compass in `taskbar`, and served-notification speech
+//! tiles/badges/shards in `taskbar`, and served-notification speech
 //! bubbles in `notify_popup`. The `Renderer` struct itself and the handful
 //! of drawing primitives genuinely shared across all of the above live here.
 
@@ -33,12 +33,12 @@ mod wallpaper;
 
 pub use buttons::BtnIcon;
 pub use chrome::{LeafView, SliceSpec, TitleInfo};
-pub use taskbar::{draw_close_badge, draw_compass, draw_taskbar_sep};
+pub use taskbar::{draw_close_badge, draw_taskbar_sep, shard_steps, QUICK_ICON_REACH};
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use pixel_fonts::{BitmapFont, FUSION_PIXEL_12_SPEC};
+use pixel_fonts::{BitmapFont, DIGITAL_DISCO_SPEC, FUSION_PIXEL_12_SPEC};
 use pixel_graphics::{Framebuffer, Paint as PgPaint, PaletteIndex, Swap};
 
 use crate::oklch::OklabPalette;
@@ -53,6 +53,10 @@ pub struct Renderer {
     /// `None` when the pixel-fonts atlases can't be read; text drawing
     /// degrades to a no-op instead of refusing to start the WM.
     font: Option<BitmapFont>,
+    /// The face the single-letter stand-ins are drawn in — a window or
+    /// taskbar slot whose app icon never loaded shows its initial instead.
+    /// Chunkier than `font`, which has whole titles to fit.
+    label_font: Option<BitmapFont>,
     /// The na16 palette all art/indices resolve through, paired with its
     /// precomputed `OKLab` coordinates for perceptual nearest-colour snapping.
     palette: OklabPalette,
@@ -87,6 +91,10 @@ pub struct Renderer {
     /// so the whole map is cleared once it exceeds `ICON_CACHE_CAP`.
     /// `Rc` payloads so a cache hit is a refcount bump, not a buffer copy.
     icon_idx_cache: IconCache<u8>,
+    /// The same trick for the letters standing in for icons that never
+    /// loaded: `label_font` has one fixed size, so a character's index
+    /// buffer is settled the first time it is drawn.
+    glyph_idx_cache: RefCell<HashMap<char, std::rc::Rc<[u8]>>>,
 }
 
 /// `fill_rect_paint` with signed, clipped coordinates.
@@ -153,19 +161,22 @@ fn accent_swap(index: Index) -> Swap {
 impl Renderer {
     pub fn new() -> Self {
         let palette = OklabPalette::new(crate::assets::palette());
-        let font = match BitmapFont::load(&FUSION_PIXEL_12_SPEC) {
+        let load = |name: &str, spec: &'static pixel_fonts::FontSpec| match BitmapFont::load(spec) {
             Ok(f) => Some(f),
             Err(e) => {
-                eprintln!("splitwm: pixel font unavailable ({e}); text labels disabled");
+                eprintln!("splitwm: {name} font unavailable ({e}); those labels disabled");
                 None
             }
         };
+        let font = load("text", &FUSION_PIXEL_12_SPEC);
+        let label_font = load("label", &DIGITAL_DISCO_SPEC);
         let fg = palette.inner().closest_to_white_index();
         let fg_dark = palette
             .inner()
             .nearest_index(pixel_graphics::Rgb { r: 0, g: 0, b: 0 });
         Self {
             font,
+            label_font,
             fg,
             fg_dark,
             wallpaper: None,
@@ -186,6 +197,7 @@ impl Renderer {
             ],
             palette,
             icon_idx_cache: RefCell::new(HashMap::new()),
+            glyph_idx_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -221,24 +233,13 @@ impl Renderer {
         ]
     }
 
-    /// Draw a single character centred at (cx, cy) in palette colour `color`.
+    /// Draw a single character centred at (cx, cy) in palette colour
+    /// `color`: the stand-in for an app icon that never loaded, in
+    /// `label_font`.
     fn draw_glyph(&self, fb: &mut Framebuffer, ch: char, cx: i32, cy: i32, color: Index) {
-        let Some(font) = &self.font else {
-            return;
-        };
-        let mut buf = [0u8; 4];
-        let s = &*ch.encode_utf8(&mut buf);
-        let w = font.text_width(s) as i32;
-        let h = font.cell_h() as i32;
-        let x = cx - w / 2;
-        let y = cy - h / 2;
-        // A glyph poking past the top edge is dropped (callers never place
-        // labels there). Negative x is real (taskbar tiles fanning off the
-        // left edge) and clips instead.
-        if y < 0 {
-            return;
-        }
-        font.draw_text_clipped(fb, s, x as isize, y as isize, color, 0, fb.width);
+        self.for_each_glyph_pixel(ch, cx, cy, |px, py, _| {
+            fb.set_pixel(px as isize, py as isize, color);
+        });
     }
 
     /// Whether the accent at `index` is light (Rec. 709 luma above 0.5):

@@ -14,8 +14,8 @@
 //!   restore strip), rebuilt only when that leaf's content fingerprint
 //!   (`LeafKey`) changes; its corners are transparent, so it is not opaque;
 //! * **taskbar** — one strip-sized texture over the bottom bar (tiles,
-//!   close badges, separator, quick-launch, and the hover compass, which
-//!   grows the strip above the bar), rebuilt only when its
+//!   close badges, separator, and quick-launch icons, whose shards reach
+//!   above the bar and grow the strip to suit), rebuilt only when its
 //!   fingerprint (`TaskbarKey`) changes; transparent between tiles so the
 //!   wallpaper shows through.
 //!
@@ -38,7 +38,7 @@ use crate::layout::{NodeId, Side};
 use crate::render::indexed::{IndexedProgram, IndexedTexture};
 use crate::render::{BtnIcon, LeafView, Renderer, SliceSpec, TitleInfo};
 use crate::theme;
-use crate::widgets::{compass_rect, BtnKind, FrameRect, Placement, N_BTNS};
+use crate::widgets::{BtnKind, FrameRect, Placement, N_BTNS};
 use crate::Index;
 use pixel_graphics::Framebuffer;
 use smithay::backend::renderer::element::Id;
@@ -309,9 +309,6 @@ struct TaskbarPaint {
     tiles: Vec<TilePaint>,
     sep: Option<FrameRect>,
     quick: Vec<QuickPaint>,
-    /// The hover compass around one quick-launch icon: the square it
-    /// covers and the wedge under the pointer.
-    compass: Option<(FrameRect, Side)>,
 }
 
 struct TilePaint {
@@ -326,6 +323,12 @@ struct QuickPaint {
     rect: FrameRect,
     icon: Option<Rc<Icon>>,
     label: char,
+    /// How far this icon has broken into its four compass shards, 0 while
+    /// it is whole.
+    split: f32,
+    /// The wedge under the pointer, traced in cream; `None` on every icon
+    /// the compass is not on.
+    hover: Option<Side>,
 }
 
 /// The taskbar's content fingerprint (mirrors `LeafKey`'s role): window
@@ -337,8 +340,7 @@ struct TaskbarKey {
     origin: (i32, i32),
     tiles: Vec<(FrameRect, FrameRect, Option<u64>, char, Index)>,
     sep: Option<FrameRect>,
-    quick: Vec<(FrameRect, Option<u64>, char)>,
-    compass: Option<(FrameRect, Side)>,
+    quick: Vec<QuickKey>,
 }
 
 fn tile_key(t: &TilePaint) -> (FrameRect, FrameRect, Option<u64>, char, Index) {
@@ -351,8 +353,21 @@ fn tile_key(t: &TilePaint) -> (FrameRect, FrameRect, Option<u64>, char, Index) {
     )
 }
 
-fn quick_key(q: &QuickPaint) -> (FrameRect, Option<u64>, char) {
-    (q.rect, q.icon.as_ref().map(|i| i.id()), q.label)
+/// One quick-launch icon's fingerprint: its slot, the icon and letter in
+/// it, the shard geometry it has broken into, and the wedge it traces in
+/// cream.
+type QuickKey = (FrameRect, Option<u64>, char, (i32, i32), Option<Side>);
+
+fn quick_key(q: &QuickPaint) -> QuickKey {
+    (
+        q.rect,
+        q.icon.as_ref().map(|i| i.id()),
+        q.label,
+        // The phase as the two integers it actually draws as, so a sweep
+        // repaints the strip only on the frames whose pixels differ.
+        crate::render::shard_steps(q.split),
+        q.hover,
+    )
 }
 
 impl TaskbarKey {
@@ -364,11 +379,18 @@ impl TaskbarKey {
             && self.h == p.h
             && self.origin == p.origin
             && self.sep == p.sep
-            && self.compass == p.compass
             && self.tiles.len() == p.tiles.len()
             && self.quick.len() == p.quick.len()
-            && self.tiles.iter().zip(&p.tiles).all(|(k, t)| *k == tile_key(t))
-            && self.quick.iter().zip(&p.quick).all(|(k, q)| *k == quick_key(q))
+            && self
+                .tiles
+                .iter()
+                .zip(&p.tiles)
+                .all(|(k, t)| *k == tile_key(t))
+            && self
+                .quick
+                .iter()
+                .zip(&p.quick)
+                .all(|(k, q)| *k == quick_key(q))
     }
 }
 
@@ -381,7 +403,6 @@ impl TaskbarPaint {
             tiles: self.tiles.iter().map(tile_key).collect(),
             sep: self.sep,
             quick: self.quick.iter().map(quick_key).collect(),
-            compass: self.compass,
         }
     }
 }
@@ -465,31 +486,21 @@ fn render_taskbar(
         h: r.h,
     };
     for t in &paint.tiles {
-        chrome.draw_taskbar_item(
-            &mut fb,
-            shift(t.rect),
-            t.icon.as_deref(),
-            t.label,
-            t.accent,
-            true,
-        );
+        chrome.draw_taskbar_tile(&mut fb, shift(t.rect), t.icon.as_deref(), t.label, t.accent);
         let c = shift(t.close);
         crate::render::draw_close_badge(&mut fb, c.x, c.y, c.w);
     }
     if let Some(sep) = paint.sep {
         crate::render::draw_taskbar_sep(&mut fb, shift(sep));
     }
-    if let Some((rect, zone)) = paint.compass {
-        crate::render::draw_compass(&mut fb, shift(rect), zone);
-    }
     for q in &paint.quick {
-        chrome.draw_taskbar_item(
+        chrome.draw_quick_item(
             &mut fb,
             shift(q.rect),
             q.icon.as_deref(),
             q.label,
-            theme::palette_color::CREAM,
-            false,
+            q.split,
+            q.hover,
         );
     }
     indexed.upload(renderer, &mut piece.tex, &fb, false);
@@ -653,25 +664,25 @@ impl Comp {
     }
 
     /// The taskbar strip's draw data: one tile per split's window, in split
-    /// order (accent highlight box, corner close badge), the separator, and
-    /// the visible quick-launch icons. The strip spans the full output width
+    /// order (accent trace, corner close badge), the separator, and the
+    /// visible quick-launch icons. The strip spans the full output width
     /// and the bottom `theme::TASKBAR_H` pixels, plus the band above them a
-    /// hover compass reaches into.
+    /// split icon's shards reach into.
     fn taskbar_paint(&self, ow: i32, oh: i32) -> TaskbarPaint {
-        let compass = self.compass_paint();
-        // A compass reaches above the bar, so the strip runs up to where one
-        // would sit whether or not one is up — it is transparent outside its
-        // tiles either way, and a fixed extent means a hover rewrites the
-        // texture in place instead of reallocating it.
+        let aim = self.quick_aim();
+        // A split icon reaches above the bar, so the strip runs up to where
+        // one would reach whether or not any is split — it is transparent
+        // outside its tiles either way, and a fixed extent means a hover
+        // rewrites the texture in place instead of reallocating it.
         let bar_top = (oh - theme::TASKBAR_H).max(0);
-        let ring_top = self
+        let shard_top = self
             .view
             .widgets
             .quick_regions
             .iter()
-            .map(|t| compass_rect(t.icon).y)
+            .map(|t| t.icon.y - crate::render::QUICK_ICON_REACH)
             .min();
-        let origin_y = ring_top.map_or(bar_top, |y| bar_top.min(y)).max(0);
+        let origin_y = shard_top.map_or(bar_top, |y| bar_top.min(y)).max(0);
         let tiles = self
             .view
             .widgets
@@ -698,6 +709,8 @@ impl Comp {
                     rect: t.icon,
                     icon: q.icon.clone(),
                     label: q.label,
+                    split: self.quick_split_phase(t.slot),
+                    hover: aim.filter(|&(slot, _)| slot == t.slot).map(|(_, z)| z),
                 })
             })
             .collect();
@@ -708,7 +721,6 @@ impl Comp {
             tiles,
             sep: self.view.widgets.taskbar_sep,
             quick,
-            compass,
         }
     }
 }

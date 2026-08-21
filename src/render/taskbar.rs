@@ -1,7 +1,7 @@
 //! The bottom taskbar's own drawing: icon tiles (with drop shadow and
 //! shown-in-a-split highlight), the separator pill before the quick-launch
-//! icons, the close badge on each tile, and the hover compass around a
-//! quick-launch icon.
+//! icons, the close badge on each tile, and the quick-launch icons, which
+//! break into the four compass shards under the pointer.
 
 use pixel_graphics::{Framebuffer, Paint as PgPaint, PaletteIndex};
 
@@ -19,82 +19,278 @@ const SHADOW_OFFSET: i32 = 2;
 /// Flat colour a taskbar icon's drop shadow silhouette is drawn in.
 const SHADOW_COLOR: Index = palette_color::BLACK;
 
-/// Gap between a highlighted taskbar icon's own footprint and the
-/// rounded-rect box traced around it.
-const ICON_BOX_PAD: i32 = 3;
+/// How far each shard of a fully split quick-launch icon slides out along
+/// its own axis, in pixels. The four slide apart rather than being cut
+/// apart: the seams between them are the space they leave behind, so they
+/// land on the compass diagonals without the drawing pass knowing where
+/// those run.
+const SHARD_SPREAD: i32 = 5;
 
-/// Thickness in pixels of the highlighted taskbar icon's rounded-rect box
-/// stroke.
-const ICON_BOX_THICKNESS: i32 = 2;
+/// How much wider a quick-launch icon grows, in pixels across, as it splits
+/// — the icon comes forward as it breaks up.
+const SHARD_GROWTH: i32 = 10;
+
+/// Thickness of the border traced around a quick-launch icon's silhouette.
+const ICON_BORDER: i32 = 2;
+
+/// How far a slot's icon sits inside the slot rect on every side.
+const SLOT_ICON_INSET: i32 = 3;
+
+/// How far past its slot a fully split quick-launch icon reaches: the
+/// growth it takes on each side, the slide of its shards, and the border
+/// around them, less the room the slot already leaves. The taskbar strip
+/// runs this far above the bar so a split icon has somewhere to go.
+pub const QUICK_ICON_REACH: i32 = SHARD_GROWTH / 2 + SHARD_SPREAD + ICON_BORDER - SLOT_ICON_INSET;
+
+/// One slot's icon as it sits on the bar: the content that fills it, the
+/// box it is scaled into, and the slot centre the letter fallback sits at.
+struct SlotIcon<'a> {
+    icon: Option<&'a Icon>,
+    label: char,
+    /// Top-left corner of the icon box, and its side.
+    x: i32,
+    y: i32,
+    size: i32,
+    /// How far each shard has slid out along its own axis — the other half
+    /// of what the split phase resolves to, kept with the box it grew so
+    /// the two can't be built from different phases.
+    spread: i32,
+}
+
+impl<'a> SlotIcon<'a> {
+    /// The icon of slot `r`, its box grown and its shards slid out by
+    /// `split` (0 = whole, at the resting size) about the slot's centre.
+    fn new(r: crate::layout::Rect, icon: Option<&'a Icon>, label: char, split: f32) -> Self {
+        let (grown, spread) = shard_steps(split);
+        let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
+        let size = r.h.min(r.w) - 2 * SLOT_ICON_INSET + grown;
+        Self {
+            icon,
+            label,
+            x: cx - size / 2,
+            y: cy - size / 2,
+            size,
+            spread,
+        }
+    }
+
+    /// The slot's centre, where the letter fallback sits. Truncating
+    /// division puts the box back on it exactly.
+    fn centre(&self) -> (i32, i32) {
+        (self.x + self.size / 2, self.y + self.size / 2)
+    }
+}
+
+/// The only two integers a split phase resolves to on screen: how much
+/// wider the icon box is, and how far its shards have slid. Two phases
+/// that agree here draw the same pixels, so this is the granularity a
+/// repaint fingerprint needs — anything finer redraws for nothing.
+pub fn shard_steps(split: f32) -> (i32, i32) {
+    let split = split.max(0.0);
+    (
+        (SHARD_GROWTH as f32 * split) as i32,
+        (SHARD_SPREAD as f32 * split) as i32,
+    )
+}
+
+/// A quick-launch icon broken into its four compass shards: which wedge
+/// each of its pixels belongs to, where that wedge has slid to, and the
+/// colour tracing it. A whole icon is the same thing at zero spread.
+struct Shards {
+    /// Doubled centre of the icon box — doubling keeps the centre of an
+    /// even-sided box exact.
+    cx2: i32,
+    cy2: i32,
+    /// How far each shard has slid out along its own axis.
+    spread: i32,
+    /// What is traced around this icon's silhouette; everything not
+    /// traced is shadowed.
+    trace: Trace,
+}
+
+/// What traces a slot icon's silhouette.
+#[derive(Clone, Copy)]
+enum Trace {
+    /// Nothing: the icon is shadowed whole, the resting look.
+    Nothing,
+    /// The whole silhouette, in the accent of the split the window is
+    /// shown in — how a taskbar tile marks itself.
+    Whole(Index),
+    /// Only the shard under the pointer, in cream — a quick-launch icon
+    /// the compass is aimed at. Its other three shards stay shadowed.
+    Aimed(Side),
+}
+
+impl Shards {
+    fn new(slot: &SlotIcon, trace: Trace) -> Self {
+        Self {
+            cx2: 2 * slot.x + slot.size,
+            cy2: 2 * slot.y + slot.size,
+            spread: slot.spread,
+            trace,
+        }
+    }
+
+    /// The wedge a pixel of the icon belongs to — `compass_side`, the same
+    /// answer the compass hit-test gives, so a shard covers exactly the
+    /// wedge that launches its direction.
+    fn wedge(&self, px: i32, py: i32) -> Side {
+        crate::widgets::compass_side(2 * px + 1 - self.cx2, 2 * py + 1 - self.cy2)
+    }
+
+    /// Where a pixel of `wedge` lands once its shard has slid out. The
+    /// four slide apart rather than being cut apart, so the seams between
+    /// them are the space they leave behind.
+    fn place(&self, wedge: Side, px: i32, py: i32) -> (i32, i32) {
+        match wedge {
+            Side::Left => (px - self.spread, py),
+            Side::Right => (px + self.spread, py),
+            Side::Up => (px, py - self.spread),
+            Side::Down => (px, py + self.spread),
+        }
+    }
+
+    /// The colour tracing a pixel of `wedge`, if anything does; `None`
+    /// means it is shadowed instead.
+    fn traced(&self, wedge: Side) -> Option<Index> {
+        match self.trace {
+            Trace::Nothing => None,
+            Trace::Whole(accent) => Some(accent),
+            Trace::Aimed(side) => (wedge == side).then_some(palette_color::CREAM),
+        }
+    }
+}
+
+/// The stamp that traces one icon pixel: every offset within
+/// `ICON_BORDER` of it, corners rounded off, so an icon's silhouette comes
+/// out ringed by a border of that thickness. Lazy, so stamping a pixel
+/// allocates nothing.
+fn border_stamp() -> impl Iterator<Item = (i32, i32)> {
+    let r = ICON_BORDER;
+    (-r..=r)
+        .flat_map(move |oy| (-r..=r).map(move |ox| (ox, oy)))
+        .filter(move |&(ox, oy)| ox * ox + oy * oy <= r * r + 1)
+}
 
 impl Renderer {
-    /// Draw one taskbar entry: the app icon (or letter-glyph fallback) with
-    /// a drop shadow, centred in its slot directly on the bar background.
-    /// Windows currently shown in a split (`highlight`) get an
-    /// accent-coloured rounded-rect box traced around the icon.
-    pub fn draw_taskbar_item(
+    /// Draw one taskbar window tile: the app icon (or letter-glyph
+    /// fallback) centred in its slot directly on the bar background,
+    /// traced in the accent of the split the window is shown in.
+    pub fn draw_taskbar_tile(
         &self,
         fb: &mut Framebuffer,
         r: crate::layout::Rect,
         icon: Option<&Icon>,
         label: char,
         accent: Index,
-        highlight: bool,
     ) {
-        let cx = r.x + r.w / 2;
-        let cy = r.y + r.h / 2;
-        let isz = r.h.min(r.w) - 6;
-        let (dx, dy) = (cx - isz / 2, cy - isz / 2);
-        if let Some(img) = icon {
-            self.draw_icon_shadow(fb, img, dx, dy, isz);
-        } else {
-            self.draw_glyph(
-                fb,
-                label,
-                cx + SHADOW_OFFSET,
-                cy + SHADOW_OFFSET,
-                SHADOW_COLOR,
-            );
-        }
-        if highlight {
-            let bx = dx - ICON_BOX_PAD;
-            let by = dy - ICON_BOX_PAD;
-            let bsz = isz + 2 * ICON_BOX_PAD;
-            draw_rounded_box(fb, bx, by, bsz, bsz, accent);
-        }
-        if let Some(img) = icon {
-            self.draw_icon(fb, img, dx, dy, isz);
-        } else {
-            self.draw_glyph(fb, label, cx, cy, self.fg);
-        }
+        self.draw_slot(fb, r, icon, label, 0.0, Trace::Whole(accent));
     }
 
-    /// Draw a solid drop shadow behind `img`: its own opaque silhouette,
-    /// offset by `SHADOW_OFFSET` and flattened to `SHADOW_COLOR`, reusing
-    /// the cached per-pixel index buffer (`cached_icon_indices`) so this
-    /// costs one extra store per opaque icon pixel instead of a second scale
-    /// pass.
-    fn draw_icon_shadow(&self, fb: &mut Framebuffer, img: &Icon, dx: i32, dy: i32, size: i32) {
-        self.for_each_icon_pixel(
-            img,
-            dx + SHADOW_OFFSET,
-            dy + SHADOW_OFFSET,
-            size,
-            |px, py, _| fb.set_pixel(px as isize, py as isize, SHADOW_COLOR),
+    /// Draw one quick-launch icon, broken `split` of the way into the four
+    /// compass shards (0 = whole, 1 = fully apart) and grown as it breaks
+    /// up, so the icon states the same four choices its compass does.
+    /// The shard under the pointer (`hover`) is traced in cream; the
+    /// others keep the drop shadow, as does an icon resting whole with
+    /// nothing aimed at it.
+    pub fn draw_quick_item(
+        &self,
+        fb: &mut Framebuffer,
+        r: crate::layout::Rect,
+        icon: Option<&Icon>,
+        label: char,
+        split: f32,
+        hover: Option<Side>,
+    ) {
+        self.draw_slot(
+            fb,
+            r,
+            icon,
+            label,
+            split,
+            hover.map_or(Trace::Nothing, Trace::Aimed),
         );
     }
-}
 
-/// Stroke an accent-coloured rounded-rect box: a `w`x`h` outline with
-/// 2px-notched corners, matching the pixel-art rounding used elsewhere in
-/// the chrome. Used to mark a taskbar icon as currently shown in a split.
-fn draw_rounded_box(fb: &mut Framebuffer, x: i32, y: i32, w: i32, h: i32, color: Index) {
-    let t = ICON_BOX_THICKNESS;
-    let paint = PgPaint::Solid(PaletteIndex::new(color));
-    fill_paint(fb, x + 2, y, w - 4, t, paint); // top
-    fill_paint(fb, x + 2, y + h - t, w - 4, t, paint); // bottom
-    fill_paint(fb, x, y + 2, t, h - 4, paint); // left
-    fill_paint(fb, x + w - t, y + 2, t, h - 4, paint); // right
+    /// Draw one taskbar slot: its backing, then the icon (or letter) over
+    /// it, both broken `split` of the way into their shards.
+    fn draw_slot(
+        &self,
+        fb: &mut Framebuffer,
+        r: crate::layout::Rect,
+        icon: Option<&Icon>,
+        label: char,
+        split: f32,
+        trace: Trace,
+    ) {
+        let slot = SlotIcon::new(r, icon, label, split);
+        let shards = Shards::new(&slot, trace);
+        self.draw_slot_backing(fb, &slot, &shards);
+        self.draw_slot_icon(fb, &slot, &shards);
+    }
+
+    /// Walk the pixels of whatever fills a slot: its app icon, or the
+    /// letter standing in for one. Both are silhouettes, so the shard,
+    /// trace and shadow passes need no idea which they are looking at —
+    /// only the letter's size is fixed, where an icon scales with the box.
+    fn for_each_slot_pixel(&self, slot: &SlotIcon, paint: impl FnMut(i32, i32, Index)) {
+        match slot.icon {
+            Some(img) => self.for_each_icon_pixel(img, slot.x, slot.y, slot.size, paint),
+            None => {
+                let (cx, cy) = slot.centre();
+                self.for_each_glyph_pixel(slot.label, cx, cy, paint);
+            }
+        }
+    }
+
+    /// Draw what sits behind a slot's icon: whatever the shards say is
+    /// traced gets a border around its own silhouette, and everything else
+    /// drops a shadow. Both follow the shards, so a split icon's backing
+    /// breaks along exactly the seams they open and travels out with them
+    /// instead of lying under them uncut. Shadows go down first: where a
+    /// trace meets a neighbouring shard's shadow, the trace wins.
+    fn draw_slot_backing(&self, fb: &mut Framebuffer, slot: &SlotIcon, shards: &Shards) {
+        // A wholly traced icon casts no shadow, and an untraced one has
+        // nothing to trace: only an aimed icon needs both walks.
+        if !matches!(shards.trace, Trace::Whole(_)) {
+            self.for_each_slot_pixel(slot, |px, py, _| {
+                let wedge = shards.wedge(px, py);
+                if shards.traced(wedge).is_some() {
+                    return;
+                }
+                let (sx, sy) = shards.place(wedge, px, py);
+                fb.set_pixel(
+                    (sx + SHADOW_OFFSET) as isize,
+                    (sy + SHADOW_OFFSET) as isize,
+                    SHADOW_COLOR,
+                );
+            });
+        }
+        if matches!(shards.trace, Trace::Nothing) {
+            return;
+        }
+        // Trace by stamping each traced pixel's own neighbourhood; the icon
+        // pass covers the middle back up, leaving a border of `ICON_BORDER`
+        // around the silhouette.
+        self.for_each_slot_pixel(slot, |px, py, _| {
+            let wedge = shards.wedge(px, py);
+            let Some(color) = shards.traced(wedge) else {
+                return;
+            };
+            let (sx, sy) = shards.place(wedge, px, py);
+            for (ox, oy) in border_stamp() {
+                fb.set_pixel((sx + ox) as isize, (sy + oy) as isize, color);
+            }
+        });
+    }
+
+    /// A slot's own content, each pixel moved out with its shard.
+    fn draw_slot_icon(&self, fb: &mut Framebuffer, slot: &SlotIcon, shards: &Shards) {
+        self.for_each_slot_pixel(slot, |px, py, i| {
+            let (sx, sy) = shards.place(shards.wedge(px, py), px, py);
+            fb.set_pixel(sx as isize, sy as isize, i);
+        });
+    }
 }
 
 /// Draw the vertical pill separating the taskbar's window tiles from its
@@ -153,44 +349,6 @@ pub fn draw_close_badge(fb: &mut Framebuffer, x: i32, y: i32, sz: i32) {
             if px >= 0 && sy >= 0 {
                 fb.set_pixel(px as isize, sy as isize, palette_color::CREAM);
             }
-        }
-    }
-}
-
-/// Width of the gap the diagonals cut between two neighbouring compass
-/// wedges, in pixels. The wedges carry no outline, so this gap is what
-/// separates them.
-const COMPASS_GAP: i32 = 4;
-
-/// Draw the hover compass around a quick-launch icon: a square, a ring
-/// wider than the icon on every side, cut by its diagonals into the four
-/// wedges that place the launched window left of, right of, above or below
-/// the focused split. The wedge under the pointer (`hover`) is solid white;
-/// the rest are the same white on a checker, so they read as half-lit next
-/// to it and let what they cover show between their pixels. The icon is
-/// drawn over the square's middle, which the wedges run under — it is part
-/// of them, not a hole in them.
-pub fn draw_compass(fb: &mut Framebuffer, r: crate::layout::Rect, hover: Side) {
-    // Doubled coordinates keep the centre of an even-sided square exact.
-    let (cx2, cy2) = (2 * r.x + r.w, 2 * r.y + r.h);
-    for y in r.y.max(0)..r.y + r.h {
-        for x in r.x.max(0)..r.x + r.w {
-            // Notched corners, the pixel-art rounding the rest of the
-            // chrome uses.
-            let notch = (x < r.x + 2 || x >= r.x + r.w - 2) && (y < r.y + 2 || y >= r.y + r.h - 2);
-            if notch {
-                continue;
-            }
-            let (dx, dy) = (2 * x + 1 - cx2, 2 * y + 1 - cy2);
-            // The diagonals themselves stay clear: equidistant from both
-            // axes is the gap between two wedges.
-            if (dx.abs() - dy.abs()).abs() < 2 * COMPASS_GAP {
-                continue;
-            }
-            if crate::widgets::compass_side(dx, dy) != hover && (x + y) % 2 != 0 {
-                continue;
-            }
-            fb.set_pixel(x as isize, y as isize, palette_color::CREAM);
         }
     }
 }

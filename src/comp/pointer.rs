@@ -397,14 +397,17 @@ impl Comp {
             .copied()
     }
 
-    /// The compass to draw: the square it covers and the wedge under the
-    /// pointer, resolved together so the two can't describe different
-    /// tiles. `None` only when no compass is up.
-    pub fn compass_paint(&self) -> Option<(crate::widgets::FrameRect, Side)> {
+    /// What the compass is aimed at: the quick-launch slot it sits on and
+    /// the wedge under the pointer, resolved together so the two can't
+    /// describe different tiles. That slot's icon breaks into its shards
+    /// and traces the named wedge in cream. `None` when no compass is up.
+    pub fn quick_aim(&self) -> Option<(usize, Side)> {
         let compass = self.quick_compass()?;
         let pos = self.pointer.current_location();
-        let zone = compass_zone(compass.icon, pos.x as i32, pos.y as i32);
-        Some((compass_rect(compass.icon), zone))
+        Some((
+            compass.slot,
+            compass_zone(compass.icon, pos.x as i32, pos.y as i32),
+        ))
     }
 
     /// Re-aim the compass at the pointer: it appears as soon as the

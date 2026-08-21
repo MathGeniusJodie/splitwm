@@ -68,20 +68,19 @@ pub fn compute_placements(
     (placed, frame_rects)
 }
 
-/// Width of the hover compass's ring around a quick-launch icon: how far
-/// each of its four wedges extends past the icon's edge. The ring reaches
-/// over the neighbouring icons, so only the hovered icon's compass is ever
-/// drawn or hit-tested.
-pub const COMPASS_RING: i32 = 9;
-
-/// The hover compass square drawn around the quick-launch icon at `icon`:
-/// the icon's rect grown by `COMPASS_RING` on every side.
+/// The hover compass around the quick-launch icon at `icon`: the icon's
+/// rect grown on every side by exactly as far as its shards reach when
+/// fully split (`render::QUICK_ICON_REACH`). The region the pointer holds
+/// is the region the icon covers, so the compass can't keep or drop the
+/// hover at a boundary nothing on screen marks. The ring reaches over the
+/// neighbouring icons, so only the hovered icon's compass is ever up.
 pub const fn compass_rect(icon: FrameRect) -> FrameRect {
+    let ring = crate::render::QUICK_ICON_REACH;
     FrameRect {
-        x: icon.x - COMPASS_RING,
-        y: icon.y - COMPASS_RING,
-        w: icon.w + 2 * COMPASS_RING,
-        h: icon.h + 2 * COMPASS_RING,
+        x: icon.x - ring,
+        y: icon.y - ring,
+        w: icon.w + 2 * ring,
+        h: icon.h + 2 * ring,
     }
 }
 

@@ -1,6 +1,9 @@
 //! Blitting an `Icon` (app icon) into the framebuffer, and the per-(icon,
 //! size) scaled-and-quantized index cache behind it. Shared by the titlebar
 //! icon (`chrome`) and the taskbar tiles (`taskbar`).
+//! The letter that stands in for an icon that never loaded is cached the
+//! same way, per character: it is a silhouette like any other, and every
+//! pass that walks an icon walks a letter too.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -47,40 +50,82 @@ impl Renderer {
 
     /// Walk `img`'s cached `size`x`size` nearest-scaled index buffer
     /// (`cached_icon_indices`), invoking `paint` at each opaque pixel's
-    /// destination `(px, py)` and palette index — the scale/clip/
-    /// skip-transparent logic shared by `draw_icon` (paints the icon) and
-    /// `taskbar::draw_icon_shadow` (paints an offset, flattened silhouette)
-    /// so it's written once for both.
+    /// destination `(px, py)` and palette index — the scale/skip-transparent
+    /// logic shared by `draw_icon` (paints the icon) and the taskbar's
+    /// shadow and shard passes so it's written once for all of them.
+    /// Destinations are signed and unclipped: a caller may move a pixel
+    /// anywhere before drawing it (the shards do), and `set_pixel` drops
+    /// whatever lands off the buffer.
     pub(super) fn for_each_icon_pixel(
         &self,
         img: &Icon,
         dx: i32,
         dy: i32,
         size: i32,
-        mut paint: impl FnMut(usize, usize, Index),
+        paint: impl FnMut(i32, i32, Index),
     ) {
         if img.w == 0 || img.h == 0 || size < 1 {
             return;
         }
         let sz = size as usize;
-        let idx = self.cached_icon_indices(img, size);
-        for ty in 0..size {
-            let py = dy + ty;
-            if py < 0 {
-                continue;
-            }
-            for tx in 0..size {
-                let px = dx + tx;
-                if px < 0 {
-                    continue;
-                }
-                let i = idx[ty as usize * sz + tx as usize];
-                if i == TRANSPARENT_INDEX {
-                    continue;
-                }
-                paint(px as usize, py as usize, i);
-            }
+        walk_indices(
+            &self.cached_icon_indices(img, size),
+            sz,
+            dx,
+            dy,
+            TRANSPARENT_INDEX,
+            paint,
+        );
+    }
+
+    /// Walk the ink of `ch` in `label_font`, centred at (cx, cy), reporting
+    /// each pixel exactly as `for_each_icon_pixel` reports an icon's.
+    pub(super) fn for_each_glyph_pixel(
+        &self,
+        ch: char,
+        cx: i32,
+        cy: i32,
+        paint: impl FnMut(i32, i32, Index),
+    ) {
+        let Some((w, h, idx)) = self.cached_glyph_indices(ch) else {
+            return;
+        };
+        walk_indices(
+            &idx,
+            w,
+            cx - w as i32 / 2,
+            cy - h as i32 / 2,
+            pixel_graphics::TRANSPARENT,
+            paint,
+        );
+    }
+
+    /// The index buffer of `ch` rendered in `label_font`, with its cell
+    /// size. The font draws into a framebuffer rather than enumerating
+    /// itself, so the glyph is rasterized into a scratch cell — once per
+    /// character, since the label font has a single fixed size, and every
+    /// pass over a lettered slot then replays the same buffer.
+    fn cached_glyph_indices(&self, ch: char) -> Option<(usize, usize, Rc<[Index]>)> {
+        let font = self.label_font.as_ref()?;
+        let mut buf = [0u8; 4];
+        let s = &*ch.encode_utf8(&mut buf);
+        let (w, h) = (font.text_width(s), font.cell_h());
+        if w == 0 || h == 0 {
+            return None;
         }
+        if let Some(v) = self.glyph_idx_cache.borrow().get(&ch) {
+            return Some((w, h, Rc::clone(v)));
+        }
+        let mut cell = pixel_graphics::Framebuffer::new(w, h, pixel_graphics::TRANSPARENT);
+        font.draw_text(&mut cell, s, 0, 0, self.fg);
+        let idx: Rc<[Index]> = (0..h).flat_map(|y| cell.row(y as isize).to_vec()).collect();
+        insert_capped(
+            &mut self.glyph_idx_cache.borrow_mut(),
+            ICON_CACHE_CAP,
+            ch,
+            Rc::clone(&idx),
+        );
+        Some((w, h, idx))
     }
 
     /// The `size`x`size` nearest-scaled palette-index buffer for `img`
@@ -133,5 +178,27 @@ impl Renderer {
             Rc::clone(&idx),
         );
         idx
+    }
+}
+
+/// Walk a `w`-wide index buffer laid out row-major, invoking `paint` at
+/// each pixel that is not `transparent`, positioned at (`dx`, `dy`).
+/// Destinations are signed and unclipped: a caller may move a pixel
+/// anywhere before drawing it (the taskbar's shards do), and `set_pixel`
+/// drops whatever lands off the buffer.
+fn walk_indices(
+    idx: &[Index],
+    w: usize,
+    dx: i32,
+    dy: i32,
+    transparent: Index,
+    mut paint: impl FnMut(i32, i32, Index),
+) {
+    for (n, &i) in idx.iter().enumerate() {
+        if i == transparent {
+            continue;
+        }
+        let (tx, ty) = (n % w, n / w);
+        paint(dx + tx as i32, dy + ty as i32, i);
     }
 }
