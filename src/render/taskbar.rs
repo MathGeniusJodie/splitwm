@@ -222,11 +222,29 @@ impl Renderer {
     /// trace and shadow passes need no idea which they are looking at —
     /// only the letter's size is fixed, where an icon scales with the box.
     fn for_each_slot_pixel(&self, slot: &SlotIcon, paint: impl FnMut(i32, i32, Index)) {
+        self.for_each_slot_pixel_where(slot, false, paint);
+    }
+
+    /// Like `for_each_slot_pixel`, but visits only the rim of the icon's (or
+    /// letter's) silhouette — the pixels a traced border actually needs to
+    /// grow outward from.
+    fn for_each_slot_edge_pixel(&self, slot: &SlotIcon, paint: impl FnMut(i32, i32, Index)) {
+        self.for_each_slot_pixel_where(slot, true, paint);
+    }
+
+    fn for_each_slot_pixel_where(
+        &self,
+        slot: &SlotIcon,
+        edge_only: bool,
+        paint: impl FnMut(i32, i32, Index),
+    ) {
         match slot.icon {
-            Some(img) => self.for_each_icon_pixel(img, slot.x, slot.y, slot.size, paint),
+            Some(img) => {
+                self.for_each_icon_pixel_where(img, slot.x, slot.y, slot.size, edge_only, paint);
+            }
             None => {
                 let (cx, cy) = slot.centre();
-                self.for_each_glyph_pixel(slot.label, cx, cy, paint);
+                self.for_each_glyph_pixel_where(slot.label, cx, cy, edge_only, paint);
             }
         }
     }
@@ -257,10 +275,12 @@ impl Renderer {
         if matches!(slot.trace, Trace::Nothing) {
             return;
         }
-        // Trace by stamping each traced pixel's own neighbourhood; the icon
+        // Trace by stamping each rim pixel's own neighbourhood; the icon
         // pass covers the middle back up, leaving a border of `ICON_BORDER`
-        // around the silhouette.
-        self.for_each_slot_pixel(slot, |px, py, _| {
+        // around the silhouette. Interior pixels need no stamp of their
+        // own — their growth lands entirely inside what their rim
+        // neighbours already throw.
+        self.for_each_slot_edge_pixel(slot, |px, py, _| {
             let wedge = slot.wedge(px, py);
             let Some(color) = slot.traced(wedge) else {
                 return;

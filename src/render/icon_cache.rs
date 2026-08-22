@@ -65,11 +65,30 @@ impl Renderer {
         size: i32,
         paint: impl FnMut(i32, i32, Index),
     ) {
+        self.for_each_icon_pixel_where(img, dx, dy, size, false, paint);
+    }
+
+    /// `edge_only` restricts the walk to the silhouette's rim — pixels with
+    /// a transparent (or out-of-bounds) neighbour. A border traced outward
+    /// from the silhouette only needs to grow from the rim: an interior
+    /// pixel's own outward growth lands entirely inside the growth already
+    /// thrown by its filled neighbours, so skipping it changes no pixel of
+    /// the result. The taskbar's border-trace pass is the one caller that
+    /// passes `true`; everything else walks every filled pixel.
+    pub(super) fn for_each_icon_pixel_where(
+        &self,
+        img: &Icon,
+        dx: i32,
+        dy: i32,
+        size: i32,
+        edge_only: bool,
+        paint: impl FnMut(i32, i32, Index),
+    ) {
         if img.w == 0 || img.h == 0 || size < 1 {
             return;
         }
         let sz = size as usize;
-        walk_indices(&self.cached_icon_indices(img, size), sz, dx, dy, paint);
+        walk_indices(&self.cached_icon_indices(img, size), sz, dx, dy, edge_only, paint);
     }
 
     /// Walk the ink of `ch` in `label_font`, centred at (cx, cy), reporting
@@ -81,10 +100,22 @@ impl Renderer {
         cy: i32,
         paint: impl FnMut(i32, i32, Index),
     ) {
+        self.for_each_glyph_pixel_where(ch, cx, cy, false, paint);
+    }
+
+    /// `edge_only` behaves as it does for `for_each_icon_pixel_where`.
+    pub(super) fn for_each_glyph_pixel_where(
+        &self,
+        ch: char,
+        cx: i32,
+        cy: i32,
+        edge_only: bool,
+        paint: impl FnMut(i32, i32, Index),
+    ) {
         let Some((w, h, idx)) = self.cached_glyph_indices(ch) else {
             return;
         };
-        walk_indices(&idx, w, cx - w as i32 / 2, cy - h as i32 / 2, paint);
+        walk_indices(&idx, w, cx - w as i32 / 2, cy - h as i32 / 2, edge_only, paint);
     }
 
     /// The index buffer of `ch` rendered in `label_font`, with its cell
@@ -173,12 +204,50 @@ impl Renderer {
 /// and unclipped: a caller may move a pixel anywhere before drawing it
 /// (the taskbar's shards do), and `set_pixel` drops whatever lands off the
 /// buffer.
-fn walk_indices(idx: &[Index], w: usize, dx: i32, dy: i32, mut paint: impl FnMut(i32, i32, Index)) {
+/// `edge_only` restricts the walk to a silhouette's rim — an opaque pixel
+/// with a transparent or out-of-bounds 8-neighbour — the pixels a border
+/// traced outward from the silhouette actually needs to grow from; an
+/// interior pixel's own outward growth lands entirely inside the growth
+/// already thrown by its filled neighbours, so skipping it changes no
+/// pixel of the result.
+fn walk_indices(
+    idx: &[Index],
+    w: usize,
+    dx: i32,
+    dy: i32,
+    edge_only: bool,
+    mut paint: impl FnMut(i32, i32, Index),
+) {
+    let h = idx.len() / w.max(1);
     for (n, &i) in idx.iter().enumerate() {
         if i == TRANSPARENT_INDEX {
             continue;
         }
         let (tx, ty) = (n % w, n / w);
-        paint(dx + tx as i32, dy + ty as i32, i);
+        if !edge_only || is_rim(idx, w, h, tx, ty) {
+            paint(dx + tx as i32, dy + ty as i32, i);
+        }
     }
+}
+
+/// Whether `(x, y)` in a `w`x`h` opaque/transparent buffer has any of its
+/// 8 neighbours transparent or off the buffer.
+fn is_rim(idx: &[Index], w: usize, h: usize, x: usize, y: usize) -> bool {
+    for oy in -1..=1i32 {
+        for ox in -1..=1i32 {
+            if ox == 0 && oy == 0 {
+                continue;
+            }
+            let (nx, ny) = (x as i32 + ox, y as i32 + oy);
+            let opaque = nx >= 0
+                && ny >= 0
+                && (nx as usize) < w
+                && (ny as usize) < h
+                && idx[ny as usize * w + nx as usize] != TRANSPARENT_INDEX;
+            if !opaque {
+                return true;
+            }
+        }
+    }
+    false
 }
