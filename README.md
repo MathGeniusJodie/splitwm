@@ -226,9 +226,9 @@ cargo run
 - TTY backend: output name fixed at startup even if the connector swaps;
   mode changes on an unchanged connector are ignored; libinput devices
   run defaults except natural scrolling (no tap-to-click config);
-  single GPU, single output by design.
+  single GPU, drives up to two monitors in mirror mode (same session screen).
 - Harness: headless output size fixed at 1280x800.
 
-Intentionally not implemented: multi-monitor, multiple tags, and a
-status bar/clock — this compositor shows one window per split, one
-split per window.
+Intentionally not implemented: multi-monitor workspace extension (mirroring
+only is supported), multiple tags, and a status bar/clock — this compositor
+shows one window per split, one split per window.
